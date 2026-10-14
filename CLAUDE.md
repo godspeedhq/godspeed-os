@@ -1713,10 +1713,11 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > state and confers no authority.
 >
 > **What it does not do, recorded rather than hidden (26.7).** ACPI asks the OS to run the firmware's `\_PTS`
-> method before S5, which is bytecode this kernel does not interpret; a machine that gates S5 on it - the HP T630, by the June
-> 2026 attempt - halts instead of powering off, and says so. The Pi 2 cannot cut its own 5 V and is expected to
-> halt (not yet checked on hardware); the Pi 4's firmware cuts
-> its rails only where its EEPROM sets `POWER_OFF_ON_HALT=1`.
+> method before S5, which is bytecode this kernel does not interpret; a machine that gates S5 on it - the HP T630 -
+> halts instead of powering off, and says so. The Pi 2 cannot cut its own 5 V and halts; the Pi 4's firmware cuts
+> its rails only where its EEPROM sets `POWER_OFF_ON_HALT=1`; the VisionFive's firmware cannot reach its power chip
+> and stops inside the call, so the kernel says what to do before making it. Hardware-verified on all five boards,
+> 2026-10-14: the Wyse powers off and the rest halt, each saying which (`docs/shutdown.md` 5).
 >
 > **Why it is recorded.** A new syscall with three operations, a query, a resource and a seam member widen the
 > surface Commandment I pins. It is mechanism on channels the kernel already owns - `reboot`'s sibling, and one
@@ -3316,8 +3317,8 @@ When real userspace work begins, the first user-facing design decision is **how 
 > never an alias, and a new exception needs a reason of its own written beside it, as this one is.
 >
 > **Note 2026-10-14: and a third, `shutdown`, with its reason.** It is the word Linux, Windows and macOS
-> share, and it names the ACT - ending the session - rather than promising a mechanism: on the T630 and the Pi 2
-> the machine is expected to halt without losing power, so `poweroff` would claim what may not happen (`docs/shutdown.md`). It
+> share, and it names the ACT - ending the session - rather than promising a mechanism: on the T630, the Pis and the
+> VisionFive the machine halts without losing power, so `poweroff` would claim what does not happen (`docs/shutdown.md`). It
 > left `FOREIGN_HINTS`, where its hint had been `reboot` - wrong advice, since `reboot` turns nothing off - and
 > `halt` and `poweroff` stay hints that answer `shutdown`.
 

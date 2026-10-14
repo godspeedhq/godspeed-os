@@ -1783,8 +1783,8 @@ pub fn hardware_reset() -> ! {
         // POKE ONCE, THEN LET THE WATCHDOG RUN OUT. This re-issued the poke on EVERY iteration, which is the
         // defect the Pi 2's `hardware_reset` records and fixed: PM_WDOG is a COUNTDOWN and writing it RESTARTS
         // it, so a tight loop keeps the ten-tick count from ever reaching zero. Found by the shutdown audit
-        // (`audits/2026-10-14-shutdown-docs-and-comments-audit.md`, defect 8); the Pi 4's `reboot` has not been
-        // re-checked on hardware since.
+        // (`audits/2026-10-14-shutdown-docs-and-comments-audit.md`, defect 8); the Pi 4's `reboot` was checked on
+        // the board after the fix, 2026-10-14: about 7 s from Enter to the next boot.
         //
         // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are what
         // invariant 12 exists for. If the SoC has not reset after a generous window the reset did NOT work, and

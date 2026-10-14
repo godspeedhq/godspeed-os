@@ -1,6 +1,6 @@
 # Utility: `poweroff` - not provided (considered and rejected)
 
-**Status:** Considered, implemented, tested on hardware, and **removed.** Its successor is built (QEMU-verified 2026-10-14; hardware cards pending):
+**Status:** Considered, implemented, tested on hardware, and **removed.** Its successor is built (QEMU- and hardware-verified 2026-10-14, all five boards):
 `shutdown` (`utilities/64_shutdown.md`, `docs/shutdown.md`, 2026-10-14), which halts where a board cannot cut its
 own power rather than claiming it did.
 **Why this doc exists:** so the next person doesn't re-attempt it expecting it to

@@ -74,3 +74,22 @@ not fixed here.
    been re-checked on hardware since: it needs a card.
 
 After the fixes: `osdev test shutdown` 35/0, and every regression suite again (in the commit).
+
+## Second pass, after the hardware cards (2026-10-14, `58a3f15f` to `0f66db5c`)
+
+**Scope.** What the five hardware cards changed: the four fixes they led to (`77949d30` the serial line and the
+`copier` cue, `155fc43a` the quiet x86 halt and the console-write window, `8458fcd3` the Pis' UART drain, `0f66db5c`
+the VisionFive's line before SBI SRST), and every document and comment whose status the cards made stale. Docs and
+comments only, as before; no code defect was found this pass.
+
+**Defect 8 verified:** the Pi 4's `reboot` works after the fix, about 7 s from Enter to the next boot.
+
+| Where | Was | Now |
+|---|---|---|
+| `docs/shutdown.md` status, 5, 7 item 4, 8 S5 | "hardware cards pending"; each board "expected" or "not tried"; S5 open | each board's result and time from its card; S5 done, with the four things the cards found |
+| `docs/shutdown.md` 8 | the serial join not mentioned | recorded, not fixed: a log line can still join the shell's line on serial when the shell takes the port first; the full fix is in four ports' serial writers, and the operator chose to leave it recorded |
+| `CLAUDE.md` 12.3 | the T630 "by the June 2026 attempt"; the Pi 2 "expected to halt (not yet checked on hardware)"; the VisionFive not mentioned | what each board does, hardware-verified on all five |
+| `CLAUDE.md` B.4 | on the T630 and the Pi 2 the machine "is expected to halt"; `poweroff` "would claim what may not happen" | the T630, the Pis and the VisionFive halt; `poweroff` would claim what does not happen |
+| `utilities/64_shutdown.md`, `utilities/14_poweroff.md`, `website/src/utilities.md`, `docs/CLAUDE.md` | "hardware cards pending" / "the other cards pending" | hardware-verified on all five boards |
+| `services/CLAUDE.md` `power` | "last-second tidy-up" | its tidy-up (three seconds out, said in the same row) |
+| `arch/aarch64/mod.rs` `hardware_reset` | "the Pi 4's `reboot` has not been re-checked on hardware since" | checked on the board after the fix |

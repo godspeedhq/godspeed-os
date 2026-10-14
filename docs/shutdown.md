@@ -1,9 +1,10 @@
 # Shutdown: turning the machine off on purpose
 
-**Status:** built on branch `feat/shutdown`, 2026-10-14, QEMU-verified; hardware cards pending. S1 to S4 are built:
-the kernel's `PowerOff` with its one deadline (S1), `fs`'s quiesce (S2), `power`'s warnings and tidy-up (S3) and the
-shell's `shutdown` (S4). `osdev test shutdown` passes 37 of 37 on x86, and the T630 card passed (it halts, as expected); QEMU RISC-V powers off through SBI SRST; the
-refusal without the capability is `osdev test adv` A12. The command is `utilities/64_shutdown.md`.
+**Status:** built on branch `feat/shutdown`, 2026-10-14; QEMU-verified and **hardware-verified on all five boards**
+(S5, section 5). S1 to S4 are built: the kernel's `PowerOff` with its one deadline (S1), `fs`'s quiesce (S2),
+`power`'s warnings and tidy-up (S3) and the shell's `shutdown` (S4). `osdev test shutdown` passes 37 of 37 on x86;
+QEMU RISC-V powers off through SBI SRST; the refusal without the capability is `osdev test adv` A12. The Wyse powers
+off; the T630, the Pis and the VisionFive halt and say so. The command is `utilities/64_shutdown.md`.
 
 ## 1. What is asked for
 
@@ -119,16 +120,17 @@ same tick every timed wait already uses.
 
 ## 5. What each board can do
 
-Read 2026-10-14. Only the QEMU rows have run; every board row needs a card.
+Every row has run, 2026-10-14. The time is from a plain `shutdown` being set to the last line, on the board's
+serial: its 3 s, plus the firmware's part.
 
 | Board | Route | What happens |
 |---|---|---|
 | QEMU x86 | ACPI S5: `SLP_TYPa` from `\_S5`, written to `PM1a_CNT` | powers off (`osdev test shutdown`) |
-| HP T630 | the same | expected to halt: in June 2026 the firmware gated S5 on `\_PTS` / `\_GTS`, ACPI bytecode needing an interpreter (`utilities/14_poweroff.md`) |
-| Dell Wyse 5070 | the same | not tried |
-| Raspberry Pi 4 | the power-management watchdog `reboot` already uses, with the boot partition set to 63 (`0x555`), which the firmware reads as halt (Linux `bcm2835_power_off`) | halts; with `POWER_OFF_ON_HALT=1` in the EEPROM the firmware also turns the rails off. Not checked on this board |
-| Raspberry Pi 2 | the same watchdog | expected to halt, "most of the chip powered off" (Linux's comment), with 5 V still on. Not checked on this board |
-| VisionFive 2 Lite | SBI SRST, the call `reboot` already makes, type shutdown | OpenSBI powers the AXP15060 PMIC off on the JH7110 since 2023; whether the firmware in this board's flash has the later device-tree fix it needs is not checked, and its cold reboot already dies reading the PMIC (`pmic_ops: cannot read pmic power register`, `arch/riscv64/sbi.rs`). On the board, 2026-10-14: the shutdown dies at the same step - OpenSBI says that line and never returns - so the kernel says what to do BEFORE the call |
+| HP T630 | the same | **halts**, 3.1 s: S5 is written and the machine stays on, the power light lit - the firmware gates S5 on `\_PTS`, ACPI bytecode this kernel does not interpret, as in June 2026 (`utilities/14_poweroff.md`). The kernel says so, then every core halts quietly |
+| Dell Wyse 5070 | the same (`SLP_TYPa` 7 on `0x0404`) | **powers off**, 3.0 s |
+| Raspberry Pi 4 | the power-management watchdog `reboot` already uses, with the boot partition set to 63 (`0x555`), which the firmware reads as halt (Linux `bcm2835_power_off`) | **halts**, about 3 s; with `POWER_OFF_ON_HALT=1` in the EEPROM the firmware also turns the rails off (whether this board's EEPROM sets it was not checked). `reboot` checked on the same card |
+| Raspberry Pi 2 | the same watchdog | **halts**, 3.0 s, "most of the chip powered off" (Linux's comment), with 5 V still on |
+| VisionFive 2 Lite | SBI SRST, the call `reboot` already makes, type shutdown | **stops in the firmware**, 3.1 s: OpenSBI says `pmic_ops: cannot read pmic power register` and never returns, the step its cold reboot already dies at (`arch/riscv64/sbi.rs`). OpenSBI powers the AXP15060 off on the JH7110 since 2023; this board's flash evidently lacks the later device-tree fix. So the kernel says what to do BEFORE the call |
 | QEMU RISC-V `virt` | SBI SRST shutdown | powers off; the tidy-up starts in time, and with no disk `fs` - blocked waiting on the storage driver - did not answer its quiesce before the kernel fired, which is the designed fallback |
 
 So the arch answer is three-valued: **off** (the call does not return), **halt** (the firmware will hold the
@@ -196,9 +198,8 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
    rights and `power` doing the tidy-up for either - which gives `reboot` the disk flush it lacks today (it resets
    without flushing). A separate step, after `shutdown` has passed its cards.
 4. **The name is `shutdown`, decided 2026-10-14.** It is the word other systems use, and it names the act - ending
-   the session - rather than promising a mechanism: on the T630 and the Pi 2 the machine halts and does not lose
-   power (expected from the June 2026 attempt and Linux's driver; not yet checked on either), so `poweroff` would
-   claim what may not happen. `poweroff` and `halt` are hints that answer `shutdown`.
+   the session - rather than promising a mechanism: on the T630, the Pis and the VisionFive the machine halts and
+   does not lose power (section 5), so `poweroff` would claim what does not happen. `poweroff` and `halt` are hints that answer `shutdown`.
 5. **Clock time** (`shutdown at 22:00`) is left out: it depends on `time` having a clock, and a durations-only
    first version cannot be wrong about that.
 
@@ -210,8 +211,17 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
 | S2 | `fs`: `OP_QUIESCE` - finish, flush, refuse writes for 10 s | `osdev test shutdown`: fs says it flushed |
 | S3 | `power`: read the deadline, warnings, the tidy-up three seconds out, carry on after a restart | `osdev test shutdown`: the countdown and tidy-up lines |
 | S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 37/0 |
-| S5 | Cards on all five boards | each says off or halted truthfully, the machine off within about 1 s of a plain `shutdown`'s 3 s |
+| S5 | Cards on all five boards | **done 2026-10-14**: each says off or halted truthfully, and its last line lands within about 0.1 s of a plain `shutdown`'s 3 s (section 5). The cards found four things QEMU could not show, fixed in turn: log lines joined onto the shell's line on serial; three cores' fault reports printed over the T630's halt; the Pis' last line cut off by their own watchdog; and the VisionFive never saying it was safe to switch off |
 | S6 | `reboot` on the same deadline, with the tidy-up | the jobs and quit suites, and a card per board |
+
+### Recorded, not fixed: a log line can still join the shell's line on serial
+
+A log line starts a new line on serial when the shell has left one open (`log.rs`, `SERIAL_LINE_OPEN` and
+`CONSOLE_WRITES`). It decides that before its own write waits for the port, so when the shell takes the port in
+between, the two still run together: the Pi 4 card showed it once, `[b] backgroundpower: tidy-up`. Only each port's
+serial writer knows the order bytes reach the wire - on the Pi 2 a queue drained later - so the complete fix is in
+four writers, the most safety-critical output path there is, for tidiness. The operator chose to leave it recorded,
+2026-10-14. The screen is unaffected: log lines go to serial only.
 
 ## 9. How other systems do it
 

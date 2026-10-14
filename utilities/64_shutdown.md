@@ -1,7 +1,7 @@
 # Utility: `shutdown` - turn the machine off
 
 **Utility:** `shutdown` - turn the machine off, now or after a delay
-**Status:** Built 2026-10-14, QEMU-verified (`osdev test shutdown`); hardware cards pending. Design: `docs/shutdown.md`.
+**Status:** Built 2026-10-14, QEMU-verified (`osdev test shutdown`) and hardware-verified on all five boards: the Wyse powers off, the T630, the Pis and the VisionFive halt. Design: `docs/shutdown.md`.
 **Shape:** shell built-in. The shell holds `POWER_OFF`; the KERNEL holds the deadline; `power` warns and tidies up.
 
 ---

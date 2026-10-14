@@ -87,6 +87,10 @@ static SERIAL_LINE_OPEN: AtomicBool = AtomicBool::new(false);
 /// BEFORE its own serial write waits for the port: at 115200 baud a shell line takes milliseconds to go out, and
 /// a log line decided during that window ran on from it (the T630, 2026-10-14; QEMU's serial is instant and
 /// never showed it). Counting it open costs at most a blank line when the console bytes end in a newline.
+///
+/// What it does NOT cover, recorded (`docs/shutdown.md` 8): a console write that STARTS after the log line has
+/// decided, and reaches the port first. Only each port's serial writer knows the order bytes reach the wire, so
+/// the complete fix is there, in four writers; the Pi 4 showed the join once in a whole card.
 static CONSOLE_WRITES: AtomicU32 = AtomicU32::new(0);
 
 /// The console path (syscall `ConsoleWrite`) brackets its serial write with these, so the next log line knows

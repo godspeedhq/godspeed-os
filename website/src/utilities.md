@@ -102,7 +102,7 @@ fails.
 | [`chaos`](utilities/chaos.md) | kill things deliberately, and see what survives |
 | [`reboot`](utilities/reboot.md) | restart the machine |
 | [`poweroff`](utilities/poweroff.md) | **not provided** - and the page says why |
-| [`shutdown`](utilities/shutdown.md) | turn the machine off, now or after a delay (QEMU-verified; hardware pending) |
+| [`shutdown`](utilities/shutdown.md) | turn the machine off, now or after a delay (hardware-verified on all five boards) |
 | [`background`](utilities/background.md) | run long work as a job, so the prompt stays usable |
 
 ### Networking
