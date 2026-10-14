@@ -363,7 +363,13 @@ went to `fs`, a 14.5 s format. `selfcheck`: `ran 593, failed 0, skipped 1` (DNS:
 background` at once, the first left with `b`, the second attached to the end: "job 1 done" the moment `fs`
 answered. Seen, not fixed: `foreground` that stays attached to the end says "job 1 done" and does NOT print
 what the check found - the live loop has never replayed the transcript (`finish_attached` does, for a typed
-command); `copier` keeps it, so a second `foreground 1` shows it. No `selfcheck` on this card. The Pi 2 is next.
+command); `copier` keeps it, so a second `foreground 1` shows it. No `selfcheck` on this card.
+
+**Pi 2 card for the same fix (`27821145`), 2026-10-14, passed:** a 34.4 s check on the USB stick; `jobs` during it
+answered with the row at once (it took 8 s on this board before the fix); `foreground 1` twice, `[q] quit   [b]
+background` each time, the first left with `b`, the second attached to the end, "job 1 done" the moment `fs`
+answered. No `selfcheck` on this card. The x86 machines were not re-carded: the change is in the shell alone
+and architecture-neutral, and `osdev test quit`, `jobs`, `shell`, `files` and `script` run it on x86 in QEMU.
 
 **The SBCs were slower than the x86 machines at backgrounding and foregrounding** (the operator, 2026-10-14):
 the Pi 2, Pi 4 and VisionFive each took longer than the T630 and Wyse from Enter to the notice, from `b` to
