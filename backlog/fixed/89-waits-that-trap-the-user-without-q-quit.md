@@ -369,7 +369,14 @@ command); `copier` keeps it, so a second `foreground 1` shows it. No `selfcheck`
 answered with the row at once (it took 8 s on this board before the fix); `foreground 1` twice, `[q] quit   [b]
 background` each time, the first left with `b`, the second attached to the end, "job 1 done" the moment `fs`
 answered. No `selfcheck` on this card. The x86 machines were not re-carded: the change is in the shell alone
-and architecture-neutral, and `osdev test quit`, `jobs`, `shell`, `files` and `script` run it on x86 in QEMU.
+and architecture-neutral, and `osdev test quit`, `jobs`, `shell` (272/0), `files` (270/0) and `script` (11/0) run it
+on x86 in QEMU.
+
+**Dell Wyse 5070 card for the fix (`b35a2faa`), 2026-10-14, passed:** `drives flash data`, then `y`, formatted in
+2.9 s with NO `[q]` line - the `[y/N]` clock edge is gone (on this board the old build printed `[q] quit` at
+the `y`). A typed `drives check`: `[q] quit   [b] background` 1.1 s after `copier` was ready, and the report
+printed when it ended 0.3 s later. A second, with `b`: `[backgrounded] job 1` in the same millisecond; `jobs`
+said `done`; `foreground 1` replayed the verdict. `selfcheck`: `ran 592, failed 0, skipped 0`.
 
 **The SBCs were slower than the x86 machines at backgrounding and foregrounding** (the operator, 2026-10-14):
 the Pi 2, Pi 4 and VisionFive each took longer than the T630 and Wyse from Enter to the notice, from `b` to
