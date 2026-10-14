@@ -302,9 +302,10 @@ task; here it cannot, and the words say so).
   waits out `copier_status`'s 8 s and comes back `Busy`. The rule is met (a `[q]` past 2 s), but `jobs` is a
   look and should not take 8 s; for a check, a scrub or a tree delete, which are each one request, it could
   say "running" from the row without asking. Recorded with the clock edge above, for after the cards.
-- The serial log does not show when Enter was pressed for `foreground 1`, so whether its wait passed 2 s
-  cannot be read off it. The code's bound on it is `copier_status`'s 8 s under the watch, and no `[q]` line
-  appears, so by the code it answered within 2 s of Enter.
+- `foreground 1`, typed while the check ran, took about 8 s by the operator's watch, and the log shows no
+  `[q]` line for it. It opens with the same `copier_status` question, so 8 s is that question's bound; the
+  missing notice is NOT explained (the clock starts after the history save, itself a silent wait of up to 2 s
+  on an `fs` busy with the check). Not reproduced; for after the cards, with the `jobs` edge above.
 - Not exercised here either: a large `copy` with `q`, `delete <dir> recursive` with `b`, and `q` on
   `foreground` of a running job.
 Still owed: the Pi 4 and the VisionFive 2 Lite.
