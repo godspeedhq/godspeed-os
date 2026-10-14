@@ -218,7 +218,10 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
 
 A log line starts a new line on serial when the shell has left one open (`log.rs`, `SERIAL_LINE_OPEN` and
 `CONSOLE_WRITES`). It decides that before its own write waits for the port, so when the shell takes the port in
-between, the two still run together: the Pi 4 card showed it once, `[b] backgroundpower: tidy-up`. Only each port's
+between, the two still run together: the Pi 4 card showed it once, `[b] backgroundpower: tidy-up`. The commonest
+case is closed at its source: the shell cues `power` only after its own line is out, because cued first, `power`'s
+announcement raced the shell's first countdown line every time (`osdev test shutdown` caught it in QEMU). What is
+left is two clocks that tick in the same second - the shell's countdown and `power`'s warnings. Only each port's
 serial writer knows the order bytes reach the wire - on the Pi 2 a queue drained later - so the complete fix is in
 four writers, the most safety-critical output path there is, for tidiness. The operator chose to leave it recorded,
 2026-10-14. The screen is unaffected: log lines go to serial only.

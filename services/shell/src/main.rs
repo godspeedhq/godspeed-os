@@ -7599,7 +7599,7 @@ fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         "cancel" => {
             return match ctx.power_off_cancel() {
-                0 => { shutdown_cue_power(ctx); gs::io::println(ctx, "shutdown: cancelled"); Ok(()) }
+                0 => { gs::io::println(ctx, "shutdown: cancelled"); shutdown_cue_power(ctx); Ok(()) }
                 1 => { gs::io::println(ctx, "shutdown: none is pending"); Err(ShellError::Unknown) }
                 rc => { gs::io::println_fmt(ctx, format_args!("shutdown: cancel refused ({})", rc)); Err(ShellError::Denied) }
             };
@@ -7625,8 +7625,10 @@ fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             }
         }
     };
+    // `power` is cued AFTER this shell's own line is out, not before: cued first, its announcement raced the line
+    // onto serial and ran on from it (`docs/shutdown.md` 8). Once the line is written the kernel knows it is open.
     match ctx.power_off_in(secs) {
-        0 => shutdown_cue_power(ctx),
+        0 => {}
         1 => {
             let sooner = ctx.power_off_pending().unwrap_or(0);
             gs::io::println_fmt(ctx, format_args!(
@@ -7642,6 +7644,7 @@ fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if secs >= SHUTDOWN_FOREGROUND_SECS {
         gs::io::println_fmt(ctx, format_args!(
             "shutdown in {} - `shutdown cancel` stops it", Delay(secs)));
+        shutdown_cue_power(ctx);
         return Ok(());
     }
     // THE COUNTDOWN, in the foreground (rule 10): one line, rewritten each second. `q` cancels the shutdown
@@ -7658,17 +7661,19 @@ fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             }
         };
         if left != shown {
+            let first = shown == u64::MAX;
             shown = left;
             gs::io::print_fmt(ctx, format_args!("\r\x1b[2Kshutdown in {}   [q] quit   [b] background",
                                                  Delay(left)));
+            if first { shutdown_cue_power(ctx); }
         }
         let key = if ctx.quit.get() { Some(b'q') } else { ctx.try_console_read() };
         match key {
             Some(b'q') | Some(b'Q') | Some(0x1b) => {
                 gs::io::println(ctx, "");
                 if ctx.power_off_cancel() == 0 {
-                    shutdown_cue_power(ctx);
                     gs::io::println(ctx, "shutdown: cancelled");
+                    shutdown_cue_power(ctx);
                 } else {
                     gs::io::println(ctx, "shutdown: it had already been cancelled");
                 }
