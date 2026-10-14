@@ -1,6 +1,6 @@
 # 89. Waits that trap the user without `[q] quit`
 
-**Status: FIXED 2026-10-14 in QEMU; the hardware cards are pending.** `osdev test quit`, the test the
+**Status: FIXED 2026-10-14 in QEMU; the T630 card passed, the other four are pending.** `osdev test quit`, the test the
 operator named, shows the rule met: 35 cases, 0 below the bar, `fs` and four services slowed (the tables
 below). Found by
 `audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for every site), what passes and what was not
@@ -256,3 +256,21 @@ when no job is believed live; and `copier` kept a mkdir helper nothing called si
 folder. One question is the operator's, not the code's: `q` on `wifi radio off hard` stops the WAIT and says
 the cut may still happen, since the cut cannot be stopped once asked (rule 11 asks that quitting stop the
 task; here it cannot, and the words say so).
+
+## Hardware cards
+
+**HP T630, 2026-10-14, passed** (`build/serial_output.log`, x86 `os-usb.img` at `3ed46d5a`, AHCI SSD):
+
+- `drives flash data`, then `y`: formatted and mounted with no reboot; `fs` wrote the standard tree.
+- A typed `drives check` ran as a `copier` job: `[q] quit   [b] background` printed 1.7 s after `copier` was
+  spawned (`fs` then took 3.9 s for the sweep), and the verdict printed as the shell's own lines.
+- A second typed `drives check`, then `b`: `[backgrounded] job 1` printed in the same millisecond as the key.
+  `jobs` listed it `done`, and `foreground 1` said "job 1 is done" and replayed its four lines.
+- `selfcheck`: `ran 592, failed 0, skipped 0`, every part with `[q] quit` on its banner, including the layout
+  block (`/system` with its four folders, `/users/default`, `pwd`, `home`), `background drives scrub` as job 2
+  and `assert fails background selfcheck`.
+- Not exercised on this card: a typed `copy` of a large file with `q`, `delete <dir> recursive` with `b`, and
+  `q` on `foreground` of a job still running (job 1 had finished). The `ResourceId(102) gen mismatch ...
+  liveness=Alive` lines after `selfcheck` kills `events` are `backlog/86`, open and not this branch's.
+
+Still owed: the Wyse, the Pi 2, the Pi 4 and the VisionFive 2 Lite.
