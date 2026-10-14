@@ -155,7 +155,7 @@ struct Transcript {
     dropped: u32,
 }
 
-/// `write!` into the transcript, for the lines a job reports (the shell's own words, `backlog/89`).
+/// `write!` into the transcript, for the lines a job reports (the shell's own words, `backlog/fixed/89`).
 impl core::fmt::Write for Transcript {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.write(s.as_bytes());
@@ -394,7 +394,7 @@ fn discard_partial(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &Job) {
 }
 
 /// A copy is complete: say so in the shell's own words (`cmd_copy`), so a copy typed at the prompt, which runs
-/// as this job since `backlog/89`, prints what it always printed.
+/// as this job since `backlog/fixed/89`, prints what it always printed.
 fn finish_copy(ctx: &ServiceContext, job: &mut Job) {
     job.state = ST_DONE;
     job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
@@ -707,7 +707,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // verdict to render.
                         // THE SHELL'S OWN WORDS, line for line (`drives_check` / `drives_scrub` in services/shell):
                         // since 2026-10-14 a `drives check` typed at the prompt RUNS as this job, so `[b]` can
-                        // detach it (`backlog/89`), and what it prints must not change with where it ran.
+                        // detach it (`backlog/fixed/89`), and what it prints must not change with where it ran.
                         use core::fmt::Write as _;
                         let outcome = if kind == KIND_SCRUB {
                             gfs.scrub().map(|v| { (v.files, v.dirs, v.bad, v.scanned, 0u64, 0u64) })

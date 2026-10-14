@@ -9,7 +9,7 @@ name = "net-stack"
 path = "src/main.rs"
 
 [features]
-# Hold every client reply 2.5 s, so `osdev test quit` (backlog/89) can watch a person wait on this
+# Hold every client reply 2.5 s, so `osdev test quit` (backlog/fixed/89) can watch a person wait on this
 # service in QEMU. TEST BUILDS ONLY.
 slow-replies = []
 # Take a deliberate EL0 page fault at startup, to PROVE the kernel kills this task and keeps running

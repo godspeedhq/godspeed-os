@@ -44,7 +44,7 @@ job 1 done
 | `q`, while attached | **stop the job**, not just the view (conventions rule 11) |
 | `b`, while attached | detach it again, leaving it running |
 
-**Typed at the prompt, four of these run as jobs anyway** (2026-10-14, `backlog/89`): `copy <file>
+**Typed at the prompt, four of these run as jobs anyway** (2026-10-14, `backlog/fixed/89`): `copy <file>
 <dst>`, `delete <dir> recursive`, `drives check` and `drives scrub` start as the job `background` would
 start, and the console attaches to it as `foreground` does. Nothing changes until 2 s; then the notice
 is `[q] quit   [b] background`, so the key the conventions promise (rule 10) is there exactly where it

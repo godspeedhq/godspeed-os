@@ -8478,7 +8478,7 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     check!(replay.contains("drives check - walking the volume"),
            "`foreground` REPLAYS THE TRANSCRIPT - the output was held in bounded RAM until it was asked for");
     check!(replay.contains("0 bad") && replay.contains("check: ok - filesystem is consistent"),
-           "the verdict is RENDERED in the shell's own words - fs answers with counts, and a typed `drives check` runs as this same job (backlog/89)");
+           "the verdict is RENDERED in the shell's own words - fs answers with counts, and a typed `drives check` runs as this same job (backlog/fixed/89)");
     // THE DETACHED FORM MUST SAY WHAT THE ATTACHED ONE SAYS. A backgrounded check that omits the
     // repair line answers less than `drives check` does, silently - and `drives check` REPAIRS as it
     // goes, so a second run cannot recover the answer. That cost a hardware run on 2026-09-22.
@@ -10803,7 +10803,7 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
-/// `osdev test quit` (`backlog/89`, `audits/2026-10-13-quit-audit.md`): every kind of wait, on an `fs` built
+/// `osdev test quit` (`backlog/fixed/89`, `audits/2026-10-13-quit-audit.md`): every kind of wait, on an `fs` built
 /// with `slow-replies` (700 ms per reply, 4 s for the long single operations), recording for each command
 /// whether `[q] quit` appeared and when, whether `[b]` did, how long `q` took to bring the prompt back, and
 /// what the command said. The record is `build/tests/quit_report.md`.

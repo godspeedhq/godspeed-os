@@ -21,7 +21,7 @@ drop-request-test = []
 crash-window = []
 # Hold every reply, so a test can see what a person sees on a slow disk: 700 ms for an ordinary
 # request (a command of several requests runs past 2 s while no single one does) and 4 s for the long
-# single operations (delete tree, check, scrub, flash). For `osdev test quit` (backlog/89). TEST BUILDS ONLY.
+# single operations (delete tree, check, scrub, flash). For `osdev test quit` (backlog/fixed/89). TEST BUILDS ONLY.
 slow-replies = []
 
 # Hold the window open INSIDE a journal replay, after the first home block has landed and before the

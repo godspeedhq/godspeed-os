@@ -544,7 +544,7 @@ const EXTRA_CHECKS: &[&str] = &[
     // and radio drivers arrived, because its driver list is hand-kept. Found by the 2026-10-09 audit;
     // the list was corrected the same day. A checker on one build path is a checker on none.
     "scripts/stdlib_gap_check.py",
-    // NO SILENT WAIT IN THE SHELL (backlog/89, conventions rule 10): every wait the shell makes reads the
+    // NO SILENT WAIT IN THE SHELL (backlog/fixed/89, conventions rule 10): every wait the shell makes reads the
     // command's watch, or carries `// quit-ok:` saying why it cannot trap anyone, and those exceptions may
     // fall and may not rise. On the build path from its first day, for the reason above.
     "scripts/quit_wait_check.py",
@@ -2597,7 +2597,7 @@ fn build_slow_services(svcs: &[&str]) {
     println!("build: slow services embedded");
 }
 
-/// `osdev test quit` (`backlog/89`): every kind of wait, on a deliberately slow `fs`, recording whether
+/// `osdev test quit` (`backlog/fixed/89`): every kind of wait, on a deliberately slow `fs`, recording whether
 /// `[q] quit` (and `[b]`) appeared, when, and what `q` did. The record is `build/tests/quit_report.md`.
 fn run_quit_test() {
     println!("\n=== quit: every wait on a slow fs - does [q] appear, and does q work? ===");

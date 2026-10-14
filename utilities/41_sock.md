@@ -115,7 +115,7 @@ Conforms to `0_conventions.md`: `sock version` / `sock help`, words-not-flags, r
 `so`-prefixed verb).
 
 **Conforms to rule 10.** The resolver lookup (`ns_deadline`, 3 s, one reacquire-and-retry) is under the
-command's watch (2026-10-13, `backlog/89`), and the open and the send go through `gs::net::Net::with_notice`,
+command's watch (2026-10-13, `backlog/fixed/89`), and the open and the send go through `gs::net::Net::with_notice`,
 which says `[q] quit` once a wait passes 2 s and ends on `q`. That notice is the request's own, not the
 command's: a `q` typed earlier in the same command does not stop the next request before it is sent. (Found
 2026-10-09 lending no notice, through `Net::new`; bounded at `gs::net::NET_SECS` (10 s) for the open and

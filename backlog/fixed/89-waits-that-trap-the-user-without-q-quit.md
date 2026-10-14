@@ -1,9 +1,12 @@
 # 89. Waits that trap the user without `[q] quit`
 
-**Status: OPEN, 2026-10-13; the route below is built and measured (2026-10-14).** Found by
+**Status: FIXED 2026-10-14 in QEMU; the hardware cards are pending.** `osdev test quit`, the test the
+operator named, shows the rule met: 35 cases, 0 below the bar, `fs` and four services slowed (the tables
+below). Found by
 `audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for every site), what passes and what was not
 checked. The observer route is built, slice by slice, with `osdev test quit` at 35 cases and none below the bar,
-and a ratchet holds it (the end of this file). Open: the waits between commands, and the hardware cards.
+and a ratchet holds it (the end of this file). Not closed by it, and recorded below: the waits between
+commands, which no command clock covers, and the `q` on `wifi radio off hard` question.
 
 ## The rule asked for
 

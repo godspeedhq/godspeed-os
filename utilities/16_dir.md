@@ -224,7 +224,7 @@ Conforms: `dir help` (usage with a real example per row) and `dir version` (numb
 creator credit) per `0_conventions.md` (the shared `help_block` helper).
 
 Also conforms to **rule 10** (`0_conventions.md` §1.10): the listing goes through a `gs::fs::Fs`
-handle lent the command's watch (`gs::call::Watch`, since 2026-10-13, `backlog/89`), so once the COMMAND
+handle lent the command's watch (`gs::call::Watch`, since 2026-10-13, `backlog/fixed/89`), so once the COMMAND
 has run 2 s (`gs::call::NOTICE_AFTER_SECS`) it prints `  [q] quit`, and `q`/`Q`/ESC returns to the prompt
 with no error (a fast listing prints nothing). This replaced a bare `request_with_reply`, which rule 10
 forbids for an interactive command. The piped form (`build_dir_table`) uses the same handle, so

@@ -84,7 +84,7 @@ storage.
 
 Conforms: own `tree help` / `tree version` (with a real example, per `0_conventions.md`).
 
-**Conforms to rule 10** (`0_conventions.md` §1.10) since 2026-10-13 (`backlog/89`). It found 2026-10-09
+**Conforms to rule 10** (`0_conventions.md` §1.10) since 2026-10-13 (`backlog/fixed/89`). It found 2026-10-09
 that the `fs` handle was lent no notice; every `fs` handle the shell makes is now lent the command's
 watch (`gs::call::Watch`), so the command says `[q] quit` once it has run 2 s, and `q`, `Q` or ESC stops the command
 at its next request (`osdev test quit` measures `tree /` on a slowed `fs`).

@@ -476,7 +476,7 @@ pub struct ShellCtx {
     cmd_start: core::cell::Cell<i64>,
     cmd_noticed: core::cell::Cell<bool>,
     /// The command now starting was TYPED at the prompt (set at Enter, taken by the outermost `execute`), so a
-    /// detachable one runs as a job the console attaches to (`run_typed_as_job`, `backlog/89`).
+    /// detachable one runs as a job the console attaches to (`run_typed_as_job`, `backlog/fixed/89`).
     typed: core::cell::Cell<bool>,
     /// The command's notice offers `[b] background` beside `[q] quit`: it runs as a job that can be detached.
     offer_b: core::cell::Cell<bool>,
@@ -1256,7 +1256,7 @@ fn complete_wifi_stored(ctx: &ShellCtx, line: &mut Line, tok_start: usize) -> bo
     // Completion runs without the shell's state, so it finds the radio itself.
     // Tab is a key, not a command, so there is no `[q]` to offer: the wait is kept under 2 s instead. The second
     // ask is for a send that never left (a timeout back inside 250 ms), not for a radio that was slow - two full
-    // waits made Tab silent for 3 s (`backlog/89`).
+    // waits made Tab silent for 3 s (`backlog/fixed/89`).
     let reply = match find_radio(ctx) {
         None => None,
         Some(radio) => {
@@ -2171,7 +2171,7 @@ impl ShellError {
 #[inline(never)]
 fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
     // TYPED AT THE PROMPT, and this is that command rather than one a script, a function or a pipe runs inside
-    // it: only then does a detachable command run as a job, so its notice can offer `[b]` (`backlog/89`). A
+    // it: only then does a detachable command run as a job, so its notice can offer `[b]` (`backlog/fixed/89`). A
     // script's `drives check` stays in the shell, because detaching it would let the script run on past it.
     let typed = ctx.typed.replace(false) && depth == 0 && matches!(*out, Out::Console);
     let Ok(s) = core::str::from_utf8(line) else {
@@ -2599,7 +2599,7 @@ fn cmd_run(ctx: &ShellCtx, cwd: &mut Cwd, arg: &str, depth: u8, save: Option<&st
     }
     resolve_imports(ctx, &mut script, &mut code);
     // Stopped by the command's watch between statements (`run_lines`), like every other command: a script
-    // nobody could stop was the worst trap the 2026-10-13 audit found (`backlog/89` Q3).
+    // nobody could stop was the worst trap the 2026-10-13 audit found (`backlog/fixed/89` Q3).
     run_with_optional_save(ctx, cwd, &[("", &script[..code])], depth, save, params, false)
 }
 
@@ -4777,7 +4777,7 @@ fn run_lines(ctx: &ShellCtx, cwd: &mut Cwd, src: &[u8], depth: u8, out: &mut Out
         // `wait`) records it as the COMMAND's quit (`gs::call::Watch`), so the script stops here rather than
         // running every later statement into a refusal - `selfcheck files` once reported "ran 150, failed 89"
         // for one `q`. The watch reads no key before `[q] quit` is showing, so typing ahead is not taken for an
-        // answer, and every script a person runs can now be stopped (`backlog/89` Q3).
+        // answer, and every script a person runs can now be stopped (`backlog/fixed/89` Q3).
         if ctx.cmd_active.get() && gs::call::Watch::stopped(ctx) {
             aborted = true;
             break;
@@ -11707,7 +11707,7 @@ fn wifi_join_outcome(ctx: &ShellCtx, out: &mut Out, name: &str, outcome: ReqOutc
         },
         ReqOutcome::Aborted => {
             // The request reached the radio, which goes on joining by itself: "not joined" was a guess about a
-            // join still in progress (`backlog/89` Q6).
+            // join still in progress (`backlog/fixed/89` Q6).
             out.line_fmt(ctx, format_args!("join: stopped waiting - the radio may still be joining; `wifi status` says where it got to"));
             Ok(())
         }
@@ -18425,7 +18425,7 @@ fn chaos_save_retry(ctx: &ShellCtx, ppath: &[u8], data: &[u8]) -> bool {
     }
 }
 
-/// The operator quit the chaos command (`gs::call::Watch`, `backlog/89`): asked at the top of every round and
+/// The operator quit the chaos command (`gs::call::Watch`, `backlog/fixed/89`): asked at the top of every round and
 /// inside the waits, so a storm stops at the next round with the command's `[q] quit`, not at its end.
 fn chaos_stopped(ctx: &ShellCtx) -> bool {
     ctx.cmd_active.get() && gs::call::Watch::stopped(ctx)
@@ -19813,7 +19813,7 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     }
 }
 
-/// A command the operator quit says it STOPPED - never "storage error" or "failed" (`backlog/89` Q6), which
+/// A command the operator quit says it STOPPED - never "storage error" or "failed" (`backlog/fixed/89` Q6), which
 /// sends a person looking for a fault that is not there. `left` says what a half-done command leaves
 /// behind, where that is anything but nothing. `true` when it was a quit, and the line is said.
 fn said_stopped(ctx: &ShellCtx, verb: &str, left: &str) -> bool {
@@ -20135,7 +20135,7 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 /// (`request_with_reply_deadline`). `None` for no answer, including a quit - the caller's `said_stopped` or
 /// `ctx.quit` tells the two apart. Every service wait in the shell is built on this, `ask_with_quit_notice`
 /// or `ctx.fs()`, or says beside it why it cannot trap anyone (`// quit-ok:`, `scripts/quit_wait_check.py`;
-/// `backlog/89`). `inline(always)`: it returns a 4 KiB message by value, and as its own frame that would be
+/// `backlog/fixed/89`). `inline(always)`: it returns a 4 KiB message by value, and as its own frame that would be
 /// another 4 KiB of the shell's stack.
 #[inline(always)]
 fn ask_watched(ctx: &ShellCtx, peer: &str, msg: &Message, secs: i64) -> Option<Message> {
@@ -23195,7 +23195,7 @@ fn start_job(ctx: &ShellCtx, kind: u8, src: &[u8], dst: &[u8], secs: u64, say: b
     if pending { Err(JobStart::Pending(id)) } else { Ok(id) }
 }
 
-// ---- A DETACHABLE COMMAND TYPED AT THE PROMPT RUNS AS A JOB (`backlog/89`) ----------------------------------
+// ---- A DETACHABLE COMMAND TYPED AT THE PROMPT RUNS AS A JOB (`backlog/fixed/89`) ----------------------------------
 //
 // `[b] background` is offered exactly where the key can work. A command the shell runs itself is the shell
 // parked in its requests, with no running state to hand on, so `b` could only abandon it. A job is `copier`'s,
@@ -23630,7 +23630,7 @@ fn replay_transcript(ctx: &ShellCtx, indent: &str) {
         req[0] = CP_OP_OUTPUT;
         req[1..5].copy_from_slice(&off.to_le_bytes());
         // Sifted by op: a reply left over from a status question is not this page. Under the command's watch
-        // when there is one, so a slow `copier` says `[q] quit` here as everywhere else (`backlog/89`); plain
+        // when there is one, so a slow `copier` says `[q] quit` here as everywhere else (`backlog/fixed/89`); plain
         // (`copier_ask`) only between commands.
         let r = if ctx.cmd_active.get() {
             match gs::call::request_watched_sifted(ctx, "copier", &Message::from_bytes(&req), 8, ctx,
@@ -24914,7 +24914,7 @@ fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellErr
         }
         Some(_) => { gs::io::println(ctx, "drives: flash FAILED (no disk, or disk too small)"); Err(ShellError::Unknown) }
         // One request formats the disk, so a quit leaves `fs` still formatting - it said "storage unavailable"
-        // here, a wrong answer about a destructive operation (`backlog/89` Q6).
+        // here, a wrong answer about a destructive operation (`backlog/fixed/89` Q6).
         None if said_stopped(ctx, "drives flash", "the format goes on in fs; `drives` says when it is done") => Ok(()),
         None    => { gs::io::println(ctx, "drives: storage unavailable (no fs?)"); Err(ShellError::Unknown) }
     }

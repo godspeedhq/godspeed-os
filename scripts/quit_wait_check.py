@@ -4,7 +4,7 @@
 
 The operator, 2026-10-13: "Any utility or blocking action that requires a user to wait should have [q] quit or
 [b] background (if it's backgroundable) beyond 2 seconds ... GodspeedOS should always be responsive and should
-never trap the user behind a block" (`utilities/0_conventions.md` rule 10, `backlog/89`).
+never trap the user behind a block" (`utilities/0_conventions.md` rule 10, `backlog/fixed/89`).
 
 THE SHELL IS THE OBSERVER (`audits/2026-10-13-quit-audit.md` 7a). A command that is a separate program waits
 inside the shell, which owns its clock, its `[q]` and its kill; a built-in starts one command clock at Enter
@@ -30,7 +30,7 @@ line added to get a build through.
 
 WHAT IT CANNOT SEE, said rather than implied:
   - a LOOP of sleeps or yields that never reads `q` (the chaos modes once were; they read the watch now). A
-    loop's bound is a runtime fact, and `osdev test quit` measures it: the table in `backlog/89`.
+    loop's bound is a runtime fact, and `osdev test quit` measures it: the table in `backlog/fixed/89`.
   - a wait reached through a helper of the shell's own that wraps one of the counted calls: the call inside
     the helper is counted, once, and its marker has to be true for every caller.
   - a wait between commands (the history save, `tidy_helpers`, an audio shortcut). Those run with no command
@@ -161,7 +161,7 @@ def main():
         print("QUIT-WAIT CHECK FAILED - a wait in the shell reads no key and says nothing past 2 s:\n")
         for where, n, code, _ in unmarked:
             print(f"  {where}:{n}: {code}")
-        print("\nThe shell is the observer (backlog/89, utilities/0_conventions.md rule 10). Make the wait read the")
+        print("\nThe shell is the observer (backlog/fixed/89, utilities/0_conventions.md rule 10). Make the wait read the")
         print("command's watch - `ask_watched`, `ask_with_quit_notice`, `gs::call::request_watched(_sifted)`, or")
         print("`ctx.fs()` for files - or, if it truly cannot trap anyone, say why on the line above it:")
         print("`// quit-ok: <reason>` (under 2 s, one pass of a loop that reads q, after a q, or between commands).")

@@ -25,7 +25,7 @@ even what printing needs (that is `log_write`, which this service holds; see bel
 REACH the console, it needs its output to survive until somebody asks. The bounded transcript
 (`CP_OP_OUTPUT`, replayed by `foreground`) is where it survives, and the check and scrub branch turns the
 counts `fs` answers with into the sentences a person reads - the shell's own lines, since 2026-10-14, when a
-typed `drives check` began to run as this job (`backlog/89`) - because passing the raw reply through
+typed `drives check` began to run as this job (`backlog/fixed/89`) - because passing the raw reply through
 printed binary at the prompt, which is the bug that produced the transcript in the first place.
 
 **The test that actually holds** is whether the work is a BOUNDED sequence of `fs` requests this

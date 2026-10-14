@@ -117,7 +117,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     be inferred from two examples that look contradictory.
 
 10. **Nothing traps the user: every wait says `[q] quit`, by 4 s, and honours it.** (Rewritten
-    2026-10-13 with the operator, `backlog/89`, `audits/2026-10-13-quit-audit.md`.) Any command a
+    2026-10-13 with the operator, `backlog/fixed/89`, `audits/2026-10-13-quit-audit.md`.) Any command a
     person waits on that can run past 2 s says `[q] quit` - aimed at 2 s, and never later than **4 s**
     on the slowest board, because the shell's clock counts whole seconds and a reply may already be on
     its way - and `q`/`Q`/ESC brings the prompt back within 3 s, saying truthfully what happened:
@@ -172,7 +172,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`) go through
     `ask_with_quit_notice`, and the re-waits after an overtaken reply (`fs_take_tagged`,
     `ns_take_tagged`) through `recv_quittable` (`backlog/84` S6). Not yet covered: the fs handles
-    listed in the note above - covered since 2026-10-13, `backlog/89`.)*
+    listed in the note above - covered since 2026-10-13, `backlog/fixed/89`.)*
 
     *(Note 2026-10-13: and the radio's and audio driver's asks. `wifi_ask` and `audio_ask` - every
     `wifi` and `audio` verb, `wifi hardware` among them, which asks each radio twice and could sit for
@@ -185,7 +185,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     noticing form that can takes whatever reply lands next, which is what the `Call` is there to prevent:
     giving them `[q]` needs a reply-matched wait that returns to the caller between slices, which does not
     exist yet. Fixed later the same day: all four are under the command's watch (`ask_watched`, `hw_ask`),
-    `backlog/89`.)*
+    `backlog/fixed/89`.)*
 
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
@@ -198,7 +198,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     and was worse for it, since `events failures` is the instrument you reach for WHEN something is
     wedged; an instrument that can hang on the thing it is measuring takes the prompt with it.
 
-    *(Superseded 2026-10-13, `backlog/89`: these requests now go through `ask_sifted_quittable`, say
+    *(Superseded 2026-10-13, `backlog/fixed/89`: these requests now go through `ask_sifted_quittable`, say
     `[q] quit` past 2 s and stop the wait on `q`. Kept as the record of why they once could not.)*
     **Recorded exception: the `wifi` radio power requests.** `wifi radio on`, `wifi radio off`,
     `wifi radio off hard` and the power request at the start of `wifi radio powercycle` block in a
