@@ -153,3 +153,65 @@ Measured: `chaos mem-pressure 10` `[q]` 2.6 s, stopped after 9 of 10; `chaos flo
 `foreground` says "stopped" only when `copier` acknowledged the cancel. None of the three can run in this table
 (a flash would wipe the test disk, QEMU has no radio, `foreground` needs a job number) - shown by the code only.
 Quit table 31 cases, 0 below the bar; files 270/0, shell 272/0, script 11/0.
+
+**The `[b]` slice (2026-10-14): a detachable command typed at the prompt runs as a job.** `copy <file> <dst>`,
+`delete <dir> recursive`, `drives check` and `drives scrub`, typed, start as the job `background` would start
+and the console attaches to it (`run_typed_as_job`), so the notice is `[q] quit   [b] background` and `b`
+answers `[backgrounded] job N`. `copier` writes the shell's own lines, so what the command prints is the same
+either way; a check or scrub that finds damage ends the job as failed, as the shell's form returns an error. A
+typed job is not in `jobs` and takes no number unless it is detached. In a script, a pipe or a function, or
+while a job is already running, the command runs in the shell with `[q]` alone.
+
+Four things the table found on the way, each fixed and re-measured, in order: the attach loop waited on
+`copier` a quarter of a second at a time (3.4 s from `b` to the prompt), so it looks every 50 ms instead; a
+status question before every typed start put a slow `copier`'s answer in front of the keys, so it is asked only
+when a job is believed live; `q` on a copy waited on two of `copier`'s answers (5.3 s), so it takes one short
+look; and the start itself held both keys (up to 5.6 s), so it is sent and its answer read by the attach loop.
+`q` before `copier` has answered the start says exactly that.
+
+Quit table, `copier` slowed to 2.5 s a reply as well as `fs`: 35 cases, 0 below the bar; the four `~` cases
+press `b`.
+
+| command | verdict | [q] after | [b] | prompt back after q | ran (no q) | last line |
+|---|---|---|---|---|---|---|
+| `dir /q` | QUICK | - | - | - | 2.9 s | 4 entries |
+| `read /q/big.txt` | PASS | 3.0 s | - | 0.1 s | - | read: stopped |
+| `copy /q/big.txt /q/big2.txt` | PASS | 3.5 s | yes | 0.4 s | - | copy: stopped - copier had not yet answered the start, and the cancel goes in behind it; ` |
+| `find h2.txt /` | PASS | 3.3 s | - | 0.1 s | - |  |
+| `tree /` | PASS | 2.7 s | - | 0.1 s | - | / |
+| `write append /q/big.txt more` | PASS | 3.5 s | - | 0.1 s | - | write: stopped - the file is as it was, or holds the whole change - never half (`read` it) |
+| `help | write /q/h3.txt` | PASS | 3.5 s | - | 0.1 s | - | pipe: write failed mid-stream |
+| `mkdir /q/m1` | QUICK | - | - | - | 3.3 s | created /q/m1 |
+| `rename /q/big2.txt big3.txt` | QUICK | - | - | - | 2.1 s | rename: failed - see fs's log |
+| `copy /q/tree /q/tree2 recursive` | PASS | 2.2 s | - | 0.1 s | - | copy: stopped |
+| `delete /q/tree2 recursive` | PASS | 2.5 s | - | 0.1 s | - | delete: stopped - fs goes on removing the tree; `dir` shows what is left |
+| `drives check` | PASS | 3.6 s | yes | 0.1 s | - | check: stopped waiting - copier had not yet answered the start; if it began, it is one req |
+| `drives scrub` | PASS | 2.6 s | yes | 0.1 s | - | scrub: stopped waiting - copier had not yet answered the start; if it began, it is one req |
+| `cd /q/tree/a` | PASS | 3.5 s | - | 0.1 s | - |  |
+| `seal /q/big.txt yes` | PASS | 2.6 s | - | 0.1 s | - | seal: stopped |
+| `wait 6` | PASS | 2.6 s | - | 0.1 s | - |  |
+| `hardware` | QUICK | - | - | - | 2.1 s | 3 device(s) with a driver, 5 without - hardware <device> for one in full |
+| `date` | PASS | 3.4 s | - | 0.1 s | - | no network link - plug the cable in and it will set itself, or run 'date sync' |
+| `events persist status` | PASS | 2.8 s | - | 0.1 s | - | events persist: recorder did not answer |
+| `net lease` | PASS | 2.5 s | - | 0.1 s | - | shell: discarded a net-stack reply for tag 0 while awaiting 1 (an earlier request was over |
+| `net dns example.com` | PASS | 1.5 s | - | 0.7 s | - | net: aborted |
+| `jobs` | PASS | 2.1 s | - | 0.1 s | - | 3    running     -      drives scrub |
+| `background copy /q/big.txt /q/bg.txt` | PASS | 2.7 s | - | 0.1 s | - | background: refused - no reason recorded |
+| `jobs` | PASS | 2.9 s | - | 0.1 s | - | reason: reading the source failed |
+| `events persist stop` | PASS | 2.8 s | - | 0.0 s | - | shell: ended `recorder` - its capture is closed |
+| `chaos kill-storm events 20` | QUICK | - | - | - | 2.1 s | verdict: PASS |
+| `chaos flood-storm events 20` | PASS | 2.2 s | - | 0.1 s | - | verdict: PASS (queue saturated + service drained + stayed alive) |
+| `chaos mem-pressure 10` | PASS | 2.5 s | - | 0.1 s | - | chaos mem-pressure: STOPPED at your request after 10 of 10 round(s) - this is not a pass;  |
+| `chaos spawn-storm 40` | QUICK | - | - | - | 0.9 s | verdict: PASS (ceiling held loudly + full reclaim + no service lost) |
+| `selfcheck files` | PASS | 2.9 s | - | 0.1 s | - | selfcheck: STOPPED at your request after 1 of 1 part(s) - this is NOT a pass. |
+| `drives check` | PASS | 2.7 s | yes | 0.1 s | - | [backgrounded] job 4 |
+| `drives scrub` | PASS | 2.7 s | yes | 0.1 s | - | [backgrounded] job 5 |
+| `delete /q/tree recursive` | PASS | 2.7 s | yes | 0.1 s | - | [backgrounded] job 6 |
+| `copy /q/big.txt /q/big5.txt` | PASS | 2.7 s | yes | 0.1 s | - | [backgrounded] job 7 |
+| `run /q/loop.gsh` | PASS | 3.2 s | - | 0.1 s | - | run: STOPPED at your request - the statements after this point did not run |
+
+A fifth, found by the jobs suite rather than the table: a start sent to a `copier` spawned a moment before had
+no name to reach and was never delivered, and the attach loop waited for its answer with no bound. The start now
+waits (twenty passes of 50 ms) for the name, and an unanswered start ends after 12 s, saying so. The table above
+ran on the build before that change, which touches neither the keys nor the notice; on the final build, jobs
+60/0, files 270/0, shell 272/0 (2 skipped), script 11/0.

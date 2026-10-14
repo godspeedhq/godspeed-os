@@ -8477,8 +8477,8 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     check!(replay.contains("job 4 is done"), "`foreground` reports the check job's outcome");
     check!(replay.contains("drives check - walking the volume"),
            "`foreground` REPLAYS THE TRANSCRIPT - the output was held in bounded RAM until it was asked for");
-    check!(replay.contains("0 bad") && replay.contains("file(s)"),
-           "the verdict is RENDERED, not passed through - fs answers with counts, and raw counts printed as text are garbage");
+    check!(replay.contains("0 bad") && replay.contains("check: ok - filesystem is consistent"),
+           "the verdict is RENDERED in the shell's own words - fs answers with counts, and a typed `drives check` runs as this same job (backlog/89)");
     // THE DETACHED FORM MUST SAY WHAT THE ATTACHED ONE SAYS. A backgrounded check that omits the
     // repair line answers less than `drives check` does, silently - and `drives check` REPAIRS as it
     // goes, so a second run cannot recover the answer. That cost a hardware run on 2026-09-22.
@@ -8491,8 +8491,8 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
            "`jobs` tells the two sweeps apart - a row that said `check` for a scrub would be a quiet lie");
     check!(scr_replay.contains("drives scrub - verifying"),
            "`foreground` replays the scrub's transcript");
-    check!(scr_replay.contains("0 bad") && scr_replay.contains("director"),
-           "the scrub verdict is rendered too - this is the one that exposed the pass-through bug");
+    check!(scr_replay.contains("0 bad") && scr_replay.contains("scrub: ok - every block verified"),
+           "the scrub verdict is rendered too, in the shell's own words - this is the one that exposed the pass-through bug");
 
     check!(ch_start.contains("[backgrounded] job 6"), "`background churn <seconds>` starts a job");
     check!(ch_table.contains("churn 12"), "`jobs` renders the churn job with its duration");
@@ -10917,6 +10917,23 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
         ("chaos mem-pressure 10",             "chaos, memory"),
         ("chaos spawn-storm 40",              "chaos, spawn to the ceiling (the cleanup is not quittable)"),
         ("selfcheck files",                   "a part of the self-check"),
+        // `[b]`: a detachable command typed at the prompt runs as a job, so `b` detaches it (a `~` case presses
+        // b, not q). A `!wait` first lets the job before it end and `!jobs` lets the shell see that it did -
+        // a typed command takes only a short look at a job it believes live, which a slowed `copier` cannot
+        // answer in time - so each starts as its own job.
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~drives check",                     "typed, runs as a job: b detaches it"),
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~drives scrub",                     "typed, runs as a job: b detaches it"),
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~delete /q/tree recursive",         "typed, runs as a job: b detaches it"),
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~copy /q/big.txt /q/big5.txt",      "typed, runs as a job: b detaches it"),
+        ("!jobs", ""),
         // Last: a script that cannot be stopped holds the shell for its whole length (20 s here, so the
         // run ends either way and leaves a prompt behind).
         ("run /q/loop.gsh",                   "a script that loops 20 s"),
@@ -10926,6 +10943,7 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
             let _ = setup!(format!("{setup_cmd}\r").as_bytes(), 90);
             continue;
         }
+        let (detach, c) = match c.strip_prefix('~') { Some(rest) => (true, rest), None => (false, *c) };
         let line = format!("{c}\r");
         let t0 = Instant::now();
         send(&mut write_half, line.as_bytes());
@@ -10937,13 +10955,15 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
                 let tail = { let g = buf.lock().unwrap(); String::from_utf8_lossy(&g[cursor..]).into_owned() };
                 let b = before.contains("[b]") || tail.lines().next().map_or(false, |l| l.contains("[b]"));
                 let tq = Instant::now();
-                send(&mut write_half, b"q");
+                send(&mut write_half, if detach { b"b" } else { b"q" });
                 let after = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+                let detached = after.as_deref().map_or(false, |a| a.contains("[backgrounded] job"));
                 let back = after.as_ref().map(|_| tq.elapsed().as_secs_f32());
                 let said = after.as_deref().unwrap_or("").lines()
                     .map(|l| l.trim()).filter(|l| !l.is_empty() && !l.contains("gsh>"))
                     .last().unwrap_or("").chars().take(90).collect::<String>();
                 let verdict = match back {
+                    Some(_) if detach && !(b && detached) => "NOT DETACHED",
                     Some(s) if tn <= NOTICE_BAR_SECS && s <= 3.0 => "PASS",
                     Some(_) if tn > NOTICE_BAR_SECS => "LATE NOTICE",
                     Some(_) => "SLOW QUIT",
@@ -10978,11 +10998,11 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
 
     let mut md = String::new();
     md.push_str("# osdev test quit - every wait on a slow fs\n\n");
-    md.push_str("`fs` built with `slow-replies`: 700 ms per reply, 4 s for delete tree, check, scrub, flash. Times are seconds after the command was sent (notice) and after `q` was pressed (back). The bar: `[q]` by 4 s, the prompt back within 3 s of `q` (rule 10).\n\n");
+    md.push_str("`fs` built with `slow-replies`: 700 ms per reply, 4 s for delete tree, check, scrub, flash. Times are seconds after the command was sent (notice) and after `q` was pressed (back) - or `b`, for a `~` command, which must answer `[backgrounded] job N`. The bar: `[q]` by 4 s, the prompt back within 3 s of `q` (rule 10).\n\n");
     md.push_str("| command | verdict | [q] after | [b] | prompt back after q | ran (no q) | last line |\n|---|---|---|---|---|---|---|\n");
     let mut bad = 0;
     for r in &rows {
-        if matches!(r.verdict, "TRAPPED" | "NO NOTICE" | "LATE NOTICE" | "SLOW QUIT") { bad += 1; }
+        if matches!(r.verdict, "TRAPPED" | "NO NOTICE" | "LATE NOTICE" | "SLOW QUIT" | "NOT DETACHED") { bad += 1; }
         md.push_str(&format!("| `{}` | {} | {} | {} | {} | {} | {} |\n", r.cmd, r.verdict,
             r.notice.map_or("-".into(), |v| format!("{v:.1} s")), if r.b { "yes" } else { "-" },
             r.back.map_or("-".into(), |v| format!("{v:.1} s")), r.total.map_or("-".into(), |v| format!("{v:.1} s")),

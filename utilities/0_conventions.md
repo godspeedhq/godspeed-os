@@ -123,7 +123,11 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     its way - and `q`/`Q`/ESC brings the prompt back within 3 s, saying truthfully what happened:
     stopped, still running underneath, or outcome unknown. `[b] background` stands beside it where the
     work can run detached - a separate program, holding no console authority, whose output fits a
-    transcript - and a command with no `[b]` says nothing about `[b]`. Waits on the person (a confirm,
+    transcript - and a command with no `[b]` says nothing about `[b]`. So `copy <file> <dst>`, `delete
+    <dir> recursive`, `drives check` and `drives scrub`, typed at the prompt, START as the job
+    `background` would start and the console attaches to it: their notice is `[q] quit   [b] background`,
+    and `b` leaves them running as job N (`55_background.md`). In a script, a pipe, or while a job is
+    already running they run in the shell and offer `[q]` alone. Waits on the person (a confirm,
     `input`, a full-screen program with its own quit key) are exempt.
 
     **The shell is the observer.** It starts a COMMAND clock at Enter, and every wait the command makes

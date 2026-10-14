@@ -155,6 +155,14 @@ struct Transcript {
     dropped: u32,
 }
 
+/// `write!` into the transcript, for the lines a job reports (the shell's own words, `backlog/89`).
+impl core::fmt::Write for Transcript {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.write(s.as_bytes());
+        Ok(())
+    }
+}
+
 impl Transcript {
     const fn new() -> Self {
         Transcript { buf: [0u8; TRANSCRIPT], len: 0, dropped: 0 }
@@ -389,12 +397,25 @@ fn discard_partial(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &Job) {
     }
 }
 
+/// A copy is complete: say so in the shell's own words (`cmd_copy`), so a copy typed at the prompt, which runs
+/// as this job since `backlog/89`, prints what it always printed.
+fn finish_copy(ctx: &ServiceContext, job: &mut Job) {
+    job.state = ST_DONE;
+    job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
+    let (src, slen, dst, dlen, total) = (job.src, job.slen, job.dst, job.dlen, job.total);
+    job.out.write(b"copied ");
+    job.out.write(&src[..slen]);
+    job.out.write(" \u{2192} ".as_bytes());
+    job.out.write(&dst[..dlen]);
+    use core::fmt::Write as _;
+    let _ = write!(job.out, " ({} bytes)\n", total);
+    ctx.log_fmt(format_args!("copier: done, {} bytes", total));
+}
+
 /// Copy one chunk. Returns when the job's state has been advanced.
 fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     if job.copied >= job.total {
-        job.state = ST_DONE;
-        job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
-        ctx.log_fmt(format_args!("copier: done, {} bytes", job.total));
+        finish_copy(ctx, job);
         return;
     }
     let mut chunk = [0u8; IO_CHUNK];
@@ -456,9 +477,7 @@ fn copy_chunk(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
     }
     job.copied += got as u64;
     if job.copied >= job.total {
-        job.state = ST_DONE;
-        job.ended_at = gs::task::epoch_secs_monotonic(ctx) as u64;
-        ctx.log_fmt(format_args!("copier: done, {} bytes", job.total));
+        finish_copy(ctx, job);
     }
 }
 
@@ -554,46 +573,6 @@ fn render_churn(out: &mut [u8; 160], job: &Job) -> usize {
     sink.n
 }
 
-/// Render a check/scrub verdict into the transcript. Numbers in, one line out.
-///
-/// `write!` into a fixed array rather than digit-by-digit arithmetic: `format_args!` does not
-/// allocate, and §26.6.1 says so explicitly - hand-rolling number formatting to avoid a heap that
-/// was never involved is itself the mistake that section warns about.
-fn render_verdict(out: &mut [u8; 160], files: u32, dirs: u32, bad: u32,
-                  free: u64, stored_before: u64) -> usize {
-    use core::fmt::Write as _;
-    struct Sink<'a> { buf: &'a mut [u8; 160], n: usize }
-    impl core::fmt::Write for Sink<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            for &c in s.as_bytes() {
-                if self.n < self.buf.len() { self.buf[self.n] = c; self.n += 1; }
-            }
-            Ok(())
-        }
-    }
-    let mut sink = Sink { buf: out, n: 0 };
-    // BAD FIRST WHEN THERE IS ANY. The one number that changes what the operator does next should
-    // not be the third clause of a sentence that opens with a file count.
-    if bad > 0 {
-        let _ = write!(sink, "{} BAD block(s) - {} file(s), {} director(ies) scanned\n", bad, files, dirs);
-    } else {
-        let _ = write!(sink, "ok - 0 bad, {} file(s), {} director(ies) scanned\n", files, dirs);
-    }
-    // THE REPAIR QUESTION, which is why a check is usually run after a crash. The superblock's count
-    // before the rebuild against the tree's count after it: equal means the accounting was already
-    // right, and any difference is named with its direction, because the two directions have
-    // opposite consequences. Higher-than-truth means a block the tree owns was considered free.
-    if stored_before == free {
-        let _ = write!(sink, "the free count already agreed with the tree - nothing was repaired\n");
-    } else if stored_before > free {
-        let _ = write!(sink, "REPAIRED the FREE COUNT - the superblock claimed {} free, the tree says {} (counted too much free space, off by {})\n",
-                       stored_before, free, stored_before - free);
-    } else {
-        let _ = write!(sink, "REPAIRED the FREE COUNT - the superblock claimed {} free, the tree says {} (counted too little free space, off by {})\n",
-                       stored_before, free, free - stored_before);
-    }
-    sink.n
-}
 
 /// [CP_OK, CP_OP_STATUS, state, why, kind, copied:u64, total:u64, elapsed:u64, slen, src.., dlen, dst..,
 ///  transcript_len:u32]
@@ -730,22 +709,57 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // check deciding whether the accounting was present - was the wire format in
                         // this service. What is left is the only part that was ever copier's: which
                         // verdict to render.
-                        let verdict = if kind == KIND_SCRUB {
-                            gfs.scrub().map(|v| (v.files, v.dirs, v.bad, 0u64, 0u64))
+                        // THE SHELL'S OWN WORDS, line for line (`drives_check` / `drives_scrub` in services/shell):
+                        // since 2026-10-14 a `drives check` typed at the prompt RUNS as this job, so `[b]` can
+                        // detach it (`backlog/89`), and what it prints must not change with where it ran.
+                        use core::fmt::Write as _;
+                        let outcome = if kind == KIND_SCRUB {
+                            gfs.scrub().map(|v| { (v.files, v.dirs, v.bad, v.scanned, 0u64, 0u64) })
                         } else {
-                            gfs.check().map(|v| (v.files, v.dirs, v.bad, v.free, v.free_before))
+                            gfs.check().map(|v| { (v.files, v.dirs, v.bad, v.used, v.free, v.free_before) })
                         };
                         job.ended_at = gs::task::epoch_secs_monotonic(&ctx) as u64;
-                        match fsr(&ctx, if kind == KIND_SCRUB { "scrub" } else { "check" },
-                                  verdict.map(|_| 0)) {
+                        match fsr(&ctx, if kind == KIND_SCRUB { "scrub" } else { "check" }, outcome.map(|_| 0)) {
                             Fs::Ok(_) => {
                                 // Unwrap is not reachable: `fsr` returned Ok only because this did.
-                                let (files, dirs, bad, free, before) =
-                                    verdict.unwrap_or((0, 0, 0, 0, 0));
-                                let mut line = [0u8; 160];
-                                let len = render_verdict(&mut line, files, dirs, bad, free, before);
-                                job.out.write(&line[..len]);
-                                job.state = ST_DONE;
+                                let (files, dirs, bad, a, free, before) = outcome.unwrap_or((0, 0, 0, 0, 0, 0));
+                                if kind == KIND_SCRUB {
+                                    let _ = write!(job.out,
+                                        "scrub: verified {} blocks across {} files, {} dirs; {} bad (read-only, nothing changed)\n",
+                                        a, files, dirs, bad);
+                                    if bad > 0 {
+                                        let _ = write!(job.out,
+                                            "scrub: WARNING - {} file(s)/dir(s) had CRC-failed blocks (bit-rot); the data is lost, see the log\n", bad);
+                                    } else {
+                                        job.out.write(b"scrub: ok - every block verified\n");
+                                    }
+                                } else {
+                                    let _ = write!(job.out,
+                                        "check: {} files, {} dirs, {} bad; {} blocks used, {} free (bitmap + free count rebuilt from the tree)\n",
+                                        files, dirs, bad, a, free);
+                                    if before == free {
+                                        job.out.write(b"check: the free count already agreed with the tree - nothing was repaired\n");
+                                    } else {
+                                        let (word, by) = if before > free { ("too much", before - free) }
+                                                         else            { ("too little", free - before) };
+                                        let _ = write!(job.out,
+                                            "check: REPAIRED the FREE COUNT - the superblock claimed {} free, the tree says {} (counted {} free space, off by {}). The bitmap was rebuilt from the tree regardless.\n",
+                                            before, free, word, by);
+                                    }
+                                    if bad > 0 {
+                                        let _ = write!(job.out,
+                                            "check: WARNING - {} file(s)/dir(s) had unreadable (CRC-failed) blocks; see the log\n", bad);
+                                    } else {
+                                        job.out.write(b"check: ok - filesystem is consistent\n");
+                                    }
+                                }
+                                // A sweep that found damage did not succeed, as the foreground form answers Err.
+                                if bad > 0 {
+                                    job.state = ST_FAILED;
+                                    job.why = WHY_READ;
+                                } else {
+                                    job.state = ST_DONE;
+                                }
                             }
                             Fs::Slow => {
                                 job.out.write(b"check: fs did not answer within the budget\n");
@@ -753,7 +767,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 job.why = WHY_UNANSWERED;
                             }
                             Fs::Failed => {
-                                job.out.write(b"check: FAILED - the filesystem reported a problem\n");
+                                let _ = write!(job.out, "{}: FAILED\n", if kind == KIND_SCRUB { "scrub" } else { "check" });
                                 job.state = ST_FAILED;
                                 job.why = WHY_READ;
                             }
@@ -786,6 +800,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         match outcome {
                             Fs::Ok(_) => {
                                 job.state = ST_DONE;
+                                job.out.write(b"deleted (recursive) ");
+                                job.out.write(&job.src[..job.slen]);
+                                job.out.write(b"\n");
                                 ctx.log("copier: subtree deleted");
                             }
                             Fs::Slow => {

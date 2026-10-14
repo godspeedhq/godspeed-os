@@ -474,6 +474,11 @@ pub struct ShellCtx {
     cmd_active: core::cell::Cell<bool>,
     cmd_start: core::cell::Cell<i64>,
     cmd_noticed: core::cell::Cell<bool>,
+    /// The command now starting was TYPED at the prompt (set at Enter, taken by the outermost `execute`), so a
+    /// detachable one runs as a job the console attaches to (`run_typed_as_job`, `backlog/89`).
+    typed: core::cell::Cell<bool>,
+    /// The command's notice offers `[b] background` beside `[q] quit`: it runs as a job that can be detached.
+    offer_b: core::cell::Cell<bool>,
     /// The radio request correlation tag (see `next_wifi_tag`).
     wifi_tag: core::cell::Cell<u8>,
     /// Byte 1 of the last `radio down` answer - WHY the driver says it is down (0 = it did not say).
@@ -556,6 +561,7 @@ impl ShellCtx {
     fn begin_command(&self) {
         self.quit.set(false);
         self.cmd_noticed.set(false);
+        self.offer_b.set(false);
         self.cmd_start.set(gs::task::epoch_secs_monotonic(&self.inner));
         self.cmd_active.set(true);
     }
@@ -595,7 +601,8 @@ impl gs::call::Watch for ShellCtx {
     }
     fn notice(&self) {
         if !self.cmd_noticed.replace(true) {
-            gs::io::println(self, "  [q] quit");
+            // `[b]` only where the key works: a command running as a job the console is attached to.
+            gs::io::println(self, if self.offer_b.get() { "  [q] quit   [b] background" } else { "  [q] quit" });
         }
     }
     fn keep(&self, key: u8) { self.keep_key(key); }
@@ -637,6 +644,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         cmd_active: core::cell::Cell::new(false),
         cmd_start: core::cell::Cell::new(0),
         cmd_noticed: core::cell::Cell::new(false),
+        typed: core::cell::Cell::new(false),
+        offer_b: core::cell::Cell::new(false),
         wifi_tag: core::cell::Cell::new(0),
         wifi_down_reason: core::cell::Cell::new(0),
         wifi_radio: core::cell::Cell::new(RADIOS[0]),
@@ -871,6 +880,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // command makes says `[q] quit` once it has run 2 s, and stops at the next request
                     // after a `q`.
                     ctx.begin_command();
+                    ctx.typed.set(true);
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
                     ctx.end_command();
                     // A typed command that failed makes a system sound - only here, at the prompt, never
@@ -2150,6 +2160,10 @@ impl ShellError {
 /// `run → cmd_run → execute` path (the same inlining-inflates-frame trap as the record builders).
 #[inline(never)]
 fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellError>, depth: u8, out: &mut Out) -> Result<(), ShellError> {
+    // TYPED AT THE PROMPT, and this is that command rather than one a script, a function or a pipe runs inside
+    // it: only then does a detachable command run as a job, so its notice can offer `[b]` (`backlog/89`). A
+    // script's `drives check` stays in the shell, because detaching it would let the script run on past it.
+    let typed = ctx.typed.replace(false) && depth == 0 && matches!(*out, Out::Console);
     let Ok(s) = core::str::from_utf8(line) else {
         gs::io::println(ctx, "shell: invalid input");
         return Err(ShellError::Unknown);
@@ -2313,6 +2327,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         }
         "reboot"  => cmd_reboot(ctx), // `-> !` coerces to the match arm's Result type
         "chaos"   => cmd_chaos(ctx, cwd, s["chaos".len()..].trim()),
+        "drives" if typed && argc >= 2 && (args[1] == "check" || args[1] == "scrub") => drives_typed(ctx, &args, argc),
         "drives"  => cmd_drives(ctx, &args, argc),
         // ── file/storage commands - converted to the Result model ──
         // ("read" and "result" are on the Result model above, not here.)
@@ -2347,6 +2362,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "copy"    => {
             if argc < 3 { gs::io::println(ctx, "usage: copy <src> <dst> [recursive]"); Err(ShellError::Unknown) }
             else if argc >= 4 && args[3] == "recursive" { cmd_copy_tree(ctx, cwd, args[1], args[2]) }
+            else if typed { copy_typed(ctx, cwd, args[1], args[2]) }
             else { cmd_copy(ctx, cwd, args[1], args[2]) }
         }
         "background" => cmd_background(ctx, cwd, &args, argc),
@@ -2377,6 +2393,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         }
         "delete"  => {
             if argc < 2 { gs::io::println(ctx, "usage: delete <path> [recursive]"); Err(ShellError::Unknown) }
+            else if typed && argc >= 3 && args[2] == "recursive" && !args[1].contains(',') { delete_typed(ctx, cwd, args[1]) }
             else { cmd_delete(ctx, cwd, args[1], argc >= 3 && args[2] == "recursive") }
         }
         "move"    => {
@@ -13871,7 +13888,7 @@ fn build_jobs_table(ctx: &ShellCtx) -> Table {
     refresh_jobs(ctx);
     let mut t = Table::new(&["job", "state", "command", "percent", "copied", "total", "src", "dst"]);
     let tab = ctx.jobs.borrow();
-    for r in tab.rows.iter().filter(|r| r.used) {
+    for r in tab.rows.iter().filter(|r| r.used && !r.hidden) {
         let state = t.intern(state_word(r.state).as_bytes());
         // The COMMAND, spelled as the rendered table spells it. A check or a scrub has no paths at
         // all, so a reader of the record form had no way to tell one job from another.
@@ -17212,7 +17229,7 @@ fn tidy_helpers(ctx: &ShellCtx) {
         let live = t.rows.iter().any(|r| r.used && r.live);
         // The newest job is the only one whose transcript `copier` still has. Held while it is unread
         // and not empty; no row at all means the service was started and its job refused.
-        let held = t.rows.iter().filter(|r| r.used).max_by_key(|r| r.id)
+        let held = t.rows.iter().filter(|r| r.used).max_by_key(|r| r.seq)
             .map_or(false, |r| !r.collected && r.out_len > 0);
         (live, held)
     };
@@ -22783,13 +22800,22 @@ struct JobRow {
     collected: bool,
     /// Bytes of transcript `copier` reported holding for this job, from its last status answer.
     out_len: u32,
+    /// A typed command running as a job (`run_typed_as_job`): not shown by `jobs` and given a job number only
+    /// if `b` detaches it, because the person never asked for a job. Its id is `HIDDEN_ID | seq` until then.
+    hidden: bool,
+    /// Start order. `copier` keeps only the newest job's transcript, and a hidden row's id is not in order.
+    seq: u32,
 }
+
+/// The id a hidden row carries, never a number `jobs` shows or `foreground` accepts.
+const HIDDEN_ID: u32 = 0x8000_0000;
 
 impl JobRow {
     const fn empty() -> Self {
         JobRow { used: false, kind: KIND_COPY, live: false, id: 0, state: ST_IDLE, why: 0,
                  copied: 0, total: 0, elapsed: 0,
-                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0, collected: false, out_len: 0 }
+                 src: [0u8; PATH_MAX], slen: 0, dst: [0u8; PATH_MAX], dlen: 0, collected: false, out_len: 0,
+                 hidden: false, seq: 0 }
     }
 }
 
@@ -22798,11 +22824,13 @@ struct JobTable {
     /// Ids never repeat within a session, so `foreground 3` cannot reach a different job than the
     /// one the operator saw. They are not slots.
     next_id: u32,
+    /// Start order of every job, hidden ones included (`JobRow::seq`).
+    next_seq: u32,
 }
 
 impl JobTable {
     const fn new() -> Self {
-        JobTable { rows: [JobRow::empty(); JOBS_MAX], next_id: 1 }
+        JobTable { rows: [JobRow::empty(); JOBS_MAX], next_id: 1, next_seq: 1 }
     }
 }
 
@@ -22852,6 +22880,11 @@ fn copier_status(ctx: &ShellCtx) -> Ask {
         Some(r) => r,
         None => return Ask::Busy,
     };
+    status_of(&r)
+}
+
+/// A `copier` STATUS reply, read.
+fn status_of(r: &Message) -> Ask {
     let p = r.payload_bytes();
     // Byte 1 is the op being answered. A reply for a different op is a stale one left over from an
     // abandoned request, and reading it as this answer is how a status display starts lying.
@@ -22882,12 +22915,18 @@ fn copier_status(ctx: &ShellCtx) -> Ask {
 /// answer, the honest report is `lost` - not `running` forever, and not `failed`, which would claim
 /// knowledge of a failure nobody observed.
 fn refresh_jobs(ctx: &ShellCtx) {
+    let ask = copier_status(ctx);
+    apply_ask(ctx, ask);
+}
+
+/// Record what `copier` said about the job in the live row.
+fn apply_ask(ctx: &ShellCtx, ask: Ask) {
     let live_idx = {
         let t = ctx.jobs.borrow();
         t.rows.iter().position(|r| r.used && r.live)
     };
     let i = match live_idx { Some(i) => i, None => return };
-    match copier_status(ctx) {
+    match ask {
         Ask::Answer(st, why, kind, copied, total, elapsed, out_len) => {
             let mut t = ctx.jobs.borrow_mut();
             let row = &mut t.rows[i];
@@ -22973,16 +23012,6 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         return Err(ShellError::Unknown);
     }
 
-    refresh_jobs(ctx);
-    {
-        let t = ctx.jobs.borrow();
-        if let Some(r) = t.rows.iter().find(|r| r.used && r.live) {
-            gs::io::println_fmt(ctx, format_args!(
-                "background: job {} is still running - one at a time", r.id));
-            return Err(ShellError::Unknown);
-        }
-    }
-
     let mut sbuf = [0u8; PATH_MAX];
     let mut slocal = [0u8; PATH_MAX];
     let mut slen = 0usize;
@@ -23000,6 +23029,48 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         dlocal[..dlen].copy_from_slice(dst);
     }
 
+    let secs: u64 = if kind == KIND_CHURN { args[2].parse().unwrap_or(30) } else { 0 };
+    match start_job(ctx, kind, &slocal[..slen], &dlocal[..dlen], secs, true) {
+        Ok(id) => {
+            gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", id));
+            Ok(())
+        }
+        Err(_) => Err(ShellError::Unknown),
+    }
+}
+
+/// Why a job did not start. `Unavailable` started nothing, so a typed command runs in the shell instead;
+/// `Failed` may have started it and has said so; `Pending` is a typed command's start sent and not yet answered:
+/// its row is written, as job `.0`, and the attach loop reads the answer.
+enum JobStart { Unavailable, Failed, Pending(u32) }
+
+/// Start a job in `copier` and record its row: `background`'s start, and a typed command's (`run_typed_as_job`).
+/// `say` is `background`'s: it reports every refusal. A typed command does not, because it then runs in the
+/// shell and that says what is wrong.
+fn start_job(ctx: &ShellCtx, kind: u8, src: &[u8], dst: &[u8], secs: u64, say: bool) -> Result<u32, JobStart> {
+    let (slen, dlen) = (src.len(), dst.len());
+    // A typed command asks only when a job is believed live, since that is the one case the answer changes:
+    // a status question on every typed command put a slow `copier`'s answer between the notice and a `b`
+    // (3.4 s from `b` to the prompt in `osdev test quit`), and none at all left a job that had ended looking
+    // live, so the next command ran in the shell with no `[b]`.
+    if say {
+        refresh_jobs(ctx);
+    } else if ctx.jobs.borrow().rows.iter().any(|r| r.used && r.live) {
+        // One short plain look, not a watched wait: unanswered, the job is taken as live and the command
+        // runs in the shell.
+        if let Some(r) = copier_ask(ctx, &[CP_OP_STATUS], 300) { apply_ask(ctx, status_of(&r)); }
+    }
+    {
+        let t = ctx.jobs.borrow();
+        if let Some(r) = t.rows.iter().find(|r| r.used && r.live) {
+            if say {
+                gs::io::println_fmt(ctx, format_args!(
+                    "background: job {} is still running - one at a time", r.id));
+            }
+            return Err(JobStart::Unavailable);
+        }
+    }
+
     // A free row BEFORE spawning anything: a table that cannot record the job must not start it,
     // or the copy runs with nothing able to report or stop it.
     let slot = {
@@ -23011,12 +23082,12 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
             // may not have read - which is why the oldest goes first rather than an arbitrary one.
             None => match t.rows.iter().enumerate()
                         .filter(|(_, r)| r.used && !r.live)
-                        .min_by_key(|(_, r)| r.id)
+                        .min_by_key(|(_, r)| r.seq)
                         .map(|(i, _)| i) {
                 Some(i) => i,
                 None => {
-                    gs::io::println(ctx, "background: every job row is live - nothing can be evicted");
-                    return Err(ShellError::Unknown);
+                    if say { gs::io::println(ctx, "background: every job row is live - nothing can be evicted"); }
+                    return Err(JobStart::Unavailable);
                 }
             }
         }
@@ -23024,62 +23095,374 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
 
     // SPAWN ON DEMAND, the `recorder` shape: nothing costs anything until a job is wanted.
     if slot_of(ctx, "copier").is_none() && ctx.spawn("copier").is_err() {
-        gs::io::println(ctx, "background: could not spawn `copier`");
-        return Err(ShellError::Unknown);
+        if say { gs::io::println(ctx, "background: could not spawn `copier`"); }
+        return Err(JobStart::Unavailable);
     }
     // From here `tidy_helpers` looks for it after each command, and ends it once its job is over and
     // collected - including when the start below is refused, which leaves it holding nothing.
     ctx.copier_started.set(true);
-    let _ = gs::cap::reacquire(ctx, "copier");
+    // A `copier` spawned a moment ago has not yet registered its name, and a start sent to it then is never
+    // delivered. A typed command's start is not waited on (below), so it must not be sent before the name
+    // resolves - the jobs suite hung on exactly that. Bounded: twenty passes of 50 ms.
+    let mut named = gs::cap::reacquire(ctx, "copier");
+    let mut tries = 0;
+    while !named && tries < 20 {
+        gs::task::sleep_ms(ctx, 50);
+        named = gs::cap::reacquire(ctx, "copier");
+        tries += 1;
+    }
 
     let mut req = [0u8; 4 + 2 * PATH_MAX + 8];
     req[0] = CP_OP_START;
     req[1] = kind;
     req[2] = slen as u8;
-    req[3..3 + slen].copy_from_slice(&slocal[..slen]);
+    req[3..3 + slen].copy_from_slice(src);
     req[3 + slen] = dlen as u8;
-    req[4 + slen..4 + slen + dlen].copy_from_slice(&dlocal[..dlen]);
+    req[4 + slen..4 + slen + dlen].copy_from_slice(dst);
     let mut n = 4 + slen + dlen;
     // The trailing parameter: churn's duration. Kinds that take none send none.
     if kind == KIND_CHURN {
-        let secs: u64 = args[2].parse().unwrap_or(30);
         req[n..n + 8].copy_from_slice(&secs.to_le_bytes());
         n += 8;
     }
 
-    let ok = match ask_watched(ctx, "copier", &Message::from_bytes(&req[..n]), 12) {
+    // A typed command's start is SENT, and its answer looked for once: the attach loop reads it if it is
+    // later, so a `q` or a `b` is read from the moment the command is a job. Waiting for it here held both
+    // keys behind a slow `copier`'s answer (up to 5.6 s from the key to the prompt in `osdev test quit`).
+    let mut pending = false;
+    let answer = if say { ask_watched(ctx, "copier", &Message::from_bytes(&req[..n]), 12) } else {
+        match ctx.request_with_reply_ms("copier", &Message::from_bytes(&req[..n]), 1) {
+            Some(r) if copier_answers(&r, CP_OP_START) => Some(r),
+            _ => { pending = true; None }
+        }
+    };
+    let ok = pending || match answer {
         Some(r) => {
             let p = r.payload_bytes();
             p.first() == Some(&CP_OK) && p.get(1) == Some(&CP_OP_START)
         }
         None => {
-            gs::io::println(ctx, "background: `copier` did not answer");
-            return Err(ShellError::Unknown);
+            gs::io::println(ctx, "background: `copier` did not answer - the job may have started; `jobs` cannot show it");
+            return Err(JobStart::Failed);
         }
     };
     if !ok {
-        // The service records WHY it refused before it answers, so ask rather than print a shrug.
-        let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _, _) => w, _ => 0 };
-        gs::io::println_fmt(ctx, format_args!("background: refused - {}", why_words(why)));
-        return Err(ShellError::Unknown);
+        if say {
+            // The service records WHY it refused before it answers, so ask rather than print a shrug.
+            let why = match copier_status(ctx) { Ask::Answer(_, w, _, _, _, _, _) => w, _ => 0 };
+            gs::io::println_fmt(ctx, format_args!("background: refused - {}", why_words(why)));
+        }
+        return Err(JobStart::Unavailable);
     }
 
     let mut t = ctx.jobs.borrow_mut();
-    let id = t.next_id;
-    t.next_id += 1;
+    let seq = t.next_seq;
+    t.next_seq += 1;
+    // `background` gives a job its number now; a typed command's job gets one only if `b` detaches it.
+    let id = if say { let id = t.next_id; t.next_id += 1; id } else { HIDDEN_ID | seq };
     let row = &mut t.rows[slot];
     *row = JobRow::empty();
     row.used = true;
+    row.hidden = !say;
+    row.seq = seq;
     row.kind = kind;
     row.live = true;
     row.id = id;
     row.state = ST_RUNNING;
     row.slen = slen;
-    row.src[..slen].copy_from_slice(&slocal[..slen]);
+    row.src[..slen].copy_from_slice(src);
     row.dlen = dlen;
-    row.dst[..dlen].copy_from_slice(&dlocal[..dlen]);
+    row.dst[..dlen].copy_from_slice(dst);
     drop(t);
-    gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", id));
+    if pending { Err(JobStart::Pending(id)) } else { Ok(id) }
+}
+
+// ---- A DETACHABLE COMMAND TYPED AT THE PROMPT RUNS AS A JOB (`backlog/89`) ----------------------------------
+//
+// `[b] background` is offered exactly where the key can work. A command the shell runs itself is the shell
+// parked in its requests, with no running state to hand on, so `b` could only abandon it. A job is `copier`'s,
+// so the console can let go of it. So `copy <file> <dst>`, `delete <dir> recursive`, `drives check` and
+// `drives scrub` typed at the prompt START as the job `background` would start, and the console attaches to
+// it: at 2 s the notice says `[q] quit   [b] background`, `b` leaves it running as job N, `q` stops it where
+// it can be stopped, and a job that ends while attached prints what it found. `copier` writes the shell's own
+// lines, so what it prints does not change. Anywhere else (a script, a pipe, a job already running, `copier`
+// unable to start) the command runs in the shell as it always did.
+
+/// Run a typed detachable command as a job and attach to it. `None` when it cannot: run it in the shell.
+fn run_typed_as_job(ctx: &ShellCtx, kind: u8, src: &[u8], dst: &[u8]) -> Option<Result<(), ShellError>> {
+    ctx.offer_b.set(true);
+    match start_job(ctx, kind, src, dst, 0, false) {
+        Ok(id) => attach_job(ctx, id, kind, false),
+        Err(JobStart::Pending(id)) => attach_job(ctx, id, kind, true),
+        Err(JobStart::Failed) => { ctx.offer_b.set(false); Some(Err(ShellError::Unknown)) }
+        Err(JobStart::Unavailable) => { ctx.offer_b.set(false); None }
+    }
+}
+
+/// `copy <src> <dst>` typed: a job when the source is a file. A directory, a missing source or a bad path
+/// is the shell's to explain, so those run there.
+fn copy_typed(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
+    ctx.offer_b.set(true);   // the stat below is a request too, and its notice should say `[b]`
+    let mut sbuf = [0u8; PATH_MAX];
+    let mut dbuf = [0u8; PATH_MAX];
+    if let (Some(sl), Some(dl)) = (resolve_path(cwd.as_str(), src, &mut sbuf), resolve_path(cwd.as_str(), dst, &mut dbuf)) {
+        if stat_kind(ctx, &sbuf[..sl]) == Some(false) && !ctx.quit.get() {
+            if let Some(r) = run_typed_as_job(ctx, KIND_COPY, &sbuf[..sl], &dbuf[..dl]) { return r; }
+        }
+    }
+    ctx.offer_b.set(false);
+    cmd_copy(ctx, cwd, src, dst)
+}
+
+/// `delete <dir> recursive` typed: a job when the path is a directory; anything else runs in the shell.
+fn delete_typed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    ctx.offer_b.set(true);
+    let mut buf = [0u8; PATH_MAX];
+    if let Some(n) = resolve_path(cwd.as_str(), arg, &mut buf) {
+        if &buf[..n] != b"/" && stat_kind(ctx, &buf[..n]) == Some(true) && !ctx.quit.get() {
+            if let Some(r) = run_typed_as_job(ctx, KIND_DELETE_TREE, &buf[..n], b"") { return r; }
+        }
+    }
+    ctx.offer_b.set(false);
+    cmd_delete(ctx, cwd, arg, true)
+}
+
+/// `drives check` / `drives scrub` typed.
+fn drives_typed(ctx: &ShellCtx, args: &[&str], argc: usize) -> Result<(), ShellError> {
+    let sel = if argc >= 3 { args[2] } else { "" };
+    if !drive_sel_ok(ctx, sel) { return Err(ShellError::Unknown); }
+    let kind = if args[1] == "scrub" { KIND_SCRUB } else { KIND_CHECK };
+    match run_typed_as_job(ctx, kind, b"", b"") {
+        Some(r) => r,
+        None if kind == KIND_SCRUB => drives_scrub(ctx),
+        None => drives_check(ctx),
+    }
+}
+
+/// A typed command's job is going on without the console: from here it is a job like any other, with a
+/// number `jobs` shows and `foreground` takes.
+fn reveal_job(ctx: &ShellCtx, id: u32) -> u32 {
+    let mut t = ctx.jobs.borrow_mut();
+    let shown = t.next_id;
+    match t.rows.iter_mut().find(|r| r.used && r.id == id) {
+        Some(r) if r.hidden => { r.id = shown; r.hidden = false; }
+        Some(_) => return id,
+        None => return id,
+    }
+    t.next_id += 1;
+    shown
+}
+
+/// The command a job kind is, for what the shell says about it.
+fn job_verb(kind: u8) -> &'static str {
+    match kind {
+        KIND_COPY => "copy",
+        KIND_DELETE_TREE => "delete",
+        KIND_CHECK => "check",
+        KIND_SCRUB => "scrub",
+        _ => "job",
+    }
+}
+
+/// Does `r` answer `copier` op `op`? Its replies carry the op at byte 1, so one left over from a question
+/// nobody waited for is told apart from this answer rather than read as it.
+fn copier_answers(r: &Message, op: u8) -> bool {
+    r.payload_bytes().get(1) == Some(&op)
+}
+
+/// The reply to `op` a question already sent is still owed, waited for up to `ms` a message. Anything else
+/// that arrives is a late reply to a question nobody is waiting for, and is dropped. Bounded: eight messages.
+fn copier_recv(ctx: &ShellCtx, op: u8, ms: u64) -> Option<Message> {
+    for _ in 0..8 {
+        match gs::ipc::recv_within_ms(ctx, ms) {
+            Some(r) if copier_answers(&r, op) => return Some(r),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// A PLAIN question to `copier`, not under the watch: asked while attached, where the console loop reads the
+/// keys itself, and after a `q`, when a watched one would not be sent at all.
+fn copier_ask(ctx: &ShellCtx, op_msg: &[u8], ms: u64) -> Option<Message> {
+    let op = op_msg.first().copied().unwrap_or(0);
+    match ctx.request_with_reply_ms("copier", &Message::from_bytes(op_msg), ms) {
+        Some(r) if copier_answers(&r, op) => Some(r),
+        Some(_) => copier_recv(ctx, op, ms),
+        None => None,
+    }
+}
+
+/// The console attached to a job a typed command started.
+///
+/// AT MOST ONE QUESTION OUTSTANDING, AND NO WAIT ON IT. `copier` reads nothing while it is inside one `fs`
+/// request, and a check, a scrub and a tree delete are each one request for their whole length, so a status
+/// question asked then is answered only when the job ends. The loop sends the question and LOOKS for the
+/// answer every 50 ms, reading the keys in between, so a `copier` that cannot answer never holds them. (It
+/// waited a quarter of a second at a time first: `osdev test quit` measured 3.4 s from `b` to the prompt.)
+fn attach_job(ctx: &ShellCtx, id: u32, kind: u8, mut start_owed: bool) -> Option<Result<(), ShellError>> {
+    // The start's answer is waited for as long as `background` waits for it, and no longer.
+    let started_at = gs::task::epoch_secs_monotonic(ctx);
+    let mut owed = false; // a STATUS question `copier` has not answered yet
+    loop {
+        if gs::call::Watch::notice_due_in(ctx) == 0 {
+            gs::call::Watch::notice(ctx);
+            // Keys typed for the next command are kept for it, in order; only `q` and `b` are this loop's.
+            let mut kept = [0u8; 16];
+            let mut nk = 0usize;
+            let mut detach = false;
+            while let Some(b) = ctx.try_console_read() {
+                if ServiceContext::QUIT_KEYS.contains(&b) { ctx.quit.set(true); break; }
+                if b == b'b' || b == b'B' { detach = true; break; }
+                if nk < kept.len() { kept[nk] = b; nk += 1; } else { ctx.keep_key(b); }
+            }
+            for &k in &kept[..nk] { ctx.keep_key(k); }
+            if detach {
+                ctx.offer_b.set(false);
+                let shown = reveal_job(ctx, id);
+                gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", shown));
+                return Some(Ok(()));
+            }
+        }
+        if ctx.quit.get() {
+            return Some(if start_owed { quit_unstarted(ctx, id, kind) } else { quit_attached(ctx, id, kind) });
+        }
+        // The start, answered late. Refused: nothing began, so the row goes and the command runs in the
+        // shell. No status question is asked before it, since `copier` answers in order.
+        if start_owed {
+            match gs::ipc::try_recv(ctx) {
+                Some(r) if copier_answers(&r, CP_OP_START) => {
+                    start_owed = false;
+                    if r.payload_bytes().first() != Some(&CP_OK) {
+                        if let Some(row) = ctx.jobs.borrow_mut().rows.iter_mut().find(|row| row.used && row.id == id) {
+                            *row = JobRow::empty();
+                        }
+                        ctx.offer_b.set(false);
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            if gs::task::epoch_secs_monotonic(ctx) - started_at > 12 {
+                let shown = reveal_job(ctx, id);
+                ctx.offer_b.set(false);
+                gs::io::println_fmt(ctx, format_args!(
+                    "{}: copier did not answer the start in 12 s - if it began, it is job {} (`jobs` says)",
+                    job_verb(kind), shown));
+                return Some(Err(ShellError::Unknown));
+            }
+            gs::task::sleep_ms(ctx, 50);
+            continue;
+        }
+        let reply = if owed {
+            // Look, do not wait. A message that is not the answer is a late reply nobody waits for.
+            match gs::ipc::try_recv(ctx) {
+                Some(r) if copier_answers(&r, CP_OP_STATUS) => Some(r),
+                _ => None,
+            }
+        } else {
+            // Sent, and the answer looked for once; the next passes look again.
+            let r = copier_ask(ctx, &[CP_OP_STATUS], 1);
+            owed = r.is_none();
+            r
+        };
+        match reply {
+            Some(ref r) => { owed = false; apply_ask(ctx, status_of(r)); }
+            None if slot_of(ctx, "copier").is_none() => apply_ask(ctx, Ask::Gone),
+            None => {}
+        }
+        let (st, why) = {
+            let t = ctx.jobs.borrow();
+            t.rows.iter().find(|r| r.used && r.id == id).map_or((ST_LOST, 0), |r| (r.state, r.why))
+        };
+        if st != ST_RUNNING {
+            return Some(finish_attached(ctx, id, kind, st, why));
+        }
+        // Answered: a copy between its chunks, and asking again straight away would slow it. Not answered:
+        // look again shortly.
+        gs::task::sleep_ms(ctx, if reply.is_some() { 100 } else { 50 });
+    }
+}
+
+/// The attached job ended: what it found, and its result as the command's.
+fn finish_attached(ctx: &ShellCtx, id: u32, kind: u8, st: u8, why: u8) -> Result<(), ShellError> {
+    ctx.offer_b.set(false);
+    let verb = job_verb(kind);
+    match st {
+        ST_DONE | ST_FAILED => {
+            replay_transcript(ctx, "");
+            if let Some(r) = ctx.jobs.borrow_mut().rows.iter_mut().find(|r| r.used && r.id == id) {
+                r.collected = true;
+            }
+            if st == ST_DONE { return Ok(()); }
+            // A check or a scrub that found damage says so in its own lines; the other two say why here.
+            if kind == KIND_COPY || kind == KIND_DELETE_TREE {
+                gs::io::println_fmt(ctx, format_args!("{}: failed - {}", verb, why_words(why)));
+            }
+            Err(ShellError::Unknown)
+        }
+        ST_CANCELLED => { gs::io::println_fmt(ctx, format_args!("{}: stopped", verb)); Ok(()) }
+        _ => {
+            gs::io::println_fmt(ctx, format_args!(
+                "{}: `copier` stopped before the job finished - how far it got is unknown", verb));
+            Err(ShellError::Unknown)
+        }
+    }
+}
+
+/// `q` before `copier` answered the start: the job may have begun, so it is a job with a number, and what is
+/// known is said - no more.
+fn quit_unstarted(ctx: &ShellCtx, id: u32, kind: u8) -> Result<(), ShellError> {
+    let shown = reveal_job(ctx, id);
+    if kind == KIND_COPY {
+        // `copier` reads its messages in order, so a cancel sent now follows the start: a copy that began stops
+        // before its first chunk, and removes what it made.
+        let _ = ctx.request_with_reply_ms("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 300);
+        gs::io::println_fmt(ctx, format_args!(
+            "copy: stopped - copier had not yet answered the start, and the cancel goes in behind it; `jobs` says what job {} did",
+            shown));
+    } else {
+        gs::io::println_fmt(ctx, format_args!(
+            "{}: stopped waiting - copier had not yet answered the start; if it began, it is one request to fs and goes on as job {} (`jobs` says)",
+            job_verb(kind), shown));
+    }
+    Ok(())
+}
+
+/// `q` while attached: stop the job where it can be stopped, and say which happened - within the 3 s rule
+/// 10 gives it, so nothing here waits on `copier` for long.
+fn quit_attached(ctx: &ShellCtx, id: u32, kind: u8) -> Result<(), ShellError> {
+    ctx.offer_b.set(false);
+    let verb = job_verb(kind);
+    // A check, a scrub and a tree delete are ONE request to `fs`, and `copier` reads nothing until it ends: a
+    // cancel would arrive after the job did. So none is sent, and the job is left running rather than claimed
+    // stopped.
+    if kind != KIND_COPY {
+        let shown = reveal_job(ctx, id);
+        gs::io::println_fmt(ctx, format_args!(
+            "{}: stopped waiting - it is one request to fs, which cannot be stopped part-way; it goes on as job {}, and `foreground {}` shows what it found",
+            verb, shown, shown));
+        return Ok(());
+    }
+    // A copy, between its chunks: `copier` cancels it and removes the incomplete destination. ONE short look
+    // for its answer and no more: a status question still owed is answered first, and waiting through both
+    // took 5.5 s from `q` to the prompt in `osdev test quit`. Unanswered is said as that, with the job's number.
+    let acked = matches!(ctx.request_with_reply_ms("copier", &Message::from_bytes(&[CP_OP_CANCEL]), 300),
+                         Some(ref r) if copier_answers(r, CP_OP_CANCEL));
+    if acked {
+        if let Some(r) = ctx.jobs.borrow_mut().rows.iter_mut().find(|r| r.used && r.id == id) {
+            r.state = ST_CANCELLED;
+            r.live = false;
+            r.collected = true;   // nothing it said is worth keeping `copier` for
+        }
+        gs::io::println(ctx, "copy: stopped - the incomplete destination was removed");
+    } else {
+        let shown = reveal_job(ctx, id);
+        gs::io::println_fmt(ctx, format_args!(
+            "copy: asked to stop - copier cancels it at its next chunk and removes the incomplete destination; `jobs` says when job {} has",
+            shown));
+    }
     Ok(())
 }
 
@@ -23091,7 +23474,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
 /// The shell therefore checks before replaying, and says nothing rather than something false.
 fn is_newest(ctx: &ShellCtx, id: u32) -> bool {
     let t = ctx.jobs.borrow();
-    t.rows.iter().filter(|r| r.used).map(|r| r.id).max() == Some(id)
+    t.rows.iter().filter(|r| r.used).max_by_key(|r| r.seq).map(|r| r.id) == Some(id)
 }
 
 /// `jobs quit <id>` - stop a job without attaching to it first.
@@ -23111,7 +23494,7 @@ fn cmd_jobs_quit(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     refresh_jobs(ctx);
     let (found, live, state) = {
         let t = ctx.jobs.borrow();
-        match t.rows.iter().find(|r| r.used && r.id == want) {
+        match t.rows.iter().find(|r| r.used && !r.hidden && r.id == want) {
             Some(r) => (true, r.live, r.state),
             None => (false, false, ST_IDLE),
         }
@@ -23148,12 +23531,12 @@ fn cmd_jobs_quit(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 fn cmd_jobs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     refresh_jobs(ctx);
     let t = ctx.jobs.borrow();
-    if !t.rows.iter().any(|r| r.used) {
+    if !t.rows.iter().any(|r| r.used && !r.hidden) {
         out.line(ctx, "no jobs");
         return Ok(());
     }
     out.line(ctx, "JOB  STATE    PROGRESS  COMMAND");
-    for r in t.rows.iter().filter(|r| r.used) {
+    for r in t.rows.iter().filter(|r| r.used && !r.hidden) {
         // Percent is derived and shown only where it means something: a zero-byte file is 100% done
         // the moment it starts, and "0%" on a finished job reads as a failure.
         // A recursive delete has no measurable progress - `fs` does the whole walk in one
@@ -23191,7 +23574,7 @@ fn cmd_jobs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
 /// A DROP IS ANNOUNCED. The ring is 4 KiB and ages out its oldest lines, so a long report can be
 /// incomplete - and an incomplete report that looks complete is exactly the silent failure this
 /// project forbids. The count comes back with every page and is printed before the text.
-fn replay_transcript(ctx: &ShellCtx) {
+fn replay_transcript(ctx: &ShellCtx, indent: &str) {
     if slot_of(ctx, "copier").is_none() {
         return;
     }
@@ -23204,7 +23587,8 @@ fn replay_transcript(ctx: &ShellCtx) {
         let mut req = [0u8; 5];
         req[0] = CP_OP_OUTPUT;
         req[1..5].copy_from_slice(&off.to_le_bytes());
-        let r = match ask_watched(ctx, "copier", &Message::from_bytes(&req), 8) {
+        // Plain and sifted (`copier_ask`): a reply left over from a status question is not this page.
+        let r = match copier_ask(ctx, &req, 8000) {
             Some(r) => r,
             None => return,
         };
@@ -23218,7 +23602,7 @@ fn replay_transcript(ctx: &ShellCtx) {
             announced = true;
             if dropped > 0 {
                 gs::io::println_fmt(ctx, format_args!(
-                    "  ... {} earlier byte(s) dropped - the transcript is 4 KiB and this job said more", dropped));
+                    "{}... {} earlier byte(s) dropped - the transcript is 4 KiB and this job said more", indent, dropped));
             }
         }
         let body = &p[10..];
@@ -23227,7 +23611,7 @@ fn replay_transcript(ctx: &ShellCtx) {
         }
         for line in body.split(|&c| c == b'\n') {
             if !line.is_empty() {
-                gs::io::println_fmt(ctx, format_args!("  {}", str_of(line)));
+                gs::io::println_fmt(ctx, format_args!("{}{}", indent, str_of(line)));
             }
         }
         off += body.len() as u32;
@@ -23246,7 +23630,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     refresh_jobs(ctx);
     let (found, live, state, why) = {
         let t = ctx.jobs.borrow();
-        match t.rows.iter().find(|r| r.used && r.id == want) {
+        match t.rows.iter().find(|r| r.used && !r.hidden && r.id == want) {
             Some(r) => (true, r.live, r.state, r.why),
             None => (false, false, ST_IDLE, 0),
         }
@@ -23268,9 +23652,9 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         // say `foreground` (§26.2).
         if is_newest(ctx, want) {
             if slot_of(ctx, "copier").is_some() {
-                replay_transcript(ctx);
+                replay_transcript(ctx, "  ");
                 // READ, SO NO LONGER HELD FOR ANYBODY: `tidy_helpers` ends `copier` after this command.
-                if let Some(r) = ctx.jobs.borrow_mut().rows.iter_mut().find(|r| r.used && r.id == want) {
+                if let Some(r) = ctx.jobs.borrow_mut().rows.iter_mut().find(|r| r.used && !r.hidden && r.id == want) {
                     r.collected = true;
                 }
             } else if ctx.jobs.borrow().rows.iter().any(|r| r.used && r.id == want && r.collected) {
@@ -23308,7 +23692,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         refresh_jobs(ctx);
         let (st, pct, why, kind) = {
             let t = ctx.jobs.borrow();
-            match t.rows.iter().find(|r| r.used && r.id == want) {
+            match t.rows.iter().find(|r| r.used && !r.hidden && r.id == want) {
                 Some(r) => (r.state,
                             if r.total == 0 { 100 } else { (r.copied * 100 / r.total) as u32 },
                             r.why, r.kind),
@@ -24511,13 +24895,11 @@ fn drives_reset(ctx: &ShellCtx, force: bool) -> Result<(), ShellError> {
 /// stored_free_before:u64] - the last field is what the SUPERBLOCK claimed before the rebuild, so a
 /// repair that was NEEDED can be reported rather than only its result.
 fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
-    // POINT AT THE DETACHABLE FORM, because `[q] quit` is the only key this can honestly offer and
-    // an operator reasonably expects `[b] background` beside it (that pair is the premise job
-    // control was designed from). It cannot be offered HERE: a foreground check is the shell parked
-    // in ONE `fs` request, so there is no running state to hand to a service - `b` could only
-    // abandon the pass and start it again from scratch, queued behind the one `fs` is still doing.
-    // Saying where the real thing lives costs a line and does not lie about a key.
-    gs::io::println(ctx, "drives check - walking the tree   [q] quit   (detach it next time: background drives check)");
+    // THE SHELL'S OWN CHECK, which offers only `[q]`: it is the shell parked in ONE `fs` request, with no
+    // running state to hand to a service. Typed at the prompt, `drives check` runs as a job instead and its
+    // notice offers `[b]` (`run_typed_as_job`); this is the form a script or a pipe runs, or when a job is
+    // already running.
+    gs::io::println(ctx, "drives check - walking the tree   [q] quit");
     // q-abortable: a tree walk on a slow stick takes seconds (bounded by FS_FSCK_SECS), and a shell
     // parked in a request it cannot leave cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_CHECK) {
