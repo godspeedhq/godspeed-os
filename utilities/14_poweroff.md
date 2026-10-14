@@ -1,6 +1,8 @@
 # Utility: `poweroff` - not provided (considered and rejected)
 
-**Status:** Considered, implemented, tested on hardware, and **removed.**
+**Status:** Considered, implemented, tested on hardware, and **removed.** Its successor is designed:
+`shutdown` (`utilities/64_shutdown.md`, `docs/shutdown.md`, 2026-10-14), which halts where a board cannot cut its
+own power rather than claiming it did.
 **Why this doc exists:** so the next person doesn't re-attempt it expecting it to
 be easy. It isn't, and the reason is instructive.
 

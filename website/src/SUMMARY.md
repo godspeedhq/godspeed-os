@@ -34,6 +34,7 @@
   - [`restart`](utilities/restart.md)
   - [`reboot`](utilities/reboot.md)
   - [`poweroff`](utilities/poweroff.md)
+  - [`shutdown`](utilities/shutdown.md)
   - [`background`](utilities/background.md)
   - [`drives`](utilities/drives.md)
   - [`dir`](utilities/dir.md)

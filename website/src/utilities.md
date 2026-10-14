@@ -102,6 +102,7 @@ fails.
 | [`chaos`](utilities/chaos.md) | kill things deliberately, and see what survives |
 | [`reboot`](utilities/reboot.md) | restart the machine |
 | [`poweroff`](utilities/poweroff.md) | **not provided** - and the page says why |
+| [`shutdown`](utilities/shutdown.md) | **designed, not built** - turn the machine off, now or after a delay |
 | [`background`](utilities/background.md) | run long work as a job, so the prompt stays usable |
 
 ### Networking
