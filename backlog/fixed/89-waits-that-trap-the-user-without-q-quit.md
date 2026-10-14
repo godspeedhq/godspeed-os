@@ -357,6 +357,7 @@ is pending.
 **The SBCs were slower than the x86 machines at backgrounding and foregrounding** (the operator, 2026-10-14):
 the Pi 2, Pi 4 and VisionFive each took longer than the T630 and Wyse from Enter to the notice, from `b` to
 `[backgrounded]`, and in `jobs` and `foreground`. Part of it is the disk: a USB stick against a SATA SSD, so a
-check runs 19 to 34 s rather than 1.4 to 3.9 s and holds `copier` deaf for that long. Part is spawning
-`copier` on a slower core: 0.7 s to 1.7 s from Enter to `copier: ready` on the boards against about 1 s on
-the T630. Not measured beyond what the five logs show; recorded rather than opened as its own entry.
+check runs 19 to 34 s rather than 1.4 to 3.9 s, and `copier` is deaf for all of it, which is when `jobs` and
+`foreground` waited their 6 to 8 s. The logs do not show the rest: the time from `copier` spawned to the notice
+is 1.3 to 2.0 s on all five, so the spawn is not visibly slower, and Enter is not in the serial capture. Not
+measured further; recorded rather than opened as its own entry.
