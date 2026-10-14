@@ -18,6 +18,7 @@
 
 use core::fmt;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::smp::SpinLock;
 
@@ -71,6 +72,24 @@ impl RingBuffer {
 }
 
 static RING: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
+
+/// Whether serial is part-way through a line: the last byte put on it was not a newline. Console output
+/// leaves a line open all the time - the `gsh> ` prompt, a countdown redrawn in place with a carriage
+/// return - and a log line written then used to run on from it (`[b] backgroundpower: shutting down in
+/// 4s`). So a log line that finds the line open starts a new one first, on serial only: the ring holds
+/// log lines alone, which are whole.
+///
+/// Tidiness, not correctness. Two cores writing at once can each miss the other's last byte, and the
+/// cost is the old join, never lost or reordered output. Relaxed for the same reason.
+static SERIAL_LINE_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// The console path (syscall `ConsoleWrite`) reports what it put on serial, so the next log line knows
+/// whether it is starting at the beginning of a line.
+pub fn note_console_bytes(s: &[u8]) {
+    if let Some(&last) = s.last() {
+        SERIAL_LINE_OPEN.store(last != b'\n', Ordering::Relaxed);
+    }
+}
 
 /// Bytes a single log message stages for serial before flushing atomically. Covers any
 /// kernel log line and the 256-byte service-log cap (+`\n`) in one flush; a longer
@@ -126,8 +145,14 @@ pub fn write_fmt(args: fmt::Arguments) {
     crate::smp::without_interrupts(|| {
         let mut ring = RING.lock();
         let mut sink = LogSink { ring: &mut ring, stage: [0u8; SERIAL_STAGE], n: 0 };
+        if SERIAL_LINE_OPEN.load(Ordering::Relaxed) {
+            sink.stage[..2].copy_from_slice(b"\r\n");
+            sink.n = 2;
+        }
         let _ = sink.write_fmt(args);
+        let open = sink.n > 0 && sink.stage[sink.n - 1] != b'\n';
         sink.flush();
+        SERIAL_LINE_OPEN.store(open, Ordering::Relaxed);
     });
 }
 

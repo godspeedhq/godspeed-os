@@ -10939,6 +10939,12 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
     check(log.contains("power: shutting down in 10s") && log.contains("power: shutting down in 1s"),
           "`power` counted down the last ten seconds");
     check(log.contains("power: tidy-up - fs"), "`power` asked fs to quiesce three seconds out");
+    // The two log quirks the T630 card showed: a log line joined onto the shell's open countdown line, and the
+    // tidy-up asking the kernel for a `copier` that was not running.
+    check(!log.contains("backgroundpower:") && !log.contains("stops itpower:"),
+          "a log line starts its own line on serial, not after the shell's open one");
+    check(!log.contains("acquire: 'copier' is not in the name directory"),
+          "the tidy-up asks for `copier` only when the shell says it is running");
     check(log.contains("fs: quiesce ended - the shutdown was cancelled") && log.contains("power: fs takes writes again"),
           "a cancel after the tidy-up ended fs's quiesce");
     check(log.contains("fs: quiesced for a shutdown"), "fs flushed and stopped taking writes");

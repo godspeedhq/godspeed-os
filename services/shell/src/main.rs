@@ -7545,10 +7545,22 @@ impl core::fmt::Display for Delay {
     }
 }
 /// Tell `power` the pending shutdown changed. A CUE with no authority in it - `power` only re-reads the deadline
-/// the kernel holds - so nothing is lost if `power` is down: it reads the deadline when it starts.
+/// the kernel holds - so nothing is lost if `power` is down: it reads the deadline when it starts. It carries
+/// whether `copier` is running, so the tidy-up asks for it only when there is a copy to cancel.
 fn shutdown_cue_power(ctx: &ShellCtx) {
+    cue_power(ctx, 3);
+}
+
+/// `copier` was started or ended. Only a pending shutdown's tidy-up cares, so the cue is sent only then.
+fn copier_cue_power(ctx: &ShellCtx) {
+    if ctx.power_off_pending().is_some() {
+        cue_power(ctx, 4);
+    }
+}
+
+fn cue_power(ctx: &ShellCtx, op: u8) {
     if let Ok(cap) = gs::cap::acquire(ctx, "power") {
-        let _ = gs::ipc::try_send_to(ctx, cap, &Message::from_bytes(&[3]));
+        let _ = gs::ipc::try_send_to(ctx, cap, &Message::from_bytes(&[op, ctx.copier_started.get() as u8]));
         gs::cap::remove(ctx, cap);
     }
 }
@@ -17416,6 +17428,7 @@ fn tidy_helpers(ctx: &ShellCtx) {
     }
     if slot_of(ctx, "copier").is_none() {
         ctx.copier_started.set(false);
+        copier_cue_power(ctx);
         return;
     }
     // NO REQUEST TO `copier` HERE. The rows are as `jobs`, `foreground` and `background` last learned
@@ -17438,6 +17451,7 @@ fn tidy_helpers(ctx: &ShellCtx) {
     }
     end_helper(ctx, "copier", "its job is over and nothing it said is left unread");
     ctx.copier_started.set(false);
+    copier_cue_power(ctx);
 }
 
 /// The restart count of the live service named `name` (None if not running). A respawn increments it
@@ -23343,7 +23357,10 @@ fn start_job(ctx: &ShellCtx, kind: u8, src: &[u8], dst: &[u8], secs: u64, say: b
     }
     // From here `tidy_helpers` looks for it after each command, and ends it once its job is over and
     // collected - including when the start below is refused, which leaves it holding nothing.
-    ctx.copier_started.set(true);
+    if !ctx.copier_started.get() {
+        ctx.copier_started.set(true);
+        copier_cue_power(ctx);
+    }
     // A `copier` spawned a moment ago has not yet registered its name, and a start sent to it then is never
     // delivered. A typed command's start is not waited on (below), so it must not be sent before the name
     // resolves - the jobs suite hung on exactly that. Bounded: twenty passes of 50 ms.

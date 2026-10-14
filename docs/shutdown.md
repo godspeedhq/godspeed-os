@@ -2,7 +2,7 @@
 
 **Status:** built on branch `feat/shutdown`, 2026-10-14, QEMU-verified; hardware cards pending. S1 to S4 are built:
 the kernel's `PowerOff` with its one deadline (S1), `fs`'s quiesce (S2), `power`'s warnings and tidy-up (S3) and the
-shell's `shutdown` (S4). `osdev test shutdown` passes 35 of 35 on x86; QEMU RISC-V powers off through SBI SRST; the
+shell's `shutdown` (S4). `osdev test shutdown` passes 37 of 37 on x86, and the T630 card passed (it halts, as expected); QEMU RISC-V powers off through SBI SRST; the
 refusal without the capability is `osdev test adv` A12. The command is `utilities/64_shutdown.md`.
 
 ## 1. What is asked for
@@ -53,8 +53,9 @@ refused with a sentence: a shutdown a day away is a calendar's job.
 - **The kernel** holds the deadline - the machine's ONE pending power-off - and fires it when it falls due,
   whether or not any service is alive. It knows nothing about why.
 - **`power`** holds no shutdown authority (no `POWER_OFF`; it keeps `CPU_CLOCK` for the clock leases). It reads the
-  deadline, gives the warnings and does the tidy-up three seconds before the deadline. The shell cues it when the deadline changes; the cue carries no authority, because `power` only ever
-  re-reads what the kernel holds, so a forged cue from anyone changes nothing.
+  deadline, gives the warnings and does the tidy-up three seconds before the deadline. The shell cues it when the deadline changes, and when it starts or ends `copier` while one is pending, so the tidy-up
+  asks for `copier` only when a copy can be running; the cue carries no authority, because `power` only ever
+  re-reads what the kernel holds, so a forged cue from anyone changes nothing but whether that one request is made.
 
 ### 4.1 The foreground countdown, and `[b]`
 
@@ -208,7 +209,7 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
 | S1 | The kernel: `PowerOff` now, at and cancel; the one deadline on the BSP tick; query 28; `POWER_OFF` to the shell; the seam member on every port; the halt fallback; the amendment | QEMU x86 and RISC-V power off; `osdev test adv` A12 refuses it without the capability |
 | S2 | `fs`: `OP_QUIESCE` - finish, flush, refuse writes for 10 s | `osdev test shutdown`: fs says it flushed |
 | S3 | `power`: read the deadline, warnings, the tidy-up three seconds out, carry on after a restart | `osdev test shutdown`: the countdown and tidy-up lines |
-| S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 35/0 |
+| S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 37/0 |
 | S5 | Cards on all five boards | each says off or halted truthfully, the machine off within about 1 s of a plain `shutdown`'s 3 s |
 | S6 | `reboot` on the same deadline, with the tidy-up | the jobs and quit suites, and a card per board |
 

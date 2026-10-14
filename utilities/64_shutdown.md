@@ -54,7 +54,8 @@ Text at the prompt. `shutdown status` is one sentence; the rest are actions (rul
 - **`POWER_OFF`**, which this shell alone holds, beside `REBOOT`: ending the session is the operator's. A second
   holder - a power button - is a decision recorded in `COMMANDMENTS.baseline.toml`, never a door.
 - **Console output**, the keys for the countdown, and a send to `power` to cue it - a cue that carries no
-  authority, since `power` only re-reads the kernel's deadline.
+  authority, since `power` only re-reads the kernel's deadline. It also says whether `copier` is running, so the
+  tidy-up asks for it only when a copy can be in flight.
 
 ## 6. Conformance
 

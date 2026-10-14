@@ -31,8 +31,8 @@
 //! **Shutdown (`docs/shutdown.md`).** This service holds no `POWER_OFF`; the shell does. It READS the one pending
 //! power-off the kernel holds (InspectKernel query 28, `power_off_pending`), warns at 1 h, 30 m, 15 m, 5 m, 1 m and
 //! each of the last ten seconds, and three seconds out (`TIDY_AT`) cancels a copy in flight and has `fs` quiesce. The
-//! kernel fires the deadline whether or not this service is alive. `OP_SHUTDOWN_CHANGED` is a cue with no reply and
-//! no authority.
+//! kernel fires the deadline whether or not this service is alive. `OP_SHUTDOWN_CHANGED` and `OP_COPIER_CHANGED` are
+//! cues with no reply and no authority.
 //!
 //! **Restart.** This service is restartable like any other. A respawned instance knows of no lease, so
 //! it puts the clock at its minimum - the honest state for "nobody has asked" - and a holder whose lease
@@ -44,14 +44,20 @@
 use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
-/// The protocol, one opcode byte. Replies to `OP_HOLD` and `OP_RELEASE` lead with a status byte; `OP_SHUTDOWN_CHANGED`
-/// is not answered.
+/// The protocol, one opcode byte. Replies to `OP_HOLD` and `OP_RELEASE` lead with a status byte; the two cues are
+/// not answered.
 const OP_HOLD: u8 = 1;
 const OP_RELEASE: u8 = 2;
-/// `[3]`, no reply: the shell set or cancelled the machine's pending power-off. A CUE, not a request - it
+/// `[3, copier]`, no reply: the shell set or cancelled the machine's pending power-off. A CUE, not a request - it
 /// carries no authority and is never trusted: this service only re-reads the deadline the kernel holds, so a
-/// forged cue from anyone changes nothing but how soon that read happens (`docs/shutdown.md` 6).
+/// forged cue from anyone changes nothing but how soon that read happens (`docs/shutdown.md` 6). `copier` is
+/// as in `OP_COPIER_CHANGED`.
 const OP_SHUTDOWN_CHANGED: u8 = 3;
+/// `[4, copier]`, no reply: the shell started `copier` (1) or ended it (0) while a shutdown is pending. It says
+/// whether the tidy-up has a copy to cancel, because `copier` runs only while a job does and asking a name
+/// nobody holds is a refusal the kernel logs (`acquire: 'copier' is not in the name directory`). A forged one
+/// costs at most that line, or a copy left for recovery: the same as a lost one.
+const OP_COPIER_CHANGED: u8 = 4;
 /// `copier`'s cancel (`services/copier`): stop a copy at its next chunk and remove the partial destination.
 const CP_OP_CANCEL: u8 = 3;
 
@@ -155,6 +161,10 @@ struct Shutdown {
     warned: u64,
     /// Whether the tidy-up has run for this deadline (and so whether a cancel must resume `fs`).
     tidied: bool,
+    /// Whether `copier` is running, as the shell last said. TRUE until it says: a respawned instance cannot know,
+    /// and asking for a `copier` that is not there costs one logged refusal, while not asking for one that is
+    /// leaves its partial file to recovery.
+    copier: bool,
 }
 
 /// Warn at these many seconds left: an hour, half, a quarter, five minutes, one, then each of the last ten.
@@ -179,7 +189,7 @@ fn passed_threshold(left: u64) -> u64 {
 }
 
 impl Shutdown {
-    fn new() -> Self { Shutdown { left: None, warned: u64::MAX, tidied: false } }
+    fn new() -> Self { Shutdown { left: None, warned: u64::MAX, tidied: false, copier: true } }
 
     /// A cue, or this service's start: the deadline may be new, moved, or gone. Re-read it and say which.
     fn changed(&mut self, ctx: &ServiceContext) {
@@ -239,7 +249,7 @@ impl Shutdown {
                 }
                 if left <= TIDY_AT && !self.tidied {
                     self.tidied = true;
-                    tidy_up(ctx);
+                    tidy_up(ctx, self.copier);
                 }
             }
         }
@@ -249,16 +259,18 @@ impl Shutdown {
 /// The last seconds before the power goes (`docs/shutdown.md` 4.3): a copy in flight is cancelled, so its partial
 /// destination is removed, and `fs` flushes and stops taking writes. Each is bounded by about a second and an
 /// unanswered one is said and skipped; whatever is not done is left to recovery, which is what it is for.
-fn tidy_up(ctx: &ServiceContext) {
+fn tidy_up(ctx: &ServiceContext, copier: bool) {
     ctx.log("power: tidy-up - the last seconds before the shutdown");
     // `copier` FIRST, because a cancelled copy removes its partial destination through `fs`, which must still take
-    // that write. It runs only while a job does, and asking a name nobody holds would spend the budget finding
-    // that out: so it is asked only when the name resolves.
-    if let Ok(cap) = gs::cap::acquire(ctx, "copier") {
-        gs::cap::remove(ctx, cap);
-        match gs::call::request_within(ctx, "copier", &Message::from_bytes(&[CP_OP_CANCEL]), 1) {
-            Ok(_) => ctx.log("power: tidy-up - copier asked to stop its job"),
-            Err(e) => ctx.log_fmt(format_args!("power: tidy-up - copier did not answer ({:?}); its job is cut", e)),
+    // that write. It runs only while a job does, so it is asked only when the shell has said it is running
+    // (`OP_COPIER_CHANGED`) and its name resolves.
+    if copier {
+        if let Ok(cap) = gs::cap::acquire(ctx, "copier") {
+            gs::cap::remove(ctx, cap);
+            match gs::call::request_within(ctx, "copier", &Message::from_bytes(&[CP_OP_CANCEL]), 1) {
+                Ok(_) => ctx.log("power: tidy-up - copier asked to stop its job"),
+                Err(e) => ctx.log_fmt(format_args!("power: tidy-up - copier did not answer ({:?}); its job is cut", e)),
+            }
         }
     }
     match gs::fs::Fs::new(ctx).patience_secs(1).quiesce() {
@@ -330,8 +342,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // A CUE FIRST: a cancel that arrives as this service wakes must be read as a cancel, not mistaken by the
         // countdown step for the deadline falling due - which left `fs` refusing writes for a shutdown that was
         // not coming (`osdev test shutdown`).
-        let cue = matches!(&msg, Some(m) if m.payload_bytes().first() == Some(&OP_SHUTDOWN_CHANGED));
-        if cue { sd.changed(&ctx); } else { sd.tick(&ctx); }
+        let op = msg.as_ref().and_then(|m| m.payload_bytes().first().copied());
+        let cue = op == Some(OP_SHUTDOWN_CHANGED) || op == Some(OP_COPIER_CHANGED);
+        if cue {
+            // A cue without the byte is read as "running", for the reason `Shutdown::copier` gives.
+            sd.copier = msg.as_ref().and_then(|m| m.payload_bytes().get(1).copied()) != Some(0);
+        }
+        if op == Some(OP_SHUTDOWN_CHANGED) { sd.changed(&ctx); } else { sd.tick(&ctx); }
 
         let Some(req) = msg else { continue };
         if cue { continue; }
