@@ -378,6 +378,11 @@ the `y`). A typed `drives check`: `[q] quit   [b] background` 1.1 s after `copie
 printed when it ended 0.3 s later. A second, with `b`: `[backgrounded] job 1` in the same millisecond; `jobs`
 said `done`; `foreground 1` replayed the verdict. `selfcheck`: `ran 592, failed 0, skipped 0`.
 
+**HP T630 card for the fix (`b35a2faa`), 2026-10-14, passed:** a typed `drives check` (4.2 s in `fs`): `[q] quit
+[b] background` 1.5 s after `copier` was ready, `b` gave `[backgrounded] job 1` in the same millisecond, `jobs`
+said `done`, `foreground 1` replayed the verdict. `selfcheck`: `ran 592, failed 0, skipped 0`. All five boards
+have now run the fix.
+
 **The SBCs were slower than the x86 machines at backgrounding and foregrounding** (the operator, 2026-10-14):
 the Pi 2, Pi 4 and VisionFive each took longer than the T630 and Wyse from Enter to the notice, from `b` to
 `[backgrounded]`, and in `jobs` and `foreground`. Part of it is the disk: a USB stick against a SATA SSD, so a
