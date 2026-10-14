@@ -76,7 +76,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    (`services/shell/src/main.rs`, beside `complete_tab`), so Tab at one of its argument
    positions does *nothing* instead of offering unrelated files. (The bug this prevents:
    `chaos max-carnage all-services <tab>`, landing on the rounds argument, listed the root
-   directory and offered `/users/default/history`.) The default is path completion; **opting out is
+   directory and offered `/.gsh_history`, where the history then lived.) The default is path completion; **opting out is
    explicit and per-command** - a path-taking utility (`dir`, `read`, `write`, `mkdir`, `find`,
    `tree`, `copy`, ...) is simply absent from `NO_PATH_CMDS` and keeps its file completion. So
    when you add a utility: if its args are paths, do nothing; if they are not, add it to
@@ -131,11 +131,14 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     `input`, a full-screen program with its own quit key) are exempt.
 
     **The shell is the observer.** It starts a COMMAND clock at Enter, and every wait the command makes
-    reads it through `gs::call::Watch` - a `gs::fs` / `gs::net` handle lent `.watching(ctx)` (the shell's
-    `ctx.fs()`), `gs::call::request_watched`, `recv_quittable` - so the notice is per command, a command
+    reads it through `gs::call::Watch` - a `gs::fs` handle lent `.watching(ctx)` (the shell's `ctx.fs()`),
+    `gs::call::request_watched`, `recv_quittable` - so the notice is per command, a command
     made of many fast requests is covered as well as one slow request, and `q` stops the command at its
-    next request. A script, a `wait` and `selfcheck` stop on it too. A wait the watch cannot see is a
-    defect to fix, not an exception to record. `osdev test quit` measures every kind of wait on an `fs`
+    next request. A script, a `wait` and `selfcheck` stop on it too. (`tcp`, `serve` and `sock` use a
+    `gs::net` handle with its own notice: quittable, on the request's clock rather than the command's.) A
+    wait the watch cannot see is a defect to fix; the few that cannot trap anyone - under 2 s, one pass of
+    a loop that reads `q`, after a `q`, or between commands - say so beside them (`// quit-ok:`), and
+    `scripts/quit_wait_check.py` refuses any other. `osdev test quit` measures every kind of wait on an `fs`
     built to answer slowly (`slow-replies`) and writes the table to `build/tests/quit_report.md`.
 
     *The rule as it read before 2026-10-13, kept as history:* **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
@@ -169,7 +172,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`) go through
     `ask_with_quit_notice`, and the re-waits after an overtaken reply (`fs_take_tagged`,
     `ns_take_tagged`) through `recv_quittable` (`backlog/84` S6). Not yet covered: the fs handles
-    listed in the note above.)*
+    listed in the note above - covered since 2026-10-13, `backlog/89`.)*
 
     *(Note 2026-10-13: and the radio's and audio driver's asks. `wifi_ask` and `audio_ask` - every
     `wifi` and `audio` verb, `wifi hardware` among them, which asks each radio twice and could sit for
@@ -181,7 +184,8 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     caller's deadline), and the 2 s spawn request to the supervisor. A task blocked in a `Call` cannot read the console, and the
     noticing form that can takes whatever reply lands next, which is what the `Call` is there to prevent:
     giving them `[q]` needs a reply-matched wait that returns to the caller between slices, which does not
-    exist yet.)*
+    exist yet. Fixed later the same day: all four are under the command's watch (`ask_watched`, `hw_ask`),
+    `backlog/89`.)*
 
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
@@ -194,6 +198,8 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     and was worse for it, since `events failures` is the instrument you reach for WHEN something is
     wedged; an instrument that can hang on the thing it is measuring takes the prompt with it.
 
+    *(Superseded 2026-10-13, `backlog/89`: these requests now go through `ask_sifted_quittable`, say
+    `[q] quit` past 2 s and stop the wait on `q`. Kept as the record of why they once could not.)*
     **Recorded exception: the `wifi` radio power requests.** `wifi radio on`, `wifi radio off`,
     `wifi radio off hard` and the power request at the start of `wifi radio powercycle` block in a
     kernel `Call` with no `q`, because a shell blocked in one cannot read the console. Each is

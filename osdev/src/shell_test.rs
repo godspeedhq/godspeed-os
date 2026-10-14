@@ -5811,7 +5811,7 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     // The disk is already formatted (drifted free count); fs auto-mounted it. Run the fsck.
     // **NOT an exact match, and the exactness is what made this test wrong.** `expect_free` is read
     // from the superblock BEFORE boot, but the running system creates files of its own on the way up
-    // - `/system/services/time/floor` (the `time` service's persisted floor) and `.gsh_history` - each taking a
+    // - `/system/services/time/floor` (the `time` service's persisted floor) and `/users/default/history` - each taking a
     // block. Both arrived after this test was written, so the pinned figure silently went stale and
     // the suite had been failing 4/1 on `main` with nobody looking: no gate that runs before a merge
     // includes the eleven fs suites. See `backlog/32`.
@@ -10934,8 +10934,8 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
         ("!jobs", ""),
         ("~copy /q/big.txt /q/big5.txt",      "typed, runs as a job: b detaches it"),
         ("!jobs", ""),
-        // Last: a script that cannot be stopped holds the shell for its whole length (20 s here, so the
-        // run ends either way and leaves a prompt behind).
+        // Last: a script that loops 20 s - stopped by `q` between its statements; the 20 s bound leaves a
+        // prompt behind either way.
         ("run /q/loop.gsh",                   "a script that loops 20 s"),
     ];
     for (c, what) in cases {

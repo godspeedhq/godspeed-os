@@ -506,7 +506,7 @@ channel.
 listing.** That makes the API right for the simple case the Stranger Test asks about ("list a
 directory") and wrong for an interleaved one.
 
-`cmd_churn_verify` - the power-cut verifier - is the interleaved case: it lists `/churn` and reads
+`cmd_churn_verify` - the power-cut verifier - is the interleaved case: it lists `/churn` (`/system/scratch/churn` since 2026-10-13) and reads
 each file as it goes. Migrating it would have forced a two-pass collect into a roughly 16 KB stack
 buffer the original never needed, on a shell stack already known to be tight. That is a memory
 discipline regression caused by the shape of my API, so **it was not migrated**, and the reason is
@@ -1445,7 +1445,7 @@ investigation here and would cost the next person the same.
 `60-data.gsh`:
 
 ```
-if dir /churn {
+if dir /system/scratch/churn {
     echo 'selfcheck: an earlier churn is still on disk - verifying it BEFORE it is overwritten'
     if churn verify { echo 'PASS  churn - the earlier run holds no torn file ...' }
 }

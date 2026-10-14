@@ -253,8 +253,8 @@ pub struct Fs<'a> {
     notice: Option<&'a dyn Fn()>,
     /// Where the keys a noticing wait reads (and does not act on) go - see [`Fs::keeping`].
     keep: Option<&'a dyn Fn(u8)>,
-    /// The command's watch (`call::Watch`): when lent, every request shows the command's `[q] quit` and
-    /// honours it, and the notice and keep above are not used.
+    /// The command's watch (`call::Watch`): when lent and active, every request shows the command's
+    /// `[q] quit` and honours it, and the notice and keep above are not used.
     watch: Option<&'a dyn call::Watch>,
     /// How long ORDINARY operations wait. `None` means [`call::DEFAULT_SECS`].
     ///
@@ -358,7 +358,8 @@ impl<'a> Fs<'a> {
 
     /// Lend this handle the command's watch ([`call::Watch`]): every request then shows the command's
     /// `[q] quit` once the COMMAND has run 2 s, and stops at the next request after a quit. Takes
-    /// precedence over a notice; a watch that is not active gives the plain wait.
+    /// precedence over a notice; a watch that is not active leaves the handle's own notice, if any, else the
+    /// plain wait.
     pub fn watching(mut self, watch: &'a dyn call::Watch) -> Fs<'a> {
         self.watch = Some(watch);
         self

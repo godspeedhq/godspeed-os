@@ -78,7 +78,7 @@ later byte is predicted. The first disagreement is the tear point:
 ```
 gsh> churn verify
 churn verify: TORN - /system/scratch/churn/f7.bin diverges at byte 1216 of 3000 (block 2, offset 200 within it)
-churn verify: 1 of 8 file(s) are TORN - each holds a mix of two writes.
+churn verify: 1 of 8 file(s) are TORN - each holds a mix of two writes. This is a DATA integrity failure, not a space-accounting one: report it with the serial log.
 ```
 
 251 is the largest prime under 256, chosen so the pattern does not align with the 508-byte block

@@ -255,7 +255,8 @@ impl<'a> Net<'a> {
 
     /// Lend this handle the command's watch ([`call::Watch`]): every request then shows the command's
     /// `[q] quit` once the COMMAND has run 2 s, and stops at the next request after a quit. Takes
-    /// precedence over a notice; a watch that is not active gives the plain wait.
+    /// precedence over a notice; a watch that is not active leaves the handle's own notice, if any, else the
+    /// plain wait.
     pub fn watching(mut self, watch: &'a dyn call::Watch) -> Net<'a> {
         self.watch = Some(watch);
         self

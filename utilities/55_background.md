@@ -59,7 +59,8 @@ gsh> drives check
 `q` stops it where it can be stopped: a copy is cancelled between its chunks and its incomplete
 destination removed. A check, a scrub or a tree delete is ONE request to `fs`, which cannot be stopped
 part-way, so `q` says that and leaves it running as job N. A job that ends while attached prints what
-it found, in the shell's own words - `copier` writes the lines the shell would have printed - and its
+it found, in the shell's own words - `copier` writes the lines the shell would have printed, after one
+line naming the job (`copying`, `deleting a subtree`, `drives check - walking the volume`) - and its
 result is the command's. In a script, a pipe, a function, or while a job is already running, the
 command runs in the shell as before and offers `[q]` alone: a script's `drives check` must not let the
 script run on past it.

@@ -2038,7 +2038,7 @@ failed` line names its port, the cause is the hub's EP0, not the command ring.
 ## 33. The branch tip on the Pi 4 (2026-10-07): sections 31 and 32 and the prompt, confirmed; the download fault still intermittent
 
 One card carried three fixes, each with its own line in the log: section 31, section 32, and the shell
-drawing its prompt before it reads `/persist.conf` (`1da33d6b`).
+drawing its prompt before it reads `/persist.conf` (`1da33d6b`; now `/system/services/events/sticky`).
 
 **The prompt:** `gsh>` came with the same timestamp as `shell: ready`, 2.4 s after power-on. On U2c's
 second run it came at 6.1 s, and 4.8 s on a boot without the dongle plugged in. **Reverted later the same day

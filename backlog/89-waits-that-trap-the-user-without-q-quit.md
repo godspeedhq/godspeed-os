@@ -1,7 +1,9 @@
 # 89. Waits that trap the user without `[q] quit`
 
-**Status: OPEN, 2026-10-13.** Found by `audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for
-every site), what passes and what was not checked. Nothing is fixed yet: the operator decides the order.
+**Status: OPEN, 2026-10-13; the route below is built and measured (2026-10-14).** Found by
+`audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for every site), what passes and what was not
+checked. The observer route is built, slice by slice, with `osdev test quit` at 35 cases and none below the bar,
+and a ratchet holds it (the end of this file). Open: the waits between commands, and the hardware cards.
 
 ## The rule asked for
 
@@ -58,9 +60,9 @@ separate program, holding no console authority, whose output fits a bounded tran
 
 ## Next step
 
-The operator chooses: the primitive first (it removes Q1, Q2, Q5 and most of Q4 at once), or the user-facing
-traps first (Q3 `run`, Q3 `chaos kill-storm`, Q4 `delete ... recursive`, Q6 `drives flash`), which are small and
-independent.
+*(Superseded: the operator chose the observer route, below, and it is built.)* The hardware cards, then
+`backlog/fixed/`. Whether the waits between commands need a clock of their own is the one open design
+question.
 
 ## Evidence: `osdev test quit` (QEMU, 2026-10-13)
 
@@ -158,8 +160,9 @@ Quit table 31 cases, 0 below the bar; files 270/0, shell 272/0, script 11/0.
 `delete <dir> recursive`, `drives check` and `drives scrub`, typed, start as the job `background` would start
 and the console attaches to it (`run_typed_as_job`), so the notice is `[q] quit   [b] background` and `b`
 answers `[backgrounded] job N`. `copier` writes the shell's own lines, so what the command prints is the same
-either way; a check or scrub that finds damage ends the job as failed, as the shell's form returns an error. A
-typed job is not in `jobs` and takes no number unless it is detached. In a script, a pipe or a function, or
+either way, after one line naming the job; a check or scrub that finds damage ends the job as failed, as the shell's form returns an error. A
+typed job is not in `jobs` and takes no number unless it goes on without the console: detached with `b`, or
+left running by a `q` it cannot stop (a check, a scrub, a tree delete, or one whose start was not yet answered). In a script, a pipe or a function, or
 while a job is already running, the command runs in the shell with `[q]` alone.
 
 Four things the table found on the way, each fixed and re-measured, in order: the attach loop waited on
@@ -215,3 +218,38 @@ no name to reach and was never delivered, and the attach loop waited for its ans
 waits (twenty passes of 50 ms) for the name, and an unanswered start ends after 12 s, saying so. The table above
 ran on the build before that change, which touches neither the keys nor the notice; on the final build, jobs
 60/0, files 270/0, shell 272/0 (2 skipped), script 11/0.
+
+**The ratchet (2026-10-14): `scripts/quit_wait_check.py`, on the build path.** It counts, in the shell, every
+wait that reads no key: the SDK's plain bounded requests, `gs::ipc::recv` and `recv_within_ms`, `gs::call`'s
+plain requests, and an `Fs` or `Net` handle made without the watch. Each must say, in a comment line among the
+four above it, why it cannot trap anyone (`// quit-ok: <reason>`), and the number of those exceptions (10) may
+fall and may not rise. `--selftest` proves it fires on an unmarked wait and passes a marked one. What it
+cannot see is said in its header: a loop of sleeps that never reads `q` (the table above measures those), and
+the waits between commands, which have no command clock.
+
+Writing it found three silent waits, each fixed:
+
+- **A finished job's transcript was read back with no `[q]`**, up to 8 s a page (`replay_transcript`, on the
+  attached finish and on `foreground`). It is under the command's watch now, sifted by op, and a `q` there says
+  "(stopped reading what it said)".
+- **`q` on `foreground` waited up to 8 s for `copier` to acknowledge the cancel**, silent, after a `q` that rule
+  10 gives 3 s. It takes one 300 ms look, as `quit_attached` does, and says "asked to stop" when unanswered.
+  The first build of this failed `osdev test jobs` 39/21: `copier` answered the cancel after the look, and the
+  next unsifted question to it - the next `background` start - took that answer as its own, so every job after
+  it was refused. The 8 s wait had hidden it. Every question to `copier` is now sifted by its op
+  (`copier_ask_watched`), so a late answer is dropped wherever it lands.
+- **Tab completion of a network name could be silent for 3 s**: two 1.5 s asks to the radio. Tab is a key, not
+  a command, so there is no `[q]` to offer; the second ask is now made only for a send that never left (back
+  inside 250 ms), which keeps it under 2 s.
+
+**Between commands, not under any clock, recorded rather than closed:** the history save at Enter (before the
+command clock starts), `tidy_helpers` after it, and the audio shortcuts. The history save is held to 2 s a request
+(`HIST_SAVE_SECS`); none of the three was measured.
+
+**From the docs and comments audit the same day** (`audits/2026-10-14-docs-and-comments-audit.md`), two code
+edges, fixed: `[b]` was offered during a typed `copy`'s or `delete`'s first look at its path even when a job
+was already running, where the command then runs in the shell and `b` does nothing - it is offered now only
+when no job is believed live; and `copier` kept a mkdir helper nothing called since churn moved to its scratch
+folder. One question is the operator's, not the code's: `q` on `wifi radio off hard` stops the WAIT and says
+the cut may still happen, since the cut cannot be stopped once asked (rule 11 asks that quitting stop the
+task; here it cannot, and the words say so).

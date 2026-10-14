@@ -209,7 +209,8 @@ pub fn request_watched(
     request_watched_sifted(ctx, peer, msg, secs, watch, &mut |_| true)
 }
 
-/// [`request_watched`] that takes only the reply `mine` accepts, and drops any other while it waits.
+/// [`request_watched`] that takes only the reply `mine` accepts, and drops any other while it waits. When the
+/// watch is not active it is [`request_within`], which does not sift.
 ///
 /// **Why a quittable wait needs this.** Quitting abandons a request whose reply is still on its way. The
 /// next request's wait would take that late reply as its own, and the next command fails for nothing -

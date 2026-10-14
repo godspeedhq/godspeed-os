@@ -16,9 +16,10 @@ stays six (CLAUDE.md 4.3).
 
 ---
 
-## 1. What is true today
+## 1. Before phase 1
 
-Everything a service keeps lives in the ROOT of the disk, next to whatever the operator wrote there:
+Before phase 1, everything a service kept lived in the ROOT of the disk, next to whatever the operator wrote
+there (section 13 has where each file is now):
 
 | File | Owner | What it holds |
 |---|---|---|
@@ -100,12 +101,13 @@ Three creators, each at its own moment:
 
 **Format.** `drives flash` asks `fs` to format, and `fs` writes the standard tree as part of the format, so a
 fresh disk shows the layout from its first boot. The shell's `drives` does not build the tree itself: the
-tree is `fs`'s. **`fs` learns two layout names and no more** - `system` and `users`, and the four folders
-under `system`. It never learns a service's name: a list of services inside `fs` would drift exactly as the
+tree is `fs`'s. **`fs` learns the standard tree and no more** - `system` with its four folders, and
+`users/default`. It never learns a service's name: a list of services inside `fs` would drift exactly as the
 six service lists `backlog/35` records did.
 
-**First use.** Each owner creates its own folder the first time it writes (`MkdirP`, which exists). This is
-what makes disks formatted before the change work without a reformat.
+**First use.** Each owner creates its own folder the first time it writes (`MkdirP`, which exists), so a
+folder removed by hand comes back. It does not make an old disk current: a disk formatted before phase 1 has
+no `/users/default` and keeps its old root files, so it needs `drives flash` (section 13).
 
 **Grant (phase 2).** When folder capabilities exist, the supervisor asks `fs` for a capability on
 `/system/services/time/` as it spawns `time`, and `fs` creates the folder if it is missing. Creating a folder
@@ -168,9 +170,9 @@ and not before.
 ## 6. The shell: where you are
 
 **The shell starts in `/users/default/`.** That changes what a bare name means: `write notes.txt` writes
-`/users/default/notes.txt`, where today it writes `/notes.txt`. Absolute paths are unaffected.
+`/users/default/notes.txt` (before phase 1 it wrote `/notes.txt`). Absolute paths are unaffected.
 
-**Going home is plain `cd`.** Today a bare `cd` goes to `/`; it will go to the session's home instead. No
+**Going home is plain `cd`.** A bare `cd` goes to the session's home (it went to `/` before phase 1). No
 `~`: it is a Unix convention you have to already know. In a path, home is the variable **`$home`** - `dir
 $home`, `cd $home/scripts` - which the shell sets from the session's home. gsh already has variables, so this
 adds no new syntax, and it cannot collide with a real folder named `home` the way a reserved path word would.
@@ -340,7 +342,7 @@ Named L1-L10 so they are not confused with the constitution's invariants 1-12 (C
 **What was built**, each piece where the design put it:
 
 - **`fs` lays down the tree when it formats** (`LAYOUT` and `make_layout` in `services/fs/src/main.rs`): the
-  five folders in one transaction after `format_into`, so a power cut leaves all of them or none. A disk
+  five paths in `LAYOUT` (seven folders, with `/system` and `/users`) in one transaction after `format_into`, so a power cut leaves all of them or none. A disk
   that formatted but could not take the tree is reported as a failed flash. `osdev mkfs` and
   `osdev script-disk` write the same tree host-side (`gsfs_layout`); the test fixtures keep the bare
   format, because several suites count what is on the disk they built.

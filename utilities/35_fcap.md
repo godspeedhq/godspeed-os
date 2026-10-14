@@ -31,7 +31,7 @@ time as a "does the file-cap model still hold end-to-end?" probe.
 | `fcap gsreuse` | The same restart question asked through the standard library (`gs::fs` / `gs::cap`). |
 
 `fcap` takes **no path** - passing one is refused (`fcap: takes no argument …`). It uses its own
-hidden files (`/.fcap-selftest`, then `/.fcap_append` and `/.fcap-gs`) and removes them, so it is
+files in the shell's scratch folder (`/system/scratch/shell/fcap-selftest`, then `fcap_append` and `fcap-gs`) and removes them, so it is
 leak-free and re-runnable. (`reuse` and `gsreuse` are NOT in `fcap help` and do not tab-complete,
 which `0_conventions.md` rules 2 and 9 require - a code defect, recorded here so the words are not
 discoverable only from the source.)

@@ -1509,6 +1509,13 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     }
 }
 
+/// `slow-replies` (TEST BUILDS ONLY): hold the reply, so `osdev test quit` sees a slow disk in QEMU.
+#[cfg(feature = "slow-replies")]
+fn slow_reply(ctx: &ServiceContext, op: u8) {
+    let long = matches!(op & 0x7F, OP_DELETE_TREE | OP_CHECK | OP_SCRUB | OP_FLASH);
+    gs::task::sleep_ms(ctx, if long { 4000 } else { 700 });
+}
+
 /// One attempt at a request. Writes its reply into `out`/`out_len` instead of sending it - see `serve`.
 ///
 /// `reply` is still passed through for the ONE arm that cannot be buffered: `OP_OPEN` embeds a freshly
@@ -1526,13 +1533,6 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
 /// That is not hypothetical: it was done on 2026-09-20 and took `fs-all` from 25 of 25 to 2 of 25,
 /// with no suite typing `flash` at all. If an arm needs a fresher capacity, refresh it at the CALLER
 /// (see the serve loop), where the selftest is not involved.
-/// `slow-replies` (TEST BUILDS ONLY): hold the reply, so `osdev test quit` sees a slow disk in QEMU.
-#[cfg(feature = "slow-replies")]
-fn slow_reply(ctx: &ServiceContext, op: u8) {
-    let long = matches!(op & 0x7F, OP_DELETE_TREE | OP_CHECK | OP_SCRUB | OP_FLASH);
-    gs::task::sleep_ms(ctx, if long { 4000 } else { 700 });
-}
-
 fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: bool, p: &[u8],
               tag: u8, reply: gs::cap::Cap, out: &mut [u8], out_len: &mut usize, quiet: bool) {
     let mut send = |bytes: &[u8]| {
@@ -3341,9 +3341,6 @@ fn replay_window(_ctx: &ServiceContext) {}
         self.dir_add(ctx, &mut parent, name, ITYPE_DIR, 0, first, 1)
     }
 
-    /// `mkdir … parents`: create every missing directory along `path`. Walks component by
-    /// component from root; descends into existing dirs, creates missing ones. Idempotent
-    /// (a fully-existing path is OK); errors only if a component is in the way as a file.
     /// Create the standard tree on a freshly formatted disk, in one transaction, so a power cut
     /// leaves either all of it or none of it. Everything below these folders is created by its
     /// owner at first use (`docs/filesystem-layout.md`).
@@ -3357,6 +3354,9 @@ fn replay_window(_ctx: &ServiceContext) {}
         self.end_txn(ctx, r)
     }
 
+    /// `mkdir … parents`: create every missing directory along `path`. Walks component by
+    /// component from root; descends into existing dirs, creates missing ones. Idempotent
+    /// (a fully-existing path is OK); errors only if a component is in the way as a file.
     fn mkdir_parents(&mut self, ctx: &ServiceContext, path: &[u8]) -> Result<(), &'static str> {
         let mut cur = self.root_entry();
         for comp in components(path) {

@@ -101,9 +101,7 @@ A shell built-in (like the other file commands) sending `LIST_DIR` to `fs`; `fs`
 disk authority. Conforms: `find help` (usage with a real example per row) and
 `find version` (number + creator credit) per `0_conventions.md`.
 
-**Does NOT currently conform to rule 10** (`0_conventions.md` §1.10), found 2026-10-09. The `fs`
-requests of the walk go through a `gs::fs::Fs` handle that is lent no notice, so each request is bounded
-(`gs::call::DEFAULT_SECS`, 5 s) but prints no `[q] quit` and cannot be ended with `q`; the
-`Cancelled` branches in the handler are unreachable. This said the request was q-abortable via
-`fs_request_q`, which no longer exists. `dir` is the one fs-backed command that still lends the
-notice (`16_dir.md` §6); the same `.noticing(...)` here is the fix.
+**Conforms to rule 10** (`0_conventions.md` §1.10) since 2026-10-13 (`backlog/89`). It found 2026-10-09
+that the `fs` handle was lent no notice; every `fs` handle the shell makes is now lent the command's
+watch (`gs::call::Watch`), so the command says `[q] quit` once it has run 2 s, and `q`, `Q` or ESC stops the command
+at its next request (`osdev test quit` measures `find h2.txt /` on a slowed `fs`).
