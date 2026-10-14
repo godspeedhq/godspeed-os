@@ -316,12 +316,12 @@ pub fn run(image_path: &Path, smp: u32) {
            "wifi: asking about wireless on a radioless machine is not an error");
 
     // THE SECURITY ASSERTION, and the one most worth having. A passphrase given as an argument would be
-    // recalled by up-arrow and written to /.gsh_history, so `connect` takes an SSID and nothing else.
+    // recalled by up-arrow and written to /users/default/history, so `connect` takes an SSID and nothing else.
     // If this ever stops refusing, somebody has added a convenience that leaks a secret to disk.
     send(&mut write_half, b"wifi join SomeSSID hunter2\r");
     let wifi_pw = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(6)).unwrap_or_default();
     check!(wifi_pw.contains("passphrase is asked for"),
-           "wifi: refuses a passphrase on the command line (it would land in /.gsh_history)");
+           "wifi: refuses a passphrase on the command line (it would land in the history file)");
 
     // Usage and unknown-word refusals, which are permanent on every board.
     send(&mut write_half, b"wifi join\r");
@@ -2535,7 +2535,7 @@ pub fn run_sticky(image_path: &Path, persist_path: &str, smp: u32) {
         Some(r) => check!(r.contains("not running"), "and `status` then says so, from the task table"),
         None => { println!("sticky-test: FAIL - timed out on status after stop"); fail += 1; }
     }
-    send(&mut write2, b"read /persist.conf\r");
+    send(&mut write2, b"read /system/services/events/sticky\r");
     match collect_until(&buf2, &mut cur2, b"gsh>", Duration::from_secs(30)) {
         Some(r) => check!(!r.contains("/cap.log"), "stop DELETED the sticky marker (it will not come back)"),
         None => { println!("sticky-test: FAIL - timed out reading the marker"); fail += 1; }
@@ -2662,7 +2662,7 @@ pub fn run_fs_tear_detect(image_path: &Path, persist_path: &str, smp: u32) {
         // `churn tear` needs a file spanning more than one block (508 bytes of payload), so it tears
         // ACROSS a block boundary - the whole point of the case. Ask the filesystem rather than the
         // clock: a size column above 508 means such a file is there.
-        send(&mut write_half, b"dir /churn\r");
+        send(&mut write_half, b"dir /system/scratch/churn\r");
         let listing = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
         // READ THE FORMAT `dir` ACTUALLY PRINTS. The first version parsed whitespace tokens as
         // integers, and `dir` renders sizes with a unit - `1.1 KiB`, not `1126`. So `1.1` and `KiB`
@@ -2990,6 +2990,88 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
             None    => { println!("files-test: FAIL - flash timeout"); fail += 1; }
         }
     } else { println!("files-test: FAIL - no flash confirm"); fail += 1; }
+
+    // THE STANDARD TREE (`docs/filesystem-layout.md`): a format lays it down, the shell starts at home and
+    // `pwd` says so, and the shell's own files land in their folders.
+    match run!(b"pwd\r", 10) {
+        Some(r) => check!(r.contains("/users/default") && !r.contains("default gsh"),
+                          "layout: the session starts at home, pwd says /users/default, the prompt is plain"),
+        None    => { println!("files-test: FAIL - pwd timeout"); fail += 1; }
+    }
+    match run!(b"dir /system\r", 10) {
+        Some(r) => check!(r.contains("services") && r.contains("utilities") && r.contains("shared") && r.contains("scratch"),
+                          "layout: a flash made /system/services, utilities, shared and scratch"),
+        None    => { println!("files-test: FAIL - dir /system timeout"); fail += 1; }
+    }
+    match run!(b"dir /users\r", 10) {
+        Some(r) => check!(r.contains("default"), "layout: a flash made /users/default"),
+        None    => { println!("files-test: FAIL - dir /users timeout"); fail += 1; }
+    }
+    match run!(b"write notes.txt hi\r", 10) {
+        Some(r) => check!(r.contains("wrote /users/default/notes.txt"), "layout: a bare name is in the home folder"),
+        None    => { println!("files-test: FAIL - write notes.txt timeout"); fail += 1; }
+    }
+    match run!(b"write append notes.txt more\r", 10) {
+        Some(_) => {}
+        None    => { println!("files-test: FAIL - write append notes.txt timeout"); fail += 1; }
+    }
+    match run!(b"read notes.txt\r", 10) {
+        Some(r) => check!(r.contains("hi") && r.contains("more"), "layout: an append through the shell's scratch folder lands"),
+        None    => { println!("files-test: FAIL - read notes.txt timeout"); fail += 1; }
+    }
+    match run!(b"dir /system/scratch\r", 10) {
+        Some(r) => check!(r.contains("shell"), "layout: the shell made its own scratch folder at first use"),
+        None    => { println!("files-test: FAIL - dir /system/scratch timeout"); fail += 1; }
+    }
+    match run!(b"tree /\r", 15) {
+        Some(r) => check!(r.contains("system") && r.contains("services") && r.contains("users") && r.contains("default") && r.contains("notes.txt"),
+                          "layout: tree / shows the standard tree and the file in home"),
+        None    => { println!("files-test: FAIL - tree / timeout"); fail += 1; }
+    }
+    match run!(b"cd /system/services\r", 10) {
+        Some(r) => check!(r.contains("/system/services"), "layout: cd prints where it went"),
+        None    => { println!("files-test: FAIL - cd /system/services timeout"); fail += 1; }
+    }
+    match run!(b"pwd\r", 10) {
+        Some(r) => check!(r.contains("/system/services"), "layout: pwd follows cd"),
+        None    => { println!("files-test: FAIL - pwd after cd timeout"); fail += 1; }
+    }
+    match run!(b"cd\r", 10) {
+        Some(r) => check!(r.contains("/users/default"), "layout: a bare cd goes home"),
+        None    => { println!("files-test: FAIL - bare cd timeout"); fail += 1; }
+    }
+    let _ = run!(b"cd /system/shared\r", 10);
+    match run!(b"home\r", 10) {
+        Some(r) => check!(r.contains("/users/default"), "layout: home goes home"),
+        None    => { println!("files-test: FAIL - home timeout"); fail += 1; }
+    }
+    match run!(b"pwd\r", 10) {
+        Some(r) => check!(r.contains("/users/default"), "layout: and pwd agrees"),
+        None    => { println!("files-test: FAIL - pwd after home timeout"); fail += 1; }
+    }
+    match run!(b"pwd | write here.txt\r", 10) {
+        Some(_) => {}
+        None    => { println!("files-test: FAIL - pwd | write timeout"); fail += 1; }
+    }
+    match run!(b"read here.txt\r", 10) {
+        Some(r) => check!(r.contains("/users/default"), "layout: pwd is a pipe source"),
+        None    => { println!("files-test: FAIL - read here.txt timeout"); fail += 1; }
+    }
+    let _ = run!(b"delete here.txt\r", 10);
+    match run!(b"pwd extra\r", 10) {
+        Some(r) => check!(r.contains("takes no argument"), "layout: pwd refuses an argument with a sentence"),
+        None    => { println!("files-test: FAIL - pwd extra timeout"); fail += 1; }
+    }
+    match run!(b"read /users/default/history\r", 10) {
+        Some(r) => check!(r.contains("write notes.txt hi"), "layout: history is kept in /users/default/history"),
+        None    => { println!("files-test: FAIL - read history timeout"); fail += 1; }
+    }
+    match run!(b"delete notes.txt\r", 10) {
+        Some(_) => {}
+        None    => { println!("files-test: FAIL - delete notes.txt timeout"); fail += 1; }
+    }
+    // The rest of this suite was written for a shell that started at the root.
+    let _ = run!(b"cd /\r", 10);
 
     // mkdir + write + dir + read (absolute paths).
     match run!(b"mkdir /docs\r", 10) {
@@ -4544,6 +4626,29 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         None    => { println!("files-test: FAIL - paginate capture timeout"); fail += 1; }
     }
 
+    // THE CHAOS SEED IS KEPT ON DISK (`docs/filesystem-layout.md` 13): a random run's seed is drawn by the
+    // shell and written to `/system/utilities/chaos/last-run` before the storm, because the storm kills
+    // `fs` and chaos holds none. Last in this suite, because the storm restarts everything.
+    send(&mut write_half, b"chaos max-carnage all-services 3 yes\r");
+    let storm = collect_until(&buf, &mut cursor, b"chaos max-carnage: report", Duration::from_secs(240)).unwrap_or_default();
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+    let recorded = storm.split("Seed ").nth(1).and_then(|t| t.split(' ').next()).unwrap_or("").to_string();
+    check!(!recorded.is_empty() && storm.contains("recorded in /system/utilities/chaos/last-run"),
+           "chaos: a random run's seed is recorded before the storm");
+    check!(!recorded.is_empty() && storm.contains(&format!("chaos: seed {} (drawn)", recorded)),
+           "chaos: and chaos runs on that seed, and says it was drawn");
+    // The storm restarted `fs`; give it a moment to answer again.
+    let mut rec = String::new();
+    for _ in 0..6 {
+        if let Some(r) = run!(b"read /system/utilities/chaos/last-run\r", 20) {
+            if r.contains("replay chaos") { rec = r; break; }
+        }
+        std::thread::sleep(Duration::from_secs(3));
+    }
+    check!(!recorded.is_empty() && rec.contains(&format!("seed {}", recorded))
+               && rec.contains(&format!("replay chaos max-carnage all-services 3 seed {}", recorded)),
+           "chaos: last-run holds the seed and the command that replays it");
+
     // Save the whole transcript. A check that fails here used to leave NOTHING to look at - the
     // harness printed a label and threw the serial away, so the first move on any failure was to
     // reproduce the whole run by hand. Same treatment `shell-test` already gives itself.
@@ -5706,7 +5811,7 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     // The disk is already formatted (drifted free count); fs auto-mounted it. Run the fsck.
     // **NOT an exact match, and the exactness is what made this test wrong.** `expect_free` is read
     // from the superblock BEFORE boot, but the running system creates files of its own on the way up
-    // - `/clock.last` (the `time` service's persisted floor) and `.gsh_history` - each taking a
+    // - `/system/services/time/floor` (the `time` service's persisted floor) and `/users/default/history` - each taking a
     // block. Both arrived after this test was written, so the pinned figure silently went stale and
     // the suite had been failing 4/1 on `main` with nobody looking: no gate that runs before a merge
     // includes the eleven fs suites. See `backlog/32`.
@@ -6206,6 +6311,11 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
         None => { println!("script-test: FAIL - unknown-part case timed out"); fail += 1; }
     }
 
+    // The whole serial, so a timed-out case leaves something to read (as `files-test` does).
+    {
+        let g = buf.lock().unwrap();
+        let _ = std::fs::write("build/tests/script_serial.log", &g[..]);
+    }
     child.kill().ok();
     child.wait().ok();
     println!("\nscript-test: {pass} passed, {fail} failed");
@@ -8367,8 +8477,8 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     check!(replay.contains("job 4 is done"), "`foreground` reports the check job's outcome");
     check!(replay.contains("drives check - walking the volume"),
            "`foreground` REPLAYS THE TRANSCRIPT - the output was held in bounded RAM until it was asked for");
-    check!(replay.contains("0 bad") && replay.contains("file(s)"),
-           "the verdict is RENDERED, not passed through - fs answers with counts, and raw counts printed as text are garbage");
+    check!(replay.contains("0 bad") && replay.contains("check: ok - filesystem is consistent"),
+           "the verdict is RENDERED in the shell's own words - fs answers with counts, and a typed `drives check` runs as this same job (backlog/fixed/89)");
     // THE DETACHED FORM MUST SAY WHAT THE ATTACHED ONE SAYS. A backgrounded check that omits the
     // repair line answers less than `drives check` does, silently - and `drives check` REPAIRS as it
     // goes, so a second run cannot recover the answer. That cost a hardware run on 2026-09-22.
@@ -8381,8 +8491,8 @@ pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
            "`jobs` tells the two sweeps apart - a row that said `check` for a scrub would be a quiet lie");
     check!(scr_replay.contains("drives scrub - verifying"),
            "`foreground` replays the scrub's transcript");
-    check!(scr_replay.contains("0 bad") && scr_replay.contains("director"),
-           "the scrub verdict is rendered too - this is the one that exposed the pass-through bug");
+    check!(scr_replay.contains("0 bad") && scr_replay.contains("scrub: ok - every block verified"),
+           "the scrub verdict is rendered too, in the shell's own words - this is the one that exposed the pass-through bug");
 
     check!(ch_start.contains("[backgrounded] job 6"), "`background churn <seconds>` starts a job");
     check!(ch_table.contains("churn 12"), "`jobs` renders the churn job with its duration");
@@ -9007,7 +9117,7 @@ pub fn run_fs_blockchaos(image_path: &Path, persist_path: &str, smp: u32) {
     //
     // `fs-churn` requires `NONE torn` because a POWER CUT returns no error - the caller is told
     // nothing, so a mixed file is corruption by any reading. This test deliberately makes writes
-    // FAIL, and the first run found `/churn/f2.bin diverges at byte 1 of 1200` sitting beside
+    // FAIL, and the first run found `/system/scratch/churn/f2.bin diverges at byte 1 of 1200` sitting beside
     // `churn: done - 26 writes ... 2 refused`. The write was refused and the caller was told; a
     // caller that ignores a reported failure and reads back a partial file is not a filesystem bug.
     //
@@ -10423,7 +10533,7 @@ fn wav_blocks(path: &str) -> Vec<(u32, u32)> {
 /// `utilities/57_audio.md`; kills the driver over the control channel and checks the supervisor brings it
 /// back with the settings it had written; then quits QEMU cleanly and READS THE WAV: the tones must be
 /// there, at the frequency asked, at a level that follows the volume, and silent when muted. Boot 2 checks
-/// the volume came back from `/audio.settings` across a reboot.
+/// the volume came back from `/system/services/audio-driver/settings` across a reboot.
 pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     println!("audio-test: two boots on one disk; the shell on COM1, the control channel on COM2");
     let _ = std::fs::create_dir_all("build/tests");
@@ -10452,7 +10562,7 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     let log = |buf: &Arc<Mutex<Vec<u8>>>| String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
     check!(log(&buf).contains("audio-driver: ready - serving requests; playback refills on the stream's interrupt"),
         "the driver refills on its interrupt, not by polling");
-    check!(log(&buf).contains("no /audio.settings yet"), "a fresh disk starts at the defaults");
+    check!(log(&buf).contains("no /system/services/audio-driver/settings yet"), "a fresh disk starts at the defaults");
     // K2: the decoy at 00:06.1 is the first of the class, and the driver was granted the other one -
     // by the BDF the supervisor supplied, which now selects the window, the arena and the vector too.
     check!(log(&buf).contains("supplied for class 0x040300, the first of that class is 0x0031 - the supplied one is granted"),
@@ -10573,8 +10683,8 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     check!(r.contains("stopped after"), "play: q stops the file (rule 11)");
     let r = run!(b"audio volume 30\r");
     check!(r.contains("volume 30 - verified"), "volume 30");
-    let r = run!(b"read /audio.settings\r");
-    check!(r.contains("volume 30") && r.contains("muted no"), "/audio.settings holds what was set");
+    let r = run!(b"read /system/services/audio-driver/settings\r");
+    check!(r.contains("volume 30") && r.contains("muted no"), "the driver's settings file holds what was set");
 
     // The driver killed: the kernel quiesces its DMA, the supervisor restarts it, and it reads its
     // settings back from the file it wrote.
@@ -10584,7 +10694,7 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
             send(&mut ctrl, b"\nKILL audio-driver\n");
             let back = collect_until(&buf, &mut cur, b"supervisor: audio-driver restarted", Duration::from_secs(30));
             check!(back.is_some(), "the supervisor restarted audio-driver after a kill");
-            let read = collect_until(&buf, &mut cur, b"settings read from /audio.settings - volume 30", Duration::from_secs(30));
+            let read = collect_until(&buf, &mut cur, b"settings read from /system/services/audio-driver/settings - volume 30", Duration::from_secs(30));
             check!(read.is_some(), "the restarted driver read its settings back");
             let _ = collect_until(&buf, &mut cur, b"audio-driver: ready", Duration::from_secs(30));
             check!(log(&buf).contains("bus-master DISABLED on driver death"), "the kernel stopped the controller's DMA on the death");
@@ -10668,7 +10778,7 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     let mut cur = 0usize;
     let booted = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(120)).is_some()
         && collect_until(&buf, &mut 0usize, b"audio-driver: ready", Duration::from_secs(60)).is_some();
-    check!(booted && log(&buf).contains("settings read from /audio.settings - volume 30, unmuted"),
+    check!(booted && log(&buf).contains("settings read from /system/services/audio-driver/settings - volume 30, unmuted"),
         "after a reboot the driver reads volume 30 back");
     send(&mut w, b"audio status\r");
     let r = collect_until(&buf, &mut cur, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
@@ -10691,4 +10801,232 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
 
     println!("\naudio-test: {pass} passed, {fail} failed (serial: build/tests/audio_test_serial.log, sound: {wav})");
     if fail > 0 { std::process::exit(1); }
+}
+
+/// `osdev test quit` (`backlog/fixed/89`, `audits/2026-10-13-quit-audit.md`): every kind of wait, on an `fs` built
+/// with `slow-replies` (700 ms per reply, 4 s for the long single operations), recording for each command
+/// whether `[q] quit` appeared and when, whether `[b]` did, how long `q` took to bring the prompt back, and
+/// what the command said. The record is `build/tests/quit_report.md`.
+///
+/// The bar, per case (`utilities/0_conventions.md` rule 10, agreed 2026-10-13): a command that runs past 2 s
+/// must say `[q] quit` by 4 s - the shell aims at 2, and its whole-second clock plus a reply already on its way
+/// put the slowest at 3.7 - and `q` must bring the prompt back within 3 s. A command that ends before its
+/// notice is due is recorded as quick, not failed.
+pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
+    // By 4 s (rule 10): aimed at 2.
+    const NOTICE_BAR_SECS: f32 = 4.0;
+    println!("quit-test: booting (smp={smp}) with a slow fs and a RAW AHCI disk");
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-smp",     &smp.to_string(),
+        "-m",       "512M",
+        "-serial",  &format!("tcp::{shell_port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ])
+    .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap_or_else(|e| { eprintln!("quit-test: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("quit-test: no serial"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        println!("quit-test: FAIL - no first prompt");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+    // Run a command to its end (setup): no q pressed.
+    macro_rules! setup {
+        ($c:expr, $secs:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs))
+        }};
+    }
+    // SETUP, not timed: a disk with a tree, a big file and a script.
+    send(&mut write_half, b"drives flash data\r");
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20));
+    send(&mut write_half, b"y\r");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+    let _ = setup!(b"mkdir /q/tree/a/b parents\r", 30);
+    let _ = setup!(b"help | write /q/big.txt\r", 90);
+    let _ = setup!(b"help | write /q/tree/a/h1.txt\r", 90);
+    let _ = setup!(b"help | write /q/tree/a/b/h2.txt\r", 90);
+    // A capture running, so `events persist status` and `stop` ask `recorder` rather than the task table.
+    let _ = setup!(b"events persist start /q/cap.log 64KiB\r", 90);
+    let _ = setup!(b"write /q/loop.gsh \"for i in range 20 { wait 1 }\"\r", 30);
+
+    struct Row { cmd: String, notice: Option<f32>, b: bool, back: Option<f32>, total: Option<f32>, said: String, verdict: &'static str }
+    let mut rows: Vec<Row> = Vec::new();
+
+    // Each case: send it, wait up to 8 s for `[q] quit`; if it comes, press q and time the prompt's return.
+    let cases: &[(&str, &str)] = &[
+        ("dir /q",                            "one directory, a few requests"),
+        ("read /q/big.txt",                   "stream a file, many fast requests"),
+        ("copy /q/big.txt /q/big2.txt",       "stream a copy"),
+        ("find h2.txt /",                     "walk the tree"),
+        ("tree /",                            "walk the tree"),
+        ("write append /q/big.txt more",      "stage, append, move"),
+        ("help | write /q/h3.txt",            "a pipe into a file"),
+        ("mkdir /q/m1",                       "one request"),
+        ("rename /q/big2.txt big3.txt",       "one request"),
+        ("copy /q/tree /q/tree2 recursive",   "walk and copy a tree"),
+        ("delete /q/tree2 recursive",         "one long request (4 s)"),
+        ("drives check",                      "one long request (4 s)"),
+        ("drives scrub",                      "one long request (4 s)"),
+        ("cd /q/tree/a",                      "one stat"),
+        ("seal /q/big.txt yes",               "one request"),
+        ("wait 6",                            "a timed wait"),
+        ("hardware",                          "supervisor and drivers (NOT slowed)"),
+        ("date",                              "time, slowed"),
+        ("events persist status",             "recorder, slowed"),
+        ("net lease",                         "net-stack and nic-driver, slowed"),
+        ("net dns example.com",               "net-stack, slowed"),
+        ("jobs",                              "copier, slowed"),
+        ("background copy /q/big.txt /q/bg.txt", "start a copier job, slowed"),
+        // The case above quits its job, so start one to completion (a `!` case is setup: no q), then `jobs`
+        // asks `copier` about a live job rather than answering that there are none.
+        ("!background copy /q/big.txt /q/bg2.txt", ""),
+        ("jobs",                              "copier with a job, slowed"),
+        ("events persist stop",               "recorder, slowed"),
+        ("chaos kill-storm events 20",        "the shell's own chaos mode, long enough to quit"),
+        ("chaos flood-storm events 20",       "chaos, flood"),
+        ("chaos mem-pressure 10",             "chaos, memory"),
+        ("chaos spawn-storm 40",              "chaos, spawn to the ceiling (the cleanup is not quittable)"),
+        ("selfcheck files",                   "a part of the self-check"),
+        // `[b]`: a detachable command typed at the prompt runs as a job, so `b` detaches it (a `~` case presses
+        // b, not q). A `!wait` first lets the job before it end and `!jobs` lets the shell see that it did -
+        // a typed command takes only a short look at a job it believes live, which a slowed `copier` cannot
+        // answer in time - so each starts as its own job.
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~drives check",                     "typed, runs as a job: b detaches it"),
+        // While that check is still one request inside `fs`: `foreground` must offer `[q]` at once and come
+        // back on `q` without waiting for `copier`, which reads nothing until the check ends (five boards
+        // showed 8 s here, `backlog/fixed/89`). `$job` is the number the `b` above was given.
+        ("foreground $job",                   "a live check: q stops the wait, not the check"),
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~drives scrub",                     "typed, runs as a job: b detaches it"),
+        // And `jobs` during the scrub: the row as last seen, without an 8 s question to a deaf `copier`.
+        ("jobs",                              "a live scrub: answered from the row"),
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~delete /q/tree recursive",         "typed, runs as a job: b detaches it"),
+        ("!wait 8", ""),
+        ("!jobs", ""),
+        ("~copy /q/big.txt /q/big5.txt",      "typed, runs as a job: b detaches it"),
+        ("!jobs", ""),
+        // Last: a script that loops 20 s - stopped by `q` between its statements; the 20 s bound leaves a
+        // prompt behind either way.
+        ("run /q/loop.gsh",                   "a script that loops 20 s"),
+    ];
+    // The number the last `b` was given, for a `$job` in a case.
+    let mut last_job = String::from("1");
+    for (c, what) in cases {
+        let owned = c.replace("$job", &last_job);
+        if let Some(setup_cmd) = owned.strip_prefix('!') {
+            let _ = setup!(format!("{setup_cmd}\r").as_bytes(), 90);
+            continue;
+        }
+        let (detach, c) = match owned.strip_prefix('~') { Some(rest) => (true, rest), None => (false, owned.as_str()) };
+        let line = format!("{c}\r");
+        let t0 = Instant::now();
+        send(&mut write_half, line.as_bytes());
+        match collect_until_any(&buf, &mut cursor, &[b"[q] quit", b"gsh>"], Duration::from_secs(8)) {
+            Some((0, before)) => {
+                let tn = t0.elapsed().as_secs_f32();
+                // See whether [b] is offered on the same line, then quit.
+                thread::sleep(Duration::from_millis(300));
+                let tail = { let g = buf.lock().unwrap(); String::from_utf8_lossy(&g[cursor..]).into_owned() };
+                let b = before.contains("[b]") || tail.lines().next().map_or(false, |l| l.contains("[b]"));
+                let tq = Instant::now();
+                send(&mut write_half, if detach { b"b" } else { b"q" });
+                let after = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+                let detached = after.as_deref().map_or(false, |a| a.contains("[backgrounded] job"));
+                if let Some(n) = after.as_deref().and_then(|a| a.split("[backgrounded] job ").nth(1))
+                    .map(|t| t.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>()).filter(|n| !n.is_empty()) {
+                    last_job = n;
+                }
+                let back = after.as_ref().map(|_| tq.elapsed().as_secs_f32());
+                let said = after.as_deref().unwrap_or("").lines()
+                    .map(|l| l.trim()).filter(|l| !l.is_empty() && !l.contains("gsh>"))
+                    .last().unwrap_or("").chars().take(90).collect::<String>();
+                let verdict = match back {
+                    Some(_) if detach && !(b && detached) => "NOT DETACHED",
+                    Some(s) if tn <= NOTICE_BAR_SECS && s <= 3.0 => "PASS",
+                    Some(_) if tn > NOTICE_BAR_SECS => "LATE NOTICE",
+                    Some(_) => "SLOW QUIT",
+                    None => "TRAPPED",
+                };
+                rows.push(Row { cmd: c.to_string(), notice: Some(tn), b, back, total: None, said, verdict });
+            }
+            Some((_, done)) => {
+                let tt = t0.elapsed().as_secs_f32();
+                let said = done.lines().map(|l| l.trim()).filter(|l| !l.is_empty() && !l.contains("gsh>")).last()
+                    .unwrap_or("").chars().take(90).collect::<String>();
+                rows.push(Row { cmd: c.to_string(), notice: None, b: false, back: None, total: Some(tt), said,
+                    verdict: if tt <= NOTICE_BAR_SECS { "QUICK" } else { "NO NOTICE" } });
+            }
+            None => {
+                // No notice in 8 s and no prompt: the case is trapped. Try q anyway, then wait it out.
+                send(&mut write_half, b"q");
+                let r = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(180));
+                let tt = t0.elapsed().as_secs_f32();
+                let _ = r;
+                rows.push(Row { cmd: c.to_string(), notice: None, b: false, back: None, total: Some(tt),
+                    said: String::new(), verdict: "TRAPPED" });
+            }
+        }
+        println!("quit-test: {:<36} {:<12} notice {:>5}  back {:>5}  {}", c, rows.last().unwrap().verdict,
+            rows.last().unwrap().notice.map_or("-".into(), |v| format!("{v:.1}s")),
+            rows.last().unwrap().back.map_or("-".into(), |v| format!("{v:.1}s")), what);
+        // A clean prompt for the next case.
+        send(&mut write_half, b"\r");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30));
+    }
+
+    let mut md = String::new();
+    md.push_str("# osdev test quit - every wait on a slow fs\n\n");
+    md.push_str("`fs` built with `slow-replies`: 700 ms per reply, 4 s for delete tree, check, scrub, flash. Times are seconds after the command was sent (notice) and after `q` was pressed (back) - or `b`, for a `~` command, which must answer `[backgrounded] job N`. The bar: `[q]` by 4 s, the prompt back within 3 s of `q` (rule 10).\n\n");
+    md.push_str("| command | verdict | [q] after | [b] | prompt back after q | ran (no q) | last line |\n|---|---|---|---|---|---|---|\n");
+    let mut bad = 0;
+    for r in &rows {
+        if matches!(r.verdict, "TRAPPED" | "NO NOTICE" | "LATE NOTICE" | "SLOW QUIT" | "NOT DETACHED") { bad += 1; }
+        md.push_str(&format!("| `{}` | {} | {} | {} | {} | {} | {} |\n", r.cmd, r.verdict,
+            r.notice.map_or("-".into(), |v| format!("{v:.1} s")), if r.b { "yes" } else { "-" },
+            r.back.map_or("-".into(), |v| format!("{v:.1} s")), r.total.map_or("-".into(), |v| format!("{v:.1} s")),
+            r.said.replace('|', "/")));
+    }
+    let _ = std::fs::write("build/tests/quit_report.md", &md);
+    {
+        let g = buf.lock().unwrap();
+        let _ = std::fs::write("build/tests/quit_serial.log", &g[..]);
+    }
+    println!("quit-test: {} case(s), {} not meeting the bar - report in build/tests/quit_report.md", rows.len(), bad);
+    child.kill().ok();
+    child.wait().ok();
 }

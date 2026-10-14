@@ -1,5 +1,9 @@
 # WiFi on a USB dongle: `wifi-usb` (design, 2026-10-05)
 
+> **Note 2026-10-13: the keys moved.** `/wifi.keys` and `/wifi.radio`, named throughout this record, are
+> `/system/shared/wifi/keys` and `/system/shared/wifi/radio` since the filesystem layout
+> (`docs/filesystem-layout.md`); nothing reads the old names.
+
 The Pi 2 has no radio of its own, and the PCs have none either. A USB WiFi dongle - a Realtek
 RTL8188CUS today, `0bda:8176` - gives every board with a USB host a radio. This is the plan for driving
 one, and the record of each card that does.
@@ -2034,7 +2038,7 @@ failed` line names its port, the cause is the hub's EP0, not the command ring.
 ## 33. The branch tip on the Pi 4 (2026-10-07): sections 31 and 32 and the prompt, confirmed; the download fault still intermittent
 
 One card carried three fixes, each with its own line in the log: section 31, section 32, and the shell
-drawing its prompt before it reads `/persist.conf` (`1da33d6b`).
+drawing its prompt before it reads `/persist.conf` (`1da33d6b`; now `/system/services/events/sticky`).
 
 **The prompt:** `gsh>` came with the same timestamp as `shell: ready`, 2.4 s after power-on. On U2c's
 second run it came at 6.1 s, and 4.8 s on a boot without the dongle plugged in. **Reverted later the same day

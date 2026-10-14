@@ -23,8 +23,9 @@ was that the service holds no `console_push` capability, so a command whose prod
 nowhere to write it. The premise is true and the conclusion did not follow - `console_push` is not
 even what printing needs (that is `log_write`, which this service holds; see below): a job does not need to
 REACH the console, it needs its output to survive until somebody asks. The bounded transcript
-(`CP_OP_OUTPUT`, replayed by `foreground`) is where it survives, and `render_verdict` turns the
-counts `fs` answers with into the sentence a person reads - because passing the raw reply through
+(`CP_OP_OUTPUT`, replayed by `foreground`) is where it survives, and the check and scrub branch turns the
+counts `fs` answers with into the sentences a person reads - the shell's own lines, since 2026-10-14, when a
+typed `drives check` began to run as this job (`backlog/fixed/89`) - because passing the raw reply through
 printed binary at the prompt, which is the bug that produced the transcript in the first place.
 
 **The test that actually holds** is whether the work is a BOUNDED sequence of `fs` requests this
@@ -83,4 +84,4 @@ is reported too.
 
 ## Tests
 
-`osdev test jobs` (36/0), part of `osdev test fs-all`.
+`osdev test jobs` (60/0, 2026-10-14), part of `osdev test fs-all`.

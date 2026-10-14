@@ -61,7 +61,7 @@ pub const OP_SYNC: u8 = 5;
 pub const SRC_UNSET: u8 = 0;
 pub const SRC_RTC: u8 = 1;
 pub const SRC_NTP: u8 = 2;
-/// The clock started from the persisted floor (`/clock.last`) - no RTC and no network yet. It is a real
+/// The clock started from the persisted floor (`/system/services/time/floor`) - no RTC and no network yet. It is a real
 /// reading, and knowing it came from the floor is what stops it being mistaken for a synced one.
 pub const SRC_FLOOR: u8 = 3;
 
@@ -168,15 +168,26 @@ impl Clock {
     }
 }
 
+/// `slow-replies` (TEST BUILDS ONLY): hold the reply, so `osdev test quit` sees a slow service in QEMU.
+#[cfg(feature = "slow-replies")]
+fn slow_reply(ctx: &ServiceContext) {
+    gs::task::sleep_ms(ctx, 2500);
+}
+
 fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
+    #[cfg(feature = "slow-replies")]
+    slow_reply(ctx);
     let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(body));
 }
 
-/// Where the clock floor lives on disk.
-const FLOOR_PATH: &[u8] = b"/clock.last";
+/// Where the clock floor lives on disk: this service's own folder (`docs/filesystem-layout.md`), which it
+/// creates before each write - a folder is made by its owner at first use.
+const FLOOR_DIR: &[u8] = b"/system/services/time";
+const FLOOR_PATH: &[u8] = b"/system/services/time/floor";
 /// fs opcodes this service uses. The wire format is [tag, op, path_len, path.., data..].
 const FS_OP_WRITE: u8 = 10;
 const FS_OP_READ: u8 = 11;
+const FS_OP_MKDIR_P: u8 = 18;
 const FS_OK: u8 = 0;
 /// Telling `fs` the wall clock: `[FS_CLOCK_PUSH, epoch:i64]`, one way, no reply capability.
 /// Mirrors `FS_CLOCK_PUSH` in `fs`, where the reasoning for it being a push is written out.
@@ -261,6 +272,7 @@ fn ntp_answer(ask: &NtpAsk, ntp: &[u8]) -> Result<i64, &'static str> {
 /// `FS_OK`, a collision that has already hidden one bug in this file.
 const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
+const TAG_FLOOR_DIR: u8 = 0xF3;
 /// How often to retry loading the floor while it has not been loaded yet.
 const FLOOR_RETRY_MS: u64 = 2_000;
 /// How long between NTP queries, while we still have no network time.
@@ -443,6 +455,17 @@ fn floor_store(ctx: &ServiceContext, epoch: i64) -> bool {
     while v > 0 { i -= 1; num[i] = b'0' + (v % 10) as u8; v /= 10; }
     let digits = &num[i..];
 
+    // The folder first. `fs` serves one request at a time, in order, so the write below finds it made; a
+    // folder that could not be made shows up as the write's refusal, which is what is reported.
+    let mut dir = [0u8; 64];
+    dir[0] = TAG_FLOOR_DIR;
+    dir[1] = FS_OP_MKDIR_P;
+    dir[2] = FLOOR_DIR.len() as u8;
+    dir[3..3 + FLOOR_DIR.len()].copy_from_slice(FLOOR_DIR);
+    if !fs_send_noblock(ctx, &dir[..3 + FLOOR_DIR.len()]) {
+        return false;
+    }
+
     let mut req = [0u8; 64];
     req[0] = TAG_FLOOR_WRITE;
     req[1] = FS_OP_WRITE;
@@ -522,7 +545,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // (its `FS_CLOCK_PUSH`). Sent on the ordinary loop tick - a stamp a few seconds stale is
         // exactly as useful, and `fs` stops believing a reading it has carried too long anyway.
         // NOT gated on being network-synced. A machine that has never seen the network still knows
-        // something: the floor adopted from `/clock.last`, which only ever moves forward. A file
+        // something: the floor adopted from `/system/services/time/floor`, which only ever moves forward. A file
         // stamped from the floor carries an approximate but HONEST date, and that is strictly better
         // than "unknown" - which is reserved for a machine that genuinely has no idea.
         {
@@ -676,6 +699,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             },
                         }
                     }
+                    // The folder's answer. Nothing to do with it: the write that follows says whether
+                    // the floor landed, and a folder that is not there is why it did not.
+                    Some(TAG_FLOOR_DIR) => {}
                     Some(TAG_FLOOR_WRITE) => {
                         if p.len() > R_STATUS && p[R_STATUS] == FS_OK {
                             ctx.log_fmt(format_args!("time: clock floor {} recorded", store_epoch));

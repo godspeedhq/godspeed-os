@@ -120,8 +120,10 @@ gsh> dir bytes /
   5 entries
 ```
 
-Both captured from one boot of `osdev test fs-fuzz`, not written by hand. Three things in them are
-worth pointing at:
+Both captured from one boot of `osdev test fs-fuzz`, not written by hand, on 2026-09-17 - before the
+layout moved the shell's history and the clock floor off the root into their folders
+(`docs/filesystem-layout.md`); the root of a disk flashed since holds `system` and `users`. Three things
+in them are worth pointing at:
 
 **The count is LAST, and it is the number of entries actually printed.** It used to lead, next to the
 path. A directory larger than one reply block arrives in several pages, so the total is not known
@@ -222,7 +224,8 @@ Conforms: `dir help` (usage with a real example per row) and `dir version` (numb
 creator credit) per `0_conventions.md` (the shared `help_block` helper).
 
 Also conforms to **rule 10** (`0_conventions.md` §1.10): the listing goes through a `gs::fs::Fs`
-handle lent a notice (`Fs::noticing`), so a wait past 2 s (`gs::call::NOTICE_AFTER_SECS`) prints
-`  [q] quit` and `q`/`Q`/ESC returns to the prompt with no error (a fast reply prints nothing). This
-replaced a bare `request_with_reply`, which rule 10 forbids for an interactive command. The piped
-form (`build_dir_table`) lends no notice, so `dir | ...` is bounded but cannot be ended with `q`.
+handle lent the command's watch (`gs::call::Watch`, since 2026-10-13, `backlog/fixed/89`), so once the COMMAND
+has run 2 s (`gs::call::NOTICE_AFTER_SECS`) it prints `  [q] quit`, and `q`/`Q`/ESC returns to the prompt
+with no error (a fast listing prints nothing). This replaced a bare `request_with_reply`, which rule 10
+forbids for an interactive command. The piped form (`build_dir_table`) uses the same handle, so
+`dir | ...` says `[q] quit` too.

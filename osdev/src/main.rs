@@ -267,6 +267,71 @@ fn format_superblock(path: &str) {
 
 fn cmd_mkfs(image: &str) {
     format_superblock(image);
+    gsfs_layout(image);
+}
+
+/// The standard tree `fs` lays down when it formats a disk (`services/fs`, `LAYOUT`;
+/// `docs/filesystem-layout.md`). Kept in step with that list by hand: it is five names.
+const FS_LAYOUT: [&str; 5] = ["system/services", "system/utilities", "system/shared", "system/scratch", "users/default"];
+
+/// Give a freshly formatted image the standard tree, as `drives flash` does on the machine. Called by the
+/// operator-facing builders (`mkfs`, `script-disk`) and by the script suite, whose `selfcheck` checks the
+/// tree; the other fixtures keep the bare format, because several suites count the directories and records
+/// on the disk they built.
+fn gsfs_layout(path: &str) {
+    let mut data = std::fs::read(path)
+        .unwrap_or_else(|e| { eprintln!("layout: cannot read {}: {}", path, e); std::process::exit(1); });
+    let rdu = |d: &[u8], o: usize| u64::from_le_bytes(d[o..o + 8].try_into().unwrap());
+    let total_blocks = rdu(&data, 16);
+    let bitmap_start = rdu(&data, 24) as usize;
+    let data_start = rdu(&data, 40);
+    let root = rdu(&data, 48);
+    let mut free_blocks = rdu(&data, 64);
+    for dir in FS_LAYOUT {
+        let mut cur = root;
+        for comp in dir.split('/') {
+            // An existing child of that name, or a new directory block for it.
+            let found = (0..FS_RECS_PER_BLOCK).find_map(|slot| {
+                let r = (cur as usize) * 512 + slot * 64;
+                let n = data[r + 1] as usize;
+                (data[r] == FS_ITYPE_DIR && &data[r + 2..r + 2 + n] == comp.as_bytes()).then(|| rdu(&data, r + 48))
+            });
+            cur = match found {
+                Some(b) => b,
+                None => {
+                    let blk = (data_start..total_blocks - 1)
+                        .find(|&b| data[bitmap_start * 512 + (b / 8) as usize] & (1u8 << (b % 8)) == 0)
+                        .unwrap_or_else(|| { eprintln!("layout: image full"); std::process::exit(1); });
+                    data[bitmap_start * 512 + (blk / 8) as usize] |= 1u8 << (blk % 8);
+                    free_blocks -= 1;
+                    let off = (blk as usize) * 512;
+                    for b in &mut data[off..off + 512] { *b = 0; }
+                    fs_dir_stamp_crc(&mut data[off..off + 512]);
+                    let pd = (cur as usize) * 512;
+                    let slot = (0..FS_RECS_PER_BLOCK).find(|&k| data[pd + k * 64] == 0)
+                        .unwrap_or_else(|| { eprintln!("layout: a directory is full"); std::process::exit(1); });
+                    let r = pd + slot * 64;
+                    data[r] = FS_ITYPE_DIR;
+                    data[r + 1] = comp.len() as u8;
+                    data[r + 2..r + 2 + comp.len()].copy_from_slice(comp.as_bytes());
+                    data[r + 40..r + 48].copy_from_slice(&0u64.to_le_bytes());
+                    data[r + 48..r + 56].copy_from_slice(&blk.to_le_bytes());
+                    data[r + 56..r + 64].copy_from_slice(&1u64.to_le_bytes());
+                    fs_dir_stamp_crc(&mut data[pd..pd + 512]);
+                    blk
+                }
+            };
+        }
+    }
+    data[64..72].copy_from_slice(&free_blocks.to_le_bytes());
+    let sb_crc = crc32::crc32(&data[..FS_SB_CRC_OFF]);
+    data[FS_SB_CRC_OFF..FS_SB_CRC_OFF + 4].copy_from_slice(&sb_crc.to_le_bytes());
+    let bk = ((total_blocks - 1) as usize) * 512;
+    let sb_copy: Vec<u8> = data[0..512].to_vec();
+    data[bk..bk + 512].copy_from_slice(&sb_copy);
+    std::fs::write(path, &data)
+        .unwrap_or_else(|e| { eprintln!("layout: cannot write {}: {}", path, e); std::process::exit(1); });
+    println!("layout: /{} into {}", FS_LAYOUT.join(", /"), path);
 }
 
 /// Bake a file into a GSFS0008 image (host-side mirror of the `fs` write path) - used to ship a
@@ -368,6 +433,7 @@ fn cmd_script_disk(out: &str, script: &str) {
     std::fs::write(out, vec![0u8; 16 * 1024 * 1024])
         .unwrap_or_else(|e| { eprintln!("script-disk: cannot create {}: {}", out, e); std::process::exit(1); });
     format_superblock(out);
+    gsfs_layout(out);
     gsfs_add_file(out, name, &content);
     println!("script-disk: {} ready - flash it to the data drive, then `run /{}`", out, name);
 }
@@ -478,6 +544,10 @@ const EXTRA_CHECKS: &[&str] = &[
     // and radio drivers arrived, because its driver list is hand-kept. Found by the 2026-10-09 audit;
     // the list was corrected the same day. A checker on one build path is a checker on none.
     "scripts/stdlib_gap_check.py",
+    // NO SILENT WAIT IN THE SHELL (backlog/fixed/89, conventions rule 10): every wait the shell makes reads the
+    // command's watch, or carries `// quit-ok:` saying why it cannot trap anyone, and those exceptions may
+    // fall and may not rise. On the build path from its first day, for the reason above.
+    "scripts/quit_wait_check.py",
 
     // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
     //
@@ -1683,6 +1753,7 @@ fn cmd_test(suite: &str) {
         "drives-raw"   => run_drives_raw_test(),
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
+        "quit"         => run_quit_test(),
         "sticky"       => run_sticky_test(),
         "edit"         => run_edit_test(),
         "script"       => run_script_test(),
@@ -1840,7 +1911,11 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         let _ = std::process::Command::new("cargo")
             .args(["clean", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none"]).status();
     }
-    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder", "audio-driver"];
+    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder", "audio-driver",
+        // `copier` and `recorder` too: `osdev test quit` builds them with `slow-replies`, and a suite run after it
+        // embedded that slow `copier` (2.5 s a reply) because nothing here rebuilt it plain - `osdev test jobs`
+        // failed 7 checks on it, none of them real.
+        "copier", "recorder"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
         if *crate_name == "block-driver" && !bd_features.is_empty() {
@@ -2499,6 +2574,50 @@ fn run_sticky_test() {
     crate::shell_test::run_sticky(&image_path, persist, 4);
 }
 
+/// Rebuild `svcs` with their test-only `slow-replies` feature, then the supervisor that embeds them and the
+/// kernel that embeds it - after `build_blockdev_fs`, which built them plain.
+fn build_slow_services(svcs: &[&str]) {
+    for svc in svcs {
+        let _ = std::process::Command::new("cargo")
+            .args(["clean", "--release", "-p", svc, "--target", "x86_64-unknown-none"]).status();
+        let status = std::process::Command::new("cargo")
+            .args(["build", "--release", "-p", svc, "--target", "x86_64-unknown-none", "--features", "slow-replies"])
+            .status().unwrap_or_else(|e| panic!("failed to run cargo build for {}: {}", svc, e));
+        if !status.success() { eprintln!("build: {} (slow-replies) FAILED", svc); std::process::exit(1); }
+        println!("build: {} (slow-replies) OK", svc);
+    }
+    clean_supervisor();
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none",
+               "--features", "supervisor/bare-metal,supervisor/blockdev"])
+        .status().unwrap_or_else(|e| panic!("failed to run cargo build for supervisor: {}", e));
+    if !status.success() { eprintln!("build: supervisor FAILED"); std::process::exit(1); }
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
+              .iter().map(|s| s.to_string())
+              .chain(kernel_feature_args()))
+        .status().expect("failed to run cargo build for kernel");
+    if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
+    println!("build: slow services embedded");
+}
+
+/// `osdev test quit` (`backlog/fixed/89`): every kind of wait, on a deliberately slow `fs`, recording whether
+/// `[q] quit` (and `[b]`) appeared, when, and what `q` did. The record is `build/tests/quit_report.md`.
+fn run_quit_test() {
+    println!("\n=== quit: every wait on a slow fs - does [q] appear, and does q work? ===");
+    build_blockdev_fs("slow-replies", "");
+    build_slow_services(&["time", "recorder", "copier", "net-stack"]);
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_quit.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("failed to create raw disk");
+    crate::shell_test::run_quit(&image_path, persist, 4);
+}
+
 fn run_files_test() {
     println!("\n=== files 4: dir / read / write / mkdir / cd (RAW AHCI disk) ===");
     cmd_build_bare_metal();
@@ -2568,6 +2687,8 @@ fn run_script_test() {
     let disk = "build/tests/script_disk.img";
     std::fs::write(disk, vec![0u8; 16 * 1024 * 1024]).expect("failed to create disk");
     format_superblock(disk);
+    // The tree a flash gives, because `selfcheck` checks it (part 50, "layout").
+    gsfs_layout(disk);
     gsfs_add_file(disk, name, &suite);
 
     crate::shell_test::run_script(&image_path, disk, name, 4);
@@ -2820,7 +2941,7 @@ fn run_peer_storm_test() {
 
 /// `osdev test audio` (`utilities/57_audio.md`, `docs/audio.md`): the `audio` utility, the driver behind it
 /// and the sound, on the bare-metal image with QEMU's HD Audio device and a data disk formatted here, so
-/// `/audio.settings` has somewhere to live from the first boot.
+/// `/system/services/<driver>/settings` has somewhere to live from the first boot.
 fn run_audio_test() {
     println!("
 === audio: the utility, the driver, and the sound it makes ===");

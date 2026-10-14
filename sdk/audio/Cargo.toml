@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 # What every audio driver shares, and the wire protocol the shell's `audio` speaks to them: the
-# request vocabulary (`wire`), the test tone (`sine`) and `/audio.settings` (`settings`).
+# request vocabulary (`wire`), the test tone (`sine`) and `/system/services/<driver>/settings` (`settings`).
 # A library, not a service: no entry point, nothing spawned.
 [lib]
 name = "godspeed_audio"

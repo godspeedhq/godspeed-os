@@ -166,6 +166,8 @@ pub struct Net<'a> {
     notice: Option<&'a dyn Fn()>,
     /// Where the keys a noticing wait reads (and does not act on) go - see [`Net::keeping`].
     keep: Option<&'a dyn Fn(u8)>,
+    /// The command's watch (`call::Watch`); see `Fs::watching`.
+    watch: Option<&'a dyn call::Watch>,
 }
 
 impl<'a> Net<'a> {
@@ -226,7 +228,7 @@ impl<'a> Net<'a> {
 
     /// Take a network handle. Cheap, allocates nothing, grants nothing.
     pub fn new(ctx: &'a ServiceContext) -> Net<'a> {
-        Net { ctx, tag: TAG_BASE, notice: None, keep: None }
+        Net { ctx, tag: TAG_BASE, notice: None, keep: None, watch: None }
     }
 
     /// A network handle that tells you when a call is taking a while.
@@ -241,13 +243,22 @@ impl<'a> Net<'a> {
     /// unreachable host waits the full deadline in silence. Losing that would have been a
     /// regression dressed up as a migration.
     pub fn with_notice(ctx: &'a ServiceContext, notice: &'a dyn Fn()) -> Net<'a> {
-        Net { ctx, tag: TAG_BASE, notice: Some(notice), keep: None }
+        Net { ctx, tag: TAG_BASE, notice: Some(notice), keep: None, watch: None }
     }
 
     /// Hand every key a noticing wait reads, other than a quit key, to `keep`, in order, instead of
     /// discarding it - as [`Fs::keeping`](crate::fs::Fs::keeping) does (`backlog/fixed/80` H16).
     pub fn keeping(mut self, keep: &'a dyn Fn(u8)) -> Net<'a> {
         self.keep = Some(keep);
+        self
+    }
+
+    /// Lend this handle the command's watch ([`call::Watch`]): every request then shows the command's
+    /// `[q] quit` once the COMMAND has run 2 s, and stops at the next request after a quit. Takes
+    /// precedence over a notice; a watch that is not active leaves the handle's own notice, if any, else the
+    /// plain wait.
+    pub fn watching(mut self, watch: &'a dyn call::Watch) -> Net<'a> {
+        self.watch = Some(watch);
         self
     }
 
@@ -272,8 +283,13 @@ impl<'a> Net<'a> {
         req[0] = tag;
         req[1] = secs.clamp(0, 255) as u8;
         req[2..2 + body.len()].copy_from_slice(body);
-        let r = call::request_within_notice(
-            self.ctx, "net-stack", &Message::from_bytes(&req[..2 + body.len()]), secs, self.notice, self.keep)?;
+        let msg = Message::from_bytes(&req[..2 + body.len()]);
+        let r = match self.watch {
+            // Only the reply carrying THIS request's tag (see `call::request_watched_sifted`).
+            Some(w) if w.active() => call::request_watched_sifted(self.ctx, "net-stack", &msg, secs, w,
+                &mut |m| m.payload_bytes().first() == Some(&tag))?,
+            _ => call::request_within_notice(self.ctx, "net-stack", &msg, secs, self.notice, self.keep)?,
+        };
         // A reply whose tag does not match is the answer to a request we already gave up on. Reading
         // it as this one's is how a channel goes "out of step" and every later exchange answers the
         // question before.

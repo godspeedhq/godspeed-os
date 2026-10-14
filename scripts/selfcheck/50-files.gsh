@@ -134,6 +134,29 @@ assert ok read /sc/a.txt
 assert fails cd /sc/a.txt
 cd /
 
+# ===== layout: the standard tree (docs/filesystem-layout.md) =====
+# `drives flash` lays it down, a session starts at home, and a bare name lands there. A disk formatted
+# before the layout existed fails these, which is the honest answer: it has no tree, and a reflash
+# gives it one.
+echo ''
+echo '===== layout: the standard tree ====='
+dir /system | assert contains services
+dir /system | assert contains utilities
+dir /system | assert contains shared
+dir /system | assert contains scratch
+dir /users | assert contains default
+cd $home
+pwd | assert contains /users/default
+write /users/default/sc-layout.txt home
+read sc-layout.txt | assert contains home
+cd /sc
+pwd | assert contains /sc
+cd
+read sc-layout.txt | assert contains home
+delete $home/sc-layout.txt
+assert fails read /users/default/sc-layout.txt
+cd /
+
 # ===== dir / find / tree as record producers (still referencing d1/d2) =====
 echo ''
 echo '===== dir / find / tree as record producers (still referencing d1/d2) ====='

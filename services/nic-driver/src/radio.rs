@@ -344,7 +344,7 @@ impl Radio {
         let use_now = r.as_ref().and_then(|m| m.payload_bytes().get(INFO_USE_AT).copied());
         if let Some(other) = self.other {
             // `USE_DEFAULT` from the radio that is NOT the default is "not me" too. `wifi hardware use onboard`
-            // removes `/wifi.radio`, so both radios answer `USE_DEFAULT`; reading only `USE_NOT` as a reason
+            // removes `/system/shared/wifi/radio`, so both radios answer `USE_DEFAULT`; reading only `USE_NOT` as a reason
             // to look, this stayed on a dongle that had just left the network while the onboard radio joined
             // it, and the machine had no link (Pi 4, 2026-10-12).
             let not_mine = use_now == Some(USE_NOT) || (use_now == Some(USE_DEFAULT) && self.name != self.default);
@@ -359,7 +359,7 @@ impl Radio {
                         ctx.log_fmt(format_args!(
                             "nic-driver: the radio bridge now goes to {} ({}) - {} {}",
                             other,
-                            if o_use == Some(USE_THIS) { "the radio in use, /wifi.radio" }
+                            if o_use == Some(USE_THIS) { "the radio in use, /system/shared/wifi/radio" }
                             else if default_wins { "the default radio - no choice is recorded" }
                             else { "the one that answers" },
                             self.name,

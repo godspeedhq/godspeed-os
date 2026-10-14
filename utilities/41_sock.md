@@ -114,9 +114,9 @@ Conforms to `0_conventions.md`: `sock version` / `sock help`, words-not-flags, r
 `osdev test shell` (open + invoke a socket capability, and `net`'s tab-completion adjusted for the new
 `so`-prefixed verb).
 
-**Rule 10: NOT currently `q`-escapable** (found 2026-10-09). This said opening the socket went
-through a helper that polls `q`. It no longer does: the resolver lookup is `ns_deadline` (3 s, one
-reacquire-and-retry), and the open and the send go through `gs::net::Net::new`, which lends no
-notice - bounded at `gs::net::NET_SECS` (10 s) for the open and `SOCKET_SECS` (30 s) for the send,
-but with no `[q] quit` and no way to end the wait early. Bounded, so never a wedge; a code defect
-against `0_conventions.md` rule 10 all the same (`Net::with_notice` is the fix, as `tcp` uses).
+**Conforms to rule 10.** The resolver lookup (`ns_deadline`, 3 s, one reacquire-and-retry) is under the
+command's watch (2026-10-13, `backlog/fixed/89`), and the open and the send go through `gs::net::Net::with_notice`,
+which says `[q] quit` once a wait passes 2 s and ends on `q`. That notice is the request's own, not the
+command's: a `q` typed earlier in the same command does not stop the next request before it is sent. (Found
+2026-10-09 lending no notice, through `Net::new`; bounded at `gs::net::NET_SECS` (10 s) for the open and
+`SOCKET_SECS` (30 s) for the send either way.)

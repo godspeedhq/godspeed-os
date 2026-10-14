@@ -87,7 +87,7 @@ delete /sc_fmt.gsh
 # `churn` exists to be INTERRUPTED. The commit-to-checkpoint window is short (sub-millisecond on an
 # AHCI SSD, a large fraction of each transaction on a USB stick - CLAUDE.md 6.1, 2026-09-23), so the
 # way a human lands in it is to write thousands of transactions and pull the cord. When that
-# happens the machine reboots with `/churn` still on disk, holding the only evidence of whether
+# happens the machine reboots with `/system/scratch/churn` still on disk, holding the only evidence of whether
 # recovery held - and that evidence is destroyed by the next churn that overwrites it.
 #
 # So: if a previous run is still there, VERIFY IT BEFORE STARTING A NEW ONE. After a cut the whole
@@ -99,7 +99,7 @@ delete /sc_fmt.gsh
 # recovery test is still `churn <seconds>` and a hand on the cord - this automates the verdict, not
 # the fault.
 echo '===== churn: sustained writes, and any evidence left by an earlier power cut ====='
-if dir /churn {
+if dir /system/scratch/churn {
     echo 'selfcheck: an earlier churn is still on disk - verifying it BEFORE it is overwritten'
     if churn verify {
         echo 'PASS  churn - the earlier run holds no torn file (if it was cut, recovery held)'

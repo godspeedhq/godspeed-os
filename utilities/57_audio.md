@@ -31,7 +31,7 @@ fault.
 | `audio status` | report, pipes | on or off, volume, muted, output, what is playing and how far through, underruns |
 | `audio info` | report, pipes | the detail a fault needs: controller version, codec, the path from converter to pin, the amplifier and the step it is at, the format, the ring, interrupt or polling |
 | `audio outputs` | report, pipes as records | BUILT: the outputs the device has - line out, speaker, headphone - with `*` on the one playing, and whether something is plugged into each where the jack can tell (`plugged in`, `empty`, or `cannot tell`). Two of a kind are numbered: `line out`, `line out 2` |
-| `audio output <name>` | action | BUILT: play through that output - `audio output headphone`. Names come from `audio outputs`; an unknown one is refused with the list. Refused while something plays, and kept in `/audio.settings` |
+| `audio output <name>` | action | BUILT: play through that output - `audio output headphone`. Names come from `audio outputs`; an unknown one is refused with the list. Refused while something plays, and kept in the driver's settings file (section 5) |
 | `audio hardware` | report, pipes as records | BUILT 2026-10-09: every audio device on this machine, one row each - its PCI address as `hardware` names it (or `jack` on the Pis), what it is, who made it, the service that drives it or `-`, its state (the driver's own word for the one it holds: `ready`, `off`, `surveyed, not played (A6)`), and `*` on the one `audio` talks to. Answers with or without an audio driver running. The T630 has two controllers (its analog codec and the Radeon's HDMI audio), which is why this exists |
 | `audio hardware <device>` | report, pipes | BUILT 2026-10-09: one device in full, by the name `audio hardware` gives it - why it is or is not driven, its registers and grant as `hardware <device>` shows them, and the driver's account (`audio info`) for the one in use. `audio hardware use` is not built: no machine has two audio devices a driver can play on |
 | `audio volume <0-100>` | action | set the volume. Reading it is `audio status` - one way to ask (rule 3) |
@@ -43,7 +43,7 @@ fault.
 | `audio tone <hz> [seconds]` | action | play a sine the driver generates itself, 20 to 20000 Hz, 2 s unless told (tenths allowed: `0.5`, up to 600). Blocks with `[q] quit`; `q` STOPS the tone (rule 11) |
 | `audio play <path>` | action | play a WAV file from disk: 16-bit PCM, mono or stereo, 44100 or 48000 Hz where the codec offers it. Blocks with `[q] quit`; `q` STOPS it. Anything else is refused with the reason |
 | `audio debug [view]` | report, pipes | BUILT: the driver's own account of itself, one view of `stats` (bare), `codec`, `stream`, `trace` or `registers` - verbs sent and unanswered, interrupts, underruns and the last sound's rate by the clock; the whole widget graph; the output stream's registers and buffer descriptors; the last 64 verbs and their answers; the controller's globals. On a driver that surveyed its codec and stopped (a codec not in its table), `codec`, `trace` and `registers` still answer. The Pis' jack answers every view, `codec` and `trace` with a line saying it has neither |
-| `audio system sounds on` / `off` | action | BUILT: the short sounds the system makes on its own - two falling tones for a command that failed at the prompt, one low tone for one that was refused, a rising chirp for a finished background job, a rising or falling pair for a USB device the supervisor starts a driver for arriving or leaving. On by default; kept in `/audio.settings`; `audio status` shows which. Never from a script, at most one in half a second, and the volume and mute apply |
+| `audio system sounds on` / `off` | action | BUILT: the short sounds the system makes on its own - two falling tones for a command that failed at the prompt, one low tone for one that was refused, a rising chirp for a finished background job, a rising or falling pair for a USB device the supervisor starts a driver for arriving or leaving. On by default; kept in the driver's settings file (section 5); `audio status` shows which. Never from a script, at most one in half a second, and the volume and mute apply |
 | Ctrl+Alt+Up / Ctrl+Alt+Down | shortcut | BUILT: volume up or down 5, stopping at 100 and 0; held, it repeats. The result as read back: `volume 65  [#############-------]`, one line above the prompt that a second press overwrites; `volume 0 - silent`; `muted (volume 65)` while muted |
 | Ctrl+Alt+M | shortcut | BUILT: mute, or unmute if muted; held, it does not repeat |
 | `audio help` | | usage, one real example per row |
@@ -114,10 +114,12 @@ An absent, wedged or restarting driver makes `audio` return with a loud sentence
 is bounded, and every answer is immediate by design - a tone is started and answered, then followed with
 `status` (`sdk/audio`'s wire protocol, which is tagged so a late answer is never read as the next one).
 
-## 5. Settings that survive a reboot: `/audio.settings`
+## 5. Settings that survive a reboot: the driver's `settings` file
 
-**The volume, the mute and the output are kept on disk**, in plain labelled lines, readable with
-`read /audio.settings`:
+**The volume, the mute and the output are kept on disk**, in the driver's own folder
+(`docs/filesystem-layout.md`): `/system/services/audio-driver/settings` on the PCs and
+`/system/services/pwm-audio/settings` on the Pis. Plain labelled lines, readable with
+`read /system/services/audio-driver/settings`:
 
 ```
 volume 60
@@ -125,7 +127,8 @@ muted no
 output headphone
 ```
 
-- **The driver owns the file.** It reads it once when it comes up and writes it after a change the codec
+- **The driver owns the file and its folder.** It makes the folder at its first write. It reads the file
+  once when it comes up and writes it after a change the codec
   did not contradict - a setting the codec refused is not written. `on` and `off` are NOT kept: audio
   comes up on at every boot.
 - **Never written while a tone plays.** A write blocks the driver, and a slow one mid-tone would starve

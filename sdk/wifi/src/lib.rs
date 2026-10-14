@@ -14,7 +14,7 @@
 //! - [`eapol`]: EAPOL-Key frames - recognised, signed, verified, unwrapped.
 //! - [`supplicant`]: the WPA2 four-way handshake and the group-key rekey, run by the HOST on every radio,
 //!   over the [`supplicant::KeyPath`] each radio supplies.
-//! - [`keyfile`]: the credentials a join earned, kept in `/wifi.keys` across a restart.
+//! - [`keyfile`]: the credentials a join earned, kept in `/system/shared/wifi/keys` across a restart.
 //! - [`data`]: an 802.11 data frame and the ethernet frame it carries, both ways, for every radio whose
 //!   host sees raw frames.
 //! - [`mgmt`]: a beacon or probe response read from the raw 802.11 frame - BSSID, capability, SSID and

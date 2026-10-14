@@ -38,6 +38,8 @@
   - [`drives`](utilities/drives.md)
   - [`dir`](utilities/dir.md)
   - [`cd`](utilities/cd.md)
+  - [`pwd`](utilities/pwd.md)
+  - [`home`](utilities/home.md)
   - [`read`](utilities/read.md)
   - [`write`](utilities/write.md)
   - [`mkdir`](utilities/mkdir.md)

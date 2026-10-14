@@ -134,8 +134,8 @@ whole file - `read` returned `storage error` and the capture was unretrievable. 
 through once at creation, which is the pause you see when a capture starts or rotates, and the reason
 the default size is modest.
 
-**`sticky`** records the capture in `/persist.conf`, a plain line the shell reads at the next boot and
-resumes unattended, announcing it. Plain text on purpose: `read /persist.conf` shows exactly what will
+**`sticky`** records the capture in `/system/services/events/sticky`, a plain line the shell reads at the next boot and
+resumes unattended, announcing it. Plain text on purpose: `read /system/services/events/sticky` shows exactly what will
 happen, which is the difference between a setting and a surprise. An explicit `stop` deletes it, so the
 one command meaning "enough" is not the one that fails to take. Pinned by `osdev test sticky`, which is
 the only two-boot test here - a setting that survives a reboot cannot be proved inside one boot.

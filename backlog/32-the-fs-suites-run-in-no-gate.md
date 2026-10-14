@@ -18,7 +18,7 @@ Two of the eleven were failing **on `main`**, at the commit released as v0.18.0:
 
 | suite | failing check | why |
 |---|---|---|
-| `fs-check` | `free count rebuilt from the tree to the correct value` | the expected count is read from the superblock BEFORE boot, but the running system then creates `/clock.last` and `.gsh_history`, each taking a block |
+| `fs-check` | `free count rebuilt from the tree to the correct value` | the expected count is read from the superblock BEFORE boot, but the running system then creates `/clock.last` and `.gsh_history`, each taking a block (since 2026-10-13 the clock floor is `/system/services/time/floor`, in a folder of its own, and the history `/users/default/history`; the count to expect was not re-measured) |
 | `fs-corrupt` | `case2: directory CRC mismatch caught (loud)` | matched the literal phrase `"directory block CRC mismatch"`, which is the NON-ROOT wording; the case corrupts the ROOT block, whose path says `"CRC mismatch on directory block ..."` and then a root-specific refusal |
 
 **Neither was a filesystem bug.** In both cases `fs` behaved correctly and the ASSERTION had gone

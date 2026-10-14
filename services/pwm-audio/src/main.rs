@@ -940,12 +940,12 @@ fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {
             p.service();
             if p.settings_dirty && p.play.is_none() {
                 p.settings_dirty = false;
-                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), Settings { volume: p.volume, muted: p.muted, output: None, system_sounds: p.system_sounds }) {
+                match settings::save(&mut gs::fs::Fs::new(ctx).patience_secs(settings::PATIENCE_SECS), "pwm-audio", Settings { volume: p.volume, muted: p.muted, output: None, system_sounds: p.system_sounds }) {
                     Ok(()) => p.settings_failing = false,
                     Err(e) if !p.settings_failing => {
                         p.settings_failing = true;
                         ctx.log_fmt(format_args!(
-                            "pwm-audio: could not write /audio.settings ({}) - the setting holds until this driver restarts", e.as_str()));
+                            "pwm-audio: could not write /system/services/pwm-audio/settings ({}) - the setting holds until this driver restarts", e.as_str()));
                     }
                     Err(_) => {}
                 }

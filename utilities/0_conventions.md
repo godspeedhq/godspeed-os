@@ -76,7 +76,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    (`services/shell/src/main.rs`, beside `complete_tab`), so Tab at one of its argument
    positions does *nothing* instead of offering unrelated files. (The bug this prevents:
    `chaos max-carnage all-services <tab>`, landing on the rounds argument, listed the root
-   directory and offered `/.gsh_history`.) The default is path completion; **opting out is
+   directory and offered `/.gsh_history`, where the history then lived.) The default is path completion; **opting out is
    explicit and per-command** - a path-taking utility (`dir`, `read`, `write`, `mkdir`, `find`,
    `tree`, `copy`, ...) is simply absent from `NO_PATH_CMDS` and keeps its file completion. So
    when you add a utility: if its args are paths, do nothing; if they are not, add it to
@@ -116,7 +116,32 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     the only rule that actually distinguishes them, so the rule is written down rather than left to
     be inferred from two examples that look contradictory.
 
-10. **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
+10. **Nothing traps the user: every wait says `[q] quit`, by 4 s, and honours it.** (Rewritten
+    2026-10-13 with the operator, `backlog/fixed/89`, `audits/2026-10-13-quit-audit.md`.) Any command a
+    person waits on that can run past 2 s says `[q] quit` - aimed at 2 s, and never later than **4 s**
+    on the slowest board, because the shell's clock counts whole seconds and a reply may already be on
+    its way - and `q`/`Q`/ESC brings the prompt back within 3 s, saying truthfully what happened:
+    stopped, still running underneath, or outcome unknown. `[b] background` stands beside it where the
+    work can run detached - a separate program, holding no console authority, whose output fits a
+    transcript - and a command with no `[b]` says nothing about `[b]`. So `copy <file> <dst>`, `delete
+    <dir> recursive`, `drives check` and `drives scrub`, typed at the prompt, START as the job
+    `background` would start and the console attaches to it: their notice is `[q] quit   [b] background`,
+    and `b` leaves them running as job N (`55_background.md`). In a script, a pipe, or while a job is
+    already running they run in the shell and offer `[q]` alone. Waits on the person (a confirm,
+    `input`, a full-screen program with its own quit key) are exempt.
+
+    **The shell is the observer.** It starts a COMMAND clock at Enter, and every wait the command makes
+    reads it through `gs::call::Watch` - a `gs::fs` handle lent `.watching(ctx)` (the shell's `ctx.fs()`),
+    `gs::call::request_watched`, `recv_quittable` - so the notice is per command, a command
+    made of many fast requests is covered as well as one slow request, and `q` stops the command at its
+    next request. A script, a `wait` and `selfcheck` stop on it too. (`tcp`, `serve` and `sock` use a
+    `gs::net` handle with its own notice: quittable, on the request's clock rather than the command's.) A
+    wait the watch cannot see is a defect to fix; the few that cannot trap anyone - under 2 s, one pass of
+    a loop that reads `q`, after a `q`, or between commands - say so beside them (`// quit-ok:`), and
+    `scripts/quit_wait_check.py` refuses any other. `osdev test quit` measures every kind of wait on an `fs`
+    built to answer slowly (`slow-replies`) and writes the table to `build/tests/quit_report.md`.
+
+    *The rule as it read before 2026-10-13, kept as history:* **Anything that blocks or waits is escapable with `q`.** If a utility can sit waiting - on
     a peer service, on the network, on a long sweep - then `q`/`Q`/ESC MUST abort it and return
     to the prompt, and a wait of more than a moment advertises `[q] quit`. A command
     that can wedge the shell with no way out is forbidden (§26.7: loud + escapable over silent +
@@ -147,7 +172,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`) go through
     `ask_with_quit_notice`, and the re-waits after an overtaken reply (`fs_take_tagged`,
     `ns_take_tagged`) through `recv_quittable` (`backlog/84` S6). Not yet covered: the fs handles
-    listed in the note above.)*
+    listed in the note above - covered since 2026-10-13, `backlog/fixed/89`.)*
 
     *(Note 2026-10-13: and the radio's and audio driver's asks. `wifi_ask` and `audio_ask` - every
     `wifi` and `audio` verb, `wifi hardware` among them, which asks each radio twice and could sit for
@@ -159,7 +184,8 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     caller's deadline), and the 2 s spawn request to the supervisor. A task blocked in a `Call` cannot read the console, and the
     noticing form that can takes whatever reply lands next, which is what the `Call` is there to prevent:
     giving them `[q]` needs a reply-matched wait that returns to the caller between slices, which does not
-    exist yet.)*
+    exist yet. Fixed later the same day: all four are under the command's watch (`ask_watched`, `hw_ask`),
+    `backlog/fixed/89`.)*
 
     **Worked example, and the reason "never block on a bare `request_with_reply`" is written as an
     absolute.** The whole networking surface broke this rule on one helper. `ns_request` - what `tcp`,
@@ -172,6 +198,8 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     and was worse for it, since `events failures` is the instrument you reach for WHEN something is
     wedged; an instrument that can hang on the thing it is measuring takes the prompt with it.
 
+    *(Superseded 2026-10-13, `backlog/fixed/89`: these requests now go through `ask_sifted_quittable`, say
+    `[q] quit` past 2 s and stop the wait on `q`. Kept as the record of why they once could not.)*
     **Recorded exception: the `wifi` radio power requests.** `wifi radio on`, `wifi radio off`,
     `wifi radio off hard` and the power request at the start of `wifi radio powercycle` block in a
     kernel `Call` with no `q`, because a shell blocked in one cannot read the console. Each is
@@ -195,10 +223,10 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
 
     **Which utilities start a pipe, and why the rest do not** (counted 2026-10-02 against the shell's
     `UTILS` and its three producer lists, `is_producer_builtin`, `is_record_producer` and
-    `is_pipe_producer_service`). Of the shell's utilities (its `UTILS` list), 27 start a pipe (two, `wifi` and `churn`, for some verbs only): the record sources (`status`, `dir`,
+    `is_pipe_producer_service`). Of the shell's utilities (its `UTILS` list), 28 start a pipe (two, `wifi` and `churn`, for some verbs only): the record sources (`status`, `dir`,
     `find`, `caps`, `drives`, `observe now`, `uptime`, `events`, `trace`, `jobs`, and `wifi list`), the
     text sources (`echo`, `read`, `tree`, `input`, `about`, `version`, `whatis`, `mem`, `cores`, `date`,
-    `net`, `ping`, `sock`, `help`, `wifi`'s other reports, `churn verify`), and the `roster` service; plus
+    `net`, `ping`, `sock`, `help`, `pwd` (added 2026-10-13), `wifi`'s other reports, `churn verify`), and the `roster` service; plus
     `random` and `tcp` (made sources that day) and the `greet` example, which are not in `UTILS`. Seventeen more are pipe STAGES or SINKS rather than
     sources - `match`, `count`, `sort`, `first`, `last`, `where`, `select`, `to`, `from`, `sum`, `min`,
     `max`, `avg`, `paginate`, `write`, `assert`, `result` - and `result`/`assert` refuse to start a pipe
@@ -210,7 +238,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     | `run`, `selfcheck` | Orchestrators: they run their own sub-pipelines, so capturing one nests a pipe inside a pipe on a 256 KiB stack - a hardware-proven crash. They write their own output with `save <path>` instead |
     | `health`, `online`, `size`, `busiest` (the library) | Scripts, run by the interpreter: the same class as `run`, refused inside another script for the same stack reason. Their contents pipe directly - `busiest` IS `status \| sort reverse mem` |
     | `docs`, `scrollback`, `edit`, bare `observe` | Full-screen: a pipe cannot carry a screen you scroll. `scrollback save` and `observe now` are the capturable forms |
-    | `clear`, `wait`, `repeat`, `cd`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
+    | `clear`, `wait`, `repeat`, `cd`, `home`, `mkdir`, `copy`, `move`, `rename`, `delete`, `seal`, `spawn`, `kill`, `restart`, `reboot`, `background`, `foreground` | Actions: the value is the effect, and what they print is a confirmation, not data |
     | `wifi scan`, `join`, `leave`, `forget`, `radio ...` | Actions; `join` also reads a passphrase from the console, and piped its prompt would vanish. Refused with a sentence naming the reports |
     | `churn <seconds>`, `churn tear`, `churn reset` | Actions; `churn verify` is the report and pipes |
     | `chaos`, `fcap` | Exercisers whose value is what they prove while running; `chaos` writes its report with `save` |

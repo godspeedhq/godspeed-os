@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The serve loop every radio shares: what `wifi` asks, answered; the frame ops `nic-driver` asks,
-//! answered; the scan cache, the credential table and `/wifi.keys`, auto-join and the rejoin after
+//! answered; the scan cache, the credential table and `/system/shared/wifi/keys`, auto-join and the rejoin after
 //! `radio on`. ONE copy, run by every radio service over its [`Station`].
 //!
 //! It lived in `wifi-driver`'s `main.rs` until the third radio (2026-10-06): the Broadcom and the AIC8800
@@ -303,13 +303,13 @@ pub fn serve<'s>(
             Outcome::HandshakeUnimplemented => wire::HANDSHAKE_UNIMPLEMENTED,
         }
     }
-    // THE KEY FILE (`keyfile.rs`, `/wifi.keys`). Loaded once the radio is up - retried a bounded number
+    // THE KEY FILE (`keyfile.rs`, `/system/shared/wifi/keys`). Loaded once the radio is up - retried a bounded number
     // of times while `fs` is still coming up, then given up with a line - and the most recent entry is
     // joined without being asked. Written after every change to the table.
     let mut keyfile_settled = false;
     let mut keyfile_tries: u32 = 0;
-    // WHICH RADIO IS IN USE (`wifi hardware use`, `utilities/56_wifi.md` 11): `/wifi.radio`, written by the
-    // shell, read here beside `/wifi.keys` and kept current by `wire::OP_USE`. A radio that is not the one
+    // WHICH RADIO IS IN USE (`wifi hardware use`, `utilities/56_wifi.md` 11): `/system/shared/wifi/radio`, written by the
+    // shell, read here beside `/system/shared/wifi/keys` and kept current by `wire::OP_USE`. A radio that is not the one
     // in use does not rejoin at start, and says so in its link status, so `nic-driver` follows the choice.
     let mut choice_use: u8 = wire::USE_DEFAULT;
     let mut choice_settled = false;
@@ -326,13 +326,13 @@ pub fn serve<'s>(
     let mut said_waiting = false;
     const KEYFILE_TRIES: u32 = 15;
     let mut auto_join: Option<([u8; SSID_MAX], u8, u8)> = None;
-    // Why `auto_join` is set, for its line: the boot rejoin from `/wifi.keys`, or the rejoin after the
+    // Why `auto_join` is set, for its line: the boot rejoin from `/system/shared/wifi/keys`, or the rejoin after the
     // access point dropped the link (`rejoin_after_drop`).
-    let mut auto_join_why: &str = "from /wifi.keys";
+    let mut auto_join_why: &str = "from /system/shared/wifi/keys";
     /// THE REJOIN AFTER A DROP. An access point drops a station for its own reasons - on 2026-10-08 a
     /// VisionFive idle for half an hour was disassociated for inactivity (reason 4) - and the network is
     /// still there and still the one chosen, so it is rejoined, ONCE per drop, through the same path as the
-    /// boot rejoin (`auto_join`, which also honours `/wifi.radio`). Not when the link lasted under
+    /// boot rejoin (`auto_join`, which also honours `/system/shared/wifi/radio`). Not when the link lasted under
     /// `REJOIN_MIN_SECS`: an access point that drops every join would otherwise be rejoined forever, and a
     /// drop that soon is an answer about this station, not an accident (Commandment VIII). Either way the
     /// line says what was done and why.
@@ -359,7 +359,7 @@ pub fn serve<'s>(
         }
     }
     /// Join a network this driver holds a key for - the rejoin after `radio on`, and the auto-join at boot
-    /// from `/wifi.keys`. `None` when there is no key for a WPA2 name (nothing was attempted); otherwise
+    /// from `/system/shared/wifi/keys`. `None` when there is no key for a WPA2 name (nothing was attempted); otherwise
     /// the join's outcome, with the driver's memory of the link updated either way.
     fn join_known(
         session: &mut dyn Station,
@@ -403,7 +403,7 @@ pub fn serve<'s>(
         pmk_buf.fill(0);
         Some(outcome)
     }
-    /// Write the table to `/wifi.keys`, most recently used first. Called after any change to it.
+    /// Write the table to `/system/shared/wifi/keys`, most recently used first. Called after any change to it.
     fn save_keys(ctx: &ServiceContext, who: &str, stored: &[Option<Stored>], forgotten: Option<&[u8]>) {
         let mut entries = [keyfile::Entry::EMPTY; keyfile::MAX_SAVED];
         let mut n = 0usize;
@@ -429,7 +429,7 @@ pub fn serve<'s>(
             }
         }
         if keyfile::save(ctx, who, &entries[..n], forgotten) {
-            say_fmt(ctx, who, format_args!("/wifi.keys written - {} network(s)", n));
+            say_fmt(ctx, who, format_args!("/system/shared/wifi/keys written - {} network(s)", n));
         }
         for e in entries.iter_mut() {
             e.pmk.fill(0);
@@ -473,7 +473,7 @@ pub fn serve<'s>(
     // THE CREDENTIAL SLOTS (`utilities/56_wifi.md` 6): a network name and the pairwise master key derived
     // from its passphrase, sixty-four of them. The passphrase itself is gone the moment the key exists. When
     // every slot is held, the one JOINED LONGEST AGO is replaced. This table is the WORKING SET; the 48 most
-    // recent keys and their names are also on disk in `/wifi.keys` (`godspeed_wifi::keyfile`), loaded when
+    // recent keys and their names are also on disk in `/system/shared/wifi/keys` (`godspeed_wifi::keyfile`), loaded when
     // the radio comes up and rewritten after every change.
     // About 80 bytes each (88 as an `Option`), some 5.5 KiB in all, against a service limit of 8 MiB or more: the count is a BOUND (26.6), chosen
     // so that nobody reaches it, not a fit to the memory - a table that grew to fill what is available is
@@ -550,7 +550,7 @@ pub fn serve<'s>(
                         choice_settled = true;
                         let mine = wire::radio_name(who).as_bytes() == &name[..len];
                         choice_use = if mine { wire::USE_THIS } else { wire::USE_NOT };
-                        say_fmt(ctx, who, format_args!("/wifi.radio names {} - {}",
+                        say_fmt(ctx, who, format_args!("/system/shared/wifi/radio names {} - {}",
                             core::str::from_utf8(&name[..len]).unwrap_or("?"),
                             if mine { "this radio is the one in use" } else { "another radio is in use; this one does not rejoin" }));
                     }
@@ -572,22 +572,22 @@ pub fn serve<'s>(
                         // Most recent first in the file, so the first keeps the highest `used_at`.
                         stored[slot] = Some(Stored { ssid: e.ssid, len: e.len, pmk: e.pmk, used_at: now - i as i64 });
                     }
-                    say_fmt(ctx, who, format_args!("/wifi.keys loaded - {} network(s) known", n));
+                    say_fmt(ctx, who, format_args!("/system/shared/wifi/keys loaded - {} network(s) known", n));
                     if n > 0 {
                         auto_join = Some((entries[0].ssid, entries[0].len, entries[0].sec));
-                        auto_join_why = "from /wifi.keys";
+                        auto_join_why = "from /system/shared/wifi/keys";
                     }
                 }
                 keyfile::Load::NoFile => {
                     keyfile_settled = true;
-                    say(ctx, who, "no /wifi.keys - nothing to rejoin; the first join writes it");
+                    say(ctx, who, "no /system/shared/wifi/keys - nothing to rejoin; the first join writes it");
                 }
                 keyfile::Load::Unreachable => {
                     keyfile_tries += 1;
                     if keyfile_tries >= KEYFILE_TRIES {
                         keyfile_settled = true;
                         say_fmt(ctx, who, format_args!(
-                            "fs could not give /wifi.keys in {} tries (no answer, or its storage unavailable) - running on the table in memory alone this boot",
+                            "fs could not give /system/shared/wifi/keys in {} tries (no answer, or its storage unavailable) - running on the table in memory alone this boot",
                             keyfile_tries
                         ));
                     }
@@ -603,14 +603,14 @@ pub fn serve<'s>(
                 standby = Some((name, len, sec));
                 match other_present {
                     Some(false) => {
-                        say(ctx, who, "the radio /wifi.radio chooses is not attached - this one rejoins in its place, and leaves when it arrives");
+                        say(ctx, who, "the radio /system/shared/wifi/radio chooses is not attached - this one rejoins in its place, and leaves when it arrives");
                         standing_in = true;
                         go = true;
                     }
-                    Some(true) => say(ctx, who, "not rejoining the network last joined - another radio is the one in use (/wifi.radio)"),
+                    Some(true) => say(ctx, who, "not rejoining the network last joined - another radio is the one in use (/system/shared/wifi/radio)"),
                     None => if !said_waiting {
                         said_waiting = true;
-                        say(ctx, who, "not rejoining yet - /wifi.radio chooses another radio, and whether it is attached is the supervisor's to say");
+                        say(ctx, who, "not rejoining yet - /system/shared/wifi/radio chooses another radio, and whether it is attached is the supervisor's to say");
                     },
                 }
             }
@@ -733,7 +733,7 @@ pub fn serve<'s>(
                             rxq.clear();
                         }
                     }
-                    say(ctx, who, "the radio /wifi.radio chooses is attached - this one leaves the network it held in its place");
+                    say(ctx, who, "the radio /system/shared/wifi/radio chooses is attached - this one leaves the network it held in its place");
                 } else if !attached && choice_use == wire::USE_NOT && !standing_in && joined.is_none() {
                     // STAND IN: the chosen radio is absent, so the rejoin this radio held back is made now.
                     auto_join = standby;
@@ -785,7 +785,7 @@ pub fn serve<'s>(
             // radio that is down must still know it is not the one to rejoin.
             (wire::OP_USE, _) => {
                 if let Some(&len) = payload.get(1) {
-                    // A name over 16 bytes is no radio's, as `keyfile` reads `/wifi.radio`: it was cut
+                    // A name over 16 bytes is no radio's, as `keyfile` reads `/system/shared/wifi/radio`: it was cut
                     // to 16 and compared, so a long name that began like this radio's chose it
                     // (`backlog/fixed/80` S8).
                     let long = len as usize > 16;
@@ -879,7 +879,7 @@ pub fn serve<'s>(
             (wire::OP_RADIO, Some(session)) if payload.get(1).copied() == Some(wire::RADIO_HARD_OFF) => {
                 // `wifi radio off hard`: leave the network politely while the firmware can still send,
                 // then cut the chip's power and stay that way. The keys held in memory go with the
-                // association; `/wifi.keys` stays, and the cold start after `on` rejoins from it.
+                // association; `/system/shared/wifi/keys` stays, and the cold start after `on` rejoins from it.
                 let was_joined = joined.is_some();
                 if let Some(s) = sweep.take() {
                     let _ = session.scan_abort(ctx);

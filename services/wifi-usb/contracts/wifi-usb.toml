@@ -5,7 +5,7 @@
 #
 # It holds no hardware grant at all: no MMIO, no DMA, no interrupt. Everything it does to the chip is a
 # request to the host, which serves only the one device it bound. Started by the supervisor when a host
-# reports the dongle attached, and stopped when it leaves (`usbdev`). `fs` holds `/wifi.keys`, which the serve loop every radio
+# reports the dongle attached, and stopped when it leaves (`usbdev`). `fs` holds `/system/shared/wifi/keys`, which the serve loop every radio
 # shares (`godspeed_wifi::serve`) loads and writes - the same reason `wifi-driver` has it.
 name    = "wifi-usb"
 version = "0.1.0"

@@ -9,7 +9,7 @@
 //! On this board the alternative would have been markedly worse. `block-driver` is built `storage_is_usb`,
 //! so the disk is behind the **`xhci` service**: reading firmware through `fs` would make the radio depend
 //! on the USB stack coming up and on a stick being present, for a file already in this repository. The driver
-//! does hold an `fs` send peer now (the supervisor wires it to `fs` and `power`), but for `/wifi.keys`; the
+//! does hold an `fs` send peer now (the supervisor wires it to `fs` and `power`), but for `/system/shared/wifi/keys`; the
 //! firmware never travels through it, and embedding needs no capability at all.
 //!
 //! **What the two blobs are.** `brcmfmac43455-sdio.bin` is the program the chip's own processor runs; the

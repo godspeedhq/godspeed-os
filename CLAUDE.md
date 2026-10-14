@@ -380,6 +380,9 @@ os/
                          #   SDK calls the standard library already covers - may fall, may not rise, and
                          #   a NEW crate starts at zero. Counts only methods with a `gs` replacement, which
                          #   it names; a gap in `gs` is closed in `gs` (backlog/71, 2026-10-05)
+    quit_wait_check.py   #   NO SILENT WAIT in the shell, which observes every command: each wait reads
+                         #   the command's watch or says on the line above why it cannot trap anyone
+                         #   (`// quit-ok:`), and those exceptions may fall, not rise (backlog/fixed/89)
     port_scope_check.py  #   ...and the one the other four cannot answer: did the port EDIT anything
                          #   outside `arch/<isa>/` and the twelve files `docs/porting.md` marks `+`.
                          #   They all ask whether a RULE was broken; an ordinary edit to a neutral
@@ -3255,6 +3258,14 @@ When real userspace work begins, the first user-facing design decision is **how 
 > mechanism is in `services/shell`; `scripts/foreign_word_check.py` reads that same table to make
 > sure no document in this repository shows one of those words being used as a command, which is how
 > the `ls` -> `dir` rename was found to have missed ten worked examples.
+>
+> **Note 2026-10-13: two Unix words are commands, `cd` and `pwd`, and each has a reason.** `cd` was kept
+> from the start because it is universal (`utilities/17_cd.md`). `pwd` joined it with the filesystem
+> layout (`docs/filesystem-layout.md` 6): the prompt is a plain `gsh> `, so something has to say where
+> you are, and `pwd` is `cd`'s other half - anyone who knows one knows the other. It left
+> `FOREIGN_HINTS`, where its hint had been `cd .`, which asked a reader to know a Unix convention (`.`)
+> without naming anything. The rule above is unchanged: every other foreign word is still a hint and
+> never an alias, and a new exception needs a reason of its own written beside it, as this one is.
 
 ---
 

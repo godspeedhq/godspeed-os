@@ -20,7 +20,7 @@
 //! has no supplicant), pairwise and group rekeys, and the radio's power through `DevicePower` - `radio off
 //! hard`, `powercycle`, and the recovery of a firmware that has stopped. It serves `nic-driver` the frame
 //! path (`frames.rs`) for when the cable is out. A respawn ADOPTS a firmware the dead instance left
-//! running rather than reloading it, and rejoins from `/wifi.keys`. A radio that cannot be brought up is
+//! running rather than reloading it, and rejoins from `/system/shared/wifi/keys`. A radio that cannot be brought up is
 //! served as `radio down` with its reason (`wire::DOWN_*`) - answered loudly, never left to time out.
 //!
 //! **VisionFive 2 Lite (riscv64, `wifi_host_dw_mmc`): the AIC8800, phases V0-V6** (`docs/wifi-aic8800.md`).
@@ -438,7 +438,7 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
                                             e.ms, e.results, scan.count(), e.unreadable)),
                                     }
                                     // ---- Stage 11 (V4, second card): the radio as a `Station`, under the serve loop
-                                    // the Pi 4's runs under - `wifi scan`, `wifi join`, `/wifi.keys` and the frame
+                                    // the Pi 4's runs under - `wifi scan`, `wifi join`, `/system/shared/wifi/keys` and the frame
                                     // path are the loop's from here (`aic_station.rs`). It does not return. ----
                                     ctx.log("wifi-driver: stage 11 - the AIC8800 is a station; serving `wifi` and the frame path");
                                     let mut station = aic_station::Aic::new(&h, i.index, &f);
@@ -910,7 +910,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // no upload (stages 9-11) - and the bus is brought up on it as it stands. Any transfer the
             // dead instance left in flight is aborted per function first (IO_ABORT, not RES). The
             // firmware is then asked the same first question the boot asks; if it answers, this instance
-            // carries on with it, joins from `/wifi.keys` as a fresh one would, and the kill cost
+            // carries on with it, joins from `/system/shared/wifi/keys` as a fresh one would, and the kill cost
             // seconds. If it does not answer there is nothing left to try on this chip short of cutting
             // its power (`backlog/fixed/69`), and the radio says so rather than restarting a firmware the ROM
             // will not boot.

@@ -1,4 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
+
+> **Note 2026-10-13: the keys moved.** This record names `/wifi.keys` and `/wifi.radio`, which is where they
+> were when each section was written. Since the filesystem layout (`docs/filesystem-layout.md`) they are
+> `/system/shared/wifi/keys` and `/system/shared/wifi/radio`; nothing reads the old names.
 # WiFi: two problems, one of which is not a driver
 
 **Status:** sections 1-12 are the design, written on `feat/wifi-driver` before any code, deliberately,
@@ -281,7 +285,7 @@ in the kernel ring buffer is a PSK in `build/putty_serial_output.log`, committed
 
 **Who prompts?** The shell is where authority is decided (Appendix D.4), so the passphrase is typed at
 the prompt - and **the invisible-entry path already exists**: `input secret` (`docs/scripting.md` §8)
-gives keystrokes that do not echo, a line excluded from both the recall ring and `/.gsh_history`, taint
+gives keystrokes that do not echo, a line excluded from both the recall ring and the history file (`/users/default/history`), taint
 that propagates across assignment, and `echo` refused and masked as `[secret]`. `input secret sealed` is
 already reserved for the escalation that additionally forbids write and assignment, which is exactly
 what a passphrase wants. So the prompt half of this is built; what was missing is somewhere to put the
@@ -613,7 +617,7 @@ Each of these means stop and investigate rather than shrug:
   a legitimate question with a definite answer, and reporting it as a fault is the silent-failure inversion
   invariant 12 forbids. Pinned in QEMU; if hardware disagrees, the pin is wrong.
 - **`wifi join Some hunter2` being ACCEPTED.** It must refuse, by name, with the reason. If any board
-  takes it, a passphrase reaches `/.gsh_history` and this is a security regression, not a cosmetic one.
+  takes it, a passphrase reaches the history file and this is a security regression, not a cosmetic one.
 - **`help` missing the row.** Then the verb exists and nobody can find it, which is what `facts_check`
   caught in QEMU.
 - **Tab after `wifi ` listing a directory.** It must offer the seven subcommands; a path menu means

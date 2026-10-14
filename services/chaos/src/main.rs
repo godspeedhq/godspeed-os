@@ -271,10 +271,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut rounds: u64 = 0;
     let mut tbuf = [0u8; 128];   // target string; may be a comma-separated list, so sized for a bounded list
     let mut tlen = 0usize;
-    // The operator's seed (`chaos max-carnage ... seed <n>`), or None for one drawn here. The message is
-    // `rounds u32 | has_seed u8 | seed u64 | target`, written by the shell's `chaos_launch` - both ends
-    // ship in one image, so the layout changed with both of them.
+    // The seed, when the shell sends one, or None for one drawn here. The message is
+    // `rounds u32 | seed_from u8 | seed u64 | target`, written by the shell's `chaos_launch` - both ends
+    // ship in one image, so the layout changed with both of them. `seed_from` says whose the seed is:
+    // 1 the operator's (`seed <n>`), 2 drawn by the shell so it could record it before the storm
+    // (`/system/utilities/chaos/last-run`), 0 none.
     let mut given_seed: Option<u64> = None;
+    let mut seed_drawn_by_shell = false;
     {
         let t0 = gs::task::epoch_secs_monotonic(&ctx);
         let mut aw = 0u32;
@@ -282,10 +285,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let Some(msg) = gs::ipc::try_recv(&ctx) {
                 let b = msg.payload_bytes();
                 if b.len() >= 4 { rounds = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64; }
-                if b.len() >= 13 && b[4] == 1 {
+                if b.len() >= 13 && (b[4] == 1 || b[4] == 2) {
                     let mut s = [0u8; 8];
                     s.copy_from_slice(&b[5..13]);
                     given_seed = Some(u64::from_le_bytes(s));
+                    seed_drawn_by_shell = b[4] == 2;
                 }
                 if b.len() > 13 { let n = (b.len() - 13).min(128); tbuf[..n].copy_from_slice(&b[13..13 + n]); tlen = n; }
                 break;
@@ -415,8 +419,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     if target_random {
         gs::io::println_fmt(&ctx, format_args!(
             "chaos: seed {} ({}) - `chaos max-carnage all-services <n> seed {}` replays these draws, not this run's timing",
-            seed, if given_seed.is_some() { "given" } else { "drawn" }, seed));
-    } else if given_seed.is_some() {
+            seed, if given_seed.is_none() || seed_drawn_by_shell { "drawn" } else { "given" }, seed));
+    } else if given_seed.is_some() && !seed_drawn_by_shell {
         gs::io::println(&ctx, "chaos: a seed has no effect on an aimed run - only `all-services` draws at random");
     }
 

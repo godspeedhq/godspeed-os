@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! A `Station`: what the serve loop asks of a radio, whichever radio it is.
 //!
-//! The loop owns the policy every radio shares - the scan cache, the credential table and `/wifi.keys`,
+//! The loop owns the policy every radio shares - the scan cache, the credential table and `/system/shared/wifi/keys`,
 //! auto-join and the rejoin after `radio on`, which key to join with, every reply's layout. A `Station`
 //! owns the chip: how a scan is started and read, how a join is done, what "up" and "the link" mean to
 //! this firmware, and how frames move. The Pi 4's Broadcom, the VisionFive 2's AIC8800 and the Pi 2's

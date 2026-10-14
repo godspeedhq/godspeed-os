@@ -44,6 +44,27 @@ job 1 done
 | `q`, while attached | **stop the job**, not just the view (conventions rule 11) |
 | `b`, while attached | detach it again, leaving it running |
 
+**Typed at the prompt, four of these run as jobs anyway** (2026-10-14, `backlog/fixed/89`): `copy <file>
+<dst>`, `delete <dir> recursive`, `drives check` and `drives scrub` start as the job `background` would
+start, and the console attaches to it as `foreground` does. Nothing changes until 2 s; then the notice
+is `[q] quit   [b] background`, so the key the conventions promise (rule 10) is there exactly where it
+can work. `b` leaves the job running and gives the prompt back:
+
+```
+gsh> drives check
+  [q] quit   [b] background
+[backgrounded] job 3
+```
+
+`q` stops it where it can be stopped: a copy is cancelled between its chunks and its incomplete
+destination removed. A check, a scrub or a tree delete is ONE request to `fs`, which cannot be stopped
+part-way, so `q` says that and leaves it running as job N. A job that ends while attached prints what
+it found, in the shell's own words - `copier` writes the lines the shell would have printed, after one
+line naming the job (`copying`, `deleting a subtree`, `drives check - walking the volume`) - and its
+result is the command's. In a script, a pipe, a function, or while a job is already running, the
+command runs in the shell as before and offers `[q]` alone: a script's `drives check` must not let the
+script run on past it.
+
 `jobs quit` exists for the reason `background` does when `b` already would (§2 of the design note):
 making somebody attach to a job in order to stop it is the interface forgetting what they just told
 it. It is **not** `kill copier` - killing the service skips its cleanup, so a half-written
@@ -171,7 +192,9 @@ JOB  STATE    PROGRESS  COMMAND
 gsh> foreground 4
 job 4 is done
   drives check - walking the volume
-  ok - 0 bad, 7 file(s), 2 director(ies) scanned
+  check: 6 files, 5 dirs, 0 bad; 11352 blocks used, 21416 free (bitmap + free count rebuilt from the tree)
+  check: the free count already agreed with the tree - nothing was repaired
+  check: ok - filesystem is consistent
 ```
 
 **The verdict is RENDERED here, not passed through.** `fs` answers a check or a scrub with COUNTS -

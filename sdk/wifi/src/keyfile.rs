@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! `/wifi.keys`: the credential table on disk, so a machine that boots with a radio joins the network it
+//! `/system/shared/wifi/keys`: the credential table on disk, so a machine that boots with a radio joins the network it
 //! last joined and is ready to go (`utilities/56_wifi.md` 6, decided by the operator 2026-09-30).
 //!
 //! **What is on the card, said plainly.** The DERIVED KEY of each network - the 32-byte pairwise master
@@ -23,7 +23,10 @@
 
 use godspeed_sdk::{Message, ServiceContext};
 
-pub const PATH: &[u8] = b"/wifi.keys";
+/// The folder the WiFi state lives in (`docs/filesystem-layout.md`): shared by the radios, so it is under
+/// `/system/shared/` rather than any one driver's folder. Whoever writes first creates it.
+pub const DIR: &[u8] = b"/system/shared/wifi";
+pub const PATH: &[u8] = b"/system/shared/wifi/keys";
 const MAGIC: [u8; 4] = *b"GSWK";
 const FILE_VERSION: u8 = 1;
 pub use crate::crypto::PMK_LEN;
@@ -36,6 +39,8 @@ const ENTRY: usize = 1 + SSID_MAX + 1 + PMK_LEN;
 /// `[tag, FS_OK, len:u32, bytes]`. The tag is echoed and interpreted no further.
 const FS_OP_WRITE: u8 = 10;
 const FS_OP_READ: u8 = 11;
+/// `fs`'s create-with-parents: succeeds when the folder is already there.
+const FS_OP_MKDIR_P: u8 = 18;
 const FS_OK: u8 = 0;
 /// `fs`'s "no such file" - the one answer that means there is nothing to load (`services/fs`, `FS_NOTFOUND`).
 const FS_NOTFOUND: u8 = 2;
@@ -100,7 +105,7 @@ pub fn load(ctx: &ServiceContext, who: &str, out: &mut [Entry; MAX_SAVED]) -> Lo
     // ONLY "NO SUCH FILE" AND "NO FILESYSTEM" SETTLE IT. Every other refusal is storage in trouble - `fs`
     // answers `FS_UNAVAIL` while its block driver is being respawned - and reading that as "no file"
     // settled the load and gave up on it for the life of this instance, so a driver started then never
-    // rejoined from `/wifi.keys` (Pi 4, chaos max-carnage, 2026-10-02: "no /wifi.keys - nothing to
+    // rejoined from `/system/shared/wifi/keys` (Pi 4, chaos max-carnage, 2026-10-02: "no /system/shared/wifi/keys - nothing to
     // rejoin" logged one millisecond after `fs: re-mount after I/O error FAILED`). The caller's retry is
     // bounded, so a disk that never comes back is still given up on, and says so.
     match p.get(1).copied() {
@@ -112,7 +117,7 @@ pub fn load(ctx: &ServiceContext, who: &str, out: &mut [Entry; MAX_SAVED]) -> Lo
     let data = &p[6..core::cmp::min(p.len(), 6 + n)];
     if data.len() < HEADER || data[..4] != MAGIC || data[4] != FILE_VERSION {
         ctx.log_fmt(format_args!(
-            "{}: /wifi.keys is {} bytes and not a version {} key file - ignored, and it will be rewritten by the next join",
+            "{}: /system/shared/wifi/keys is {} bytes and not a version {} key file - ignored, and it will be rewritten by the next join",
             who, data.len(), FILE_VERSION
         ));
         return Load::NoFile;
@@ -183,11 +188,11 @@ pub fn save(ctx: &ServiceContext, who: &str, entries: &[Entry], forgotten: Optio
     ok
 }
 
-/// The radio the operator chose (`wifi hardware use`), as the shell wrote it: `/wifi.radio`, holding the
-/// radio's name (`wire::radio_name`). Read beside `/wifi.keys`, with the same settling rules.
-pub const RADIO_PATH: &[u8] = b"/wifi.radio";
+/// The radio the operator chose (`wifi hardware use`), as the shell wrote it: `/system/shared/wifi/radio`, holding the
+/// radio's name (`wire::radio_name`). Read beside `/system/shared/wifi/keys`, with the same settling rules.
+pub const RADIO_PATH: &[u8] = b"/system/shared/wifi/radio";
 
-/// What `/wifi.radio` says.
+/// What `/system/shared/wifi/radio` says.
 pub enum Choice {
     /// The radio by this name, `len` bytes of it.
     Named([u8; 16], usize),
@@ -221,8 +226,31 @@ pub fn load_choice(ctx: &ServiceContext) -> Choice {
     Choice::Named(name, text.len())
 }
 
+/// Create `DIR` if it is not there, so a write into it can land. `true` when the folder exists afterwards.
+/// The writer of each file in it calls this first: a folder is made by its owner at first use.
+pub fn make_dir(ctx: &ServiceContext) -> bool {
+    let mut req = [0u8; 3 + 32];
+    req[0] = TAG;
+    req[1] = FS_OP_MKDIR_P;
+    req[2] = DIR.len() as u8;
+    req[3..3 + DIR.len()].copy_from_slice(DIR);
+    match ask(ctx, &req[..3 + DIR.len()]) {
+        Some(r) => {
+            let p = r.payload_bytes();
+            p.len() >= 2 && p[1] == FS_OK
+        }
+        None => false,
+    }
+}
+
 /// Write `entries` as the whole file.
 fn write(ctx: &ServiceContext, who: &str, entries: &[Entry]) -> bool {
+    if !make_dir(ctx) {
+        ctx.log_fmt(format_args!(
+            "{}: {} could not be created - fs refused or did not answer; the keys stay in memory and the next join tries again",
+            who, core::str::from_utf8(DIR).unwrap_or("?")));
+        return false;
+    }
     let count = core::cmp::min(entries.len(), MAX_SAVED);
     let mut req = [0u8; 3 + 32 + HEADER + MAX_SAVED * ENTRY];
     req[0] = TAG;
@@ -252,7 +280,7 @@ fn write(ctx: &ServiceContext, who: &str, entries: &[Entry]) -> bool {
     req.fill(0);
     if !ok {
         ctx.log_fmt(format_args!(
-            "{}: /wifi.keys was NOT written ({} entr{}) - fs refused or did not answer; the table in memory is unchanged and the next join tries again",
+            "{}: /system/shared/wifi/keys was NOT written ({} entr{}) - fs refused or did not answer; the table in memory is unchanged and the next join tries again",
             who, count,
             if count == 1 { "y" } else { "ies" }
         ));
