@@ -1,6 +1,6 @@
 # 89. Waits that trap the user without `[q] quit`
 
-**Status: FIXED 2026-10-14 in QEMU; the T630 card passed, the other four are pending.** `osdev test quit`, the test the
+**Status: FIXED 2026-10-14 in QEMU; the T630 and Wyse cards passed, the Pi 2, Pi 4 and VisionFive are pending.** `osdev test quit`, the test the
 operator named, shows the rule met: 35 cases, 0 below the bar, `fs` and four services slowed (the tables
 below). Found by
 `audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for every site), what passes and what was not
@@ -273,4 +273,17 @@ task; here it cannot, and the words say so).
   `q` on `foreground` of a job still running (job 1 had finished). The `ResourceId(102) gen mismatch ...
   liveness=Alive` lines after `selfcheck` kills `events` are `backlog/86`, open and not this branch's.
 
-Still owed: the Wyse, the Pi 2, the Pi 4 and the VisionFive 2 Lite.
+**Dell Wyse 5070, 2026-10-14, passed** (`build/serial_output.log`, the same image, `3ed46d5a`, SATA SSD):
+
+- `drives flash data`, then `y`: formatted in 0.23 s, mounted with no reboot.
+- A typed `drives check` ran as a `copier` job: `[q] quit   [b] background` printed 1.35 s after `copier` was
+  spawned, and the sweep finished 0.1 s later (1.4 s in `fs`), so the `b` pressed for it landed at the prompt.
+- `selfcheck`: `ran 592, failed 0, skipped 0`; `background drives scrub` became job 1.
+- Not exercised: the three checks the T630 left (a large `copy` with `q`, `delete <dir> recursive` with `b`,
+  `q` on `foreground` of a running job); this disk is too fast for a check to stay running long enough.
+- **Seen, not fixed (no new card mid-run):** `drives flash` printed `[q] quit` the moment `y` was answered,
+  for a format that then took 0.23 s. The command clock starts at Enter and `read_confirm` does not restart
+  it, so the time a person spends answering `[y/N]` counts toward the 2 s, though rule 10 exempts a wait on
+  the user. Harmless (the notice is true, only early); the fix is to restart the clock when `read_confirm`
+  returns, and it waits for the cards in hand to finish.
+Still owed: the Pi 2, the Pi 4 and the VisionFive 2 Lite.
