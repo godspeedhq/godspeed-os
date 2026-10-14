@@ -358,7 +358,12 @@ and the history save is skipped while a one-request job holds `fs`; `read_confir
 `[q] quit   [b] background` at once and `b` gave the prompt back; a second `jobs` answered at once; once the
 check ended, `foreground 1` replayed its four lines. `drives flash` printed `[q] quit` 1.3 s after its request
 went to `fs`, a 14.5 s format. `selfcheck`: `ran 593, failed 0, skipped 1` (DNS: no internet on that network).
-The Pi 4 card is next.
+**Pi 4 card for the same fix (`87356d2e`, docs only after `ca40aa75`), 2026-10-14, passed:** a 19.4 s check;
+`jobs` twice during it, each answered with the row at once; `foreground 1` twice, each `[q] quit   [b]
+background` at once, the first left with `b`, the second attached to the end: "job 1 done" the moment `fs`
+answered. Seen, not fixed: `foreground` that stays attached to the end says "job 1 done" and does NOT print
+what the check found - the live loop has never replayed the transcript (`finish_attached` does, for a typed
+command); `copier` keeps it, so a second `foreground 1` shows it. No `selfcheck` on this card. The Pi 2 is next.
 
 **The SBCs were slower than the x86 machines at backgrounding and foregrounding** (the operator, 2026-10-14):
 the Pi 2, Pi 4 and VisionFive each took longer than the T630 and Wyse from Enter to the notice, from `b` to
