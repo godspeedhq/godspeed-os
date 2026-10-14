@@ -7557,17 +7557,24 @@ fn shutdown_cue_power(ctx: &ShellCtx) {
 ///
 /// THE KERNEL HOLDS THE DEADLINE (`PowerOff`, syscall 56, `docs/shutdown.md` 6), so a shutdown survives the death
 /// of this shell and of `power`; this command sets it, shows it and cancels it. `power` gives the warnings and the
-/// tidy-up two seconds before it. The shell holds `POWER_OFF` for the operator, beside `REBOOT`.
+/// tidy-up three seconds before it. The shell holds `POWER_OFF` for the operator, beside `REBOOT`.
 fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     match arg {
         "now" => {
             // A copy in flight leaves a full-size file with an undefined tail when it is cut: say so.
+            // Said as it is: `fs`'s journal keeps the filesystem consistent, but a copy cut part-way leaves its
+            // destination full-size with an undefined tail, which only a countdown's tidy-up removes.
             if fs_held_by_job(ctx) || job_believed_live(ctx) {
-                gs::io::println(ctx, "shutdown: a job is running and is cut where it stands; fs recovers on the next boot");
+                gs::io::println(ctx, "shutdown: a job is running and is cut where it stands - a copy in flight leaves a \
+                                      partial file (a plain `shutdown` cancels it first)");
             }
             gs::io::println(ctx, "shutting down now");
             let rc = ctx.power_off();
-            gs::io::println_fmt(ctx, format_args!("shutdown: refused ({}) - this shell does not hold POWER_OFF", rc));
+            if rc == -2 {
+                gs::io::println(ctx, "shutdown: refused - this shell does not hold POWER_OFF");
+            } else {
+                gs::io::println_fmt(ctx, format_args!("shutdown: the kernel did not turn the machine off ({})", rc));
+            }
             return Err(ShellError::Denied);
         }
         "status" => {
@@ -7592,6 +7599,10 @@ fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     } else {
         match parse_duration(arg) {
             Some(s) if (1..=SHUTDOWN_MAX_SECS).contains(&s) => s as u64,
+            Some(0) => {
+                gs::io::println(ctx, "shutdown: a delay is at least 1s - or `shutdown now`");
+                return Err(ShellError::Unknown);
+            }
             Some(_) => {
                 gs::io::println(ctx, "shutdown: at most 24h - a shutdown further away is a calendar's job");
                 return Err(ShellError::Unknown);

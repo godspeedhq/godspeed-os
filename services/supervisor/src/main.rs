@@ -504,7 +504,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // minimum or maximum and nothing else; ONE holder, because the clock is one machine-wide setting and
     // a second holder would silently overwrite this one. It does NOT hold POWER_OFF: a shutdown is the
     // operator's, so the shell holds it, and `power` only reads the deadline the kernel keeps (docs/shutdown.md).
-    // Peers for the shutdown's tidy-up alone, two seconds before it: `fs` to flush and stop writes, `copier` to stop a copy.
+    // Peers for the shutdown's tidy-up alone, three seconds before it: `fs` to flush and stop writes, `copier` to stop a copy.
     ("power", POWER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "copier"],
      godspeed_sdk::service_context::privbits::CPU_CLOCK, 0, 0),
     // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one

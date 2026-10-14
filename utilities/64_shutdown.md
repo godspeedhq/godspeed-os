@@ -9,7 +9,7 @@
 ## 1. Purpose
 
 `shutdown` turns the machine off: in 3 seconds, after a delay you name, or at once. It is a polite power cut. In
-its last two seconds `power` cancels a copy in flight and has `fs` flush and stop taking writes, then the power goes off
+its last three seconds `power` cancels a copy in flight and has `fs` flush and stop taking writes, then the power goes off
 whether or not every step answered, because GodspeedOS recovers from a power cut anyway (`docs/shutdown.md` 2).
 
 ```text

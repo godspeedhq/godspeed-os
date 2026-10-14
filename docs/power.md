@@ -486,5 +486,5 @@ that is absent or refuses costs one log line and the load goes ahead at whatever
 - **Rates between the two ends.** The kernel offers the firmware's minimum and maximum and nothing in
   between. Widening that is a kernel change and needs a reason.
 - **Other power: device power-down, thermal.** This is where they would live. Neither exists.
-- **Shutdown** (2026-10-14, `docs/shutdown.md`): this service gives the warnings and the tidy-up two seconds before the deadline,
+- **Shutdown** (2026-10-14, `docs/shutdown.md`): this service gives the warnings and the tidy-up three seconds before the deadline,
   reading the one deadline the kernel holds. It holds no authority to turn the machine off; the shell does.

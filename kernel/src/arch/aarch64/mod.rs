@@ -1780,25 +1780,34 @@ pub fn hardware_reset() -> ! {
         let rstc_val =
             PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
 
-        // Re-issue the poke every iteration so a write that did not take (a briefly-unready PM block) is
-        // retried, rather than spinning forever on one failed attempt.
+        // POKE ONCE, THEN LET THE WATCHDOG RUN OUT. This re-issued the poke on EVERY iteration, which is the
+        // defect the Pi 2's `hardware_reset` records and fixed: PM_WDOG is a COUNTDOWN and writing it RESTARTS
+        // it, so a tight loop keeps the ten-tick count from ever reaching zero. Found by the shutdown audit
+        // (`audits/2026-10-14-shutdown-docs-and-comments-audit.md`, defect 8); the Pi 4's `reboot` has not been
+        // re-checked on hardware since.
         //
-        // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are
-        // what invariant 12 exists for. If the SoC has not reset after a generous window the reset did
-        // NOT work, and an operator staring at `rebooting...` deserves to be told rather than left
-        // guessing whether to wait or pull the plug. Then keep poking - a late reset is still a reset.
+        // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are what
+        // invariant 12 exists for. If the SoC has not reset after a generous window the reset did NOT work, and
+        // an operator staring at `rebooting...` deserves to be told. A write that genuinely did not land gets
+        // another chance at a cadence far LONGER than the timeout it drives.
+        wdog.write_volatile(PM_PASSWORD | 10);
+        rstc.write_volatile(rstc_val);
         let mut n: u32 = 0;
+        let mut said = false;
         loop {
-            wdog.write_volatile(PM_PASSWORD | 10);
-            rstc.write_volatile(rstc_val);
             n = n.saturating_add(1);
-            if n == 2_000_000 {
-                serial_write_bytes_lockfree(
-                    b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n",
-                );
-                serial_write_bytes_lockfree(
-                    b"reset: power-cycle the board. (still poking in case it takes late)\r\n",
-                );
+            if n % 20_000_000 == 0 {
+                if !said {
+                    said = true;
+                    serial_write_bytes_lockfree(
+                        b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n",
+                    );
+                    serial_write_bytes_lockfree(
+                        b"reset: power-cycle the board. (re-arming slowly in case it takes late)\r\n",
+                    );
+                }
+                wdog.write_volatile(PM_PASSWORD | 10);
+                rstc.write_volatile(rstc_val);
             }
             core::hint::spin_loop();
         }

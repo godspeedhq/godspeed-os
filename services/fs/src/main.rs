@@ -276,13 +276,14 @@ const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep - wa
                              // scanned:u64]. Writes nothing (unlike CHECK, which repairs the bitmap).
 /// Seal a file: `[op, plen, path]`. Content frozen permanently - see `Fs::seal`.
 const OP_SEAL: u8 = 31;
-/// Quiesce for a shutdown (`docs/shutdown.md` 4.3): `[op]` -> `[FS_OK, durable:u8]`. Answered after the request in
+/// Quiesce for a shutdown (`docs/shutdown.md` 4.3): `[op, 0]` -> `[FS_OK, durable:u8]`; `[op, 0, 1]` ends a quiesce
+/// early, for a shutdown cancelled after its tidy-up, -> `[FS_OK]`. Answered after the request in
 /// hand (this service serves one at a time), it flushes the device and then refuses every write for
 /// `QUIESCE_SECS`, so nothing changes between the flush and the power going off. BOUNDED, so a shutdown that never
 /// comes - its caller died between the two - leaves a filesystem that takes writes again by itself.
 const OP_QUIESCE: u8 = 32;
-/// How long a quiesce refuses writes. The power-off follows within about two seconds (`power` starts its tidy-up
-/// two out); ten is the margin.
+/// How long a quiesce refuses writes. The power-off follows within about three seconds (`power` starts its tidy-up
+/// three out); ten is the margin, and a cancelled shutdown ends it at once (`[op, 0, 1]`).
 const QUIESCE_SECS: i64 = 10;
 const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, path, rights:u8] → mint a
                              // delegated resource for the file, reply [FS_OK] + the embedded FILE CAP.
@@ -1590,6 +1591,14 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
     match p[0] & 0x7F {
         OP_QUIESCE => {
             match vol {
+                // Resume: the shutdown this quiesce was for was cancelled, so writes are taken again now rather
+                // than refused for the rest of the ten seconds.
+                Some(f) if p.get(2) == Some(&1) => {
+                    let was = f.quiesced_until > gs::task::epoch_secs_monotonic(ctx);
+                    f.quiesced_until = 0;
+                    if was { ctx.log("fs: quiesce ended - the shutdown was cancelled; writes are taken again"); }
+                    send(&[FS_OK]);
+                }
                 Some(f) => {
                     let durable = block_flush(ctx);
                     f.quiesced_until = gs::task::epoch_secs_monotonic(ctx) + QUIESCE_SECS;

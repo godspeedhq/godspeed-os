@@ -10874,6 +10874,30 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
     check(s.contains("shutdown: cancelled"), "`shutdown cancel` clears it");
     let s = run!(b"shutdown cancel\r");
     check(s.contains("none is pending"), "a second cancel says there is none");
+    let s = run!(b"shutdown 0\r");
+    check(s.contains("at least 1s"), "`shutdown 0` is refused for what it is, not as too long");
+    // A countdown past a threshold: `power` wakes at the 1m mark of a 70 s shutdown, and must WARN there - not
+    // announce the shutdown a second time (the audit's defect 1) or say a threshold already behind it (defect 2).
+    let mark = { buf.lock().unwrap().len() };
+    let _ = run!(b"shutdown 70\r");
+    thread::sleep(Duration::from_secs(13));
+    let seg = { let g = buf.lock().unwrap(); String::from_utf8_lossy(&g[mark..]).into_owned() };
+    check(seg.matches("power: the machine will shut down in").count() == 1,
+          "a countdown's progress is not announced again as a new shutdown");
+    check(seg.contains("power: shutting down in 1m"), "`power` warns at the one-minute mark");
+    check(!seg.contains("shutting down in 5m") && !seg.contains("shutting down in 15m"),
+          "no threshold behind the deadline is said");
+    let s = run!(b"shutdown cancel\r");
+    check(s.contains("shutdown: cancelled"), "the 70 s shutdown is cancelled");
+    // A cancel AFTER the tidy-up: `fs` must take writes again at once, not refuse them for ten seconds (defect 4).
+    send(&mut write_half, b"shutdown 6\r");
+    let tidy = collect_until(&buf, &mut cursor, b"power: tidy-up - fs", Duration::from_secs(15));
+    check(tidy.is_some(), "the tidy-up ran three seconds out");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(1));
+    let s = run!(b"write /after-cancel.txt hi\r");
+    check(s.contains("wrote /after-cancel.txt"), "a write is taken straight after a cancel that followed the tidy-up");
     // A countdown, quit.
     send(&mut write_half, b"shutdown 5\r");
     let shown = collect_until(&buf, &mut cursor, b"[b] background", Duration::from_secs(10));
@@ -10914,7 +10938,9 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
     check(log.contains("power: the machine will shut down in"), "`power` announced the shutdown");
     check(log.contains("power: shutting down in 10s") && log.contains("power: shutting down in 1s"),
           "`power` counted down the last ten seconds");
-    check(log.contains("power: tidy-up - fs"), "`power` asked fs to quiesce two seconds out");
+    check(log.contains("power: tidy-up - fs"), "`power` asked fs to quiesce three seconds out");
+    check(log.contains("fs: quiesce ended - the shutdown was cancelled") && log.contains("power: fs takes writes again"),
+          "a cancel after the tidy-up ended fs's quiesce");
     check(log.contains("fs: quiesced for a shutdown"), "fs flushed and stopped taking writes");
     check(log.contains("power-off: the pending power-off fell due"), "the KERNEL fired the deadline, with nothing asking");
     check(log.contains("power-off: ACPI S5"), "ACPI S5 was written");

@@ -2,7 +2,7 @@
 
 **Status:** built on branch `feat/shutdown`, 2026-10-14, QEMU-verified; hardware cards pending. S1 to S4 are built:
 the kernel's `PowerOff` with its one deadline (S1), `fs`'s quiesce (S2), `power`'s warnings and tidy-up (S3) and the
-shell's `shutdown` (S4). `osdev test shutdown` passes 27 of 27 on x86; QEMU RISC-V powers off through SBI SRST; the
+shell's `shutdown` (S4). `osdev test shutdown` passes 35 of 35 on x86; QEMU RISC-V powers off through SBI SRST; the
 refusal without the capability is `osdev test adv` A12. The command is `utilities/64_shutdown.md`.
 
 ## 1. What is asked for
@@ -53,7 +53,7 @@ refused with a sentence: a shutdown a day away is a calendar's job.
 - **The kernel** holds the deadline - the machine's ONE pending power-off - and fires it when it falls due,
   whether or not any service is alive. It knows nothing about why.
 - **`power`** holds no shutdown authority (no `POWER_OFF`; it keeps `CPU_CLOCK` for the clock leases). It reads the
-  deadline, gives the warnings and does the tidy-up two seconds before the deadline. The shell cues it when the deadline changes; the cue carries no authority, because `power` only ever
+  deadline, gives the warnings and does the tidy-up three seconds before the deadline. The shell cues it when the deadline changes; the cue carries no authority, because `power` only ever
   re-reads what the kernel holds, so a forged cue from anyone changes nothing.
 
 ### 4.1 The foreground countdown, and `[b]`
@@ -82,15 +82,17 @@ command shows everything pending. A line, not a row: it is not a `copier` job.
 
 ### 4.3 At the deadline
 
-The shell refuses `background` in a shutdown's last minute, naming the shutdown. Then `power`, two seconds out,
-each step bounded at about a second and best-effort - a step that is slow can be cut by the deadline:
+The shell refuses `background` in a shutdown's last minute, naming the shutdown. Then `power`, three seconds out,
+each step bounded at about a second - two steps in the two to three seconds left - and best-effort: a step
+that is slower still is cut by the deadline:
 
 1. **`copier`**, if it is running, is sent a cancel: a copy removes its partial destination. A check, a scrub and a
    tree delete are one `fs` request and cannot be stopped; they are cut, and `fs` recovers.
 2. **`fs`** is asked to quiesce (up to 1 s): finish the request in hand, flush the device, and refuse every write
    for ten seconds after. Unanswered (a 34 s check in flight on a USB stick) is said, and skipped: the journal
    covers metadata. Ten seconds and not forever, so a shutdown that never comes leaves a filesystem that takes
-   writes again by itself.
+   writes again by itself - and a shutdown CANCELLED after this step has `power` tell `fs` to take writes again at
+   once.
 
 Then the kernel's deadline falls due and the machine goes off. `shutdown now` skips both; that is a power cut
 asked for on purpose.
@@ -205,8 +207,8 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
 |---|---|---|
 | S1 | The kernel: `PowerOff` now, at and cancel; the one deadline on the BSP tick; query 28; `POWER_OFF` to the shell; the seam member on every port; the halt fallback; the amendment | QEMU x86 and RISC-V power off; `osdev test adv` A12 refuses it without the capability |
 | S2 | `fs`: `OP_QUIESCE` - finish, flush, refuse writes for 10 s | `osdev test shutdown`: fs says it flushed |
-| S3 | `power`: read the deadline, warnings, the tidy-up two seconds out, carry on after a restart | `osdev test shutdown`: the countdown and tidy-up lines |
-| S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 27/0 |
+| S3 | `power`: read the deadline, warnings, the tidy-up three seconds out, carry on after a restart | `osdev test shutdown`: the countdown and tidy-up lines |
+| S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 35/0 |
 | S5 | Cards on all five boards | each says off or halted truthfully, the machine off within about 1 s of a plain `shutdown`'s 3 s |
 | S6 | `reboot` on the same deadline, with the tidy-up | the jobs and quit suites, and a card per board |
 

@@ -30,7 +30,7 @@
 //!
 //! **Shutdown (`docs/shutdown.md`).** This service holds no `POWER_OFF`; the shell does. It READS the one pending
 //! power-off the kernel holds (InspectKernel query 28, `power_off_pending`), warns at 1 h, 30 m, 15 m, 5 m, 1 m and
-//! each of the last ten seconds, and two seconds out (`TIDY_AT`) cancels a copy in flight and has `fs` quiesce. The
+//! each of the last ten seconds, and three seconds out (`TIDY_AT`) cancels a copy in flight and has `fs` quiesce. The
 //! kernel fires the deadline whether or not this service is alive. `OP_SHUTDOWN_CHANGED` is a cue with no reply and
 //! no authority.
 //!
@@ -144,20 +144,27 @@ fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
 /// DEADLINE, and fires it whether or not this service is alive: a polite power cut becomes a plain one, never a
 /// lost one. What this adds is the warnings and the tidy-up in the last seconds. It holds no authority, keeps no
 /// clock of its own for the shutdown, and reads the deadline rather than trusting anyone's word for it.
+///
+/// WHEN IS A DEADLINE NEW? Only on a cue from the shell, which sends one for every set and cancel, or when this
+/// service starts. A countdown's own progress is never read as a new deadline: an earlier version compared the
+/// seconds left with the last read, and every scheduled wake on a long countdown announced the shutdown again.
 struct Shutdown {
     /// The seconds left when last read; `None` when none is pending.
     left: Option<u64>,
-    /// The last warning given, as seconds left (`u64::MAX` = none yet), so each threshold is said once.
+    /// The smallest threshold already said or already behind, so each is said once and none is said late.
     warned: u64,
-    /// Whether the tidy-up has run for this deadline.
+    /// Whether the tidy-up has run for this deadline (and so whether a cancel must resume `fs`).
     tidied: bool,
 }
 
 /// Warn at these many seconds left: an hour, half, a quarter, five minutes, one, then each of the last ten.
 const WARN_AT: [u64; 15] = [3600, 1800, 900, 300, 60, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-/// When the tidy-up starts. Its budget is up to a second per peer (`copier`, then `fs`), so a slow `copier` can leave
-/// `fs`'s quiesce to be cut by the deadline - best-effort, and the journal covers what is cut.
-const TIDY_AT: u64 = 2;
+/// When the tidy-up starts. Its two steps take up to a second each (`copier`, then `fs`), and the kernel's seconds
+/// are rounded up, so three out leaves them two to three seconds - enough for both.
+const TIDY_AT: u64 = 3;
+/// The longest this service sleeps while a shutdown is pending, so a deadline brought earlier without a cue (a
+/// cue lost to a full queue) is still seen within a minute - and before the tidy-up, for any but the last minute.
+const SHUTDOWN_RECHECK_SECS: u64 = 60;
 
 fn say_left(secs: u64) -> (u64, &'static str) {
     if secs >= 3600 && secs % 3600 == 0 { (secs / 3600, "h") }
@@ -165,54 +172,76 @@ fn say_left(secs: u64) -> (u64, &'static str) {
     else { (secs, "s") }
 }
 
+/// The smallest warning threshold at or above `left`: thresholds above a new deadline are behind it, and are not
+/// said (a `shutdown 10m` must not open with "15m").
+fn passed_threshold(left: u64) -> u64 {
+    WARN_AT.iter().copied().filter(|&t| t >= left).last().unwrap_or(u64::MAX)
+}
+
 impl Shutdown {
     fn new() -> Self { Shutdown { left: None, warned: u64::MAX, tidied: false } }
 
-    /// Re-read the kernel's deadline and say what changed.
-    fn refresh(&mut self, ctx: &ServiceContext) {
-        let was = self.left;
+    /// A cue, or this service's start: the deadline may be new, moved, or gone. Re-read it and say which.
+    fn changed(&mut self, ctx: &ServiceContext) {
+        let had = self.left;
+        let was_tidied = self.tidied;
         self.left = ctx.power_off_pending();
-        match (was, self.left) {
-            // New, or brought earlier than the time that was left: warnings start again from where it now stands.
-            (w, Some(secs)) if w.map_or(true, |w| secs + 1 < w) => {
-                self.warned = u64::MAX;
+        match self.left {
+            Some(secs) => {
+                self.warned = passed_threshold(secs);
                 self.tidied = false;
                 let (n, u) = say_left(secs);
                 ctx.log_fmt(format_args!("power: the machine will shut down in {}{} - `shutdown cancel` stops it", n, u));
             }
-            // Gone in its last seconds is the kernel claiming it as it falls due, not a cancel: the kernel clears the
-            // deadline when it fires, and saying "cancelled" then would be the one false line.
-            (Some(w), None) if w > TIDY_AT => ctx.log("power: the pending shutdown was cancelled"),
-            _ => {}
+            None if had.is_some() => {
+                ctx.log("power: the pending shutdown was cancelled");
+                // A cancel after the tidy-up: `fs` is refusing writes for a shutdown that is not coming.
+                if was_tidied {
+                    match gs::fs::Fs::new(ctx).patience_secs(1).resume() {
+                        Ok(()) => ctx.log("power: fs takes writes again"),
+                        Err(e) => ctx.log_fmt(format_args!(
+                            "power: fs did not answer the resume ({:?}); it takes writes again within ten seconds", e)),
+                    }
+                }
+            }
+            None => {}
         }
     }
 
-    /// Whole seconds until this service next has something to do for the shutdown: the next warning, or the
-    /// tidy-up. `None` when none is pending.
-    fn secs_to_next(&self, _ctx: &ServiceContext) -> Option<u64> {
+    /// Whole seconds until this service next has something to do for the shutdown - the next warning, the tidy-up,
+    /// or the recheck - in the KERNEL's seconds. `None` when none is pending.
+    fn secs_to_next(&self) -> Option<u64> {
         let left = self.left?;
         let mut target = WARN_AT.iter().copied().find(|&t| t < left && t < self.warned).unwrap_or(0);
         if !self.tidied && TIDY_AT < left { target = target.max(TIDY_AT); }
-        // At least a second: the kernel counts whole seconds, and the loop re-reads it on every wake.
-        Some(left.saturating_sub(target).max(1))
+        Some(left.saturating_sub(target).clamp(1, SHUTDOWN_RECHECK_SECS))
     }
 
-    /// Warn at a threshold reached; tidy up in the last seconds.
+    /// Between cues: follow the countdown, warn at a threshold reached, and tidy up three seconds out.
     fn tick(&mut self, ctx: &ServiceContext) {
         if self.left.is_none() { return; }
-        // The kernel's word is the truth: a cancel or an earlier deadline is picked up here even without a cue.
-        self.refresh(ctx);
-        let Some(left) = self.left else { return };
-        if let Some(t) = WARN_AT.iter().copied().find(|&t| left <= t && t < self.warned) {
-            // Only the threshold just reached is said; any skipped on the way are not repeated late.
-            let t = WARN_AT.iter().copied().filter(|&x| x >= left).last().unwrap_or(t);
-            self.warned = t;
-            let (n, u) = say_left(t);
-            ctx.log_fmt(format_args!("power: shutting down in {}{}", n, u));
-        }
-        if left <= TIDY_AT && !self.tidied {
-            self.tidied = true;
-            tidy_up(ctx);
+        match ctx.power_off_pending() {
+            // Gone without a cue: the kernel fired it (it clears the deadline as it does), or a cancel whose cue was
+            // lost - which `changed` says and acts on.
+            None => {
+                // The kernel fires when the last second runs out, so only a deadline last read at one second left can have fallen due.
+                if self.left.map_or(false, |l| l > 1) { self.changed(ctx); } else { self.left = None; }
+            }
+            Some(left) => {
+                self.left = Some(left);
+                if left < self.warned {
+                    let t = passed_threshold(left);
+                    if t < self.warned {
+                        self.warned = t;
+                        let (n, u) = say_left(t);
+                        ctx.log_fmt(format_args!("power: shutting down in {}{}", n, u));
+                    }
+                }
+                if left <= TIDY_AT && !self.tidied {
+                    self.tidied = true;
+                    tidy_up(ctx);
+                }
+            }
         }
     }
 }
@@ -254,7 +283,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // A shutdown the kernel already holds - set before this instance started, or before the last one died -
     // is picked up here and said, so a restart surfaces a pending shutdown rather than hiding it.
     let mut sd = Shutdown::new();
-    sd.refresh(&ctx);
+    sd.changed(&ctx);
 
     let mut no_cap: u32 = 0;
     loop {
@@ -268,7 +297,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             .map(|until| { let left = until.saturating_sub(now); (left + per_sec - 1) / per_sec });
         // The shutdown's next event is in the KERNEL's seconds, never this service's clock: on QEMU RISC-V the
         // two did not keep time together, and the deadline fired before the last-second tidy-up.
-        let wait = match (lease_wait, sd.secs_to_next(&ctx)) {
+        let wait = match (lease_wait, sd.secs_to_next()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
@@ -297,14 +326,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
 
         // The pending shutdown: re-read the kernel's deadline (a cancel, or one brought earlier), warn at the
-        // thresholds, and tidy up two seconds out.
-        sd.tick(&ctx);
+        // thresholds, and tidy up three seconds out.
+        // A CUE FIRST: a cancel that arrives as this service wakes must be read as a cancel, not mistaken by the
+        // countdown step for the deadline falling due - which left `fs` refusing writes for a shutdown that was
+        // not coming (`osdev test shutdown`).
+        let cue = matches!(&msg, Some(m) if m.payload_bytes().first() == Some(&OP_SHUTDOWN_CHANGED));
+        if cue { sd.changed(&ctx); } else { sd.tick(&ctx); }
 
         let Some(req) = msg else { continue };
-        if req.payload_bytes().first() == Some(&OP_SHUTDOWN_CHANGED) {
-            sd.refresh(&ctx);
-            continue;
-        }
+        if cue { continue; }
         let Some(cap) = gs::ipc::take_sent_cap(&ctx) else {
             // A request with no reply cap cannot be answered. Rate-limited, because the sender chooses how
             // often this happens (a flood is exactly this), and still loud.

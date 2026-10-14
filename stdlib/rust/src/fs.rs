@@ -799,6 +799,14 @@ impl<'a> Fs<'a> {
         Ok(r.msg.payload_bytes().get(2) == Some(&1))
     }
 
+    /// End a [`quiesce`](Fs::quiesce) early, for a shutdown that was cancelled after its tidy-up: `fs` takes writes
+    /// again at once rather than refusing them for the rest of its ten seconds. **Authority:** the caller's `fs`
+    /// capability.
+    pub fn resume(&mut self) -> Result<(), Error> {
+        self.call(OP_QUIESCE, b"", &[1], self.secs())?;
+        Ok(())
+    }
+
     /// Ask whether a path exists, and what it is.
     ///
     /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's

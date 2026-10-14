@@ -1702,7 +1702,7 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > **Who holds it.** `POWER_OFF` (resource 19) is a privilege bit the supervisor may delegate, granted to the SHELL
 > alone, beside `REBOOT`: ending the session is the operator's, and no service has a reason to end it - a failing
 > service is restarted, never the machine. `power` holds no shutdown authority; it reads the deadline, warns and does a
-> bounded tidy-up two seconds before it. The Commandments baseline lists the shell as the one holder, so a second (a power
+> bounded tidy-up three seconds before it. The Commandments baseline lists the shell as the one holder, so a second (a power
 > button) is a recorded decision. A holder acts only on its own inputs and never offers shutdown-on-request to
 > other services, which would reopen an anonymous path one level up; the keyboard residual of SEC-2 (6.4) applies,
 > since anything that can type can type `shutdown`.

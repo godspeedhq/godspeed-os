@@ -112,7 +112,7 @@ fn find_s5() -> Result<S5, &'static str> {
     // X_DSDT (offset 140, 64-bit) wins where the FADT carries it and it is set.
     let dsdt_phys = match le(fadt, 140, 8) { Some(x) if x != 0 => x, _ => le(fadt, 40, 4).unwrap_or(0) };
     let dsdt = table(dsdt_phys).ok_or("the FADT names no readable DSDT")?;
-    let (a, b) = scan_s5(dsdt).ok_or("the DSDT has no \\_S5 package")?;
+    let (a, b) = scan_s5(dsdt).ok_or("the DSDT has no \\_S5 package this kernel can read")?;
     Ok(S5 {
         pm1a_cnt: pm1a as u16,
         pm1b_cnt: if pm1b <= 0xFFFF { pm1b as u16 } else { 0 },
@@ -128,8 +128,8 @@ fn find_s5() -> Result<S5, &'static str> {
 /// A scan, not an interpreter: the name `_S5_` preceded by `NameOp` (0x08, optionally with a root `\`),
 /// then `PackageOp` (0x12), its length (one to four bytes, the count of extra bytes in the first byte's top
 /// two bits), the element count, and the two values - each a `BytePrefix` (0x0A) and a byte, or a bare
-/// `Zero` (0x00) / `One` (0x01) opcode. `Ones` (0xFF) is read as 0 and any other byte as the value itself, so a
-/// `\_S5` written with a Word or DWord prefix is not handled.
+/// `Zero` (0x00) / `One` (0x01) opcode. Any other encoding (`Ones`, a Word or DWord prefix) is REFUSED rather than
+/// guessed at: a sleep type read wrongly would be written to the power-management port as if it were right.
 fn scan_s5(dsdt: &[u8]) -> Option<(u16, u16)> {
     let aml = dsdt.get(SDT_HEADER_LEN..)?;
     for i in 2..aml.len().saturating_sub(4) {
@@ -140,13 +140,11 @@ fn scan_s5(dsdt: &[u8]) -> Option<(u16, u16)> {
         let mut q = i + 5 + 1 + extra + 1; // past the package length and the element count
         let mut vals = [0u16; 2];
         for v in vals.iter_mut() {
-            let op = *aml.get(q)?;
-            if op == 0x0A {
-                *v = *aml.get(q + 1)? as u16;
-                q += 2;
-            } else {
-                *v = if op == 0xFF { 0 } else { op as u16 };
-                q += 1;
+            match *aml.get(q)? {
+                0x0A => { *v = *aml.get(q + 1)? as u16; q += 2; }
+                0x00 => { *v = 0; q += 1; }
+                0x01 => { *v = 1; q += 1; }
+                _ => return None,
             }
         }
         return Some((vals[0], vals[1]));
@@ -191,6 +189,8 @@ pub fn power_off() -> &'static str {
             n += 1;
         }
     }
+    // Whether the chipset is in ACPI mode, so a write that does not take can say which of two causes it is.
+    let acpi_mode = inw(s5.pm1a_cnt) & SCI_EN != 0;
     outw(s5.pm1a_cnt, (inw(s5.pm1a_cnt) & !SLP_TYP_MASK) | ((s5.slp_typa & 7) << 10) | SLP_EN);
     if s5.pm1b_cnt != 0 {
         outw(s5.pm1b_cnt, (inw(s5.pm1b_cnt) & !SLP_TYP_MASK) | ((s5.slp_typb & 7) << 10) | SLP_EN);
@@ -199,6 +199,11 @@ pub fn power_off() -> &'static str {
     for _ in 0..50_000_000u64 {
         core::hint::spin_loop();
     }
-    "ACPI S5 was written and the machine is still running - its firmware wants \\_PTS run first, \
-     which is ACPI bytecode this kernel does not interpret"
+    if !acpi_mode {
+        "ACPI S5 was written and the machine is still running - the firmware never handed power management to \
+         the OS (SCI_EN stayed clear)"
+    } else {
+        "ACPI S5 was written and the machine is still running - most likely its firmware wants \\_PTS run first, \
+         which is ACPI bytecode this kernel does not interpret"
+    }
 }

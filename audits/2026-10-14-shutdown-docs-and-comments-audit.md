@@ -48,30 +48,29 @@ not fixed here.
 | supervisor, shell, `power`, test text | "last second" where the tidy-up starts two out |
 | `osdev/src/main.rs` | `run_quit_test`'s doc comment was left on `run_shutdown_test`; `power` in the plain build list had no reason |
 
-## Code defects (recorded, not fixed here)
+## Code defects (recorded by the audit; fixed the same day, in the commit after it, at the operator's word)
 
-1. **`power` re-announces a shutdown as it counts down.** `Shutdown::refresh` treats any read where the seconds left
-   fell by two or more as "new or brought earlier" (`secs + 1 < w`), so each scheduled wake on a long countdown logs
-   "the machine will shut down in ..." again and resets the warnings. `osdev test shutdown` passes because it checks
-   only that lines are present.
-2. **A wrong warning right after a deadline is set.** With `warned` reset, a `tick` before the first scheduled wake
-   (a lease request arriving, say) announces the smallest threshold at or above the time left - "15m" for a
-   `shutdown 10m`.
-3. **The tidy-up can be cut.** It starts when the kernel says two seconds or less remain (rounded up, so between one
-   and two), and takes up to a second for `copier` and a second for `fs`. A slow `copier` leaves `fs`'s quiesce to
-   be cut. Start it at 3, or share one budget.
-4. **A cancel in the last two seconds is silent in `power`**, and `fs` may already be refusing writes for its ten
-   seconds; the shell does say "cancelled".
-5. **`shutdown now`'s line "fs recovers on the next boot"** overclaims for a cut copy, which leaves a full-size file
-   with an undefined tail; and any non-success return is reported as "does not hold POWER_OFF".
-6. **`shutdown 0`** is refused as "at most 24h".
-7. **`acpi.rs` blames `\_PTS`** whenever S5 does not take, which the kernel does not know: an SCI_EN that never set,
-   or a misread `SLP_TYPa`, ends the same way. `Ones` (0xFF) read as 0, and an unknown prefix taken as a value rather
-   than refused.
-8. **The Pi 4's `hardware_reset` re-arms the watchdog on every loop pass** - the pattern the Pi 2's `hardware_reset`
-   records as having stopped `reboot` from ever resetting ("kept petting the dog it was waiting on to bite").
-   Pre-existing, not this branch's; whether the Pi 4's `reboot` misbehaves on hardware is not checked here. The new
-   Pi 4 `power_off` pokes once.
+1. **`power` re-announced a shutdown as it counted down.** `Shutdown::refresh` read any fall of two seconds or more
+   as "new or brought earlier". **Fixed:** a deadline is new only on a cue from the shell or at `power`'s start
+   (`Shutdown::changed`); a countdown step only follows it. `osdev test shutdown`: a 70 s shutdown warns at 1m and is
+   announced once.
+2. **A wrong first warning after a deadline was set** ("15m" for a `shutdown 10m`). **Fixed:** a new deadline marks
+   every threshold at or above it as passed (`passed_threshold`). Checked in the same 70 s case.
+3. **The tidy-up could be cut** (two steps of up to a second each, started at two seconds left, rounded up).
+   **Fixed:** it starts three seconds out (`TIDY_AT = 3`), and while a shutdown is pending `power` re-reads the
+   deadline at least once a minute, so one brought earlier without a cue is still seen in time.
+4. **A cancel in the last seconds was silent, and `fs` went on refusing writes.** **Fixed:** `fs` takes `[op, 0, 1]`
+   to end a quiesce (`gs::fs::Fs::resume`), and `power` sends it when a shutdown is cancelled after its tidy-up. Found
+   while fixing it: `power` ran its countdown step BEFORE reading the cancel's cue, and took the vanished deadline for
+   one falling due; the cue is now read first. `osdev test shutdown`: a write goes straight through after such a cancel.
+5. **`shutdown now`'s lines overclaimed.** **Fixed:** it says a copy in flight leaves a partial file, and it reports
+   "does not hold POWER_OFF" only for that refusal.
+6. **`shutdown 0` was refused as "at most 24h".** **Fixed:** "a delay is at least 1s - or `shutdown now`".
+7. **`acpi.rs` blamed `\_PTS` whenever S5 did not take, and read unknown `\_S5` encodings as values.** **Fixed:** an
+   SCI_EN that never set is said as that, `\_PTS` is "most likely" rather than certain, and any encoding but
+   `BytePrefix`, `Zero` and `One` is refused rather than guessed.
+8. **The Pi 4's `hardware_reset` re-armed the watchdog on every loop pass.** **Fixed** as the Pi 2's: poke once, then
+   re-arm only at a cadence far longer than the timeout. Not this branch's defect, and the Pi 4's `reboot` has not
+   been re-checked on hardware since: it needs a card.
 
-1 to 7 are this branch's own and stand between it and the hardware cards; 8 is older. Where they are recorded and
-fixed is the operator's call (no new backlog entry without asking).
+After the fixes: `osdev test shutdown` 35/0, and every regression suite again (in the commit).
