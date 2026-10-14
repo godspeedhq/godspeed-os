@@ -10924,9 +10924,15 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
         ("!wait 8", ""),
         ("!jobs", ""),
         ("~drives check",                     "typed, runs as a job: b detaches it"),
+        // While that check is still one request inside `fs`: `foreground` must offer `[q]` at once and come
+        // back on `q` without waiting for `copier`, which reads nothing until the check ends (five boards
+        // showed 8 s here, `backlog/fixed/89`). `$job` is the number the `b` above was given.
+        ("foreground $job",                   "a live check: q stops the wait, not the check"),
         ("!wait 8", ""),
         ("!jobs", ""),
         ("~drives scrub",                     "typed, runs as a job: b detaches it"),
+        // And `jobs` during the scrub: the row as last seen, without an 8 s question to a deaf `copier`.
+        ("jobs",                              "a live scrub: answered from the row"),
         ("!wait 8", ""),
         ("!jobs", ""),
         ("~delete /q/tree recursive",         "typed, runs as a job: b detaches it"),
@@ -10938,12 +10944,15 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
         // prompt behind either way.
         ("run /q/loop.gsh",                   "a script that loops 20 s"),
     ];
+    // The number the last `b` was given, for a `$job` in a case.
+    let mut last_job = String::from("1");
     for (c, what) in cases {
-        if let Some(setup_cmd) = c.strip_prefix('!') {
+        let owned = c.replace("$job", &last_job);
+        if let Some(setup_cmd) = owned.strip_prefix('!') {
             let _ = setup!(format!("{setup_cmd}\r").as_bytes(), 90);
             continue;
         }
-        let (detach, c) = match c.strip_prefix('~') { Some(rest) => (true, rest), None => (false, *c) };
+        let (detach, c) = match owned.strip_prefix('~') { Some(rest) => (true, rest), None => (false, owned.as_str()) };
         let line = format!("{c}\r");
         let t0 = Instant::now();
         send(&mut write_half, line.as_bytes());
@@ -10958,6 +10967,10 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
                 send(&mut write_half, if detach { b"b" } else { b"q" });
                 let after = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
                 let detached = after.as_deref().map_or(false, |a| a.contains("[backgrounded] job"));
+                if let Some(n) = after.as_deref().and_then(|a| a.split("[backgrounded] job ").nth(1))
+                    .map(|t| t.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>()).filter(|n| !n.is_empty()) {
+                    last_job = n;
+                }
                 let back = after.as_ref().map(|_| tq.elapsed().as_secs_f32());
                 let said = after.as_deref().unwrap_or("").lines()
                     .map(|l| l.trim()).filter(|l| !l.is_empty() && !l.contains("gsh>"))

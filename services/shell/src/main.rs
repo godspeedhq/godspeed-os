@@ -503,6 +503,11 @@ pub struct ShellCtx {
     /// Whether this shell has started `copier` and not yet ended it - so [`tidy_helpers`] looks for it
     /// only when there can be one, rather than walking every task slot after every command.
     copier_started: core::cell::Cell<bool>,
+    /// A STATUS question `copier` has not answered yet, and when it was asked. A check, a scrub and a tree
+    /// delete are one `fs` request each, and `copier` reads nothing until it ends, so `jobs` and `foreground`
+    /// look for the answer to the question already asked rather than wait on a new one (`copier_status`).
+    copier_owed: core::cell::Cell<bool>,
+    copier_owed_at: core::cell::Cell<i64>,
 }
 
 /// The shell's bounded type-ahead (see `ShellCtx::typeahead`): a FIFO of keys, and whether a key has
@@ -561,11 +566,23 @@ impl ShellCtx {
     }
     /// A command starts: the clock runs from now, nothing has been shown, nothing has been quit.
     fn begin_command(&self) {
+        self.begin_command_at(gs::task::epoch_secs_monotonic(&self.inner));
+    }
+    /// [`begin_command`](Self::begin_command) with the clock started at `start`: Enter, read before the
+    /// history save, so a save held up by a busy `fs` counts toward the 2 s rather than going unshown.
+    fn begin_command_at(&self, start: i64) {
         self.quit.set(false);
         self.cmd_noticed.set(false);
         self.offer_b.set(false);
-        self.cmd_start.set(gs::task::epoch_secs_monotonic(&self.inner));
+        self.cmd_start.set(start);
         self.cmd_active.set(true);
+    }
+    /// The person just answered a question (`[y/N]`): the time spent answering was a wait on them, which
+    /// rule 10 does not count, so the clock starts again from here.
+    fn restart_clock(&self) {
+        if self.cmd_active.get() && !self.cmd_noticed.get() {
+            self.cmd_start.set(gs::task::epoch_secs_monotonic(&self.inner));
+        }
     }
     /// The command is over: waits are plain again until the next one.
     fn end_command(&self) {
@@ -655,6 +672,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         jobs: core::cell::RefCell::new(JobTable::new()),
         typeahead: core::cell::RefCell::new(TypeAhead::new()),
         copier_started: core::cell::Cell::new(false),
+        copier_owed: core::cell::Cell::new(false),
+        copier_owed_at: core::cell::Cell::new(0),
     };
     let ctx = &ctx;
     // The boot sequence (kernel + every service's logs, the xHCI enumeration) is
@@ -871,17 +890,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // to echo the Enter as "\r\n").
                 gs::io::print(ctx, "\r\n");
                 if line.len > 0 {
+                    // Enter, before anything waits: the command clock runs from here (below).
+                    let entered = gs::task::epoch_secs_monotonic(&ctx);
                     // A line that READS a secret (`input secret ...`) never enters the recall ring or
                     // /users/default/history (§8 secret taint): a password recovered on up-arrow would defeat the
                     // whole point of invisible entry. It still EXECUTES below; it just isn't remembered.
                     if !line_reads_secret(line.bytes()) {
                         hist.push(line.bytes());
-                        hist.save(&ctx); // write-through to the fs (best-effort; never stalls the prompt)
+                        // Write-through to the fs (best-effort). Not while a job holds `fs` inside one
+                        // request (a check, a scrub, a tree delete): the save would wait its 2 s for
+                        // nothing, before the command had begun. The ring is written whole, so the next
+                        // save carries this line. Looked at again first (a short look, `copier_status`), so a
+                        // job that has ended does not go on stopping the save.
+                        if fs_held_by_job(&ctx) { refresh_jobs(&ctx); }
+                        if !fs_held_by_job(&ctx) {
+                            hist.save(&ctx);
+                        }
                     }
-                    // The command clock runs from Enter to the prompt (`begin_command`): every wait the
-                    // command makes says `[q] quit` once it has run 2 s, and stops at the next request
-                    // after a `q`.
-                    ctx.begin_command();
+                    // The command clock runs from Enter to the prompt (`begin_command_at`): every wait the
+                    // command makes says `[q] quit` once 2 s have passed since Enter, and stops at the next
+                    // request after a `q`. From Enter, so a slow history save above counts.
+                    ctx.begin_command_at(entered);
                     ctx.typed.set(true);
                     last_result = execute(&ctx, line.bytes(), &mut cwd, last_result, 0, &mut Out::Console);
                     ctx.end_command();
@@ -22892,11 +22921,41 @@ fn copier_status(ctx: &ShellCtx) -> Ask {
     if slot_of(ctx, "copier").is_none() {
         return Ask::Gone;
     }
+    // A job that is one `fs` request (a check, a scrub, a tree delete): `copier` answers nothing until it
+    // ends, so waiting on it is waiting for the job. `jobs` and `foreground` waited 8 s for that on all five
+    // boards (`backlog/fixed/89`). So its answer is LOOKED for, not waited on: one short question, and a
+    // new one only when none is owed or the owed one is 2 s old - its answer may have been taken by another
+    // wait's opening drain, and a job believed running that has ended must still be seen to end. The look is
+    // 300 ms, which an idle `copier` answers inside; 1 ms was too short for that and left a finished job
+    // `running` (`osdev test quit`). Late answers are sifted by op wherever they land.
+    if fs_held_by_job(ctx) {
+        if ctx.copier_owed.get() {
+            for _ in 0..8 {
+                match gs::ipc::try_recv(ctx) {
+                    Some(r) if copier_answers(&r, CP_OP_STATUS) => {
+                        ctx.copier_owed.set(false);
+                        return status_of(&r);
+                    }
+                    Some(_) => continue,
+                    None => break,
+                }
+            }
+            if gs::task::epoch_secs_monotonic(ctx) - ctx.copier_owed_at.get() < 2 {
+                return Ask::Busy;
+            }
+        }
+        let _ = gs::cap::reacquire(ctx, "copier");
+        let r = copier_ask(ctx, &[CP_OP_STATUS], 300);
+        ctx.copier_owed.set(r.is_none());
+        ctx.copier_owed_at.set(gs::task::epoch_secs_monotonic(ctx));
+        return r.map_or(Ask::Busy, |r| status_of(&r));
+    }
     let _ = gs::cap::reacquire(ctx, "copier");
     let r = match copier_ask_watched(ctx, &[CP_OP_STATUS], 8) {
         Some(r) => r,
         None => return Ask::Busy,
     };
+    ctx.copier_owed.set(false);
     status_of(&r)
 }
 
@@ -23222,6 +23281,17 @@ fn job_believed_live(ctx: &ShellCtx) -> bool {
     ctx.jobs.borrow().rows.iter().any(|r| r.used && r.live)
 }
 
+/// Is the live job one `fs` request for its whole length - a check, a scrub, a tree delete? While it is,
+/// `copier` reads nothing and `fs` answers nobody else, so a wait on either is a wait for the job to end.
+fn one_request_kind(kind: u8) -> bool {
+    kind == KIND_CHECK || kind == KIND_SCRUB || kind == KIND_DELETE_TREE
+}
+
+/// The live job, as the shell last saw it, is one `fs` request (`one_request_kind`).
+fn fs_held_by_job(ctx: &ShellCtx) -> bool {
+    ctx.jobs.borrow().rows.iter().any(|r| r.used && r.live && r.state == ST_RUNNING && one_request_kind(r.kind))
+}
+
 /// `copy <src> <dst>` typed: a job when the source is a file. A directory, a missing source or a bad path
 /// is the shell's to explain, so those run there.
 fn copy_typed(ctx: &ShellCtx, cwd: &Cwd, src: &str, dst: &str) -> Result<(), ShellError> {
@@ -23326,7 +23396,7 @@ fn copier_ask_watched(ctx: &ShellCtx, op_msg: &[u8], secs: i64) -> Option<Messag
 /// keys itself, and after a `q`, when a watched one would not be sent at all.
 fn copier_ask(ctx: &ShellCtx, op_msg: &[u8], ms: u64) -> Option<Message> {
     let op = op_msg.first().copied().unwrap_or(0);
-    // quit-ok: bounded by its callers: 1 ms in the attach loop, 300 ms before a start, 8 to 12 s only between commands
+    // quit-ok: bounded by its callers: 1 ms in the attach loop, 300 ms for the status look and before a start, 8 to 12 s only between commands
     match ctx.request_with_reply_ms("copier", &Message::from_bytes(op_msg), ms) {
         Some(r) if copier_answers(&r, op) => Some(r),
         Some(_) => copier_recv(ctx, op, ms),
@@ -23405,10 +23475,13 @@ fn attach_job(ctx: &ShellCtx, id: u32, kind: u8, mut start_owed: bool) -> Option
             // Sent, and the answer looked for once; the next passes look again.
             let r = copier_ask(ctx, &[CP_OP_STATUS], 1);
             owed = r.is_none();
+            // Shared with `copier_status`, so a `jobs` after `b` looks for this answer rather than asking again.
+            ctx.copier_owed.set(owed);
+            ctx.copier_owed_at.set(gs::task::epoch_secs_monotonic(ctx));
             r
         };
         match reply {
-            Some(ref r) => { owed = false; apply_ask(ctx, status_of(r)); }
+            Some(ref r) => { owed = false; ctx.copier_owed.set(false); apply_ask(ctx, status_of(r)); }
             None if slot_of(ctx, "copier").is_none() => apply_ask(ctx, Ask::Gone),
             None => {}
         }
@@ -23724,12 +23797,24 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     gs::io::println(ctx, "[q] quit   [b] background");
     let mut shown = 101u32; // impossible, so the first sample always prints
     loop {
-        if let Some(b) = ctx.try_console_read() {
+        // A `q` the status wait below read is the command's quit, set on `ctx.quit` rather than left for this
+        // loop to read; it was ignored, and the loop ran on until the job ended.
+        let key = if ctx.quit.get() { Some(b'q') } else { ctx.try_console_read() };
+        if let Some(b) = key {
             if b == b'b' || b == b'B' {
                 gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", want));
                 return Ok(());
             }
             if b == b'q' || b == b'Q' || b == 0x1b {
+                // A check, a scrub or a tree delete is one `fs` request that cannot be stopped part-way, and
+                // `copier` would read a cancel only after it ended: say that, as `quit_attached` does.
+                let k = ctx.jobs.borrow().rows.iter().find(|r| r.used && !r.hidden && r.id == want).map_or(0, |r| r.kind);
+                if one_request_kind(k) {
+                    gs::io::println_fmt(ctx, format_args!(
+                        "{}: stopped waiting - it is one request to fs, which cannot be stopped part-way; it goes on as job {}, and `foreground {}` shows what it found",
+                        job_verb(k), want, want));
+                    return Ok(());
+                }
                 // `q` STOPS THE TASK, not just this view of it (conventions rule 11). Anything else
                 // would make the key mean two different things depending on what it is pressed in.
                 // Plain, not under the watch: the command is already quit and the cancel must still go. ONE
@@ -23785,7 +23870,8 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             shown = 0;
             gs::io::println(ctx, "running - this kind of job has no measurable progress");
         }
-        gs::task::yield_now(ctx);
+        // One `fs` request: the status is only looked for (`copier_status`), so pace the looks rather than spin.
+        if one_request_kind(kind) { gs::task::sleep_ms(ctx, 50); } else { gs::task::yield_now(ctx); }
     }
 }
 
@@ -25114,6 +25200,7 @@ fn read_confirm(ctx: &ShellCtx) -> bool {
             _ => {}
         }
     }
+    ctx.restart_clock();
     len > 0 && (buf[0] == b'y' || buf[0] == b'Y')
 }
 

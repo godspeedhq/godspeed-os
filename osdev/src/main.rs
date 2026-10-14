@@ -1911,7 +1911,11 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         let _ = std::process::Command::new("cargo")
             .args(["clean", "--release", "-p", "block-driver", "--target", "x86_64-unknown-none"]).status();
     }
-    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder", "audio-driver"];
+    let non_supervisor = ["events", "console", "control", "time", "hw-enumerator", "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci", "block-driver", "nic-driver", "net-stack", "counter", "reply-server", "asker", "resource-server", "holder", "audio-driver",
+        // `copier` and `recorder` too: `osdev test quit` builds them with `slow-replies`, and a suite run after it
+        // embedded that slow `copier` (2.5 s a reply) because nothing here rebuilt it plain - `osdev test jobs`
+        // failed 7 checks on it, none of them real.
+        "copier", "recorder"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
         if *crate_name == "block-driver" && !bd_features.is_empty() {
