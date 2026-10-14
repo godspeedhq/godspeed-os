@@ -1,6 +1,6 @@
 # 89. Waits that trap the user without `[q] quit`
 
-**Status: FIXED 2026-10-14 in QEMU; the T630, Wyse and Pi 2 cards passed, the Pi 4 and VisionFive are pending.** `osdev test quit`, the test the
+**Status: FIXED 2026-10-14 in QEMU; the T630, Wyse, Pi 2 and Pi 4 cards passed, the VisionFive is pending.** `osdev test quit`, the test the
 operator named, shows the rule met: 35 cases, 0 below the bar, `fs` and four services slowed (the tables
 below). Found by
 `audits/2026-10-13-quit-audit.md`, which has the evidence (file:line for every site), what passes and what was not
@@ -304,8 +304,27 @@ task; here it cannot, and the words say so).
   say "running" from the row without asking. Recorded with the clock edge above, for after the cards.
 - `foreground 1`, typed while the check ran, took about 8 s by the operator's watch, and the log shows no
   `[q]` line for it. It opens with the same `copier_status` question, so 8 s is that question's bound; the
-  missing notice is NOT explained (the clock starts after the history save, itself a silent wait of up to 2 s
-  on an `fs` busy with the check). Not reproduced; for after the cards, with the `jobs` edge above.
+  missing notice has an explanation that fits both boards, not yet proved: the history save at Enter runs
+  before the command clock starts and waits up to 2 s on an `fs` busy with the check, silent (the "between
+  commands" gap above). Both logs then show "sdk: discarded 1 abandoned reply before a request to `fs` - an
+  earlier request timed out", which is that save. So up to about 4 s from Enter can pass with no `[q]`: 2 s
+  of save, then 2 s of clock. A wait the operator timed at 8 s does not fit that, and stays open. The fix
+  for both is to stop the save waiting on a busy `fs`, and to stop `jobs` and `foreground` asking a `copier`
+  that is inside one request; for after the cards.
 - Not exercised here either: a large `copy` with `q`, `delete <dir> recursive` with `b`, and `q` on
   `foreground` of a running job.
-Still owed: the Pi 4 and the VisionFive 2 Lite.
+**Raspberry Pi 4, 2026-10-14, passed** (`build/serial_output.log`, the same commit, `3ed46d5a`, the USB stick
+through `xhci`):
+
+- `drives flash` of drive 0, then `y`: 14.1 s in `fs`, `[q] quit` 0.3 s after the `y`; `tree /` showed the standard
+  tree and `users/default/history`. `home` and `pwd` answered `/users/default`.
+- A typed `drives check`: `[q] quit   [b] background` 1.7 s after `copier` was spawned, `b` gave
+  `[backgrounded] job 1` 1.4 s later; the sweep took 21 s in `fs`.
+- `jobs` during it: `[q] quit`, then the table 8 s after the clock began, the row as last seen - the edge the
+  Pi 2 showed, the same on a second board.
+- `foreground 1` during it: "job 1 is done" and the four lines replayed when the sweep ended, about 5 s after
+  the prompt, with no `[q]` line - the Pi 2's missing notice, seen again.
+- `selfcheck`: `ran 594, failed 0, skipped 0`.
+- Not exercised: `q` on `foreground` of a running job (the job ended first), a large `copy` with `q`,
+  `delete <dir> recursive` with `b`.
+Still owed: the VisionFive 2 Lite.
