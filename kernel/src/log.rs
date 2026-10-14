@@ -18,7 +18,7 @@
 
 use core::fmt;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::smp::SpinLock;
 
@@ -79,16 +79,27 @@ static RING: SpinLock<RingBuffer> = SpinLock::new(RingBuffer::new());
 /// 4s`). So a log line that finds the line open starts a new one first, on serial only: the ring holds
 /// log lines alone, which are whole.
 ///
-/// Tidiness, not correctness. Two cores writing at once can each miss the other's last byte, and the
-/// cost is the old join, never lost or reordered output. Relaxed for the same reason.
+/// Tidiness, not correctness: the worst a race costs is a join or a spare blank line, never lost or reordered
+/// output. Relaxed for the same reason.
 static SERIAL_LINE_OPEN: AtomicBool = AtomicBool::new(false);
 
-/// The console path (syscall `ConsoleWrite`) reports what it put on serial, so the next log line knows
+/// Console writes under way. A log line that finds one counts the line as open, because the decision is made
+/// BEFORE its own serial write waits for the port: at 115200 baud a shell line takes milliseconds to go out, and
+/// a log line decided during that window ran on from it (the T630, 2026-10-14; QEMU's serial is instant and
+/// never showed it). Counting it open costs at most a blank line when the console bytes end in a newline.
+static CONSOLE_WRITES: AtomicU32 = AtomicU32::new(0);
+
+/// The console path (syscall `ConsoleWrite`) brackets its serial write with these, so the next log line knows
 /// whether it is starting at the beginning of a line.
-pub fn note_console_bytes(s: &[u8]) {
+pub fn console_write_begin() {
+    CONSOLE_WRITES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn console_write_end(s: &[u8]) {
     if let Some(&last) = s.last() {
         SERIAL_LINE_OPEN.store(last != b'\n', Ordering::Relaxed);
     }
+    CONSOLE_WRITES.fetch_sub(1, Ordering::Relaxed);
 }
 
 /// Bytes a single log message stages for serial before flushing atomically. Covers any
@@ -145,7 +156,7 @@ pub fn write_fmt(args: fmt::Arguments) {
     crate::smp::without_interrupts(|| {
         let mut ring = RING.lock();
         let mut sink = LogSink { ring: &mut ring, stage: [0u8; SERIAL_STAGE], n: 0 };
-        if SERIAL_LINE_OPEN.load(Ordering::Relaxed) {
+        if SERIAL_LINE_OPEN.load(Ordering::Relaxed) || CONSOLE_WRITES.load(Ordering::Relaxed) > 0 {
             sink.stage[..2].copy_from_slice(b"\r\n");
             sink.n = 2;
         }

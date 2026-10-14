@@ -285,8 +285,9 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // console's drain loop was not reaching its paint. That is fixed in the service, and the
     // counters used to find it are gone - a measurement kept after it has answered its question is
     // just a tax on the hot path (three rdtsc reads per write, here).
+    crate::log::console_write_begin();
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
-    crate::log::note_console_bytes(bytes);
+    crate::log::console_write_end(bytes);
     // Serial is written FIRST and unconditionally above, so the log is complete and never duplicated
     // even though the call below can park this task. What the return value carries is the outcome of
     // the wait, not of the write: 0, or a negative code if the terminal died while we were blocked.
