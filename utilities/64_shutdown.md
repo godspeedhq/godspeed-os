@@ -1,18 +1,17 @@
-# Utility: `shutdown` - turn the machine off (not provided yet: designed, being built)
+# Utility: `shutdown` - turn the machine off
 
 **Utility:** `shutdown` - turn the machine off, now or after a delay
-**Status:** Design, 2026-10-14, not built (`docs/shutdown.md`, branch `feat/shutdown`).
-**Shape:** shell built-in that asks the `power` service (see `0_conventions.md` section 2).
+**Status:** Built 2026-10-14, QEMU-verified (`osdev test shutdown`); hardware cards pending. Design: `docs/shutdown.md`.
+**Shape:** shell built-in. The shell holds `POWER_OFF`; the KERNEL holds the deadline; `power` warns and tidies up.
 
 ---
 
 ## 1. Purpose
 
-`shutdown` turns the machine off: in 3 seconds, after a delay you name, or at once. It is a polite power cut. A
-short, fixed tidy-up flushes the disk and cancels a copy in flight, then the power goes off whether or not every
-step answered, because GodspeedOS recovers from a power cut anyway (`docs/shutdown.md` section 2).
+`shutdown` turns the machine off: in 3 seconds, after a delay you name, or at once. It is a polite power cut. In
+its last two seconds `power` cancels a copy in flight and has `fs` flush and stop taking writes, then the power goes off
+whether or not every step answered, because GodspeedOS recovers from a power cut anyway (`docs/shutdown.md` 2).
 
-<!-- foreign-ok: `shutdown` is designed here and not built; it leaves the shell's FOREIGN_HINTS in step S4 -->
 ```text
 gsh> shutdown 5
 shutdown in 5s   [q] quit   [b] background
@@ -20,43 +19,45 @@ shutdown in 5s   [q] quit   [b] background
 
 ## 2. Invocation
 
-<!-- foreign-ok: `shutdown` is designed here and not built; it leaves the shell's FOREIGN_HINTS in step S4 -->
 ```text
 shutdown              shut down in 3 s
-shutdown <delay>      shut down after <delay>: 5, 5s, 5m, 5h; a bare number is seconds; at most 24 h
-shutdown now          at once: no countdown, no tidy-up; names a copy in flight that it will cut
-shutdown status       whether one is pending, when, and how long is left
+shutdown <delay>      shut down after <delay>: 5, 5s, 5m, 5h; a bare number is seconds; at most 24h
+shutdown now          at once: no countdown, no tidy-up
+shutdown status       whether one is pending, and how long is left
 shutdown cancel       stop a pending shutdown
 ```
-One shutdown is pending at a time; a second is refused and names the first.
 
 ## 3. Behaviour
 
+- **The deadline is the kernel's.** `shutdown` sets the machine's one pending power-off in the kernel (`PowerOff`,
+  syscall 56), so it survives the death of this shell, of `power`, of every service; and it is gone at a reboot. The
+  kernel logs every set and cancel with who asked, and anyone can read how long is left.
+- **Earliest wins.** A second `shutdown` for LATER than the pending one is refused and names it - nothing can
+  postpone a shutdown already set. One for sooner moves it forward.
 - **Under a minute**, the countdown runs in the foreground on one line, rewritten each second, with `[q] quit` and
   `[b] background`. `q` cancels the shutdown (rule 11). `b` gives the prompt back and the shutdown goes on.
-- **A minute or more** gives the prompt back at once and says when: `shutdown at 14:05 (in 5h) - shutdown cancel
-  stops it` (the clock time only when `time` has one).
-- **Warnings** come from `power` at 1 h, 30 m, 15 m, 5 m and 1 m before, then every second for the last 10.
-- **In the last minute** no new job starts; `background` and a typed copy refuse and name the shutdown.
-- **At the deadline**, about 1 s at most: a running copy is cancelled (its partial file removed), `fs` flushes and
-  stops taking writes, then the power-off.
-- **The last line is the truth**: `powered off`, or `halted - it is safe to switch off` where the board cannot cut
-  its own power (`docs/shutdown.md` section 5).
-- If `power` is not running, `shutdown` says so and nothing happens.
+- **A minute or more** gives the prompt back at once: `shutdown in 5m - shutdown cancel stops it`.
+- **Warnings** come from `power`: when it is set, at 1 h, 30 m, 15 m, 5 m and 1 m before, then each of the last ten
+  seconds. A restarted `power` reads the kernel's deadline and carries on.
+- **`jobs`** lists a pending shutdown above the jobs.
+- **In the last minute** no new job starts: `background` refuses and names the shutdown.
+- **`shutdown now`** names a running job it will cut, then turns the machine off.
+- **The last line is the truth**: the machine is off, or the kernel says `every core is halting - it is safe to
+  switch the machine off` where the board cannot cut its own power (`docs/shutdown.md` 5).
 
 ## 4. Output
 
-`shutdown status` is a report: at the prompt, a sentence; piped, one record with `state` (`none`, `pending`),
-`left_secs` and `at` (a clock time, or empty). `shutdown`, `shutdown now` and `shutdown cancel` are actions and
-refuse a pipe with a sentence (rule 12).
+Text at the prompt. `shutdown status` is one sentence; the rest are actions (rule 12).
 
 ## 5. Capabilities
 
-- A send right to **`power`**, which holds the timer and the one capability that turns the machine off
-  (`POWER_OFF`). The shell does not hold it.
-- **Console output**, and the keys for the countdown.
+- **`POWER_OFF`**, which this shell alone holds, beside `REBOOT`: ending the session is the operator's. A second
+  holder - a power button - is a decision recorded in `COMMANDMENTS.baseline.toml`, never a door.
+- **Console output**, the keys for the countdown, and a send to `power` to cue it - a cue that carries no
+  authority, since `power` only re-reads the kernel's deadline.
 
 ## 6. Conformance
 
-To be built to: its `help` and `version` subcommands with real examples; listed by the shell's top-level `help`
-beside `reboot`; rule 10 (`[q] quit` and `[b] background` on the countdown) and rule 11 (`q` stops the shutdown).
+Conforms: `shutdown help` and `shutdown version` with real examples; listed by the shell's top-level `help` under
+**Power**, beside `reboot`; rule 10 (`[q] quit` and `[b] background` on the countdown) and rule 11 (`q` stops the
+shutdown). `halt` and `poweroff` are hints that answer "try `shutdown`".

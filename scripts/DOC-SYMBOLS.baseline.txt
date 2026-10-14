@@ -115,3 +115,5 @@ spawn_on_kernel                    # backlog/fixed/80 K14 - DELETED 2026-10-10, 
 spawn_pipe                         # backlog/fixed/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
 spawn_pipe_on                      # backlog/fixed/80 K14 - DELETED 2026-10-10, the per-core SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
 left_secs                          # utilities/64_shutdown.md - PROPOSAL, step S4: a field of `shutdown status` piped; not built yet
+CAP_SYS_BOOT                       # docs/shutdown.md - Linux capability gating reboot(2), EXTERNAL; how other systems gate shutdown
+zx_system_powerctl                 # docs/shutdown.md - Fuchsia syscall, EXTERNAL; how other systems gate shutdown

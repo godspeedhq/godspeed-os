@@ -1917,8 +1917,6 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         // embedded that slow `copier` (2.5 s a reply) because nothing here rebuilt it plain - `osdev test jobs`
         // failed 7 checks on it, none of them real.
         "copier", "recorder",
-        // `power` too, for the same reason and a worse outcome: `osdev test shutdown` builds it with
-        // `shutdown-test`, which turns the machine off 8 s after boot, and every suite after it would.
         "power"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
@@ -2607,64 +2605,22 @@ fn build_slow_services(svcs: &[&str]) {
 
 /// `osdev test quit` (`backlog/fixed/89`): every kind of wait, on a deliberately slow `fs`, recording whether
 /// `[q] quit` (and `[b]`) appeared, when, and what `q` did. The record is `build/tests/quit_report.md`.
-/// `osdev test shutdown` (`docs/shutdown.md`), step S1 so far: the kernel's `PowerOff` end to end on x86. `power` is built
-/// with `shutdown-test`, which asks for it 8 s after start; QEMU is launched WITHOUT `-no-shutdown`, so an
-/// ACPI S5 that took ends the QEMU process. Passes when the kernel named the caller, wrote S5, and QEMU
-/// exited on its own - and did not fall back to the halt, which would mean the write did not take.
-/// `power` is rebuilt plain afterwards, so no later image carries the test feature.
+/// `osdev test shutdown` (`docs/shutdown.md`): the whole of `shutdown` at the prompt, over a real disk. The shell sets,
+/// shows and cancels the deadline the KERNEL holds; `power` warns and tidies up; the deadline fires with nothing
+/// asking and QEMU (launched without `-no-shutdown`) switches itself off - ACPI S5 on x86.
 fn run_shutdown_test() {
-    println!("\n=== shutdown: S1, PowerOff on x86 (ACPI S5) ===");
-    cmd_build_bare_metal();
-    let build = |args: &[&str]| {
-        let ok = std::process::Command::new("cargo").args(args).status().map(|s| s.success()).unwrap_or(false);
-        if !ok { eprintln!("build FAILED: cargo {}", args.join(" ")); std::process::exit(1); }
-    };
-    build(&["build", "--release", "-p", "power", "--target", "x86_64-unknown-none", "--features", "shutdown-test"]);
-    let rebuild_rest = |build: &dyn Fn(&[&str])| {
-        clean_supervisor();
-        build(&["build", "--release", "-p", "supervisor", "--target", "x86_64-unknown-none", "--features", "supervisor/bare-metal"]);
-        let kargs: Vec<String> = ["build", "--release", "-p", "kernel", "--target", "x86_64-unknown-none"]
-            .iter().map(|s| s.to_string()).chain(kernel_feature_args()).collect();
-        let kref: Vec<&str> = kargs.iter().map(|s| s.as_str()).collect();
-        build(&kref);
-    };
-    rebuild_rest(&build);
+    println!("\n=== shutdown: the shell's command, the kernel's deadline, power's tidy-up ===");
+    build_blockdev_fs("selftest", "");
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
     let limine_dir = std::path::Path::new("tools/limine");
     let image_path = disk_image::create(kernel_elf, limine_dir);
     disk_image::install_bootloader(limine_dir, &image_path);
     let _ = std::fs::create_dir_all("build/tests");
-    let serial = "build/tests/shutdown_serial.log";
-    let _ = std::fs::remove_file(serial);
-    let image = image_path.to_string_lossy().replace('\\', "/");
-    let mut child = std::process::Command::new(crate::qemu::qemu_binary())
-        .args(["-drive", &format!("format=raw,file={image},if=ide"), "-smp", "2", "-m", "512M",
-               "-serial", &format!("file:{serial}"), "-display", "none", "-no-reboot"])
-        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .spawn().unwrap_or_else(|e| { eprintln!("shutdown: QEMU launch failed: {e}"); std::process::exit(1); });
-    let t0 = std::time::Instant::now();
-    let mut exited = None;
-    while t0.elapsed() < std::time::Duration::from_secs(180) {
-        if let Ok(Some(st)) = child.try_wait() { exited = Some(st); break; }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    if exited.is_none() { let _ = child.kill(); let _ = child.wait(); }
-    let log = std::fs::read_to_string(serial).unwrap_or_default();
-    // Plain again before anything can be built from this tree.
-    build(&["build", "--release", "-p", "power", "--target", "x86_64-unknown-none"]);
-    rebuild_rest(&build);
-    let mut pass = 0; let mut fail = 0;
-    let mut check = |ok: bool, what: &str| {
-        if ok { pass += 1; println!("shutdown: PASS - {what}"); } else { fail += 1; println!("shutdown: FAIL - {what}"); }
-    };
-    check(log.contains("spawn[power]: 'power' may turn the machine off (POWER_OFF)"), "the kernel minted POWER_OFF to `power`, and only from its spawn request");
-    check(log.contains("power-off: 'power' asked to turn the machine off"), "the kernel named who asked");
-    check(log.contains("power-off: ACPI S5 - SLP_TYPa"), "it found \\_S5 in the DSDT and PM1a_CNT in the FADT");
-    check(exited.is_some(), &format!("QEMU powered off on its own, {:.1} s after launch", t0.elapsed().as_secs_f32()));
-    check(!log.contains("every core is halting"), "it did not fall back to the halt");
-    check(!log.contains("KERNEL PANIC"), "no kernel panic");
-    println!("shutdown: {pass} passed, {fail} failed (serial: {serial})");
-    if fail > 0 { std::process::exit(1); }
+    let persist = "build/tests/persist_shutdown.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_shutdown(&image_path, persist, 2);
 }
 
 fn run_quit_test() {

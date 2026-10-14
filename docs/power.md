@@ -485,4 +485,6 @@ that is absent or refuses costs one log line and the load goes ahead at whatever
   bring the trap back unless the load held a lease. It does.
 - **Rates between the two ends.** The kernel offers the firmware's minimum and maximum and nothing in
   between. Widening that is a kernel change and needs a reason.
-- **Other power: device power-down, shutdown, thermal.** This is where they would live. None exists.
+- **Other power: device power-down, thermal.** This is where they would live. Neither exists.
+- **Shutdown** (2026-10-14, `docs/shutdown.md`): this service gives the warnings and the last-second tidy-up,
+  reading the one deadline the kernel holds. It holds no authority to turn the machine off; the shell does.

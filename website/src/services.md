@@ -253,7 +253,9 @@ stops it when the dongle leaves (`docs/wifi-usb.md`).
 ```
 
 Holds `CPU_CLOCK` alone. Leases of up to 30 s keep the Arm clock at its maximum while any is open; a
-lease nobody returns expires on its own, so a holder that dies cannot pin the machine fast.
+lease nobody returns expires on its own, so a holder that dies cannot pin the machine fast. It also gives a
+shutdown's warnings and its last-second tidy-up, reading the deadline the kernel holds; it cannot shut the
+machine down itself - only the shell can.
 
 **Peers:** none - it answers, it does not ask.
 

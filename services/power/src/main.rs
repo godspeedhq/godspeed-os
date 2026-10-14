@@ -41,6 +41,12 @@ use godspeed_sdk::{Message, ServiceContext};
 /// The protocol, one opcode byte. Replies lead with a status byte.
 const OP_HOLD: u8 = 1;
 const OP_RELEASE: u8 = 2;
+/// `[3]`, no reply: the shell set or cancelled the machine's pending power-off. A CUE, not a request - it
+/// carries no authority and is never trusted: this service only re-reads the deadline the kernel holds, so a
+/// forged cue from anyone changes nothing but how soon that read happens (`docs/shutdown.md` 6).
+const OP_SHUTDOWN_CHANGED: u8 = 3;
+/// `copier`'s cancel (`services/copier`): stop a copy at its next chunk and remove the partial destination.
+const CP_OP_CANCEL: u8 = 3;
 
 const ST_OK: u8 = 0;
 /// Every lease slot is taken. The holder runs at whatever the clock is; nothing is pinned.
@@ -127,6 +133,104 @@ fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
     let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(body));
 }
 
+/// The machine's pending shutdown, as this service follows it (`docs/shutdown.md` 4). THE KERNEL HOLDS THE
+/// DEADLINE, and fires it whether or not this service is alive: a polite power cut becomes a plain one, never a
+/// lost one. What this adds is the warnings and the tidy-up in the last seconds. It holds no authority, keeps no
+/// clock of its own for the shutdown, and reads the deadline rather than trusting anyone's word for it.
+struct Shutdown {
+    /// The seconds left when last read; `None` when none is pending.
+    left: Option<u64>,
+    /// The last warning given, as seconds left (`u64::MAX` = none yet), so each threshold is said once.
+    warned: u64,
+    /// Whether the tidy-up has run for this deadline.
+    tidied: bool,
+}
+
+/// Warn at these many seconds left: an hour, half, a quarter, five minutes, one, then each of the last ten.
+const WARN_AT: [u64; 15] = [3600, 1800, 900, 300, 60, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
+/// When the tidy-up starts: its budget is about a second, so it begins two out.
+const TIDY_AT: u64 = 2;
+
+fn say_left(secs: u64) -> (u64, &'static str) {
+    if secs >= 3600 && secs % 3600 == 0 { (secs / 3600, "h") }
+    else if secs >= 60 && secs % 60 == 0 { (secs / 60, "m") }
+    else { (secs, "s") }
+}
+
+impl Shutdown {
+    fn new() -> Self { Shutdown { left: None, warned: u64::MAX, tidied: false } }
+
+    /// Re-read the kernel's deadline and say what changed.
+    fn refresh(&mut self, ctx: &ServiceContext) {
+        let was = self.left;
+        self.left = ctx.power_off_pending();
+        match (was, self.left) {
+            // New, or brought earlier than the time that was left: warnings start again from where it now stands.
+            (w, Some(secs)) if w.map_or(true, |w| secs + 1 < w) => {
+                self.warned = u64::MAX;
+                self.tidied = false;
+                let (n, u) = say_left(secs);
+                ctx.log_fmt(format_args!("power: the machine will shut down in {}{} - `shutdown cancel` stops it", n, u));
+            }
+            // Gone in its last seconds is the kernel claiming it as it falls due, not a cancel: the kernel clears the
+            // deadline when it fires, and saying "cancelled" then would be the one false line.
+            (Some(w), None) if w > TIDY_AT => ctx.log("power: the pending shutdown was cancelled"),
+            _ => {}
+        }
+    }
+
+    /// Whole seconds until this service next has something to do for the shutdown: the next warning, or the
+    /// tidy-up. `None` when none is pending.
+    fn secs_to_next(&self, _ctx: &ServiceContext) -> Option<u64> {
+        let left = self.left?;
+        let mut target = WARN_AT.iter().copied().find(|&t| t < left && t < self.warned).unwrap_or(0);
+        if !self.tidied && TIDY_AT < left { target = target.max(TIDY_AT); }
+        // At least a second: the kernel counts whole seconds, and the loop re-reads it on every wake.
+        Some(left.saturating_sub(target).max(1))
+    }
+
+    /// Warn at a threshold reached; tidy up in the last seconds.
+    fn tick(&mut self, ctx: &ServiceContext) {
+        if self.left.is_none() { return; }
+        // The kernel's word is the truth: a cancel or an earlier deadline is picked up here even without a cue.
+        self.refresh(ctx);
+        let Some(left) = self.left else { return };
+        if let Some(t) = WARN_AT.iter().copied().find(|&t| left <= t && t < self.warned) {
+            // Only the threshold just reached is said; any skipped on the way are not repeated late.
+            let t = WARN_AT.iter().copied().filter(|&x| x >= left).last().unwrap_or(t);
+            self.warned = t;
+            let (n, u) = say_left(t);
+            ctx.log_fmt(format_args!("power: shutting down in {}{}", n, u));
+        }
+        if left <= TIDY_AT && !self.tidied {
+            self.tidied = true;
+            tidy_up(ctx);
+        }
+    }
+}
+
+/// The last second before the power goes (`docs/shutdown.md` 4.3): a copy in flight is cancelled, so its partial
+/// destination is removed, and `fs` flushes and stops taking writes. Each is bounded by about a second and an
+/// unanswered one is said and skipped; whatever is not done is left to recovery, which is what it is for.
+fn tidy_up(ctx: &ServiceContext) {
+    ctx.log("power: tidy-up - the last seconds before the shutdown");
+    // `copier` FIRST, because a cancelled copy removes its partial destination through `fs`, which must still take
+    // that write. It runs only while a job does, and asking a name nobody holds would spend the budget finding
+    // that out: so it is asked only when the name resolves.
+    if let Ok(cap) = gs::cap::acquire(ctx, "copier") {
+        gs::cap::remove(ctx, cap);
+        match gs::call::request_within(ctx, "copier", &Message::from_bytes(&[CP_OP_CANCEL]), 1) {
+            Ok(_) => ctx.log("power: tidy-up - copier asked to stop its job"),
+            Err(e) => ctx.log_fmt(format_args!("power: tidy-up - copier did not answer ({:?}); its job is cut", e)),
+        }
+    }
+    match gs::fs::Fs::new(ctx).patience_secs(1).quiesce() {
+        Ok(true) => ctx.log("power: tidy-up - fs flushed and stopped taking writes"),
+        Ok(false) => ctx.log("power: tidy-up - fs stopped taking writes; the device did not confirm a flush"),
+        Err(e) => ctx.log_fmt(format_args!("power: tidy-up - fs did not answer ({:?}); the journal covers it", e)),
+    }
+}
+
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
@@ -139,34 +243,31 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // held is gone, and leaving the clock where it was could leave it fast with nobody to bring it down.
     let control = apply(&ctx, false, "no lease is open (start-up)", &mut no_control_said).is_some();
     ctx.log("power: serving - leases of up to 30 s hold the Arm clock at its maximum (docs/power.md)");
-    // TEST ONLY: the kernel's PowerOff end to end, before `shutdown` exists (docs/shutdown.md S1).
-    #[cfg(feature = "shutdown-test")]
-    {
-        gs::task::sleep_ms(&ctx, 8000);
-        ctx.log("power: shutdown-test - asking the kernel to turn the machine off");
-        let rc = ctx.power_off();
-        ctx.log_fmt(format_args!("power: shutdown-test - PowerOff was refused ({})", rc));
-    }
+    // A shutdown the kernel already holds - set before this instance started, or before the last one died -
+    // is picked up here and said, so a restart surfaces a pending shutdown rather than hiding it.
+    let mut sd = Shutdown::new();
+    sd.refresh(&ctx);
 
     let mut no_cap: u32 = 0;
     loop {
         // WAIT FOR THE EARLIEST EXPIRY, or block outright when nothing is open: an idle machine costs
         // this service nothing at all.
         let now = gs::driver::wait::ticks(&ctx);
-        let next = leases.slots.iter().flatten().map(|l| l.until).min();
         // Whole seconds, rounded UP, because `gs::ipc::recv_within` counts in seconds: waking a fraction
         // late is a lease running a fraction long, and waking early would only loop back here.
-        let msg = match next {
+        let per_sec = cycles(&ctx, 1000).max(1);
+        let lease_wait = leases.slots.iter().flatten().map(|l| l.until).min()
+            .map(|until| { let left = until.saturating_sub(now); (left + per_sec - 1) / per_sec });
+        // The shutdown's next event is in the KERNEL's seconds, never this service's clock: on QEMU RISC-V the
+        // two did not keep time together, and the deadline fired before the last-second tidy-up.
+        let wait = match (lease_wait, sd.secs_to_next(&ctx)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let msg = match wait {
             None => Some(gs::ipc::recv(&ctx)),
-            Some(until) => {
-                let left = until.saturating_sub(now);
-                if left == 0 {
-                    None
-                } else {
-                    let per_sec = cycles(&ctx, 1000).max(1);
-                    gs::ipc::recv_within(&ctx, ((left + per_sec - 1) / per_sec) as i64)
-                }
-            }
+            Some(0) => None,
+            Some(secs) => gs::ipc::recv_within(&ctx, secs as i64),
         };
 
         // EXPIRE whatever is due, whether or not a message arrived - a busy endpoint must not keep a
@@ -187,7 +288,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let _ = apply(&ctx, false, "the last lease expired", &mut no_control_said);
         }
 
+        // The pending shutdown: re-read the kernel's deadline (a cancel, or one brought earlier), warn at the
+        // thresholds, and tidy up in its last second.
+        sd.tick(&ctx);
+
         let Some(req) = msg else { continue };
+        if req.payload_bytes().first() == Some(&OP_SHUTDOWN_CHANGED) {
+            sd.refresh(&ctx);
+            continue;
+        }
         let Some(cap) = gs::ipc::take_sent_cap(&ctx) else {
             // A request with no reply cap cannot be answered. Rate-limited, because the sender chooses how
             // often this happens (a flood is exactly this), and still loud.

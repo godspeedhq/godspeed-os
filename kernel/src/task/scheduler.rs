@@ -317,6 +317,74 @@ pub fn clear_wake_deadline(slot: usize) {
     }
 }
 
+// ---- The pending power-off (`PowerOff` with a delay, CLAUDE.md 12.3, `docs/shutdown.md`) ----
+//
+// ONE deadline for the whole machine, in BSP ticks (the clock every timed wake uses, never the wall clock:
+// `time` sets that from the network, and a spoofed clock must not move a shutdown). 0 = none pending. It is
+// the kernel's own scheduled action, not a service's state: the kernel holds it so that a shutdown survives
+// the death of every service that asked for it or counts it down - and it is gone at reboot, as all kernel
+// memory is. EARLIEST WINS: a holder may bring a shutdown forward and never push one back, so no holder can
+// postpone what another asked for. Any holder may cancel. Every change is logged by the syscall with who.
+
+/// The pending power-off, as the BSP tick it falls due at; 0 = none.
+static POWER_OFF_AT: AtomicU64 = AtomicU64::new(0);
+/// The furthest ahead a power-off may be set: a shutdown a day away is a calendar's job (`docs/shutdown.md` 3).
+pub const POWER_OFF_MAX_SECS: u64 = 24 * 3600;
+/// A tick is a scheduler quantum, 10 ms (9.1).
+const POWER_OFF_TICKS_PER_SEC: u64 = 100;
+
+/// Set the power-off `secs` from now, unless one is already due sooner. `true` when this request is now the
+/// pending one (none was pending, or it is earlier than the one that was).
+pub fn power_off_arm(secs: u64) -> bool {
+    let at = MONOTONIC_TICKS.load(Ordering::Relaxed)
+        .saturating_add(secs.saturating_mul(POWER_OFF_TICKS_PER_SEC)).max(1);
+    let mut cur = POWER_OFF_AT.load(Ordering::Acquire);
+    loop {
+        if cur != 0 && cur <= at {
+            return false;
+        }
+        match POWER_OFF_AT.compare_exchange(cur, at, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+/// Clear the pending power-off. `true` when there was one.
+pub fn power_off_disarm() -> bool {
+    POWER_OFF_AT.swap(0, Ordering::AcqRel) != 0
+}
+
+/// Whole seconds until the pending power-off, rounded up, or `None` when none is pending.
+pub fn power_off_pending_secs() -> Option<u64> {
+    let at = POWER_OFF_AT.load(Ordering::Acquire);
+    if at == 0 {
+        return None;
+    }
+    let left = at.saturating_sub(MONOTONIC_TICKS.load(Ordering::Relaxed));
+    Some((left + POWER_OFF_TICKS_PER_SEC - 1) / POWER_OFF_TICKS_PER_SEC)
+}
+
+/// Turn the machine off now, or halt every core where the hardware cannot: the end of `PowerOff`, called by
+/// the syscall and by the BSP tick when a pending one falls due.
+///
+/// THE ORDER IS THE PANIC PATH'S, because the outcome is the same - nothing will run again - and a line that
+/// is queued and never drained is a line never said. The screen is taken back from `console` (which is about
+/// to stop) and serial output goes straight to the wire BEFORE the arch is asked, so whatever it says reaches
+/// someone. The arch returns only when the hardware did not turn off, with the reason; then every core halts.
+/// A halt asked for is not a crash, and the last line says so.
+pub fn power_off_now(why: core::fmt::Arguments) -> ! {
+    crate::bootcon::reclaim_for_panic();
+    crate::arch::imp::serial_enter_panic_mode();
+    crate::kprintln!("power-off: {}", why);
+    crate::arch::imp::tx_ring_flush_blocking();
+    let reason = crate::arch::imp::power_off();
+    crate::kprintln!("power-off: {}", reason);
+    crate::kprintln!("power-off: every core is halting - it is safe to switch the machine off");
+    crate::arch::imp::tx_ring_flush_blocking();
+    crate::arch::imp::halt_all_cores()
+}
+
 /// Advance the BSP tick clock and wake every task whose `recv_timeout` deadline has passed.
 /// Called from the **BSP** (core 0) timer ISR - the BSP ticks reliably even when other cores
 /// idle, so it is the dependable driver of all timed wakes. Cheap: a scan of `MAX_TASKS` relaxed
@@ -336,6 +404,14 @@ pub fn clear_wake_deadline(slot: usize) {
 /// cross-core IPI is needed for correctness (the IPI in `wake_by_slot` only shortens the latency).
 pub fn scan_timed_wakes() {
     let now = MONOTONIC_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // The pending power-off, if it has fallen due. Claimed by compare-exchange, so a cancel that races the
+    // tick either wins (nothing happens) or loses (the machine goes off), never both.
+    let at = POWER_OFF_AT.load(Ordering::Acquire);
+    if at != 0 && now >= at
+        && POWER_OFF_AT.compare_exchange(at, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    {
+        power_off_now(format_args!("the pending power-off fell due"));
+    }
     for slot in 0..MAX_TASKS {
         let deadline = TASK_WAKE_DEADLINE[slot].load(Ordering::Relaxed);
         if deadline != 0

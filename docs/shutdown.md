@@ -1,8 +1,9 @@
 # Shutdown: turning the machine off on purpose
 
-**Status:** design, 2026-10-14, branch `feat/shutdown`. **S1 (the kernel's `PowerOff`) is built and QEMU-verified**
-(`osdev test shutdown` 6/0 on x86, SBI SRST on QEMU RISC-V, the refusal in `osdev test adv` A12). **S2 (`fs`'s quiesce,
-`gs::fs::Fs::quiesce`) is built**, not yet exercised: its caller is S3. S3 to S6 are not built. The command is `utilities/64_shutdown.md`.
+**Status:** built on branch `feat/shutdown`, 2026-10-14, QEMU-verified; hardware cards pending. S1 to S4 are built:
+the kernel's `PowerOff` with its one deadline (S1), `fs`'s quiesce (S2), `power`'s warnings and tidy-up (S3) and the
+shell's `shutdown` (S4). `osdev test shutdown` passes 27 of 27 on x86; QEMU RISC-V powers off through SBI SRST; the
+refusal without the capability is `osdev test adv` A12. The command is `utilities/64_shutdown.md`.
 
 ## 1. What is asked for
 
@@ -10,7 +11,8 @@ The operator, 2026-10-14: `shutdown 5` shuts down in five seconds, counting down
 down at once; a plain `shutdown` waits a default 3 s; a delay may be `5s`, `5m` or `5h`, a long one runs in the
 background, and the warnings come closer together as the moment nears. And: "GodspeedOS is built to fail and
 recover in its core DNA ... I don't want those checks to take a long time. If I type `shutdown` it should
-shut down in much less than 5 seconds."
+shut down in much less than 5 seconds." And, when a pending shutdown could have been lost with the services
+holding it: that "has to be unacceptable."
 
 ## 2. The principle: a polite power cut
 
@@ -22,7 +24,8 @@ amendment 2026-09-23: five of five). So a shutdown is not a rescue. It does thre
    (CLAUDE.md 6.1, 2026-07-25: "unflushed FILE DATA can be lost on a power cut"). One flush closes that.
 2. **It leaves nothing half-made.** A copy in flight has its whole extent allocated up front, so cutting it leaves
    a full-size file with an undefined tail (`services/copier/CLAUDE.md`). Cancelling it first removes the file.
-3. **It says what happened.** "Powered off", or "halted, safe to switch off", never one claimed for the other.
+3. **It says what happened.** The machine is off, or the kernel says every core is halting and it is safe to
+   switch off - never one claimed for the other.
 
 Everything else is left to recovery, which is what recovery is for. **The tidy-up has a fixed budget, about 1 s,
 and the machine goes off when it runs out whether or not every step answered.** No service is drained, no driver
@@ -34,181 +37,191 @@ is waited on, and nothing is retried. A step that does not answer is said in one
 |---|---|
 | `shutdown` | in 3 s |
 | `shutdown 5`, `5s`, `5m`, `5h` | in that long; a bare number is seconds, as `wait 5` is. The ceiling is 24 h |
-| `shutdown now` | no countdown and no tidy-up: the power-off call at once, after naming a copy it will cut |
-| `shutdown status` | when, and how long is left; one record when piped |
+| `shutdown now` | no countdown and no tidy-up: the power-off at once, after naming a job it will cut |
+| `shutdown status` | whether one is pending, and how long is left |
 | `shutdown cancel` | stop a pending shutdown |
 
-One shutdown is pending at a time: a second is refused and names the first. The duration words are the shell's
-`parse_duration`, which `wait` and `serve` already use. A delay over 24 h is refused with a sentence: a
-shutdown a day away is a calendar's job.
+The duration words are the shell's `parse_duration`, which `wait` and `serve` already use. A delay over 24 h is
+refused with a sentence: a shutdown a day away is a calendar's job.
 
 ## 4. Who does what
 
-- **The shell** parses the command, shows a short countdown, and owns the keys. Nothing else.
-- **`power`** owns every shutdown that has a delay, from the moment it is asked: the deadline, the warnings, the
-  tidy-up and the final call. A five-hour wait cannot live in the shell, which would hold the prompt for five
-  hours and lose the shutdown silently if it restarted.
-- **The kernel** turns the machine off, or halts it, when `power` asks. It knows nothing about why or when.
-
-`power` is already the home `docs/power.md` 15.6 names for "device power-down, shutdown, thermal".
+- **The shell** holds the authority, `POWER_OFF`, beside `REBOOT`: ending the session is the operator's, and the
+  shell is how the operator speaks. It sets, cancels and fires the deadline, shows a short countdown, and owns the
+  keys.
+- **The kernel** holds the deadline - the machine's ONE pending power-off - and fires it when it falls due,
+  whether or not any service is alive. It knows nothing about why.
+- **`power`** holds no authority at all. It reads the deadline, gives the warnings and does the last-second
+  tidy-up. The shell cues it when the deadline changes; the cue carries no authority, because `power` only ever
+  re-reads what the kernel holds, so a forged cue from anyone changes nothing.
 
 ### 4.1 The foreground countdown, and `[b]`
 
 Under a minute, the shell shows the countdown on one line, rewritten each second, with the keys rule 10 asks for:
 
-<!-- foreign-ok: `shutdown` is designed here and not built; it leaves the shell's FOREIGN_HINTS in step S4 -->
 ```text
 gsh> shutdown 5
 shutdown in 5s   [q] quit   [b] background
 ```
 
 - **`q` cancels the shutdown** (rule 11: quitting stops the task, not just the view of it).
-- **`b` stops watching** and gives the prompt back. The timer was always `power`'s, so nothing moves.
+- **`b` stops watching** and gives the prompt back. The deadline was always the kernel's, so nothing moves.
 
-A minute or more returns the prompt at once: `shutdown at 14:05 (in 5h) - shutdown cancel stops it`. The clock
-time is said only when `time` has one; otherwise the delay alone.
+A minute or more returns the prompt at once: `shutdown in 5m - shutdown cancel stops it`.
 
 ### 4.2 Warnings
 
-`power` prints them as its own log lines, the way other services already print between prompts: when asked, then
-at 1 h, 30 m, 15 m, 5 m and 1 m before, then every second for the last 10. The shell cannot print on a timer
-while it waits for a key, and a warning from `power` is truthful about who is speaking. While a full-screen
+`power` prints them as its own log lines, the way other services already print between prompts: when the deadline
+is set, then at 1 h, 30 m, 15 m, 5 m and 1 m before, then every second for the last 10. The shell cannot print on a
+timer while it waits for a key, and a warning from `power` is truthful about who is speaking. While a full-screen
 program (`edit`) owns the screen the lines may land on top of it; that is recorded, not solved here.
 
-`jobs` lists a pending shutdown as a row, `shutdown in 4h 12m (power)`, so one command shows everything pending.
-It is a row, not a `copier` job.
+`jobs` lists a pending shutdown above the jobs, `shutdown in 4h 12m (pending; shutdown cancel stops it)`, so one
+command shows everything pending. A line, not a row: it is not a `copier` job.
 
 ### 4.3 At the deadline
 
-In order, the whole of it bounded at about 1 s:
+`power`, two seconds out, the whole of it bounded at about 1 s (it starts two out so it finishes before the kernel fires):
 
-1. **No new job** may start in the last minute: `background` and a typed copy refuse, naming the shutdown.
-2. **`copier`**, if it is running, is sent a cancel (300 ms): a copy removes its partial destination. A check, a
-   scrub and a tree delete are one `fs` request and cannot be stopped; they are cut, and `fs` recovers.
+1. **No new job** may start in the last minute: `background` refuses, naming the shutdown.
+2. **`copier`**, if it is running, is sent a cancel: a copy removes its partial destination. A check, a scrub and a
+   tree delete are one `fs` request and cannot be stopped; they are cut, and `fs` recovers.
 3. **`fs`** is asked to quiesce (up to 1 s): finish the request in hand, flush the device, and refuse every write
-   after. Unanswered (a 34 s check in flight on a USB stick) is said, and skipped: the journal covers metadata.
-4. **The kernel's power-off call.**
+   for ten seconds after. Unanswered (a 34 s check in flight on a USB stick) is said, and skipped: the journal
+   covers metadata. Ten seconds and not forever, so a shutdown that never comes leaves a filesystem that takes
+   writes again by itself.
 
-`shutdown now` skips 1 to 3 and names a copy it will cut; that is a power cut asked for on purpose.
+Then the kernel's deadline falls due and the machine goes off. `shutdown now` skips all three; that is a power cut
+asked for on purpose.
 
-### 4.4 Who remembers a pending shutdown
+### 4.4 Who remembers a pending shutdown: the kernel
 
-Asked by the operator, 2026-10-14: if `power` dies, the supervisor restarts it, but who remembers the shutdown -
-and what if the machine booted with no disk at all? The answer has to hold state somewhere without the kernel.
+Asked by the operator, 2026-10-14: if `power` dies the supervisor restarts it, but who remembers the shutdown - and
+what if the machine booted with no disk? A first answer kept it in `power`'s memory and the shell's, each re-arming
+the other after a restart; that lost the shutdown if both died at once, and the operator called that unacceptable.
 
-**Not the kernel**, which keeps no service state (26.10), and **not the supervisor**, which would become a store
-for other services' state - a new job for the trusted root - and is itself restartable, so it loses what it holds.
-**Not `fs` either** (an earlier draft wrote the deadline to `/system/services/power/shutdown`): a machine booted with
-no disk has no `fs` to write to, and a pending shutdown must work there too.
+**The kernel holds it**, because the kernel is the one thing that cannot die. Not as service state - CLAUDE.md 15
+keeps state with services, and a per-service store in the kernel would bring back name-keyed kernel tables and
+hand a crashed service the state that crashed it - but as the kernel's own scheduled action: one deadline, on the
+same tick every timed wait already uses.
 
-**The two that already know hold it, each in memory: `power`, which owns the timer, and the shell, which asked.**
-Under question 1's answer the shell is the only one that may ask, so it is also the one that knows what was asked.
-
-- **`power` restarts**: it knows of no pending shutdown. While the shell's copy says one is pending, the shell asks
-  `power` at each prompt whether it still has it - one fast request, made only while a shutdown is pending - and if
-  `power` says no, it sets it again with the time that is left and says so: `power restarted - the shutdown is set
-  again for 14:05`.
-- **The shell restarts**: it asks `power` once whether a shutdown is pending (`shutdown status`) and rebuilds its row.
-- **Both die in the same window**: the shutdown is lost. The supervisor logs both deaths, and the machine stays on,
-  which is the safe direction for this failure. Recorded rather than closed (26.7).
-- **No disk**: nothing here needs `fs`. A shutdown works the same, and the tidy-up's `fs` step is skipped because no
-  `fs` is running.
-
-The same rule GodspeedOS applies everywhere after a restart (CLAUDE.md 14.3): reacquire, and re-derive what hung off
-the dead instance - here, from the peer that asked.
-
-If `power` is not running when `shutdown` is typed, the shell says so and nothing happens: it fails safe.
+- **`power` restarts**: it reads the deadline (InspectKernel query 28) and carries on, saying what it found.
+- **The shell restarts**: `shutdown status` reads the kernel; nothing to rebuild.
+- **Everything else dies**: the kernel still turns the machine off at the deadline, without the tidy-up if `power`
+  is not there to do it. A polite power cut becomes a plain one, which `fs` recovers from; never a lost one.
+- **No disk**: nothing here needs `fs`. The tidy-up's `fs` step is skipped because no `fs` is running.
+- **A reboot** clears it, as it clears all kernel memory. A shutdown can never persist across boots.
 
 ## 5. What each board can do
 
-Read 2026-10-14; the two "not checked" rows need a card.
+Read 2026-10-14; the "not checked" rows need a card.
 
 | Board | Route | What happens |
 |---|---|---|
-| QEMU x86 | ACPI S5: `SLP_TYPa` from `\_S5`, written to `PM1a_CNT` | powers off (worked in June 2026, `utilities/14_poweroff.md`) |
-| HP T630 | the same | **does not power off**: the firmware gates S5 on `\_PTS` / `\_GTS`, ACPI bytecode needing an interpreter. Halts |
+| QEMU x86 | ACPI S5: `SLP_TYPa` from `\_S5`, written to `PM1a_CNT` | powers off (`osdev test shutdown`) |
+| HP T630 | the same | expected to halt: in June 2026 the firmware gated S5 on `\_PTS` / `\_GTS`, ACPI bytecode needing an interpreter (`utilities/14_poweroff.md`) |
 | Dell Wyse 5070 | the same | not tried |
 | Raspberry Pi 4 | the power-management watchdog `reboot` already uses, with the boot partition set to 63 (`0x555`), which the firmware reads as halt (Linux `bcm2835_power_off`) | halts; with `POWER_OFF_ON_HALT=1` in the EEPROM the firmware also turns the rails off. Not checked on this board |
 | Raspberry Pi 2 | the same watchdog | halts, "most of the chip powered off" (Linux's comment); 5 V stays on |
 | VisionFive 2 Lite | SBI SRST, the call `reboot` already makes, type shutdown | OpenSBI powers the AXP15060 PMIC off on the JH7110 since 2023; whether the firmware in this board's flash has the later device-tree fix it needs is not checked, and its cold reboot already dies reading the PMIC (`pmic_ops: cannot read pmic power register`, `arch/riscv64/sbi.rs`), so a refusal or a dark board is likely |
-| QEMU RISC-V `virt` | SBI SRST shutdown | powers off |
+| QEMU RISC-V `virt` | SBI SRST shutdown | powers off; the tidy-up starts in time, and with no disk `fs` - blocked waiting on the storage driver - did not answer its quiesce before the kernel fired, which is the designed fallback |
 
 So the arch answer is three-valued: **off** (the call does not return), **halt** (the firmware will hold the
 board stopped), and **cannot** (the port has no route). The kernel says which before it acts.
 
 ## 6. The kernel's part
 
-One new syscall, `PowerOff`, gated by a new capability, `POWER_OFF`, held by `power` alone, as `CPU_CLOCK` is: the
-machine has one power state and a second holder would race the first. Behind it, one new member of the
-`arch::imp` seam that every port must answer (`scripts/arch_seam_check.py`):
+One syscall, `PowerOff` (56), gated by `POWER_OFF` (resource 19), which the shell holds:
+
+- **op 0, now**: does not return. The machine is off, or every core is halted.
+- **op 1, at `secs`** (1 ..= 24 h): set the machine's one pending power-off. **Earliest wins**: a request for
+  LATER than the pending one is refused (code 1) and names it, so no holder can postpone a shutdown another
+  asked for; one for sooner moves it forward.
+- **op 2, cancel**: any holder may clear it.
+- **Every set and cancel is logged** with the caller's name, from the task that called - nothing is looked up by
+  name. The deadline counts in BSP ticks, never the wall clock, so a clock set from a spoofed network cannot move
+  it.
+- **Query 28** of InspectKernel returns the seconds left, or -1. UNGATED, the one deliberate addition to the
+  ungated list: a deadline that outlives every service must be visible to everything that might report it, and
+  a shutdown planted by a compromised holder must never be hidden. It discloses no task's state.
+
+Behind it, one member of the `arch::imp` seam every port answers (`scripts/arch_seam_check.py`):
 
 - x86-64: find `PM1a_CNT` in the FADT (the ACPI tables `iommu.rs` already walks for IVRS) and `SLP_TYPa` in the
-  DSDT's `\_S5` package, then write S5. If the machine is still running a moment later, it did not take.
-- arm32 and AArch64: `hardware_reset` with the boot partition set to 63 instead of cleared.
+  DSDT's `\_S5` package, then write S5 (`arch/x86_64/acpi.rs`). If the machine is still running a moment later,
+  it did not take.
+- arm32 and AArch64: `hardware_reset`'s watchdog reset with the boot partition set to 63 instead of cleared.
 - RISC-V 64: SBI SRST, reset type shutdown, probed first as `hardware_reset` does.
 - The stubs (`riscv32`, `loongarch64`, `s390x`): cannot.
 
 **When the hardware does not power off**, the kernel halts every core through the path a panic already takes, and
-prints its last line through the 11.4 floor: `halted - it is safe to switch off`. A halt is not a crash, so it is
-not printed as one.
+its last line is `power-off: every core is halting - it is safe to switch the machine off`. A halt asked for is
+not a crash, and is not printed as one.
 
 ### 6.1 Does this add a kernel responsibility?
 
-No. Turning the machine off is reboot's sibling: the same registers on the Pis, the same firmware call on RISC-V,
-the ACPI tables the kernel already reads on x86. It is mechanism on channels the kernel already owns, the argument
-the `DevicePower` and `CpuClock` amendments made (CLAUDE.md 12.3). The kernel learns nothing about why, when, or
-what to save; the countdown, the tidy-up and the decision are services'. What it does add is **surface**: a
-syscall, a capability and a seam member, which Commandment I pins. So it needs the amendment below before the
-gate will accept it, and that is the gate working.
+No, and MISCIS stays at six. Turning the machine off is reboot's sibling: the same registers on the Pis, the same
+firmware call on RISC-V, the ACPI tables the kernel already reads on x86 - mechanism on channels the kernel already
+owns, the argument the `DevicePower` and `CpuClock` amendments made (CLAUDE.md 12.3). The deadline is one more
+timed action on the scheduler's existing tick. The kernel holds no policy: when, and whether, are the holder's, and
+the bounds (one deadline, earliest wins, 24 h) are limits on a value, as a queue depth is. What grows is
+**surface** - the syscall, its ops, the query, the resource and the seam member - which Commandment I pins and the
+CLAUDE.md 12.3 amendment of 2026-10-14 records.
 
-### 6.2 The amendment, as it would be written into CLAUDE.md 12.3
+### 6.2 Security
 
-> **Amendment 2026-10-xx (`PowerOff`, syscall 56): the kernel turns the machine off, or halts it, and a SERVICE
-> decides when.** `reboot` resets the machine through a channel the kernel owns on every port; turning it off uses
-> the same channels - the Pis' power-management watchdog, the RISC-V firmware's SRST call, the ACPI tables x86
-> already parses - asked for a different outcome. `PowerOff` is gated by `POWER_OFF`, granted to ONE service,
-> `power`, because the machine has one power state. Each port answers the new seam member with what it can do:
-> off, halt, or cannot, and the kernel says which before it acts; where the hardware does not power off, every
-> core halts through the panic path's stop and the 11.4 floor prints that it is safe to switch off. The kernel
-> holds no policy (26.10): the countdown, the warnings, the tidy-up and whether to shut down at all are
-> `power`'s (`docs/shutdown.md`). Not a seventh responsibility - mechanism on channels the kernel already owns -
-> but a new syscall, resource and seam member, which Commandment I pins and this records.
+Deferring adds no new reach: whoever can set a deadline could already turn the machine off at once. What it adds is
+a shutdown that can be planted now and fire later, after the service that planted it has been restarted. That is
+acceptable only because it can never be anonymous or silent: one holder today, every change logged with who, the
+deadline readable by all and announced by `power` whenever it starts, monotonic time only, and gone at reboot.
 
-## 7. Open questions, for the operator
+## 7. Decisions and open questions
 
-1. **Who may ask `power` to shut down.** A send right to `power` today carries its whole protocol, and `wifi-driver`
-   holds one (for leases). Without more, it could ask for a shutdown too. Options:
-   - (a) the send right IS the authority: record the holders (the shell, `wifi-driver`) and pin them with a gate.
-     Simplest; honest about a coarse grant. On the Pis `wifi-driver` is unconfined DMA and already
-     kernel-equivalent (CLAUDE.md 6.4, SEC-33), so it gains nothing there it lacked.
-   - (b) a narrower right: `power` mints a delegated resource capability for "shut down" (CLAUDE.md 7.10, as `fs`
-     mints a file) and the supervisor hands it to the shell alone. No service has two endpoints today, so this is
-     the capability-correct route; it costs `power` the `RESOURCE_MINT` authority and the supervisor a hand-over.
-   **Decided 2026-10-14: (b).** The operator chose the narrower right.
-2. **`reboot` moves into `power`, decided 2026-10-14, as its own step (S6)** after `shutdown` has passed its cards:
-   both ways of ending a session then go through one service with one budget, the shell holds neither authority,
-   and `reboot` gains the tidy-up it lacks today (it resets without flushing the disk).
+1. **Only the shell may shut the machine down, decided 2026-10-14.** No service has a reason to end the session -
+   a failing service is restarted on its own - so the right is the operator's, beside `REBOOT`. The Commandments
+   baseline lists the shell as its one holder; a second is a decision made there, in a commit that says why.
+   Earlier options - any sender to `power`, or a capability `power` mints and hands out - were dropped: a request
+   routed through `power` cannot say who sent it, which a deferred shutdown must.
+2. **A second holder, when one is wanted** (the PCs' power button, a battery or thermal limit): it holds
+   `POWER_OFF` itself, acts only on its own inputs, and never offers "shut down on request" to other services - a
+   holder that did would reopen the anonymous door one level up. With more than one holder the single deadline is
+   still exact (earliest wins, any holder cancels). A per-holder request list, where each cancels only its own, is
+   the refinement; it needs an identity that survives a restart, which is a name, and the kernel keeps no
+   name-keyed tables, so that is decided when the second holder arrives.
+3. **`reboot`** (S6): the same kernel deadline could hold "turn off or reboot at T", with the shell holding both
+   rights and `power` doing the tidy-up for either - which gives `reboot` the disk flush it lacks today (it resets
+   without flushing). A separate step, after `shutdown` has passed its cards.
 4. **The name is `shutdown`, decided 2026-10-14.** It is the word other systems use, and it names the act - ending
    the session - rather than promising a mechanism: on the T630 and the Pi 2 the machine halts and does not lose
-   power, so `poweroff` would claim what did not happen. `poweroff` and `halt` stay hints that answer
-   "try `shutdown`" (step S4).
-3. **Clock time** (`shutdown at 22:00`) is left out: it depends on `time` having a clock, and a durations-only
+   power, so `poweroff` would claim what did not happen. `poweroff` and `halt` are hints that answer `shutdown`.
+5. **Clock time** (`shutdown at 22:00`) is left out: it depends on `time` having a clock, and a durations-only
    first version cannot be wrong about that.
 
 ## 8. Phasing
 
-Each step is QEMU-verified before the next, and the cards come at the end.
-
 | Step | What | Verified by |
 |---|---|---|
-| S1 | The kernel: `PowerOff`, `POWER_OFF`, the seam member on every port, the halt fallback, the amendment | QEMU x86 and RISC-V power off; the Pis' QEMU halt; a probe without the capability is refused |
-| S2 | `fs`: `OP_QUIESCE` - finish, flush, refuse writes after | `osdev test files`: a write after quiesce is refused loudly |
-| S3 | `power`: the schedule, warnings, the final sequence, and question 1's answer; the shell re-arms a shutdown `power` lost in a restart (4.4) | a QEMU suite: `shutdown 5s`, `cancel`, `status`, a `power` kill mid-wait |
-| S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` row, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` (where it answers "try `reboot`" today), `halt` and `poweroff` hint at `shutdown` instead, and CLAUDE.md Appendix B.4 records why `shutdown` is a command | `osdev test quit` and `jobs` cases; `foreign_word_check` with the `foreign-ok` markers in this note removed |
-| S5 | Cards on all five boards | each says "powered off" or "halted" truthfully, under 5 s from Enter for a plain `shutdown` beyond its 3 s |
-| S6 | `reboot` moves into `power`: the same bounded tidy-up before the reset, `reboot now` as `shutdown now`, Ctrl+Alt+Del asking `power`, and `REBOOT` leaving the shell | the jobs and quit suites, and a card per board |
+| S1 | The kernel: `PowerOff` now, at and cancel; the one deadline on the BSP tick; query 28; `POWER_OFF` to the shell; the seam member on every port; the halt fallback; the amendment | QEMU x86 and RISC-V power off; `osdev test adv` A12 refuses it without the capability |
+| S2 | `fs`: `OP_QUIESCE` - finish, flush, refuse writes for 10 s | `osdev test shutdown`: fs says it flushed |
+| S3 | `power`: read the deadline, warnings, the last-second tidy-up, carry on after a restart | `osdev test shutdown`: the countdown and tidy-up lines |
+| S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 27/0 |
+| S5 | Cards on all five boards | each says off or halted truthfully, the machine off within about 1 s of a plain `shutdown`'s 3 s |
+| S6 | `reboot` on the same deadline, with the tidy-up | the jobs and quit suites, and a card per board |
 
-## 9. Sources
+## 9. How other systems do it
+
+- **Linux**: `reboot(2)` gated by `CAP_SYS_BOOT`; `shutdown +5` is held by systemd-logind in memory and a file in the
+  RAM-backed `/run`, with warnings to logged-in users; polkit decides who may ask, and the power button, UPower and
+  UPS daemons ask too. A critical thermal trip makes the kernel itself ask userspace to power off, and arm a timer
+  that forces it if userspace does not.
+- **Windows**: a privilege (`SeShutdownPrivilege`); `shutdown /s /t` held by the session manager, `shutdown /a`
+  aborts; services get a shutdown notice and about 20 s.
+- **Classic BSD and macOS**: `shutdown -h +5` forks a process that sleeps, warns and then calls `reboot()`; kill it
+  and the shutdown is lost.
+- **Fuchsia**: `zx_system_powerctl` needs a root-resource handle, held by one component; who may ask it is settled by
+  capability routing.
+
+## 10. Sources
 
 - Linux `drivers/watchdog/bcm2835_wdt.c`, `bcm2835_power_off`: partition 63 (`PM_RSTS_RASPBERRYPI_HALT`, `0x555`)
   tells `bootcode.bin` not to reboot.

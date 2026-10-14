@@ -1054,8 +1054,8 @@ pub mod privbits {
     /// One holder because the clock is one machine-wide setting: two holders would simply overwrite
     /// each other, and the second would never know (`docs/power.md`).
     pub const CPU_CLOCK:       u32 = 1 << 13;
-    /// POWER_OFF: turn the machine off, or halt every core where it cannot (`PowerOff`, syscall 56). Held by
-    /// ONE service, `power`, which decides when (`docs/shutdown.md`): the machine has one power state.
+    /// POWER_OFF: turn the machine off, now or at the kernel's one deadline, or halt every core where it cannot
+    /// (`PowerOff`, syscall 56). Held by the shell for the operator, beside REBOOT (`docs/shutdown.md`).
     pub const POWER_OFF:       u32 = 1 << 14;
     /// Every bit this kernel understands. Anything outside it is refused, so a newer spawner cannot
     /// quietly ask for a privilege this kernel would ignore.
@@ -1143,7 +1143,7 @@ struct Privileges {
     net_device:      bool, // NET_DEVICE: move ethernet frames via an in-kernel net device (held by nothing now)
     pci_cfg:         bool, // PCI_CFG: read PCI config space via CF8/CFC (hw-enumerator, step D2)
     cpu_clock:       bool, // CPU_CLOCK: set the Arm cores to their minimum or maximum rate (power)
-    power_off:       bool, // POWER_OFF: turn the machine off, or halt it (power)
+    power_off:       bool, // POWER_OFF: turn the machine off, or halt it (the shell)
     usb_disk:        bool, // USB_DISK: read/write blocks on an in-kernel USB mass-storage device (held by nothing now)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
     set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock (no syscall spends it now; SET_CLOCK_RESOURCE)
@@ -1231,7 +1231,7 @@ fn service_privileges(name: &str) -> Privileges {
         // CPU_CLOCK: the same shape as PCI_CFG above - `power` is a supervisor-owned service, which asks
         // for the bit in its spawn request; nothing in the kernel's own catalogue holds it.
         cpu_clock: false,
-        // POWER_OFF: the same shape - `power` asks for it in its spawn request.
+        // POWER_OFF: the same shape - the shell's spawn request asks for it.
         power_off: false,
         // Nothing holds USB_DISK any more. It named `block-driver` alone, and `block-driver`'s image
         // moved to the supervisor - so this arm could not fire even if the authority were still
@@ -1913,7 +1913,7 @@ fn spawn_service_with_image(
         crate::kprintln!("spawn[clock]: '{}' may set the Arm clock (CPU_CLOCK)", name);
     }
 
-    // POWER_OFF: `power` turns the machine off (`PowerOff`, syscall 56). WHO holds it is the spawn request's
+    // POWER_OFF: the shell turns the machine off (`PowerOff`, syscall 56). WHO holds it is the spawn request's
     // privilege word; here it is only minted, WRITE alone, as CPU_CLOCK above.
     if privs.power_off {
         let po_cap = mint_cap(POWER_OFF_RESOURCE, Rights::WRITE);

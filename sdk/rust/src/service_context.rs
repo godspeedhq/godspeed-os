@@ -395,8 +395,8 @@ pub mod privbits {
     /// Set the Arm cores to the platform's minimum or maximum clock (`CpuClock`, syscall 55). Held by
     /// ONE service, `power`, because the clock is one machine-wide setting (`docs/power.md`).
     pub const CPU_CLOCK:       u32 = 1 << 13;
-    /// Turn the machine off, or halt it where it cannot cut its own power (`PowerOff`, syscall 56). Held by
-    /// ONE service, `power`, which decides when (`docs/shutdown.md`).
+    /// Turn the machine off, now or at a deadline the kernel holds, or halt it where it cannot cut its own
+    /// power (`PowerOff`, syscall 56). Held by the shell, for the operator (`docs/shutdown.md`).
     pub const POWER_OFF:       u32 = 1 << 14;
 }
 
@@ -3977,13 +3977,37 @@ impl ServiceContext {
         if r > 0 { Some(r as u32) } else { None }
     }
 
-    /// Turn the machine off (`PowerOff`, syscall 56). Needs `POWER_OFF`, which only the `power` service is
-    /// spawned with. With it, this does not return: the machine is off, or - where the hardware cannot cut
-    /// its own power - every core is halted and the kernel's last line says it is safe to switch off. It
-    /// returns only when refused, with the kernel's code; the kernel says why on the serial log.
+    /// Turn the machine off NOW (`PowerOff`, syscall 56, op 0). Needs `POWER_OFF`, which the shell holds for the
+    /// operator. With it, this does not return: the machine is off, or - where the hardware cannot cut its own
+    /// power - every core is halted and the kernel's last line says it is safe to switch off. It returns only
+    /// when refused, with the kernel's code; the kernel says why on the serial log.
     pub fn power_off(&self) -> i64 {
-        // SAFETY: a plain syscall with no arguments; the kernel validates the capability before acting.
-        unsafe { crate::syscall::raw_syscall(56, 0, 0, 0) }
+        self.power_off_call(0, 0)
+    }
+
+    /// Set the machine's one pending power-off `secs` from now (1 ..= 24 h), held by the KERNEL so it survives
+    /// every service (`docs/shutdown.md` 6). `0`: this is now the pending one. `1`: one due sooner was kept
+    /// (earliest wins). `-1`: out of range. `-2`: refused (no `POWER_OFF`).
+    pub fn power_off_in(&self, secs: u64) -> i64 {
+        self.power_off_call(1, secs)
+    }
+
+    /// Cancel the pending power-off. `0`: there was one. `1`: there was none. `-2`: refused.
+    pub fn power_off_cancel(&self) -> i64 {
+        self.power_off_call(2, 0)
+    }
+
+    fn power_off_call(&self, op: u64, secs: u64) -> i64 {
+        // SAFETY: a plain syscall with two integers; the kernel validates the capability before acting.
+        unsafe { crate::syscall::raw_syscall(56, op, secs, 0) }
+    }
+
+    /// Whole seconds until the machine's pending power-off, rounded up, or `None` when none is pending
+    /// (InspectKernel query 28). Readable by every task, deliberately: a pending shutdown must never be hidden.
+    pub fn power_off_pending(&self) -> Option<u64> {
+        // SAFETY: syscall(13) = InspectKernel; query 28 takes no pointer and is ungated.
+        let r = unsafe { raw_syscall(13, 28, 0, 0) };
+        if r >= 0 { Some(r as u64) } else { None }
     }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.

@@ -19,10 +19,10 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **78** | **grandfathered floor** (§18.5; +1 `power_off`, 2026-10-14 amendment; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
+| `sdk/rust/src/service_context.rs` | **79** | **grandfathered floor** (§18.5; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
-**The 86 (78 + 8) are not 86 defects.** 83 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12 and moved with `power_off`, 2026-10-14; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
+**The 87 (79 + 8) are not 87 defects.** 84 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12 and moved with `power_off`, 2026-10-14; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
 is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
 these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
 worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
@@ -54,7 +54,7 @@ boot-only ports answer it with safe stubs.
 | `arch/aarch64/mod.rs` | 73 -> 74 (+1) | `power_off` (Pi 4): the BCM2711 power-management registers `hardware_reset` already writes, through the kernel's Device mapping, with the boot partition set to 63 (halt, Linux `bcm2835_power_off`) instead of cleared. Password-gated volatile writes, poked once. |
 | `arch/arm/mod.rs` | 52 -> 53 (+1) | `power_off` (Pi 2): the same for the BCM2836, in the Device-mapped peripheral window. |
 | `arch/riscv64/sbi.rs` | 11 -> 12 (+1) | `system_shutdown`: SBI SRST with the specification's shutdown type, probed first; it does not return on success and answers an error otherwise, touching no kernel memory. |
-| `sdk/rust/src/service_context.rs` | 77 -> 78 (+1) | `power_off`: one more `unsafe { raw_syscall(56, ..) }` call site, the single design consequence the `cpu_clock` entry below names. No arguments; the kernel checks the capability before acting. Floor amended at CLAUDE.md 18.5, 2026-10-14. |
+| `sdk/rust/src/service_context.rs` | 77 -> 79 (+2) | `power_off_call`: one `unsafe { raw_syscall(56, ..) }` call site behind the three safe wrappers `power_off`, `power_off_in` and `power_off_cancel`, two integers to a kernel that checks the capability before acting; and `power_off_pending`, one `unsafe { raw_syscall(13, 28, ..) }` read with no pointer. The single design consequence the `cpu_clock` entry below names. Floor amended at CLAUDE.md 18.5, 2026-10-14. |
 
 ## 2026-10-10 - the unused TLB shootdown deleted; P7 tests the property (backlog/fixed/80 K20)
 

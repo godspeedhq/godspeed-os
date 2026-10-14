@@ -18,9 +18,9 @@ request = "4MiB"
 limit   = "8MiB"
 
 [capabilities]
+# The shutdown's last-second tidy-up (docs/shutdown.md 4.3): `fs` flushes and stops taking writes, `copier`
+# stops a copy in flight. Nothing else; the leases still only ever answer.
+ipc_send    = ["fs", "copier"]
 ipc_receive = ["power"]
 log_write   = true
 cpu_clock   = true
-# `power_off` turns the machine off, or halts it where it cannot cut its own power (`PowerOff`, syscall 56,
-# docs/shutdown.md). Held here alone, for the clock's reason: the machine has one power state.
-power_off   = true

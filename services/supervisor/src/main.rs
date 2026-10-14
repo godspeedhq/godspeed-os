@@ -502,11 +502,11 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("time", TIME_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "net-stack", "events"], 0, 0, 0),
     // The power policy (docs/power.md). Carries CPU_CLOCK, which sets the Arm cores to the firmware's
     // minimum or maximum and nothing else; ONE holder, because the clock is one machine-wide setting and
-    // a second holder would silently overwrite this one. And POWER_OFF, which turns the machine off or
-    // halts it (docs/shutdown.md); one holder for the same reason - the machine has one power state.
-    // No peers: it only ever answers.
-    ("power", POWER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &[],
-     godspeed_sdk::service_context::privbits::CPU_CLOCK | godspeed_sdk::service_context::privbits::POWER_OFF, 0, 0),
+    // a second holder would silently overwrite this one. It does NOT hold POWER_OFF: a shutdown is the
+    // operator's, so the shell holds it, and `power` only reads the deadline the kernel keeps (docs/shutdown.md).
+    // Peers for the shutdown's last-second tidy-up alone: `fs` to flush and stop writes, `copier` to stop a copy.
+    ("power", POWER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "copier"],
+     godspeed_sdk::service_context::privbits::CPU_CLOCK, 0, 0),
     // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
     // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
     // config space at all - that would be write access to every BAR and command register of every
@@ -607,7 +607,9 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // The user's interface. GPIO and SET_CLOCK_FLOOR are ARM-only in effect but the bits are
     // arch-neutral: the kernel refuses any the supervisor cannot delegate, and on x86 the underlying
     // grant is simply never used. SET_CLOCK_FLOOR is the NARROW right (raise the clock floor), not
-    // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter.
+    // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter. POWER_OFF, beside
+    // REBOOT and for the same reason: ending the session is the operator's, and the shell is how the
+    // operator speaks (docs/shutdown.md). The only holder; a gate pins that.
     ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
                        | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,
      8 * 1024 * 1024, board::SHELL_CORE, &["fs", "block-driver", "time", "console", "events", "supervisor"],
@@ -616,6 +618,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::SERVICE_CONTROL
      | godspeed_sdk::service_context::privbits::ACQUIRE_ANY
      | godspeed_sdk::service_context::privbits::REBOOT
+     | godspeed_sdk::service_context::privbits::POWER_OFF
      | godspeed_sdk::service_context::privbits::GPIO
      | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
     ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "events"],

@@ -233,7 +233,13 @@ service_configs = [
 # has no way to give them back once the ring wraps, which on a busy machine is seconds after boot. A
 # copy, never a drain, so no log line depends on a reader (the reason nothing drains the ring stands).
 # INTROSPECT-gated: the boot log names every service and device on the machine. Read by `events log boot`.
-introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27]
+#
+# 28 (added 2026-10-14) is the seconds until the machine's pending power-off (`PowerOff` with a delay), -1 for
+# none. UNGATED, the one deliberate addition to that list since it was written: the deadline is the kernel's
+# own scheduled action, it outlives every service, and its visibility IS the safeguard - a shutdown planted by
+# a compromised holder must be seen by `power`'s warnings, `shutdown status` and `ask`. It discloses no task's
+# state and confers no authority (docs/shutdown.md 6).
+introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the
@@ -485,9 +491,10 @@ DEVICE_POWER       = 17
 # machine-wide setting. Added because the Pi firmware drops the cores to their minimum a minute after
 # boot and the WiFi chip's firmware traps when loaded that slowly (docs/wifi.md 55). CLAUDE.md 12.3.
 CPU_CLOCK          = 18
-# POWER OFF - turn the machine off, or halt every core where the hardware cannot cut its own power
-# (`PowerOff`, syscall 56). A privilege bit, delegatable, held by ONE service: `power`, which owns WHEN
-# (docs/shutdown.md). One holder because the machine has one power state. CLAUDE.md 12.3, 2026-10-14.
+# POWER OFF - turn the machine off, now or at a deadline the kernel holds, or halt every core where the
+# hardware cannot cut its own power (`PowerOff`, syscall 56). A privilege bit, delegatable, held by the
+# SHELL alone: ending the session is the operator's, beside REBOOT. `power` reads the deadline and holds
+# nothing. A second holder (a power button, docs/shutdown.md) is a decision recorded here. CLAUDE.md 12.3.
 POWER_OFF          = 19
 
 
@@ -653,11 +660,12 @@ DevicePower              = 54
 # Two rates are on offer and the caller cannot name a third. Who may be fast and for how long is the
 # `power` service's (26.10, docs/power.md). Gated by CPU_CLOCK. CLAUDE.md 12.3, 2026-10-01.
 CpuClock                 = 55
-# POWER OFF - turn the machine off. Why isn't this a service? It is, above the kernel: `power` decides when
-# and whether, with a countdown, warnings and a bounded tidy-up (docs/shutdown.md). What only the kernel can
-# do is the last step, on channels it already owns for `Reboot` - the Pis' power-management watchdog, the
-# RISC-V firmware's SRST call, the ACPI tables x86 already parses - and, where the hardware cannot cut its
-# own power, halting every core as the panic path does. Gated by POWER_OFF. CLAUDE.md 12.3, 2026-10-14.
+# POWER OFF - turn the machine off, now or at a deadline. Why isn't this a service? The policy is: the
+# operator decides when through the shell, and `power` does the countdown, warnings and bounded tidy-up
+# (docs/shutdown.md). What only the kernel can do is the last step, on channels it already owns for
+# `Reboot`, and holding the ONE deadline where no service's death can lose it - one more timed action on
+# the scheduler's existing tick. Earliest wins, any holder cancels, every change logged with who; the
+# deadline is readable by all (query 28). Gated by POWER_OFF, the shell's. CLAUDE.md 12.3, 2026-10-14.
 PowerOff                 = 56
 Gpio                     = 45
 UsbDiskInfo              = 46
@@ -785,10 +793,11 @@ SpawnImage               = 52
 "observe-live" = ["priv:INTROSPECT"]
 "observe-now" = ["priv:INTROSPECT"]
 "ping" = ["peer:pong"]
-"power" = ["priv:CPU_CLOCK", "priv:POWER_OFF"]
+# power: peer:fs and peer:copier (2026-10-14) - a shutdown's last-second tidy-up (docs/shutdown.md 4.3).
+"power" = ["peer:copier", "peer:fs", "priv:CPU_CLOCK"]
 "recorder" = ["peer:events", "peer:fs"]
 "resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
-"shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
+"shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:POWER_OFF", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
 "supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
 "time" = ["peer:events", "peer:fs", "peer:net-stack"]
 # wifi-driver: hw:WIFI_SDIO - the Arasan SDIO host the radio sits on, and its power control, granted by
