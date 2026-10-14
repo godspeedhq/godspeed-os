@@ -1,8 +1,8 @@
 # Shutdown: turning the machine off on purpose
 
 **Status:** design, 2026-10-14, branch `feat/shutdown`. **S1 (the kernel's `PowerOff`) is built and QEMU-verified**
-(`osdev test shutdown` 6/0 on x86, SBI SRST on QEMU RISC-V, the refusal in `osdev test adv` A12); S2 to S6 are not
-built. The command is `utilities/64_shutdown.md`.
+(`osdev test shutdown` 6/0 on x86, SBI SRST on QEMU RISC-V, the refusal in `osdev test adv` A12). **S2 (`fs`'s quiesce,
+`gs::fs::Fs::quiesce`) is built**, not yet exercised: its caller is S3. S3 to S6 are not built. The command is `utilities/64_shutdown.md`.
 
 ## 1. What is asked for
 

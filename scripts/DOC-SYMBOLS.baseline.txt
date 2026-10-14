@@ -114,5 +114,4 @@ spawn_with_caps                    # backlog/fixed/80 K14 - DELETED 2026-10-10, 
 spawn_on_kernel                    # backlog/fixed/80 K14 - DELETED 2026-10-10, the SDK wrapper for Spawn (7); syscall retired; a record of a removal must name what was removed
 spawn_pipe                         # backlog/fixed/80 K14 - DELETED 2026-10-10, the SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
 spawn_pipe_on                      # backlog/fixed/80 K14 - DELETED 2026-10-10, the per-core SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
-OP_QUIESCE                         # docs/shutdown.md - PROPOSAL, step S2: the fs request a shutdown makes; not built yet
 left_secs                          # utilities/64_shutdown.md - PROPOSAL, step S4: a field of `shutdown status` piped; not built yet
