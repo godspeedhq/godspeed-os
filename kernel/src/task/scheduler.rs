@@ -333,7 +333,7 @@ pub const POWER_OFF_MAX_SECS: u64 = 24 * 3600;
 /// A tick is a scheduler quantum, 10 ms (9.1).
 const POWER_OFF_TICKS_PER_SEC: u64 = 100;
 
-/// Set the power-off `secs` from now, unless one is already due sooner. `true` when this request is now the
+/// Set the power-off `secs` from now, unless one is already due at the same time or sooner. `true` when this request is now the
 /// pending one (none was pending, or it is earlier than the one that was).
 pub fn power_off_arm(secs: u64) -> bool {
     let at = MONOTONIC_TICKS.load(Ordering::Relaxed)
@@ -385,7 +385,8 @@ pub fn power_off_now(why: core::fmt::Arguments) -> ! {
     crate::arch::imp::halt_all_cores()
 }
 
-/// Advance the BSP tick clock and wake every task whose `recv_timeout` deadline has passed.
+/// Advance the BSP tick clock, fire the machine's pending power-off if it has fallen due (`power_off_now`, which
+/// does not return), and wake every task whose `recv_timeout` deadline has passed.
 /// Called from the **BSP** (core 0) timer ISR - the BSP ticks reliably even when other cores
 /// idle, so it is the dependable driver of all timed wakes. Cheap: a scan of `MAX_TASKS` relaxed
 /// loads, almost all zero. Only wakes a task still `BlockedOnRecv` (one that already returned

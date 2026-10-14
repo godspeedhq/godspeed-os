@@ -41,7 +41,7 @@ shutdown cancel       stop a pending shutdown
   seconds. A restarted `power` reads the kernel's deadline and carries on.
 - **`jobs`** lists a pending shutdown above the jobs.
 - **In the last minute** no new job starts: `background` refuses and names the shutdown.
-- **`shutdown now`** names a running job it will cut, then turns the machine off.
+- **`shutdown now`** warns that a running job will be cut, then turns the machine off.
 - **The last line is the truth**: the machine is off, or the kernel says `every core is halting - it is safe to
   switch the machine off` where the board cannot cut its own power (`docs/shutdown.md` 5).
 

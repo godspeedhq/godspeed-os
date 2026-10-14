@@ -281,7 +281,8 @@ const OP_SEAL: u8 = 31;
 /// `QUIESCE_SECS`, so nothing changes between the flush and the power going off. BOUNDED, so a shutdown that never
 /// comes - its caller died between the two - leaves a filesystem that takes writes again by itself.
 const OP_QUIESCE: u8 = 32;
-/// How long a quiesce refuses writes. The power-off follows within a second; ten is the margin.
+/// How long a quiesce refuses writes. The power-off follows within about two seconds (`power` starts its tidy-up
+/// two out); ten is the margin.
 const QUIESCE_SECS: i64 = 10;
 const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, path, rights:u8] → mint a
                              // delegated resource for the file, reply [FS_OK] + the embedded FILE CAP.

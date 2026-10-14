@@ -2157,7 +2157,7 @@ fn mode_adv_a12(ctx: &ServiceContext) -> ! {
         ctx.log("adv: A12 FAIL - reboot not denied without REBOOT cap (gate open or wrong error)");
         idle(ctx);
     }
-    // And its sibling, PowerOff (56), gated by POWER_OFF, which only `power` holds. An open gate would not
+    // And its sibling, PowerOff (56), gated by POWER_OFF, which only the shell holds. An open gate would not
     // return either: the machine would turn off or halt, and the harness would see no pass marker.
     if ctx.power_off() != CAP_NOT_HELD {
         ctx.log("adv: A12 FAIL - power-off not denied without POWER_OFF cap (gate open or wrong error)");

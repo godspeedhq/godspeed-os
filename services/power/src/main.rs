@@ -28,17 +28,24 @@
 //!   machine at full power: it lasts `MAX_SECS` at most, and the expiry is said (26.7). No death
 //!   notification is needed for that, which is why there is none.
 //!
+//! **Shutdown (`docs/shutdown.md`).** This service holds no `POWER_OFF`; the shell does. It READS the one pending
+//! power-off the kernel holds (InspectKernel query 28, `power_off_pending`), warns at 1 h, 30 m, 15 m, 5 m, 1 m and
+//! each of the last ten seconds, and two seconds out (`TIDY_AT`) cancels a copy in flight and has `fs` quiesce. The
+//! kernel fires the deadline whether or not this service is alive. `OP_SHUTDOWN_CHANGED` is a cue with no reply and
+//! no authority.
+//!
 //! **Restart.** This service is restartable like any other. A respawned instance knows of no lease, so
 //! it puts the clock at its minimum - the honest state for "nobody has asked" - and a holder whose lease
 //! was lost simply runs slower until it asks again. Bounded, loud, and never stuck fast.
 
 // The stdlib for everything it covers - receiving, the reply capability, answering on it - and the
-// SDK only for the one call that is this service's alone (`cpu_clock`, a privileged syscall the stdlib
-// deliberately does not wrap).
+// SDK only for what the stdlib does not wrap: `cpu_clock` (a privileged syscall, this service's alone) and
+// `power_off_pending` (query 28).
 use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
-/// The protocol, one opcode byte. Replies lead with a status byte.
+/// The protocol, one opcode byte. Replies to `OP_HOLD` and `OP_RELEASE` lead with a status byte; `OP_SHUTDOWN_CHANGED`
+/// is not answered.
 const OP_HOLD: u8 = 1;
 const OP_RELEASE: u8 = 2;
 /// `[3]`, no reply: the shell set or cancelled the machine's pending power-off. A CUE, not a request - it
@@ -148,7 +155,8 @@ struct Shutdown {
 
 /// Warn at these many seconds left: an hour, half, a quarter, five minutes, one, then each of the last ten.
 const WARN_AT: [u64; 15] = [3600, 1800, 900, 300, 60, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1];
-/// When the tidy-up starts: its budget is about a second, so it begins two out.
+/// When the tidy-up starts. Its budget is up to a second per peer (`copier`, then `fs`), so a slow `copier` can leave
+/// `fs`'s quiesce to be cut by the deadline - best-effort, and the journal covers what is cut.
 const TIDY_AT: u64 = 2;
 
 fn say_left(secs: u64) -> (u64, &'static str) {
@@ -209,7 +217,7 @@ impl Shutdown {
     }
 }
 
-/// The last second before the power goes (`docs/shutdown.md` 4.3): a copy in flight is cancelled, so its partial
+/// The last seconds before the power goes (`docs/shutdown.md` 4.3): a copy in flight is cancelled, so its partial
 /// destination is removed, and `fs` flushes and stops taking writes. Each is bounded by about a second and an
 /// unanswered one is said and skipped; whatever is not done is left to recovery, which is what it is for.
 fn tidy_up(ctx: &ServiceContext) {
@@ -250,8 +258,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     let mut no_cap: u32 = 0;
     loop {
-        // WAIT FOR THE EARLIEST EXPIRY, or block outright when nothing is open: an idle machine costs
-        // this service nothing at all.
+        // WAIT FOR THE EARLIEST EVENT - a lease expiry, or the shutdown's next warning or tidy-up - or block outright
+        // when there is none: an idle machine costs this service nothing at all.
         let now = gs::driver::wait::ticks(&ctx);
         // Whole seconds, rounded UP, because `gs::ipc::recv_within` counts in seconds: waking a fraction
         // late is a lease running a fraction long, and waking early would only loop back here.
@@ -289,7 +297,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
 
         // The pending shutdown: re-read the kernel's deadline (a cancel, or one brought earlier), warn at the
-        // thresholds, and tidy up in its last second.
+        // thresholds, and tidy up two seconds out.
         sd.tick(&ctx);
 
         let Some(req) = msg else { continue };

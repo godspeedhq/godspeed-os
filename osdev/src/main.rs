@@ -1917,6 +1917,8 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         // embedded that slow `copier` (2.5 s a reply) because nothing here rebuilt it plain - `osdev test jobs`
         // failed 7 checks on it, none of them real.
         "copier", "recorder",
+        // `power`, so this path never embeds a stale build of it: it holds a shutdown's tidy-up, and an image
+        // with a power from an older tree would warn and tidy by older rules.
         "power"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
@@ -2603,8 +2605,6 @@ fn build_slow_services(svcs: &[&str]) {
     println!("build: slow services embedded");
 }
 
-/// `osdev test quit` (`backlog/fixed/89`): every kind of wait, on a deliberately slow `fs`, recording whether
-/// `[q] quit` (and `[b]`) appeared, when, and what `q` did. The record is `build/tests/quit_report.md`.
 /// `osdev test shutdown` (`docs/shutdown.md`): the whole of `shutdown` at the prompt, over a real disk. The shell sets,
 /// shows and cancels the deadline the KERNEL holds; `power` warns and tidies up; the deadline fires with nothing
 /// asking and QEMU (launched without `-no-shutdown`) switches itself off - ACPI S5 on x86.
@@ -2623,6 +2623,8 @@ fn run_shutdown_test() {
     crate::shell_test::run_shutdown(&image_path, persist, 2);
 }
 
+/// `osdev test quit` (`backlog/fixed/89`): every kind of wait, on a deliberately slow `fs`, recording whether
+/// `[q] quit` (and `[b]`) appeared, when, and what `q` did. The record is `build/tests/quit_report.md`.
 fn run_quit_test() {
     println!("\n=== quit: every wait on a slow fs - does [q] appear, and does q work? ===");
     build_blockdev_fs("slow-replies", "");

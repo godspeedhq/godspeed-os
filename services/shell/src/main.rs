@@ -7557,7 +7557,7 @@ fn shutdown_cue_power(ctx: &ShellCtx) {
 ///
 /// THE KERNEL HOLDS THE DEADLINE (`PowerOff`, syscall 56, `docs/shutdown.md` 6), so a shutdown survives the death
 /// of this shell and of `power`; this command sets it, shows it and cancels it. `power` gives the warnings and the
-/// last-second tidy-up. The shell holds `POWER_OFF` for the operator, beside `REBOOT`.
+/// tidy-up two seconds before it. The shell holds `POWER_OFF` for the operator, beside `REBOOT`.
 fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     match arg {
         "now" => {

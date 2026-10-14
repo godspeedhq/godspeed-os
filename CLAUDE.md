@@ -1701,20 +1701,21 @@ The kernel validates these at spawn time and grants caps only for the specified 
 >
 > **Who holds it.** `POWER_OFF` (resource 19) is a privilege bit the supervisor may delegate, granted to the SHELL
 > alone, beside `REBOOT`: ending the session is the operator's, and no service has a reason to end it - a failing
-> service is restarted, never the machine. `power` holds nothing; it reads the deadline, warns and does a bounded
-> tidy-up in the last second. The Commandments baseline lists the shell as the one holder, so a second (a power
+> service is restarted, never the machine. `power` holds no shutdown authority; it reads the deadline, warns and does a
+> bounded tidy-up two seconds before it. The Commandments baseline lists the shell as the one holder, so a second (a power
 > button) is a recorded decision. A holder acts only on its own inputs and never offers shutdown-on-request to
 > other services, which would reopen an anonymous path one level up; the keyboard residual of SEC-2 (6.4) applies,
 > since anything that can type can type `shutdown`.
 >
-> **Visible, deliberately.** InspectKernel query 28 (the seconds left, or -1) is UNGATED - the one deliberate
-> addition to the ungated list - because a deadline that outlives every service must be seen by everything that
+> **Visible, deliberately.** InspectKernel query 28 (the seconds left, or -1) is UNGATED, deliberately,
+> because a deadline that outlives every service must be seen by everything that
 > might report it, and a shutdown planted by a compromised holder must never be hidden. It discloses no task's
 > state and confers no authority.
 >
 > **What it does not do, recorded rather than hidden (26.7).** ACPI asks the OS to run the firmware's `\_PTS`
-> method before S5, which is bytecode this kernel does not interpret; a machine that gates S5 on it (the HP T630)
-> halts instead of powering off, and says so. The Pi 2 cannot cut its own 5 V and halts; the Pi 4's firmware cuts
+> method before S5, which is bytecode this kernel does not interpret; a machine that gates S5 on it - the HP T630, by the June
+> 2026 attempt - halts instead of powering off, and says so. The Pi 2 cannot cut its own 5 V and is expected to
+> halt (not yet checked on hardware); the Pi 4's firmware cuts
 > its rails only where its EEPROM sets `POWER_OFF_ON_HALT=1`.
 >
 > **Why it is recorded.** A new syscall with three operations, a query, a resource and a seam member widen the
@@ -2109,7 +2110,7 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
 
 > **Amendment 2026-10-14 (`PowerOff`): `sdk/rust/src/service_context.rs` 77 -> 79.** Two call sites behind
 > the §12.3 amendment of the same date: `power_off_call`, one `unsafe { raw_syscall(56, ..) }` behind the three
@@ -2363,7 +2364,7 @@ Adversarial tests verify capability isolation holds under direct attack. The sys
 | A9  | Service tries to spawn another service directly, bypassing the supervisor           |
 | A10 | Service passes kernel addresses as syscall arguments                                |
 | A11 | Service invokes `InspectKernel` system queries without an `INTROSPECT` cap          |
-| A12 | Service invokes `Reboot` without the capability                                     |
+| A12 | Service invokes `Reboot` or `PowerOff` without the capability                         |
 | A13 | Service invokes `AcquireSendCap` without the capability                             |
 | A14 | Ring-3 CPU exception (null read, non-canonical read, divide-by-zero) kills the task, not the kernel |
 | A15 | A bad user pointer kills the caller, not the kernel                                 |
@@ -3316,7 +3317,7 @@ When real userspace work begins, the first user-facing design decision is **how 
 >
 > **Note 2026-10-14: and a third, `shutdown`, with its reason.** It is the word Linux, Windows and macOS
 > share, and it names the ACT - ending the session - rather than promising a mechanism: on the T630 and the Pi 2
-> the machine halts without losing power, so `poweroff` would claim what did not happen (`docs/shutdown.md`). It
+> the machine is expected to halt without losing power, so `poweroff` would claim what may not happen (`docs/shutdown.md`). It
 > left `FOREIGN_HINTS`, where its hint had been `reboot` - wrong advice, since `reboot` turns nothing off - and
 > `halt` and `poweroff` stay hints that answer `shutdown`.
 

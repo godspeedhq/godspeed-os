@@ -10914,7 +10914,7 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
     check(log.contains("power: the machine will shut down in"), "`power` announced the shutdown");
     check(log.contains("power: shutting down in 10s") && log.contains("power: shutting down in 1s"),
           "`power` counted down the last ten seconds");
-    check(log.contains("power: tidy-up - fs"), "`power` asked fs to quiesce in the last second");
+    check(log.contains("power: tidy-up - fs"), "`power` asked fs to quiesce two seconds out");
     check(log.contains("fs: quiesced for a shutdown"), "fs flushed and stopped taking writes");
     check(log.contains("power-off: the pending power-off fell due"), "the KERNEL fired the deadline, with nothing asking");
     check(log.contains("power-off: ACPI S5"), "ACPI S5 was written");

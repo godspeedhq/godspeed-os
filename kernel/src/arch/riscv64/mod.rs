@@ -1575,7 +1575,8 @@ pub fn hardware_reset() -> ! {
 /// Turn the machine off (`PowerOff`, syscall 56): SBI SRST with the shutdown type, the same firmware call
 /// `hardware_reset` makes. QEMU `virt` powers off; on the VisionFive 2 Lite OpenSBI must find the AXP15060
 /// PMIC to do it, and the cold reboot already dies at that step on this board (`sbi::system_reset`), so a
-/// refusal here is likely and is said (`docs/shutdown.md` 5). Returns only if the firmware did not act.
+/// refusal (which is said) or a board that goes dark without powering off is likely; not yet tried on the board
+/// (`docs/shutdown.md` 5). Returns only if the firmware did not act.
 pub fn power_off() -> &'static str {
     match sbi::system_shutdown() {
         None => "this firmware implements no SBI SRST extension - it cannot turn the board off",

@@ -235,9 +235,9 @@ service_configs = [
 # INTROSPECT-gated: the boot log names every service and device on the machine. Read by `events log boot`.
 #
 # 28 (added 2026-10-14) is the seconds until the machine's pending power-off (`PowerOff` with a delay), -1 for
-# none. UNGATED, the one deliberate addition to that list since it was written: the deadline is the kernel's
+# none. UNGATED, deliberately: the deadline is the kernel's
 # own scheduled action, it outlives every service, and its visibility IS the safeguard - a shutdown planted by
-# a compromised holder must be seen by `power`'s warnings, `shutdown status` and `ask`. It discloses no task's
+# a compromised holder must be seen by `power`'s warnings and `shutdown status`. It discloses no task's
 # state and confers no authority (docs/shutdown.md 6).
 introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
@@ -493,8 +493,8 @@ DEVICE_POWER       = 17
 CPU_CLOCK          = 18
 # POWER OFF - turn the machine off, now or at a deadline the kernel holds, or halt every core where the
 # hardware cannot cut its own power (`PowerOff`, syscall 56). A privilege bit, delegatable, held by the
-# SHELL alone: ending the session is the operator's, beside REBOOT. `power` reads the deadline and holds
-# nothing. A second holder (a power button, docs/shutdown.md) is a decision recorded here. CLAUDE.md 12.3.
+# SHELL alone: ending the session is the operator's, beside REBOOT. `power` reads the deadline and holds no
+# shutdown authority. A second holder (a power button, docs/shutdown.md) is a decision recorded here. CLAUDE.md 12.3.
 POWER_OFF          = 19
 
 

@@ -1887,7 +1887,8 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // and task-neutral board/transport facts that disclose nobody's state: the input-ready flag (10),
     // the RTC and timing reads (11, 12, 16, 17), NIC identity and BAR, driver-presence bits, a hardware random word, the
     // EMMC base clock, one byte off the COM2 operator channel and the board MAC (14, 15, 18, 19, 20,
-    // 21, 23). Every other query discloses another task's or system-wide state and requires the
+    // 21, 23). And one that IS system-wide, deliberately: 28, the seconds left on a pending power-off,
+    // ungated so a pending shutdown can never be hidden (`docs/shutdown.md` 6). Every other query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (docs/introspection-capability.md).
     //
     // 9 and 22 are not here: both queries were REMOVED (see the notes at their old arms below). They
@@ -2019,7 +2020,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // 28: seconds until the machine's pending power-off (`PowerOff` with a delay), or -1 when none is
         // pending. UNGATED, and that is the safeguard rather than a convenience: a deadline the kernel holds
         // outlives every service, so it must be visible to anything that might report it - `power`'s warnings,
-        // `shutdown status`, `ask` - and a shutdown planted by a compromised holder can never be hidden. It
+        // `shutdown status` - and a shutdown planted by a compromised holder can never be hidden. It
         // discloses no task's state and confers no authority (`docs/shutdown.md` 6).
         28 => scheduler::power_off_pending_secs().map_or(-1, |s| s as i64),
         // 27: the BOOT RECORD - a fixed copy of the first bytes ever logged, which never wraps
@@ -2528,7 +2529,7 @@ fn handle_cpu_clock(max: u64) -> i64 {
 ///
 /// - `arg0 = 0`: NOW. Does not return: the machine is off, or every core is halted (`scheduler::power_off_now`).
 /// - `arg0 = 1`, `arg1 = secs` (1 ..= 24 h): set the machine's one pending power-off `secs` from now. 0 when this
-///   is now the pending one; 1 when one already due SOONER was kept (earliest wins, so nobody can postpone a
+///   is now the pending one; 1 when one already due at the same time or SOONER was kept (earliest wins, so nobody can postpone a
 ///   shutdown somebody else asked for); -1 for a time out of range.
 /// - `arg0 = 2`: cancel the pending one. 0 when there was one, 1 when there was none.
 ///

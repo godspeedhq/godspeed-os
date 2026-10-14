@@ -15,7 +15,7 @@
 //! the DSDT, not by running it, which is the one piece of AML this needs and the common way it is done.
 //!
 //! **Each table is read as one bounds-checked slice.** The only `unsafe` in the walk is turning a table's
-//! address into a slice of its own stated length (`table`); every field and the whole `\_S5` scan are then
+//! address into a slice of its own stated length (`region`, which `table` calls with the header's length); every field and the whole `\_S5` scan are then
 //! ordinary indexing, so a malformed table is an `Err`, never an out-of-bounds read.
 //!
 //! The tables are walked when `power_off` is called, not at boot: the only thing kept from boot is where
@@ -128,7 +128,8 @@ fn find_s5() -> Result<S5, &'static str> {
 /// A scan, not an interpreter: the name `_S5_` preceded by `NameOp` (0x08, optionally with a root `\`),
 /// then `PackageOp` (0x12), its length (one to four bytes, the count of extra bytes in the first byte's top
 /// two bits), the element count, and the two values - each a `BytePrefix` (0x0A) and a byte, or a bare
-/// `Zero` (0x00) / `One` (0x01) opcode.
+/// `Zero` (0x00) / `One` (0x01) opcode. `Ones` (0xFF) is read as 0 and any other byte as the value itself, so a
+/// `\_S5` written with a Word or DWord prefix is not handled.
 fn scan_s5(dsdt: &[u8]) -> Option<(u16, u16)> {
     let aml = dsdt.get(SDT_HEADER_LEN..)?;
     for i in 2..aml.len().saturating_sub(4) {
@@ -179,7 +180,7 @@ pub fn power_off() -> &'static str {
     // down either way, and the caller halts every core if it does not.
     unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
     // A machine booted in legacy mode has SCI_EN clear and ignores SLP_EN until ACPI is enabled through
-    // SMI_CMD. Bounded: a firmware that never sets SCI_EN gets the write anyway, and the result says.
+    // SMI_CMD. Bounded: a firmware that never sets SCI_EN gets the write anyway.
     if inw(s5.pm1a_cnt) & SCI_EN == 0 && s5.smi_cmd != 0 && s5.acpi_enable != 0 {
         // SAFETY: an 8-bit write of the FADT's ACPI_ENABLE value to the FADT's SMI_CMD port - the
         // specification's handshake for handing the chipset to the OS.
