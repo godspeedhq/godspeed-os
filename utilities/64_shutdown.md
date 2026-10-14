@@ -1,4 +1,4 @@
-# Utility: `shutdown` - turn the machine off
+# Utility: `shutdown` - turn the machine off (not provided yet: designed, being built)
 
 **Utility:** `shutdown` - turn the machine off, now or after a delay
 **Status:** Design, 2026-10-14, not built (`docs/shutdown.md`, branch `feat/shutdown`).

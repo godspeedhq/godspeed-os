@@ -1682,6 +1682,31 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > request the kernel already validates. The name the kernel still knows is `supervisor`, because the
 > kernel spawns and respawns it (6.2). `docs/audio.md`, "No service names in the kernel".
 
+> **Amendment 2026-10-14 (`PowerOff`, syscall 56): the kernel turns the machine off, or halts it, and a
+> SERVICE decides when.** `reboot` resets the machine through a channel the kernel owns on every port;
+> turning it off uses the same channels - the Pis' power-management watchdog with the boot partition set to
+> 63 (halt) instead of cleared, the RISC-V firmware's SRST call with the shutdown type instead of a reboot,
+> and on x86 ACPI soft-off (S5), read from the FADT and the DSDT's `\_S5` package in the tables the kernel
+> already walks for the IOMMU. `PowerOff` is gated by `POWER_OFF` (resource 19), a privilege bit the
+> supervisor may delegate and grants to ONE service, `power`, because the machine has one power state.
+>
+> **What the kernel learns, and what it does not.** Each port answers one new seam member, `power_off`,
+> which returns only when the hardware did not turn off, with the reason. The handler takes the screen and
+> the serial line as the panic path does, so what is said reaches someone, then asks the arch; if it
+> returns, every core halts through `halt_all_cores` and the last line says it is safe to switch off. A
+> halt asked for is not a crash and is not printed as one. The kernel holds no policy (26.10): the
+> countdown, the warnings, the bounded tidy-up before it and whether to shut down at all are `power`'s
+> (`docs/shutdown.md`).
+>
+> **What it does not do, recorded rather than hidden (26.7).** ACPI asks the OS to run the firmware's
+> `\_PTS` method before S5, which is bytecode this kernel does not interpret; a machine that gates S5 on it
+> (the HP T630) halts instead of powering off, and says so. The Pi 2 cannot cut its own 5 V and halts; the
+> Pi 4's firmware cuts its rails only where its EEPROM sets `POWER_OFF_ON_HALT=1`.
+>
+> **Why it is recorded.** A new syscall, resource and seam member widen the surface Commandment I pins. It
+> is mechanism on channels the kernel already owns - `reboot`'s sibling - not a seventh responsibility,
+> the argument the `DevicePower` and `CpuClock` amendments above make.
+
 ---
 
 ## 13. Service Contracts
@@ -2069,8 +2094,13 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`). A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 78 on 2026-10-14 by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
 
+> **Amendment 2026-10-14 (`PowerOff`): `sdk/rust/src/service_context.rs` 77 -> 78.** One more
+> `unsafe { raw_syscall(56, ..) }` call site, the wrapper `power_off` behind the §12.3 amendment of the same
+> date - the same single design consequence as the `CpuClock` amendment below. Necessity: a service cannot
+> reach a syscall any other way. Safety: no arguments, and the kernel checks the capability before acting.
+>
 > **Amendment 2026-10-08 (the boot record): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
 > `unsafe { raw_syscall(13, 27, ..) }` call site, `boot_record_query`, behind the safe
 > `boot_record_size` and `boot_record_read` of the 11.4 amendment of the same date - one block for both,

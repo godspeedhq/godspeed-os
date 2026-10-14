@@ -136,6 +136,10 @@ def main():
             feats_svc = []
             if svc == "fs" and crash_window:
                 feats_svc = ["--features", "crash-window"]
+            # TEST ONLY (docs/shutdown.md S1): `power` asks the kernel to turn the machine off 8 s after
+            # start, so QEMU can show SBI SRST shutdown working. Never an image to flash.
+            if svc == "power" and "--shutdown-test" in sys.argv:
+                feats_svc = ["--features", "shutdown-test"]
             run(["cargo", "build", "-p", svc, "--target", TARGET, "--release"] + feats_svc)
         if crash_window:
             print("")

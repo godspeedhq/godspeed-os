@@ -189,6 +189,8 @@ pub fn panic_halt_check() {}
 /// `kernel/src/arch/CLAUDE.md`, item 5.
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
+/// `PowerOff` (syscall 56): this port has no route, and says so; the caller halts every core.
+pub fn power_off() -> &'static str { "this port has no way to turn the machine off" }
 
 // ---- Serial / console (NS16550 on QEMU virt @ 0x1000_0000; stubbed) ----
 pub fn serial_write_byte(b: u8) { unsafe { UART_THR.write_volatile(b); } }

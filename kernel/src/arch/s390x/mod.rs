@@ -136,6 +136,8 @@ pub fn panic_halt_check() {}
 /// `kernel/src/arch/CLAUDE.md`, item 5.
 pub fn halt_all_cores() -> ! { loop { core::hint::spin_loop(); } }
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
+/// `PowerOff` (syscall 56): this port has no route, and says so; the caller halts every core.
+pub fn power_off() -> &'static str { "this port has no way to turn the machine off" }
 
 // ---- Serial / console (s390x SCLP console; stubbed - see sclp_write) ----
 pub fn serial_write_byte(b: u8) { sclp_putc(b); }

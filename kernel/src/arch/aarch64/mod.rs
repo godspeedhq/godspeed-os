@@ -1808,6 +1808,45 @@ pub fn hardware_reset() -> ! {
 #[cfg(not(feature = "pi4"))]
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
 
+/// Turn the machine off (`PowerOff`, syscall 56) as far as a Pi 4 can: `hardware_reset`'s watchdog reset
+/// with the boot partition set to 63, which the firmware reads as HALT (Linux `bcm2835_power_off`). The
+/// firmware then also turns the power rails off if `POWER_OFF_ON_HALT=1` is set in the board's EEPROM;
+/// otherwise the board is halted and still powered (`docs/shutdown.md` 5). Returns only if the watchdog did
+/// not fire, with the reason.
+#[cfg(feature = "pi4")]
+pub fn power_off() -> &'static str {
+    const PM_RSTC: usize = 0xFE10_001C;
+    const PM_RSTS: usize = 0xFE10_0020;
+    const PM_WDOG: usize = 0xFE10_0024;
+    const PM_PASSWORD: u32 = 0x5A00_0000;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x0000_0020;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xFFFF_FFCF;
+    const PM_RSTS_PARTITION: u32 = 0xFFFF_FAAA;
+    /// Partition 63: every partition bit set (Linux `PM_RSTS_RASPBERRYPI_HALT`).
+    const PM_RSTS_HALT: u32 = !PM_RSTS_PARTITION;
+    crate::kprintln!("power-off: halting through the firmware (boot partition 63); the rails go off only if \
+                      the EEPROM sets POWER_OFF_ON_HALT=1");
+    // SAFETY: the same BCM2711 power-management registers `hardware_reset` writes, through the kernel's
+    // Device mapping; volatile 32-bit writes gated by the 0x5A password. Poked once: re-arming the watchdog
+    // restarts its countdown.
+    unsafe {
+        let rstc = mmio(PM_RSTC) as *mut u32;
+        let rsts = mmio(PM_RSTS) as *mut u32;
+        let wdog = mmio(PM_WDOG) as *mut u32;
+        rsts.write_volatile(PM_PASSWORD | (rsts.read_volatile() & PM_RSTS_PARTITION) | PM_RSTS_HALT);
+        let rstc_val = PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
+        wdog.write_volatile(PM_PASSWORD | 10);
+        rstc.write_volatile(rstc_val);
+    }
+    for _ in 0..80_000_000u32 {
+        core::hint::spin_loop();
+    }
+    "the power-management watchdog did not fire - the board is still running"
+}
+
+#[cfg(not(feature = "pi4"))]
+pub fn power_off() -> &'static str { "this board has no way to turn itself off" }
+
 // ---- Serial / console ----
 // These go through `put_byte`, which POLLS the TX FIFO before writing. They previously wrote straight
 // to the data register: correct-looking, and fine while nothing called them (this file was a boundary

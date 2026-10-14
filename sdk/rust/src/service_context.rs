@@ -395,6 +395,9 @@ pub mod privbits {
     /// Set the Arm cores to the platform's minimum or maximum clock (`CpuClock`, syscall 55). Held by
     /// ONE service, `power`, because the clock is one machine-wide setting (`docs/power.md`).
     pub const CPU_CLOCK:       u32 = 1 << 13;
+    /// Turn the machine off, or halt it where it cannot cut its own power (`PowerOff`, syscall 56). Held by
+    /// ONE service, `power`, which decides when (`docs/shutdown.md`).
+    pub const POWER_OFF:       u32 = 1 << 14;
 }
 
 /// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to
@@ -3972,6 +3975,15 @@ impl ServiceContext {
         // SAFETY: a plain syscall; the kernel validates the capability before asking the firmware.
         let r = unsafe { crate::syscall::raw_syscall(55, if max { 1 } else { 0 }, 0, 0) };
         if r > 0 { Some(r as u32) } else { None }
+    }
+
+    /// Turn the machine off (`PowerOff`, syscall 56). Needs `POWER_OFF`, which only the `power` service is
+    /// spawned with. With it, this does not return: the machine is off, or - where the hardware cannot cut
+    /// its own power - every core is halted and the kernel's last line says it is safe to switch off. It
+    /// returns only when refused, with the kernel's code; the kernel says why on the serial log.
+    pub fn power_off(&self) -> i64 {
+        // SAFETY: a plain syscall with no arguments; the kernel validates the capability before acting.
+        unsafe { crate::syscall::raw_syscall(56, 0, 0, 0) }
     }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.

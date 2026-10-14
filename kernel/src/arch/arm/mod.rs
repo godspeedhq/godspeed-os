@@ -1262,6 +1262,43 @@ pub fn hardware_reset() -> ! {
 }
 
 
+/// Turn the machine off (`PowerOff`, syscall 56) as far as a Pi 2 can: the reset `hardware_reset` makes,
+/// with the boot partition set to 63 rather than cleared. The firmware reads 63 as HALT and stays down
+/// instead of booting, with most of the chip powered off; the 5 V supply stays on, because nothing on this
+/// board can cut it (Linux `bcm2835_power_off`, `docs/shutdown.md` 5). Returns only if the watchdog did
+/// not fire, with the reason.
+pub fn power_off() -> &'static str {
+    const PM_RSTC: usize = PERIPHERAL_BASE + 0x10_001c;
+    const PM_RSTS: usize = PERIPHERAL_BASE + 0x10_0020;
+    const PM_WDOG: usize = PERIPHERAL_BASE + 0x10_0024;
+    const PM_PASSWORD: u32 = 0x5A00_0000;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x0000_0020;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xffff_ffcf;
+    const PM_RSTS_PARTITION: u32 = 0xffff_faaa;
+    /// Partition 63, spread across the partition bits: every one of them set (Linux
+    /// `PM_RSTS_RASPBERRYPI_HALT`).
+    const PM_RSTS_HALT: u32 = !PM_RSTS_PARTITION;
+    const WDOG_TICKS: u32 = 10;
+    crate::kprintln!("power-off: halting through the firmware (boot partition 63); the board stays powered");
+    // SAFETY: the same BCM2835 power-management registers `hardware_reset` writes, in the Device-mapped
+    // peripheral window; volatile 32-bit writes gated by the 0x5A password. Poked ONCE and then left to run
+    // out - re-arming the watchdog restarts its countdown (see `hardware_reset`).
+    unsafe {
+        let rstc = PM_RSTC as *mut u32;
+        let rsts = PM_RSTS as *mut u32;
+        let wdog = PM_WDOG as *mut u32;
+        rsts.write_volatile(PM_PASSWORD | (rsts.read_volatile() & PM_RSTS_PARTITION) | PM_RSTS_HALT);
+        let rstc_val = PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
+        wdog.write_volatile(PM_PASSWORD | WDOG_TICKS);
+        rstc.write_volatile(rstc_val);
+    }
+    // Ten watchdog ticks is about 150 us. A generous bounded wait, then the honest answer.
+    for _ in 0..40_000_000u32 {
+        core::hint::spin_loop();
+    }
+    "the power-management watchdog did not fire - the board is still running"
+}
+
 /// The SD/EMMC controller's base clock in Hz, read from the VideoCore mailbox at boot (0 = the GPU
 /// never reported one). Exposed to `block-driver` through InspectKernel query 20 because the Arasan's
 /// own capability register reports this wrongly on the BCM283x, and the driver is granted only its

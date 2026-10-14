@@ -485,6 +485,10 @@ DEVICE_POWER       = 17
 # machine-wide setting. Added because the Pi firmware drops the cores to their minimum a minute after
 # boot and the WiFi chip's firmware traps when loaded that slowly (docs/wifi.md 55). CLAUDE.md 12.3.
 CPU_CLOCK          = 18
+# POWER OFF - turn the machine off, or halt every core where the hardware cannot cut its own power
+# (`PowerOff`, syscall 56). A privilege bit, delegatable, held by ONE service: `power`, which owns WHEN
+# (docs/shutdown.md). One holder because the machine has one power state. CLAUDE.md 12.3, 2026-10-14.
+POWER_OFF          = 19
 
 
 [kernel.arch_roles]
@@ -559,6 +563,7 @@ CPU_CLOCK          = 18
 "x86_64/fb.rs"                = "console"
 "x86_64/interrupts.rs"        = "interrupts"
 "x86_64/ioapic.rs"            = "interrupts"
+"x86_64/acpi.rs"              = "discovery"
 "x86_64/iommu.rs"             = "mmu"
 "x86_64/mod.rs"               = "arch-entry"
 "x86_64/page_tables.rs"       = "mmu"
@@ -648,6 +653,12 @@ DevicePower              = 54
 # Two rates are on offer and the caller cannot name a third. Who may be fast and for how long is the
 # `power` service's (26.10, docs/power.md). Gated by CPU_CLOCK. CLAUDE.md 12.3, 2026-10-01.
 CpuClock                 = 55
+# POWER OFF - turn the machine off. Why isn't this a service? It is, above the kernel: `power` decides when
+# and whether, with a countdown, warnings and a bounded tidy-up (docs/shutdown.md). What only the kernel can
+# do is the last step, on channels it already owns for `Reboot` - the Pis' power-management watchdog, the
+# RISC-V firmware's SRST call, the ACPI tables x86 already parses - and, where the hardware cannot cut its
+# own power, halting every core as the panic path does. Gated by POWER_OFF. CLAUDE.md 12.3, 2026-10-14.
+PowerOff                 = 56
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47
@@ -774,7 +785,7 @@ SpawnImage               = 52
 "observe-live" = ["priv:INTROSPECT"]
 "observe-now" = ["priv:INTROSPECT"]
 "ping" = ["peer:pong"]
-"power" = ["priv:CPU_CLOCK"]
+"power" = ["priv:CPU_CLOCK", "priv:POWER_OFF"]
 "recorder" = ["peer:events", "peer:fs"]
 "resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
 "shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
@@ -820,6 +831,7 @@ service_control = "SERVICE_CONTROL"
 resource_mint = "RESOURCE_MINT"
 pci_cfg = "PCI_CFG"
 cpu_clock = "CPU_CLOCK"
+power_off = "POWER_OFF"
 
 # Commandment X - which utility spec covers which VERBS, where the filename is not the verb.
 # Read by `X-user-vocabulary`. Two specs each cover a set:

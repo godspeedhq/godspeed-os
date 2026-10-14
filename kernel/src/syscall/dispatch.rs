@@ -105,6 +105,11 @@ pub enum SyscallNumber {
     /// the rate they read back in Hz. Gated by `CPU_CLOCK`, which the `power` service alone is spawned
     /// with. The kernel learns two rates and nothing about why one is wanted (`docs/power.md`).
     CpuClock               = 55,
+    /// Turn the machine off, or, where the hardware cannot cut its own power, halt every core so it is safe
+    /// to switch off. Returns only when refused (`CapNotHeld`). Gated by `POWER_OFF`, which the `power`
+    /// service alone is spawned with. The kernel learns how each board turns off and nothing about when
+    /// or why (`docs/shutdown.md`).
+    PowerOff               = 56,
 }
 
 /// Raw syscall dispatcher - the one neutral entry every port's trap path calls (`arch/<isa>/`:
@@ -177,6 +182,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::PciCfgRead as u64 => handle_pci_cfg_read(arg0, arg1),
         n if n == SyscallNumber::DevicePower as u64 => handle_device_power(arg0),
         n if n == SyscallNumber::CpuClock as u64 => handle_cpu_clock(arg0),
+        n if n == SyscallNumber::PowerOff as u64 => handle_power_off(),
         _ => -1, // Unknown syscall.
     }
 }
@@ -2509,6 +2515,35 @@ fn handle_cpu_clock(max: u64) -> i64 {
             -1
         }
     }
+}
+
+/// PowerOff (56): turn the machine off. Gated by `POWER_OFF_RESOURCE` + WRITE; without it, `CapNotHeld` (-2)
+/// and nothing else happens. With it, this does not return: the machine is off, or every core is halted.
+///
+/// THE ORDER IS THE PANIC PATH'S, because the outcome is the same - nothing will run again - and a line
+/// that is queued and never drained is a line never said. The screen is taken back from `console` (which is
+/// about to stop) and serial output goes straight to the wire, BEFORE the arch is asked, so whatever it
+/// says reaches someone. The arch returns only when the hardware did not turn off, with the reason, and
+/// then every core halts. A halt asked for is not a crash, and the last line says so.
+///
+/// MECHANISM, NOT A SEVENTH RESPONSIBILITY: turning the machine off is reboot's sibling, on the channels
+/// the kernel already owns for it (the Pis' watchdog, the RISC-V firmware's SRST, the ACPI tables x86
+/// already reads). When, and whether at all, are the `power` service's (26.10, CLAUDE.md 12.3).
+fn handle_power_off() -> i64 {
+    if !scheduler::current_task_holds_resource(crate::capability::POWER_OFF_RESOURCE, Rights::WRITE) {
+        crate::kprintln!("power-off: refused - caller does not hold POWER_OFF");
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let name = scheduler::task_name(scheduler::current_task_slot());
+    crate::bootcon::reclaim_for_panic();
+    crate::arch::imp::serial_enter_panic_mode();
+    crate::kprintln!("power-off: '{}' asked to turn the machine off", name);
+    crate::arch::imp::tx_ring_flush_blocking();
+    let why = crate::arch::imp::power_off();
+    crate::kprintln!("power-off: {}", why);
+    crate::kprintln!("power-off: every core is halting - it is safe to switch the machine off");
+    crate::arch::imp::tx_ring_flush_blocking();
+    crate::arch::imp::halt_all_cores()
 }
 
 /// PciCfgRead (53): `arg0` = configuration selector, `arg1` = register offset. Gated by

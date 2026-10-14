@@ -1,6 +1,8 @@
 # Shutdown: turning the machine off on purpose
 
-**Status:** design, 2026-10-14, branch `feat/shutdown`. Nothing is built. The command is `utilities/64_shutdown.md`.
+**Status:** design, 2026-10-14, branch `feat/shutdown`. **S1 (the kernel's `PowerOff`) is built and QEMU-verified**
+(`osdev test shutdown` 6/0 on x86, SBI SRST on QEMU RISC-V, the refusal in `osdev test adv` A12); S2 to S6 are not
+built. The command is `utilities/64_shutdown.md`.
 
 ## 1. What is asked for
 
@@ -89,12 +91,31 @@ In order, the whole of it bounded at about 1 s:
 
 `shutdown now` skips 1 to 3 and names a copy it will cut; that is a power cut asked for on purpose.
 
-### 4.4 If `power` restarts
+### 4.4 Who remembers a pending shutdown
 
-A pending shutdown must not vanish silently. `power` writes the deadline, with the kernel uptime it was set at, to
-`/system/services/power/shutdown`. A respawn in the same boot (uptime still above the recorded one) reads it back
-and carries on. A fresh boot finds an uptime below the recorded one, deletes the file, and logs "a shutdown set for
-14:05 was not reached - the machine restarted first". No wall clock is needed for either.
+Asked by the operator, 2026-10-14: if `power` dies, the supervisor restarts it, but who remembers the shutdown -
+and what if the machine booted with no disk at all? The answer has to hold state somewhere without the kernel.
+
+**Not the kernel**, which keeps no service state (26.10), and **not the supervisor**, which would become a store
+for other services' state - a new job for the trusted root - and is itself restartable, so it loses what it holds.
+**Not `fs` either** (an earlier draft wrote the deadline to `/system/services/power/shutdown`): a machine booted with
+no disk has no `fs` to write to, and a pending shutdown must work there too.
+
+**The two that already know hold it, each in memory: `power`, which owns the timer, and the shell, which asked.**
+Under question 1's answer the shell is the only one that may ask, so it is also the one that knows what was asked.
+
+- **`power` restarts**: it knows of no pending shutdown. While the shell's copy says one is pending, the shell asks
+  `power` at each prompt whether it still has it - one fast request, made only while a shutdown is pending - and if
+  `power` says no, it sets it again with the time that is left and says so: `power restarted - the shutdown is set
+  again for 14:05`.
+- **The shell restarts**: it asks `power` once whether a shutdown is pending (`shutdown status`) and rebuilds its row.
+- **Both die in the same window**: the shutdown is lost. The supervisor logs both deaths, and the machine stays on,
+  which is the safe direction for this failure. Recorded rather than closed (26.7).
+- **No disk**: nothing here needs `fs`. A shutdown works the same, and the tidy-up's `fs` step is skipped because no
+  `fs` is running.
+
+The same rule GodspeedOS applies everywhere after a restart (CLAUDE.md 14.3): reacquire, and re-derive what hung off
+the dead instance - here, from the peer that asked.
 
 If `power` is not running when `shutdown` is typed, the shell says so and nothing happens: it fails safe.
 
@@ -109,7 +130,7 @@ Read 2026-10-14; the two "not checked" rows need a card.
 | Dell Wyse 5070 | the same | not tried |
 | Raspberry Pi 4 | the power-management watchdog `reboot` already uses, with the boot partition set to 63 (`0x555`), which the firmware reads as halt (Linux `bcm2835_power_off`) | halts; with `POWER_OFF_ON_HALT=1` in the EEPROM the firmware also turns the rails off. Not checked on this board |
 | Raspberry Pi 2 | the same watchdog | halts, "most of the chip powered off" (Linux's comment); 5 V stays on |
-| VisionFive 2 Lite | SBI SRST, the call `reboot` already makes, type shutdown | OpenSBI powers the AXP15060 PMIC off on the JH7110 since 2023; whether the firmware in this board's flash has the later device-tree fix it needs is not checked |
+| VisionFive 2 Lite | SBI SRST, the call `reboot` already makes, type shutdown | OpenSBI powers the AXP15060 PMIC off on the JH7110 since 2023; whether the firmware in this board's flash has the later device-tree fix it needs is not checked, and its cold reboot already dies reading the PMIC (`pmic_ops: cannot read pmic power register`, `arch/riscv64/sbi.rs`), so a refusal or a dark board is likely |
 | QEMU RISC-V `virt` | SBI SRST shutdown | powers off |
 
 So the arch answer is three-valued: **off** (the call does not return), **halt** (the firmware will hold the
@@ -164,9 +185,9 @@ gate will accept it, and that is the gate working.
      mints a file) and the supervisor hands it to the shell alone. No service has two endpoints today, so this is
      the capability-correct route; it costs `power` the `RESOURCE_MINT` authority and the supervisor a hand-over.
    **Decided 2026-10-14: (b).** The operator chose the narrower right.
-2. **`reboot`** stays with the shell (`REBOOT`) for now. Whether it should move to `power`, so both ways of ending
-   a session go through one service with one budget, is a separate change, discussed with the operator 2026-10-14
-   and not yet decided.
+2. **`reboot` moves into `power`, decided 2026-10-14, as its own step (S6)** after `shutdown` has passed its cards:
+   both ways of ending a session then go through one service with one budget, the shell holds neither authority,
+   and `reboot` gains the tidy-up it lacks today (it resets without flushing the disk).
 4. **The name is `shutdown`, decided 2026-10-14.** It is the word other systems use, and it names the act - ending
    the session - rather than promising a mechanism: on the T630 and the Pi 2 the machine halts and does not lose
    power, so `poweroff` would claim what did not happen. `poweroff` and `halt` stay hints that answer
@@ -182,9 +203,10 @@ Each step is QEMU-verified before the next, and the cards come at the end.
 |---|---|---|
 | S1 | The kernel: `PowerOff`, `POWER_OFF`, the seam member on every port, the halt fallback, the amendment | QEMU x86 and RISC-V power off; the Pis' QEMU halt; a probe without the capability is refused |
 | S2 | `fs`: `OP_QUIESCE` - finish, flush, refuse writes after | `osdev test files`: a write after quiesce is refused loudly |
-| S3 | `power`: the schedule, warnings, the restart file, the final sequence, and question 1's answer | a QEMU suite: `shutdown 5s`, `cancel`, `status`, a `power` kill mid-wait |
+| S3 | `power`: the schedule, warnings, the final sequence, and question 1's answer; the shell re-arms a shutdown `power` lost in a restart (4.4) | a QEMU suite: `shutdown 5s`, `cancel`, `status`, a `power` kill mid-wait |
 | S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` row, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` (where it answers "try `reboot`" today), `halt` and `poweroff` hint at `shutdown` instead, and CLAUDE.md Appendix B.4 records why `shutdown` is a command | `osdev test quit` and `jobs` cases; `foreign_word_check` with the `foreign-ok` markers in this note removed |
 | S5 | Cards on all five boards | each says "powered off" or "halted" truthfully, under 5 s from Enter for a plain `shutdown` beyond its 3 s |
+| S6 | `reboot` moves into `power`: the same bounded tidy-up before the reset, `reboot now` as `shutdown now`, Ctrl+Alt+Del asking `power`, and `REBOOT` leaving the shell | the jobs and quit suites, and a card per board |
 
 ## 9. Sources
 

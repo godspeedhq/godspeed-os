@@ -21,3 +21,6 @@ limit   = "8MiB"
 ipc_receive = ["power"]
 log_write   = true
 cpu_clock   = true
+# `power_off` turns the machine off, or halts it where it cannot cut its own power (`PowerOff`, syscall 56,
+# docs/shutdown.md). Held here alone, for the clock's reason: the machine has one power state.
+power_off   = true

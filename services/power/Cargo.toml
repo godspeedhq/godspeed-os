@@ -11,3 +11,8 @@ path = "src/main.rs"
 [dependencies]
 godspeed-sdk = { path = "../../sdk/rust" }
 godspeed = { path = "../../stdlib/rust" }
+
+[features]
+# TEST ONLY (docs/shutdown.md S1): turn the machine off 8 s after start, so QEMU can show PowerOff working
+# before the schedule and the shell exist. Never in an image that ships.
+shutdown-test = []

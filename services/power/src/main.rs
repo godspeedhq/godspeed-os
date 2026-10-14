@@ -139,6 +139,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // held is gone, and leaving the clock where it was could leave it fast with nobody to bring it down.
     let control = apply(&ctx, false, "no lease is open (start-up)", &mut no_control_said).is_some();
     ctx.log("power: serving - leases of up to 30 s hold the Arm clock at its maximum (docs/power.md)");
+    // TEST ONLY: the kernel's PowerOff end to end, before `shutdown` exists (docs/shutdown.md S1).
+    #[cfg(feature = "shutdown-test")]
+    {
+        gs::task::sleep_ms(&ctx, 8000);
+        ctx.log("power: shutdown-test - asking the kernel to turn the machine off");
+        let rc = ctx.power_off();
+        ctx.log_fmt(format_args!("power: shutdown-test - PowerOff was refused ({})", rc));
+    }
 
     let mut no_cap: u32 = 0;
     loop {

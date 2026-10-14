@@ -12,7 +12,7 @@ The capability system (§7). Unsafe boundary: the global resource table uses a r
 | `generation.rs`  | `Generation` monotonic counter; `bump()` |
 | `table.rs`       | `CapTable` (per-task, 64 slots), `GlobalResourceTable` (kernel-wide) |
 | `delegated.rs`   | The delegated-resource band (§7.10, file-as-capability): allocate, owner lookup, revoke, release on owner death |
-| `mod.rs`         | Also the well-known kernel resource ids (`LOG_WRITE_RESOURCE` 1 ... `CPU_CLOCK_RESOURCE` 18) |
+| `mod.rs`         | Also the well-known kernel resource ids (`LOG_WRITE_RESOURCE` 1 ... `POWER_OFF_RESOURCE` 19) |
 
 ## The generation contract (§7.5)
 
