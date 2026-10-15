@@ -6,8 +6,8 @@
 QEMU RISC-V powers off through SBI SRST; the refusal without the capability is `osdev test adv` A12. The Wyse powers
 off; the T630, the Pis and the VisionFive halt and say so. The command is `utilities/64_shutdown.md`.
 
-**`reboot` on the same deadline (S6), built 2026-10-15, QEMU-verified on all four ports and hardware-verified on the
-VisionFive 2 Lite; the other four boards' cards pending.** `reboot` takes
+**`reboot` on the same deadline (S6), built 2026-10-15, QEMU-verified on all four ports and hardware-verified on all
+five boards the same day; the Pi 4's whole-last-line re-card is pending (section 8, S6).** `reboot` takes
 `shutdown`'s forms - a 3 s countdown, `reboot <delay>`, `reboot now`, `status`, `cancel` - and a countdown gets the
 same warnings and tidy-up, so a plain `reboot` now flushes the disk first. `osdev test shutdown` passes 55 of 55,
 including a reboot that falls due and comes back to a prompt. The command is `utilities/13_reboot.md`.
@@ -232,7 +232,7 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
 | S3 | `power`: read the deadline, warnings, the tidy-up three seconds out, carry on after a restart | `osdev test shutdown`: the countdown and tidy-up lines |
 | S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 37/0 |
 | S5 | Cards on all five boards | **done 2026-10-14**: each says off or halted truthfully, and its last line lands within about 0.1 s of a plain `shutdown`'s 3 s (section 5). The cards found four things QEMU could not show, fixed in turn: log lines joined onto the shell's line on serial; three cores' fault reports printed over the T630's halt; the Pis' last line cut off by their own watchdog; and the VisionFive never saying it was safe to switch off |
-| S6 | `reboot` on the same deadline, with the tidy-up | **built 2026-10-15**: `osdev test shutdown` 55/0, a reboot falling due and the machine back at a prompt; the jobs and quit suites; QEMU RISC-V, Pi 4 and Pi 2 reset and boot again. **VisionFive card passed 2026-10-15** (64488fb5): every step, a `q` after the tidy-up giving `fs` back, and a plain `reboot` falling due 3.1 s after it was set, back at `gsh>` 11.5 s later; its warm reset (SBI SRST) works where its power-off stops in the firmware. The other four boards pending |
+| S6 | `reboot` on the same deadline, with the tidy-up | **built 2026-10-15**: `osdev test shutdown` 55/0, a reboot falling due and the machine back at a prompt; the jobs and quit suites; QEMU RISC-V, Pi 4 and Pi 2 reset and boot again. **VisionFive card passed 2026-10-15** (64488fb5): every step, a `q` after the tidy-up giving `fs` back, and a plain `reboot` falling due 3.1 s after it was set, back at `gsh>` 11.5 s later; its warm reset (SBI SRST) works where its power-off stops in the firmware. **Pi 4 passed** every step at 2051073f, but both resets cut their last line (`...reboot fel`, `rebooti`): `hardware_reset` armed the watchdog without the UART wait `power_off` already had. Fixed 09ae3177 (`uart_drain`, both Pis); **Pi 2 passed** at 09ae3177 with both lines whole; **Wyse** and **T630 passed** at 09ae3177 (fell due 3.0 s after the set; back at the banner after 25 s and 18 s of firmware). Open: the Pi 4's re-card for whole lines |
 
 ### Recorded, not fixed: a log line can still join the shell's line on serial
 

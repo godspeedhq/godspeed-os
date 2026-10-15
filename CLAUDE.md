@@ -1743,7 +1743,8 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > grows is surface - two ops and a query's encoding - recorded here because Commandment I pins surface and the gate
 > counts syscalls and queries, not ops, so it would not have refused this. `reboot now` and Ctrl+Alt+Del stay the
 > immediate `Reboot` (18). QEMU-verified 2026-10-15 (`osdev test shutdown`, a reboot falling due and the machine back
-> at a prompt); hardware-verified on the VisionFive 2 Lite the same day, the other four boards pending.
+> at a prompt); hardware-verified on all five boards the same day. The Pi 4's card cut its last line on reset; the
+> UART wait that fixed it is in `arch/` and verified on the Pi 2, with the Pi 4's re-card pending.
 
 ---
 

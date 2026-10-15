@@ -2,8 +2,9 @@
 
 **Utility:** `reboot` - reset the machine, now or after a delay
 **Status:** Built. As-built reference. The delayed forms built 2026-10-15 and QEMU-verified (`osdev test shutdown`);
-hardware-verified on the VisionFive 2 Lite (2026-10-15: a plain `reboot` fell due 3.1 s after it was set and the
-board was back at `gsh>` 11.5 s later); the other four boards' cards pending. Design: `docs/shutdown.md` (S6).
+hardware-verified on all five boards, 2026-10-15: on each a plain `reboot` fell due about 3 s after it was set and
+the board came back to `gsh>`. The Pi 4 passed every step with its last line cut by the reset watchdog; the wait that
+fixed it (`09ae3177`) is verified on the Pi 2, and the Pi 4's own re-card is pending. Design: `docs/shutdown.md` (S6).
 **Shape:** shell built-in (see `0_conventions.md` §2). The shell holds `REBOOT`; the KERNEL holds the deadline;
 `power` warns and tidies up.
 
