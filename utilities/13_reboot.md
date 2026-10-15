@@ -2,7 +2,8 @@
 
 **Utility:** `reboot` - reset the machine, now or after a delay
 **Status:** Built. As-built reference. The delayed forms built 2026-10-15 and QEMU-verified (`osdev test shutdown`);
-hardware cards pending. Design: `docs/shutdown.md` (S6).
+hardware-verified on the VisionFive 2 Lite (2026-10-15: a plain `reboot` fell due 3.1 s after it was set and the
+board was back at `gsh>` 11.5 s later); the other four boards' cards pending. Design: `docs/shutdown.md` (S6).
 **Shape:** shell built-in (see `0_conventions.md` §2). The shell holds `REBOOT`; the KERNEL holds the deadline;
 `power` warns and tidies up.
 
