@@ -113,6 +113,7 @@ direction.
 | [85](85-the-pi4-and-visionfive-pcie-xhci-window-is-not-sized-from-its-bar.md) | The Pi 4's and VisionFive's PCIe `xhci` is granted a fixed window, not its BAR; x86 sizes from the BAR since 2026-10-09 (`backlog/fixed/80` K1) | Authority (3.1) | - |
 | [86](86-a-client-sends-to-events-one-generation-late-after-a-kill-storm.md) | After `chaos kill-storm events` some client sends to `events` one generation late for ~30 s; harmless, caller not named (from `backlog/fixed/73`) | Minor | - |
 | [87](87-the-wyse-serial-echo-corrupts-what-was-typed.md) | The Wyse echoed a typed line corrupted (a comma, the tail three times) while the shell received it clean; last seen 2026-09-16 (from `backlog/fixed/29`) | Cosmetic | - |
+| [90](90-adversarial-verification-and-executable-commandments.md) | Adversarial verification of the kernel: the commandments as a traceability matrix of invariants, per-responsibility state models, and a first executable capability verifier with a mutation test. Not started; a brief, no findings yet | Assurance | - |
 
 Severity is about the MODEL, not about noise: "Constitutional" means the code and CLAUDE.md
 disagree, which by 26.3 means one of them is wrong and it has to be settled.
