@@ -1754,6 +1754,7 @@ fn cmd_test(suite: &str) {
         "drives"       => run_drives_scripted_test(),
         "files"        => run_files_test(),
         "quit"         => run_quit_test(),
+        "shutdown"     => run_shutdown_test(),
         "sticky"       => run_sticky_test(),
         "edit"         => run_edit_test(),
         "script"       => run_script_test(),
@@ -1915,7 +1916,10 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         // `copier` and `recorder` too: `osdev test quit` builds them with `slow-replies`, and a suite run after it
         // embedded that slow `copier` (2.5 s a reply) because nothing here rebuilt it plain - `osdev test jobs`
         // failed 7 checks on it, none of them real.
-        "copier", "recorder"];
+        "copier", "recorder",
+        // `power`, so this path never embeds a stale build of it: it holds a shutdown's tidy-up, and an image
+        // with a power from an older tree would warn and tidy by older rules.
+        "power"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
         if *crate_name == "block-driver" && !bd_features.is_empty() {
@@ -2599,6 +2603,24 @@ fn build_slow_services(svcs: &[&str]) {
         .status().expect("failed to run cargo build for kernel");
     if !status.success() { eprintln!("build: kernel FAILED"); std::process::exit(1); }
     println!("build: slow services embedded");
+}
+
+/// `osdev test shutdown` (`docs/shutdown.md`): the whole of `shutdown` at the prompt, over a real disk. The shell sets,
+/// shows and cancels the deadline the KERNEL holds; `power` warns and tidies up; the deadline fires with nothing
+/// asking and QEMU (launched without `-no-shutdown`) switches itself off - ACPI S5 on x86.
+fn run_shutdown_test() {
+    println!("\n=== shutdown: the shell's command, the kernel's deadline, power's tidy-up ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_shutdown.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_shutdown(&image_path, persist, 2);
 }
 
 /// `osdev test quit` (`backlog/fixed/89`): every kind of wait, on a deliberately slow `fs`, recording whether

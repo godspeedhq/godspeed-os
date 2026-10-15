@@ -32,6 +32,9 @@ ipc_receive = ["shell"]
 # REQUEST are their single source (U15), so their absence here is by design. `spawn` exists in the
 # schema but is marked a DEAD KEY there for exactly this reason.
 service_control = true
+#   `power_off` - `shutdown`: turn the machine off, now or at a deadline the KERNEL holds, so a shutdown
+#   survives every service (docs/shutdown.md). The operator's authority, beside REBOOT; the only holder.
+power_off = true
 log_write   = true
 
 [placement]

@@ -1682,6 +1682,70 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > request the kernel already validates. The name the kernel still knows is `supervisor`, because the
 > kernel spawns and respawns it (6.2). `docs/audio.md`, "No service names in the kernel".
 
+> **Amendment 2026-10-14 (`PowerOff`, syscall 56): the kernel turns the machine off, now or at the ONE deadline
+> it holds, and the OPERATOR decides when.** `reboot` resets the machine through a channel the kernel owns on every
+> port; turning it off uses the same channels - the Pis' power-management watchdog with the boot partition set to
+> 63 (halt) instead of cleared, the RISC-V firmware's SRST call with the shutdown type instead of a reboot, and on
+> x86 ACPI soft-off (S5), read from the FADT and the DSDT's `\_S5` package in the tables the kernel already walks
+> for the IOMMU. Each port answers one new seam member, `power_off`, which returns only when the hardware did not
+> turn off, with the reason; then every core halts through `halt_all_cores` and the last line says it is safe to
+> switch off. A halt asked for is not a crash and is not printed as one.
+>
+> **The deadline, and why the kernel holds it.** `PowerOff` turns the machine off now, or sets the machine's one
+> pending power-off up to 24 h ahead, or cancels it. The kernel holds that deadline on the scheduler's existing tick
+> and fires it whether or not any service is alive, because a shutdown must not be lost with the services that
+> asked for it or count it down (the operator ruled a lost shutdown unacceptable, `docs/shutdown.md` 4.4). It is the
+> kernel's own scheduled action, not service state (15): no service's data is kept, nothing is keyed by name, and a
+> reboot clears it. Earliest wins - a holder may bring a shutdown forward, never push one back - any holder may
+> cancel, every change is logged with the caller, and the time is monotonic, never the wall clock.
+>
+> **Who holds it.** `POWER_OFF` (resource 19) is a privilege bit the supervisor may delegate, granted to the SHELL
+> alone, beside `REBOOT`: ending the session is the operator's, and no service has a reason to end it - a failing
+> service is restarted, never the machine. `power` holds no shutdown authority; it reads the deadline, warns and does a
+> bounded tidy-up three seconds before it. The Commandments baseline lists the shell as the one holder, so a second (a power
+> button) is a recorded decision. A holder acts only on its own inputs and never offers shutdown-on-request to
+> other services, which would reopen an anonymous path one level up; the keyboard residual of SEC-2 (6.4) applies,
+> since anything that can type can type `shutdown`.
+>
+> **Visible, deliberately.** InspectKernel query 28 (the seconds left, or -1) is UNGATED, deliberately,
+> because a deadline that outlives every service must be seen by everything that
+> might report it, and a shutdown planted by a compromised holder must never be hidden. It discloses no task's
+> state and confers no authority.
+>
+> **What it does not do, recorded rather than hidden (26.7).** ACPI asks the OS to run the firmware's `\_PTS`
+> method before S5, which is bytecode this kernel does not interpret; a machine that gates S5 on it - the HP T630 -
+> halts instead of powering off, and says so. The Pi 2 cannot cut its own 5 V and halts; the Pi 4's firmware cuts
+> its rails only where its EEPROM sets `POWER_OFF_ON_HALT=1`; the VisionFive's firmware cannot reach its power chip
+> and stops inside the call, so the kernel says what to do before making it. Hardware-verified on all five boards,
+> 2026-10-14: the Wyse powers off and the rest halt, each saying which (`docs/shutdown.md` 5).
+>
+> **Why it is recorded.** A new syscall with three operations, a query, a resource and a seam member widen the
+> surface Commandment I pins. It is mechanism on channels the kernel already owns - `reboot`'s sibling, and one
+> more timed action - not a seventh responsibility, the argument the `DevicePower` and `CpuClock` amendments above
+> make. MISCIS is unchanged.
+>
+> **Amendment 2026-10-15 (`reboot` on the deadline, S6): the one deadline also holds a REBOOT.** The operator asked
+> that `reboot` take `shutdown`'s forms - `reboot` counting down from 3, `reboot now`, `reboot 10m`. A delayed reboot
+> has exactly the problem a delayed shutdown had: held in a service, it dies with the service. So it rides the same
+> deadline. `PowerOff` gains two ops, 3 (reboot in `secs`) and 4 (cancel it), gated by `REBOOT` rather than
+> `POWER_OFF` - the right that already resets the machine, held by the shell alone (SEC-2) - and the deadline is one
+> word holding the tick and which of the two falls due, so a set, a cancel and the tick each see both together. A
+> reboot that falls due resets through `hardware_reset`, the path `Reboot` (18) already takes.
+>
+> **There is still ONE deadline, and it holds one action.** While a shutdown is pending a reboot is refused, and the
+> other way round, so neither can quietly replace the other and a shutdown can never be lost to a reboot that
+> happened to be asked for sooner. Earliest wins within a kind, as before. Query 28 now answers `secs * 2 + kind`
+> (1 for a reboot), still ungated, so what is pending and when are one answer that cannot disagree with itself.
+>
+> **What it does not add.** No syscall, no resource, no privilege bit, no seam member: two ops on a syscall this
+> section already records, gated by a right the shell already holds, firing a reset the kernel already performs on
+> its existing tick. Not a seventh responsibility, for the reason the amendment above gives; MISCIS is unchanged. What
+> grows is surface - two ops and a query's encoding - recorded here because Commandment I pins surface and the gate
+> counts syscalls and queries, not ops, so it would not have refused this. `reboot now` and Ctrl+Alt+Del stay the
+> immediate `Reboot` (18). QEMU-verified 2026-10-15 (`osdev test shutdown`, a reboot falling due and the machine back
+> at a prompt); hardware-verified on all five boards the same day. The Pi 4's card cut its last line on reset; the
+> UART wait that fixed it is in `arch/` and verified on the Pi 2, with the Pi 4's re-card pending.
+
 ---
 
 ## 13. Service Contracts
@@ -2069,8 +2133,15 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Three amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`). A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
 
+> **Amendment 2026-10-14 (`PowerOff`): `sdk/rust/src/service_context.rs` 77 -> 79.** Two call sites behind
+> the §12.3 amendment of the same date: `power_off_call`, one `unsafe { raw_syscall(56, ..) }` behind the three
+> safe wrappers `power_off`, `power_off_in` and `power_off_cancel`; and `power_off_pending`, one
+> `unsafe { raw_syscall(13, 28, ..) }`. The same single design consequence as the `CpuClock` amendment below.
+> Necessity: a service cannot reach a syscall any other way. Safety: integers only, and the kernel checks the
+> capability before acting; query 28 takes no pointer.
+>
 > **Amendment 2026-10-08 (the boot record): `sdk/rust/src/service_context.rs` 83 -> 84.** One more
 > `unsafe { raw_syscall(13, 27, ..) }` call site, `boot_record_query`, behind the safe
 > `boot_record_size` and `boot_record_read` of the 11.4 amendment of the same date - one block for both,
@@ -2316,7 +2387,7 @@ Adversarial tests verify capability isolation holds under direct attack. The sys
 | A9  | Service tries to spawn another service directly, bypassing the supervisor           |
 | A10 | Service passes kernel addresses as syscall arguments                                |
 | A11 | Service invokes `InspectKernel` system queries without an `INTROSPECT` cap          |
-| A12 | Service invokes `Reboot` without the capability                                     |
+| A12 | Service invokes `Reboot` or `PowerOff` without the capability                         |
 | A13 | Service invokes `AcquireSendCap` without the capability                             |
 | A14 | Ring-3 CPU exception (null read, non-canonical read, divide-by-zero) kills the task, not the kernel |
 | A15 | A bad user pointer kills the caller, not the kernel                                 |
@@ -3266,6 +3337,12 @@ When real userspace work begins, the first user-facing design decision is **how 
 > `FOREIGN_HINTS`, where its hint had been `cd .`, which asked a reader to know a Unix convention (`.`)
 > without naming anything. The rule above is unchanged: every other foreign word is still a hint and
 > never an alias, and a new exception needs a reason of its own written beside it, as this one is.
+>
+> **Note 2026-10-14: and a third, `shutdown`, with its reason.** It is the word Linux, Windows and macOS
+> share, and it names the ACT - ending the session - rather than promising a mechanism: on the T630, the Pis and the
+> VisionFive the machine halts without losing power, so `poweroff` would claim what does not happen (`docs/shutdown.md`). It
+> left `FOREIGN_HINTS`, where its hint had been `reboot` - wrong advice, since `reboot` turns nothing off - and
+> `halt` and `poweroff` stay hints that answer `shutdown`.
 
 ---
 

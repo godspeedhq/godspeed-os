@@ -317,7 +317,121 @@ pub fn clear_wake_deadline(slot: usize) {
     }
 }
 
-/// Advance the BSP tick clock and wake every task whose `recv_timeout` deadline has passed.
+// ---- The pending power action (`PowerOff` with a delay, CLAUDE.md 12.3, `docs/shutdown.md`) ----
+//
+// ONE deadline for the whole machine, in BSP ticks (the clock every timed wake uses, never the wall clock:
+// `time` sets that from the network, and a spoofed clock must not move a shutdown), and what falls due at it:
+// turn the machine off, or reboot it. 0 = none pending. It is the kernel's own scheduled action, not a
+// service's state: the kernel holds it so that it survives the death of every service that asked for it or
+// counts it down - and it is gone at reboot, as all kernel memory is. EARLIEST WINS: a holder may bring it
+// forward and never push it back, so no holder can postpone what another asked for. Any holder of the right
+// for its kind may cancel it. A request of the OTHER kind while one is pending is refused rather than
+// replacing it, so a reboot can never quietly swallow a shutdown or the other way round. Every change is
+// logged by the syscall with who.
+
+/// The pending action, as `(the BSP tick it falls due at) << 1 | (1 for a reboot, 0 for a power-off)`; 0 =
+/// none. One word, so a set, a cancel and the tick that fires it each see the time and the kind together.
+static POWER_PENDING: AtomicU64 = AtomicU64::new(0);
+/// The furthest ahead a power action may be set: one a day away is a calendar's job (`docs/shutdown.md` 3).
+pub const POWER_OFF_MAX_SECS: u64 = 24 * 3600;
+/// A tick is a scheduler quantum, 10 ms (9.1).
+const POWER_OFF_TICKS_PER_SEC: u64 = 100;
+
+/// What `power_arm` and `power_disarm` found.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PowerChange {
+    /// Done: this request is now the pending one, or the pending one is cancelled.
+    Done,
+    /// Nothing changed: one of the same kind already falls due at the same time or sooner (arm), or none is
+    /// pending (disarm).
+    Unchanged,
+    /// Refused: the action pending is the other kind.
+    OtherKind,
+}
+
+/// Set the power action `secs` from now - a reboot when `reboot` - unless one of the same kind is already due
+/// at the same time or sooner, or one of the other kind is pending.
+pub fn power_arm(secs: u64, reboot: bool) -> PowerChange {
+    let at = MONOTONIC_TICKS.load(Ordering::Relaxed)
+        .saturating_add(secs.saturating_mul(POWER_OFF_TICKS_PER_SEC)).max(1);
+    let word = (at << 1) | reboot as u64;
+    let mut cur = POWER_PENDING.load(Ordering::Acquire);
+    loop {
+        if cur != 0 {
+            if (cur & 1 == 1) != reboot {
+                return PowerChange::OtherKind;
+            }
+            if cur >> 1 <= at {
+                return PowerChange::Unchanged;
+            }
+        }
+        match POWER_PENDING.compare_exchange(cur, word, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return PowerChange::Done,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+/// Cancel the pending action of this kind.
+pub fn power_disarm(reboot: bool) -> PowerChange {
+    let mut cur = POWER_PENDING.load(Ordering::Acquire);
+    loop {
+        if cur == 0 {
+            return PowerChange::Unchanged;
+        }
+        if (cur & 1 == 1) != reboot {
+            return PowerChange::OtherKind;
+        }
+        match POWER_PENDING.compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return PowerChange::Done,
+            Err(seen) => cur = seen,
+        }
+    }
+}
+
+/// Whole seconds until the pending action, rounded up, and whether it is a reboot; `None` when none is pending.
+pub fn power_pending() -> Option<(u64, bool)> {
+    let word = POWER_PENDING.load(Ordering::Acquire);
+    if word == 0 {
+        return None;
+    }
+    let left = (word >> 1).saturating_sub(MONOTONIC_TICKS.load(Ordering::Relaxed));
+    Some(((left + POWER_OFF_TICKS_PER_SEC - 1) / POWER_OFF_TICKS_PER_SEC, word & 1 == 1))
+}
+
+/// Reset the machine: the end of a pending reboot falling due, called by the BSP tick. The serial line goes
+/// straight to the wire first, for the reason `power_off_now` gives - a queued line is never drained after a
+/// reset. The reset itself is `Reboot`'s (`hardware_reset`), which says so if the SoC fails to reset.
+pub fn reboot_now(why: core::fmt::Arguments) -> ! {
+    crate::arch::imp::serial_enter_panic_mode();
+    crate::kprintln!("reboot: {}", why);
+    crate::kprintln!("reboot: hardware reset");
+    crate::arch::imp::tx_ring_flush_blocking();
+    crate::arch::imp::hardware_reset()
+}
+
+/// Turn the machine off now, or halt every core where the hardware cannot: the end of `PowerOff`, called by
+/// the syscall and by the BSP tick when a pending one falls due.
+///
+/// THE ORDER IS THE PANIC PATH'S, because the outcome is the same - nothing will run again - and a line that
+/// is queued and never drained is a line never said. The screen is taken back from `console` (which is about
+/// to stop) and serial output goes straight to the wire BEFORE the arch is asked, so whatever it says reaches
+/// someone. The arch returns only when the hardware did not turn off, with the reason; then every core halts.
+/// A halt asked for is not a crash, and the last line says so.
+pub fn power_off_now(why: core::fmt::Arguments) -> ! {
+    crate::bootcon::reclaim_for_panic();
+    crate::arch::imp::serial_enter_panic_mode();
+    crate::kprintln!("power-off: {}", why);
+    crate::arch::imp::tx_ring_flush_blocking();
+    let reason = crate::arch::imp::power_off();
+    crate::kprintln!("power-off: {}", reason);
+    crate::kprintln!("power-off: every core is halting - it is safe to switch the machine off");
+    crate::arch::imp::tx_ring_flush_blocking();
+    crate::arch::imp::halt_all_cores()
+}
+
+/// Advance the BSP tick clock, fire the machine's pending power action if it has fallen due (`power_off_now` or
+/// `reboot_now`, neither of which returns), and wake every task whose `recv_timeout` deadline has passed.
 /// Called from the **BSP** (core 0) timer ISR - the BSP ticks reliably even when other cores
 /// idle, so it is the dependable driver of all timed wakes. Cheap: a scan of `MAX_TASKS` relaxed
 /// loads, almost all zero. Only wakes a task still `BlockedOnRecv` (one that already returned
@@ -336,6 +450,17 @@ pub fn clear_wake_deadline(slot: usize) {
 /// cross-core IPI is needed for correctness (the IPI in `wake_by_slot` only shortens the latency).
 pub fn scan_timed_wakes() {
     let now = MONOTONIC_TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    // The pending power action, if it has fallen due. Claimed by compare-exchange, so a cancel that races the
+    // tick either wins (nothing happens) or loses (the machine goes off or resets), never both.
+    let word = POWER_PENDING.load(Ordering::Acquire);
+    if word != 0 && now >= word >> 1
+        && POWER_PENDING.compare_exchange(word, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+    {
+        if word & 1 == 1 {
+            reboot_now(format_args!("the pending reboot fell due"));
+        }
+        power_off_now(format_args!("the pending power-off fell due"));
+    }
     for slot in 0..MAX_TASKS {
         let deadline = TASK_WAKE_DEADLINE[slot].load(Ordering::Relaxed);
         if deadline != 0

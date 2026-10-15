@@ -276,6 +276,15 @@ const OP_SCRUB: u8 = 29;      // scrub (Phase K): READ-ONLY integrity sweep - wa
                              // scanned:u64]. Writes nothing (unlike CHECK, which repairs the bitmap).
 /// Seal a file: `[op, plen, path]`. Content frozen permanently - see `Fs::seal`.
 const OP_SEAL: u8 = 31;
+/// Quiesce for a shutdown (`docs/shutdown.md` 4.3): `[op, 0]` -> `[FS_OK, durable:u8]`; `[op, 0, 1]` ends a quiesce
+/// early, for a shutdown cancelled after its tidy-up, -> `[FS_OK]`. Answered after the request in
+/// hand (this service serves one at a time), it flushes the device and then refuses every write for
+/// `QUIESCE_SECS`, so nothing changes between the flush and the power going off. BOUNDED, so a shutdown that never
+/// comes - its caller died between the two - leaves a filesystem that takes writes again by itself.
+const OP_QUIESCE: u8 = 32;
+/// How long a quiesce refuses writes. The power-off follows within about three seconds (`power` starts its tidy-up
+/// three out); ten is the margin, and a cancelled shutdown ends it at once (`[op, 0, 1]`).
+const QUIESCE_SECS: i64 = 10;
 const OP_OPEN: u8 = 30;       // file-as-capability (§7.10, P2): [op, plen, path, rights:u8] → mint a
                              // delegated resource for the file, reply [FS_OK] + the embedded FILE CAP.
                              // The client then operates the file by INVOKING that cap (no fs name in
@@ -461,6 +470,8 @@ struct Fs {
     feat_ro_compat: u32,
     feat_incompat: u32,
     read_only: bool,
+    // Writes are refused until this monotonic second (`OP_QUIESCE`, a shutdown in progress). 0 = never quiesced.
+    quiesced_until: i64,
     // Last directory block reported as CRC-failed, so one bad block is reported ONCE per mount
     // instead of once per read. A corrupt root produced 84 identical lines in a single selfcheck,
     // which is the letter of invariant 12 without its purpose: the failure was loud but said
@@ -1563,10 +1574,43 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
     // dispatch on the opcode with it masked off. Matching the RAW byte meant a forced flash (op | 0x80)
     // matched no arm at all and fell through to a generic error, so the format never ran and the shell
     // reported "flash FAILED (no disk, or disk too small)" on a perfectly good 15 GB disk. Every opcode
-    // is <= 30, so bit 7 is free for this.
+    // is <= 32, so bit 7 is free for this.
     let forced = p[0] & 0x80 != 0;
+    // QUIESCED FOR A SHUTDOWN: every write is refused, loudly and with the reason, until the deadline. The
+    // flash, label, reset and check arms below write the volume too, so they are refused with the file ops.
+    if let Some(f) = vol.as_ref() {
+        let op = p[0] & 0x7F;
+        let writes = op_is_mutating(op) || matches!(op, OP_FLASH | OP_LABEL | OP_RESET | OP_CHECK);
+        if writes && f.quiesced_until > gs::task::epoch_secs_monotonic(ctx) {
+            ctx.log("fs: write refused - the machine is shutting down or rebooting");
+            send_res!(send, Err::<(), &str>("the machine is shutting down or rebooting"));
+            return;
+        }
+    }
     // drives API - INFO/FLASH work on a raw disk; LABEL/RESET as below.
     match p[0] & 0x7F {
+        OP_QUIESCE => {
+            match vol {
+                // Resume: the shutdown this quiesce was for was cancelled, so writes are taken again now rather
+                // than refused for the rest of the ten seconds.
+                Some(f) if p.get(2) == Some(&1) => {
+                    let was = f.quiesced_until > gs::task::epoch_secs_monotonic(ctx);
+                    f.quiesced_until = 0;
+                    if was { ctx.log("fs: quiesce ended - the shutdown or reboot was cancelled; writes are taken again"); }
+                    send(&[FS_OK]);
+                }
+                Some(f) => {
+                    let durable = block_flush(ctx);
+                    f.quiesced_until = gs::task::epoch_secs_monotonic(ctx) + QUIESCE_SECS;
+                    ctx.log_fmt(format_args!(
+                        "fs: quiesced for a shutdown or reboot - the device {}; writes refused for {} s",
+                        if durable { "flushed" } else { "did NOT confirm a flush" }, QUIESCE_SECS));
+                    send(&[FS_OK, durable as u8]);
+                }
+                None => send(&[nofs]),
+            }
+            return;
+        }
         OP_DRIVES_INFO => {
             // RE-DERIVE the capacity before answering, and drop the mount if the device has gone.
             //
@@ -2186,6 +2230,7 @@ impl Fs {
             feat_ro_compat,
             feat_incompat,
             read_only,
+            quiesced_until: 0,
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false), read_damaged: core::cell::Cell::new(false),
@@ -2845,6 +2890,7 @@ fn replay_window(_ctx: &ServiceContext) {}
             feat_ro_compat: 0,
             feat_incompat: 0,
             read_only: false,
+            quiesced_until: 0,
             last_bad_dir_lba: core::cell::Cell::new(u64::MAX),
             flush_warned: core::cell::Cell::new(false),
             io_error_seen: core::cell::Cell::new(false), read_damaged: core::cell::Cell::new(false),

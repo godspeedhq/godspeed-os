@@ -171,6 +171,20 @@ pub fn system_reset() -> ResetRefusal {
     ResetRefusal::Both { warm: warm.error, cold: cold.error }
 }
 
+/// Ask firmware to turn the platform off (`PowerOff`), and return only if it did not: `None` when it has no
+/// SRST extension, else the SBI error it answered with. On the JH7110 OpenSBI powers the AXP15060 PMIC off
+/// for this, where its device tree lets it find the PMIC (`docs/shutdown.md` 5).
+pub fn system_shutdown() -> Option<i64> {
+    if !probe(EXT_SRST) {
+        return None;
+    }
+    // SAFETY: SRST function 0 with the specification's shutdown type and the no-reason reason. It does not
+    // return on success; on failure it answers with an error like any other SBI call, touching no memory
+    // this kernel owns.
+    let r = unsafe { call(EXT_SRST, FID_SYSTEM_RESET, RESET_TYPE_SHUTDOWN, RESET_REASON_NONE) };
+    Some(r.error)
+}
+
 /// The SBI specification version the firmware implements, as (major, minor).
 pub fn spec_version() -> (u64, u64) {
     // SAFETY: the Base extension is mandatory in every SBI version, and this function has no

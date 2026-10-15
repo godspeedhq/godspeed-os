@@ -138,6 +138,7 @@ const OP_DELETE_TREE: u8 = 19;
 const OP_OPEN: u8 = 30;
 const OP_CHECK: u8 = 27;
 const OP_SEAL: u8 = 31;
+const OP_QUIESCE: u8 = 32;
 const OP_SCRUB: u8 = 29;
 const OP_STAT_FILE: u8 = 12;
 const OP_MKDIR: u8 = 13;
@@ -783,6 +784,26 @@ impl<'a> Fs<'a> {
     ///   here may be retried, unlike most mutations.
     pub fn seal(&mut self, path: impl AsRef<[u8]>) -> Result<(), Error> {
         self.call(OP_SEAL, path.as_ref(), &[], self.secs())?;
+        Ok(())
+    }
+
+    /// Quiesce the filesystem for a shutdown (`docs/shutdown.md` 4.3): `fs` finishes the request in hand,
+    /// flushes the device, and then refuses every write for ten seconds - so nothing changes between the
+    /// flush and the power going off, and a shutdown that never comes leaves a filesystem that takes
+    /// writes again by itself. `Ok(true)` when the device confirmed the flush, `Ok(false)` when it did not.
+    ///
+    /// **Blocks** up to [`call::DEFAULT_SECS`], or this handle's [`patience_secs`](Fs::patience_secs) - a
+    /// shutdown gives it about one. **Authority:** the caller's existing `fs` capability.
+    pub fn quiesce(&mut self) -> Result<bool, Error> {
+        let r = self.call(OP_QUIESCE, b"", &[], self.secs())?;
+        Ok(r.msg.payload_bytes().get(2) == Some(&1))
+    }
+
+    /// End a [`quiesce`](Fs::quiesce) early, for a shutdown that was cancelled after its tidy-up: `fs` takes writes
+    /// again at once rather than refusing them for the rest of its ten seconds. **Authority:** the caller's `fs`
+    /// capability.
+    pub fn resume(&mut self) -> Result<(), Error> {
+        self.call(OP_QUIESCE, b"", &[1], self.secs())?;
         Ok(())
     }
 

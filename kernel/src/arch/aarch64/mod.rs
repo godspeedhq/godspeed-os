@@ -1757,6 +1757,9 @@ pub fn halt_all_cores() -> ! {
 /// and recorded it, so this inherits the fix rather than the symptom.
 #[cfg(feature = "pi4")]
 pub fn hardware_reset() -> ! {
+    // The last line first: the watchdog fires about 150 us after it is armed, and `rebooting...` was cut to
+    // `rebooti` on the board (2026-10-15), as the power-off line was before `uart_drain` (`power_off`).
+    uart_drain();
     const PM_RSTC: usize = 0xFE10_001C;
     const PM_RSTS: usize = 0xFE10_0020;
     const PM_WDOG: usize = 0xFE10_0024;
@@ -1780,25 +1783,34 @@ pub fn hardware_reset() -> ! {
         let rstc_val =
             PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
 
-        // Re-issue the poke every iteration so a write that did not take (a briefly-unready PM block) is
-        // retried, rather than spinning forever on one failed attempt.
+        // POKE ONCE, THEN LET THE WATCHDOG RUN OUT. This re-issued the poke on EVERY iteration, which is the
+        // defect the Pi 2's `hardware_reset` records and fixed: PM_WDOG is a COUNTDOWN and writing it RESTARTS
+        // it, so a tight loop keeps the ten-tick count from ever reaching zero. Found by the shutdown audit
+        // (`audits/2026-10-14-shutdown-docs-and-comments-audit.md`, defect 8); the Pi 4's `reboot` was checked on
+        // the board after the fix, 2026-10-14: about 7 s from Enter to the next boot.
         //
-        // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are
-        // what invariant 12 exists for. If the SoC has not reset after a generous window the reset did
-        // NOT work, and an operator staring at `rebooting...` deserves to be told rather than left
-        // guessing whether to wait or pull the plug. Then keep poking - a late reset is still a reset.
+        // BOUNDED, because "this never returns" is an assumption about hardware, and assumptions are what
+        // invariant 12 exists for. If the SoC has not reset after a generous window the reset did NOT work, and
+        // an operator staring at `rebooting...` deserves to be told. A write that genuinely did not land gets
+        // another chance at a cadence far LONGER than the timeout it drives.
+        wdog.write_volatile(PM_PASSWORD | 10);
+        rstc.write_volatile(rstc_val);
         let mut n: u32 = 0;
+        let mut said = false;
         loop {
-            wdog.write_volatile(PM_PASSWORD | 10);
-            rstc.write_volatile(rstc_val);
             n = n.saturating_add(1);
-            if n == 2_000_000 {
-                serial_write_bytes_lockfree(
-                    b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n",
-                );
-                serial_write_bytes_lockfree(
-                    b"reset: power-cycle the board. (still poking in case it takes late)\r\n",
-                );
+            if n % 20_000_000 == 0 {
+                if !said {
+                    said = true;
+                    serial_write_bytes_lockfree(
+                        b"\r\nreset: the SoC did NOT reset - the watchdog poke had no effect.\r\n",
+                    );
+                    serial_write_bytes_lockfree(
+                        b"reset: power-cycle the board. (re-arming slowly in case it takes late)\r\n",
+                    );
+                }
+                wdog.write_volatile(PM_PASSWORD | 10);
+                rstc.write_volatile(rstc_val);
             }
             core::hint::spin_loop();
         }
@@ -1807,6 +1819,60 @@ pub fn hardware_reset() -> ! {
 
 #[cfg(not(feature = "pi4"))]
 pub fn hardware_reset() -> ! { loop { core::hint::spin_loop(); } }
+
+/// Turn the machine off (`PowerOff`, syscall 56) as far as a Pi 4 can: `hardware_reset`'s watchdog reset
+/// with the boot partition set to 63, which the firmware reads as HALT (Linux `bcm2835_power_off`). The
+/// firmware then also turns the power rails off if `POWER_OFF_ON_HALT=1` is set in the board's EEPROM;
+/// otherwise the board is halted and still powered (`docs/shutdown.md` 5). Returns only if the watchdog did
+/// not fire, with the reason.
+#[cfg(feature = "pi4")]
+pub fn power_off() -> &'static str {
+    const PM_RSTC: usize = 0xFE10_001C;
+    const PM_RSTS: usize = 0xFE10_0020;
+    const PM_WDOG: usize = 0xFE10_0024;
+    const PM_PASSWORD: u32 = 0x5A00_0000;
+    const PM_RSTC_WRCFG_FULL_RESET: u32 = 0x0000_0020;
+    const PM_RSTC_WRCFG_CLR: u32 = 0xFFFF_FFCF;
+    const PM_RSTS_PARTITION: u32 = 0xFFFF_FAAA;
+    /// Partition 63: every partition bit set (Linux `PM_RSTS_RASPBERRYPI_HALT`).
+    const PM_RSTS_HALT: u32 = !PM_RSTS_PARTITION;
+    crate::kprintln!("power-off: halting through the firmware (boot partition 63); the rails go off only if \
+                      the EEPROM sets POWER_OFF_ON_HALT=1");
+    uart_drain();
+    // SAFETY: the same BCM2711 power-management registers `hardware_reset` writes, through the kernel's
+    // Device mapping; volatile 32-bit writes gated by the 0x5A password. Poked once: re-arming the watchdog
+    // restarts its countdown.
+    unsafe {
+        let rstc = mmio(PM_RSTC) as *mut u32;
+        let rsts = mmio(PM_RSTS) as *mut u32;
+        let wdog = mmio(PM_WDOG) as *mut u32;
+        rsts.write_volatile(PM_PASSWORD | (rsts.read_volatile() & PM_RSTS_PARTITION) | PM_RSTS_HALT);
+        let rstc_val = PM_PASSWORD | (rstc.read_volatile() & PM_RSTC_WRCFG_CLR) | PM_RSTC_WRCFG_FULL_RESET;
+        wdog.write_volatile(PM_PASSWORD | 10);
+        rstc.write_volatile(rstc_val);
+    }
+    for _ in 0..80_000_000u32 {
+        core::hint::spin_loop();
+    }
+    "the power-management watchdog did not fire - the board is still running"
+}
+
+#[cfg(not(feature = "pi4"))]
+pub fn power_off() -> &'static str { "this board has no way to turn itself off" }
+
+/// Wait for the UART's FIFO and shift register to empty (BUSY), before the watchdog is armed for a reset or a
+/// halt. The watchdog fires about 150 us after it is armed, long before a line has left at 115200 baud: the Pi 2
+/// lost the end of its power-off line this way (2026-10-14), and the Pi 4 its reboot lines (2026-10-15). Bounded,
+/// so a wedged UART delays the reset and never stops it.
+#[cfg(feature = "pi4")]
+fn uart_drain() {
+    // SAFETY: a volatile read of the PL011 flag register through the kernel's Device mapping, as at init.
+    unsafe {
+        let fr = mmio(PL011_FR as usize) as *const u32;
+        let mut t = 0u32;
+        while fr.read_volatile() & PL011_FR_BUSY != 0 && t < 1_000_000 { t += 1; }
+    }
+}
 
 // ---- Serial / console ----
 // These go through `put_byte`, which POLLS the TX FIFO before writing. They previously wrote straight

@@ -10803,6 +10803,208 @@ pub fn run_audio(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `osdev test shutdown` (`docs/shutdown.md`): set, show, refuse a later one, cancel, quit a countdown, background
+/// one, refuse a job in its last minute, then let it fall due with nothing asking and see QEMU turn itself off.
+pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
+    println!("shutdown-test: booting (smp={smp}) with a raw AHCI disk");
+    let qemu = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let persist = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let persist_str = persist.to_string_lossy().replace('\\', "/");
+    let shell_port = pick_free_port();
+    let mut child = std::process::Command::new(&qemu)
+        .args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={persist_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-smp",     &smp.to_string(),
+            "-m",       "512M",
+            "-serial",  &format!("tcp::{shell_port},server"),
+            "-serial",  "null",
+            // No `-no-reboot`: a `reboot` resets the machine and it boots again, and `-no-shutdown` is left out so
+            // the final shutdown's ACPI S5 ends QEMU.
+            "-display", "none",
+        ])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn().unwrap_or_else(|e| { eprintln!("shutdown-test: QEMU launch failed: {e}"); std::process::exit(1); });
+    let stream = match retry_tcp_connect(shell_port, Duration::from_secs(10)) {
+        Some(s) => s,
+        None => { eprintln!("shutdown-test: no serial"); child.kill().ok(); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone tcp stream");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 256];
+            loop {
+                match read_half.read(&mut tmp) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+    }
+    let mut cursor = 0usize;
+    let (mut pass, mut fail) = (0u32, 0u32);
+    let mut check = |ok: bool, what: &str| {
+        if ok { pass += 1; println!("shutdown-test: PASS - {what}"); } else { fail += 1; println!("shutdown-test: FAIL - {what}"); }
+    };
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        println!("shutdown-test: FAIL - no first prompt");
+        child.kill().ok(); child.wait().ok(); std::process::exit(1);
+    }
+    macro_rules! run {
+        ($c:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default()
+        }};
+    }
+    let s = run!(b"shutdown status\r");
+    check(s.contains("no shutdown is pending"), "`shutdown status` with none pending says so");
+    let s = run!(b"shutdown 10m\r");
+    check(s.contains("shutdown in 10m"), "`shutdown 10m` gives the prompt back and says when");
+    let s = run!(b"jobs\r");
+    check(s.contains("shutdown in ") && s.contains("pending"), "`jobs` lists the pending shutdown");
+    let s = run!(b"shutdown 20m\r");
+    check(s.contains("already due sooner"), "a LATER shutdown is refused - nobody can postpone one already set");
+    let s = run!(b"shutdown status\r");
+    check(s.contains("a shutdown is pending"), "`shutdown status` reads the kernel's deadline");
+    let s = run!(b"shutdown cancel\r");
+    check(s.contains("shutdown: cancelled"), "`shutdown cancel` clears it");
+    let s = run!(b"shutdown cancel\r");
+    check(s.contains("none is pending"), "a second cancel says there is none");
+    let s = run!(b"shutdown 0\r");
+    check(s.contains("at least 1s"), "`shutdown 0` is refused for what it is, not as too long");
+    // A countdown past a threshold: `power` wakes at the 1m mark of a 70 s shutdown, and must WARN there - not
+    // announce the shutdown a second time (the audit's defect 1) or say a threshold already behind it (defect 2).
+    let mark = { buf.lock().unwrap().len() };
+    let _ = run!(b"shutdown 70\r");
+    thread::sleep(Duration::from_secs(13));
+    let seg = { let g = buf.lock().unwrap(); String::from_utf8_lossy(&g[mark..]).into_owned() };
+    check(seg.matches("power: the machine will shut down in").count() == 1,
+          "a countdown's progress is not announced again as a new shutdown");
+    check(seg.contains("power: shutting down in 1m"), "`power` warns at the one-minute mark");
+    check(!seg.contains("shutting down in 5m") && !seg.contains("shutting down in 15m"),
+          "no threshold behind the deadline is said");
+    let s = run!(b"shutdown cancel\r");
+    check(s.contains("shutdown: cancelled"), "the 70 s shutdown is cancelled");
+    // A cancel AFTER the tidy-up: `fs` must take writes again at once, not refuse them for ten seconds (defect 4).
+    send(&mut write_half, b"shutdown 6\r");
+    let tidy = collect_until(&buf, &mut cursor, b"power: tidy-up - fs", Duration::from_secs(15));
+    check(tidy.is_some(), "the tidy-up ran three seconds out");
+    send(&mut write_half, b"q");
+    let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(1));
+    let s = run!(b"write /after-cancel.txt hi\r");
+    check(s.contains("wrote /after-cancel.txt"), "a write is taken straight after a cancel that followed the tidy-up");
+    // A countdown, quit.
+    send(&mut write_half, b"shutdown 5\r");
+    let shown = collect_until(&buf, &mut cursor, b"[b] background", Duration::from_secs(10));
+    check(shown.is_some(), "a countdown under a minute shows [q] quit and [b] background at once");
+    let tq = Instant::now();
+    send(&mut write_half, b"q");
+    let s = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check(s.contains("shutdown: cancelled") && tq.elapsed() < Duration::from_secs(3),
+          &format!("`q` cancels the shutdown, and the prompt is back in {:.1} s", tq.elapsed().as_secs_f32()));
+    let s = run!(b"shutdown status\r");
+    check(s.contains("no shutdown is pending"), "after `q` nothing is pending");
+    // REBOOT, on the same one deadline (S6): the same forms, and neither kind can replace the other.
+    let s = run!(b"reboot status\r");
+    check(s.contains("no reboot is pending"), "`reboot status` with none pending says so");
+    let s = run!(b"reboot 10m\r");
+    check(s.contains("reboot in 10m"), "`reboot 10m` gives the prompt back and says when");
+    let s = run!(b"jobs\r");
+    check(s.contains("reboot in ") && s.contains("`reboot cancel`"), "`jobs` lists the pending reboot");
+    let s = run!(b"reboot 20m\r");
+    check(s.contains("already due sooner"), "a LATER reboot is refused");
+    let s = run!(b"shutdown 5m\r");
+    check(s.contains("refused - a reboot is pending"), "a shutdown is refused while a reboot is pending - one deadline");
+    let s = run!(b"shutdown status\r");
+    check(s.contains("no shutdown is pending; a reboot is"), "`shutdown status` names the reboot that is pending");
+    let s = run!(b"shutdown cancel\r");
+    check(s.contains("a reboot is, and is kept"), "`shutdown cancel` does not cancel a reboot");
+    let s = run!(b"reboot cancel\r");
+    check(s.contains("reboot: cancelled"), "`reboot cancel` clears it");
+    let s = run!(b"shutdown 10m\r");
+    let s2 = run!(b"reboot 5\r");
+    check(s.contains("shutdown in 10m") && s2.contains("refused - a shutdown is pending"),
+          "a reboot is refused while a shutdown is pending");
+    let _ = run!(b"shutdown cancel\r");
+    let s = run!(b"reboot 0\r");
+    check(s.contains("at least 1s - or `reboot now`"), "`reboot 0` is refused for what it is");
+    send(&mut write_half, b"reboot 5\r");
+    let shown = collect_until(&buf, &mut cursor, b"[b] background", Duration::from_secs(10)).unwrap_or_default();
+    check(shown.contains("reboot in "), "a reboot under a minute counts down with [q] and [b]");
+    send(&mut write_half, b"q");
+    let s = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check(s.contains("reboot: cancelled"), "`q` cancels the reboot");
+    // A plain `reboot`: 3 s, the tidy-up, the reset - and the machine comes back to a prompt.
+    let tr = Instant::now();
+    send(&mut write_half, b"reboot\r");
+    let r = collect_until(&buf, &mut cursor, b"reboot: hardware reset", Duration::from_secs(20)).unwrap_or_default();
+    let took = tr.elapsed().as_secs_f32();
+    check(r.contains("power: tidy-up - the last seconds before the reboot"), "`power` tidied up before the reboot");
+    check(r.contains("fs: quiesced for a shutdown or reboot"), "fs flushed before the reboot");
+    check(r.contains("reboot: the pending reboot fell due"), "the KERNEL fired the reboot, with nothing asking");
+    check(!r.is_empty() && took < 6.0, &format!("a plain `reboot` reset the machine {took:.1} s after it was typed (3 s asked)"));
+    let back = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+    check(back.is_some(), "the machine came back to a prompt after the reboot");
+    let s = run!(b"reboot status\r");
+    check(s.contains("no reboot is pending"), "nothing is pending after the reboot");
+    // A countdown, backgrounded, then left to fall due.
+    let t0 = Instant::now();
+    send(&mut write_half, b"shutdown 20\r");
+    let _ = collect_until(&buf, &mut cursor, b"[b] background", Duration::from_secs(10));
+    send(&mut write_half, b"b");
+    let s = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check(s.contains("[backgrounded] shutdown in"), "`b` backgrounds the countdown and gives the prompt back");
+    let s = run!(b"background drives check\r");
+    check(s.contains("refused") && s.contains("shuts down in"), "no job starts in a shutdown's last minute");
+    // Now nothing asks: the kernel's deadline fires, power tidies up first, and QEMU switches itself off.
+    let mut exited = false;
+    while t0.elapsed() < Duration::from_secs(90) {
+        if let Ok(Some(_)) = child.try_wait() { exited = true; break; }
+        thread::sleep(Duration::from_millis(200));
+    }
+    let took = t0.elapsed().as_secs_f32();
+    if !exited { child.kill().ok(); }
+    child.wait().ok();
+    thread::sleep(Duration::from_millis(300));
+    let log = { let g = buf.lock().unwrap(); String::from_utf8_lossy(&g[..]).into_owned() };
+    let _ = std::fs::write("build/tests/shutdown_serial.log", log.as_bytes());
+    check(log.contains("spawn[power]: 'shell' may turn the machine off (POWER_OFF)"),
+          "the kernel minted POWER_OFF to the shell, from its spawn request");
+    check(!log.contains("spawn[power]: 'power'"), "`power` holds no POWER_OFF");
+    check(log.contains("power-off: 'shell' set the machine to turn off in"), "the kernel logged who set the deadline");
+    check(log.contains("power-off: 'shell' cancelled the pending power-off"), "the kernel logged who cancelled it");
+    check(log.contains("power: the machine will shut down in"), "`power` announced the shutdown");
+    check(log.contains("power: shutting down in 10s") && log.contains("power: shutting down in 1s"),
+          "`power` counted down the last ten seconds");
+    check(log.contains("power: tidy-up - fs"), "`power` asked fs to quiesce three seconds out");
+    // The two log quirks the T630 card showed: a log line joined onto the shell's open countdown line, and the
+    // tidy-up asking the kernel for a `copier` that was not running.
+    check(!log.contains("backgroundpower:") && !log.contains("stops itpower:"),
+          "a log line starts its own line on serial, not after the shell's open one");
+    check(!log.contains("acquire: 'copier' is not in the name directory"),
+          "the tidy-up asks for `copier` only when the shell says it is running");
+    check(log.contains("fs: quiesce ended - the shutdown or reboot was cancelled") && log.contains("power: fs takes writes again"),
+          "a cancel after the tidy-up ended fs's quiesce");
+    check(log.contains("fs: quiesced for a shutdown"), "fs flushed and stopped taking writes");
+    check(log.contains("power-off: the pending power-off fell due"), "the KERNEL fired the deadline, with nothing asking");
+    check(log.contains("power-off: ACPI S5"), "ACPI S5 was written");
+    check(exited, &format!("QEMU switched itself off, {took:.1} s after `shutdown 20` (20 s asked)"));
+    check(exited && took < 25.0, "the machine was off within 5 s of its deadline");
+    let tail = log.rsplit("power-off: 'shell' set the machine to turn off in 20 s").next().unwrap_or("");
+    check(!tail.contains("power: the pending shutdown was cancelled"), "`power` did not call the deadline falling due a cancel");
+    check(!log.contains("every core is halting"), "it did not fall back to the halt");
+    check(!log.contains("KERNEL PANIC"), "no kernel panic");
+    println!("shutdown-test: {pass} passed, {fail} failed (serial: build/tests/shutdown_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// `osdev test quit` (`backlog/fixed/89`, `audits/2026-10-13-quit-audit.md`): every kind of wait, on an `fs` built
 /// with `slow-replies` (700 ms per reply, 4 s for the long single operations), recording for each command
 /// whether `[q] quit` appeared and when, whether `[b]` did, how long `q` took to bring the prompt back, and

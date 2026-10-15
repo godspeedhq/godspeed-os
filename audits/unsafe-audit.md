@@ -19,10 +19,10 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **77** | **grandfathered floor** (§18.5; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
+| `sdk/rust/src/service_context.rs` | **79** | **grandfathered floor** (§18.5; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
-**The 85 (77 + 8) are not 85 defects.** 82 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
+**The 87 (79 + 8) are not 87 defects.** 84 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12 and moved with `power_off`, 2026-10-14; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
 is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
 these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
 worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
@@ -40,6 +40,23 @@ Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and eit
 FAILS. They may decrease freely.
 
 ---
+
+## 2026-10-14 - PowerOff: turning the machine off (feat/shutdown)
+
+A new syscall (56) and a new resource (`POWER_OFF`, 19), with the constitution amended at 12.3 and the
+floor at 18.5 (`docs/shutdown.md`). The neutral handler adds NO unsafe: it checks a holding, takes the
+screen and the serial line as the panic path does, and calls the arch seam `power_off`. The three
+boot-only ports answer it with safe stubs.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/x86_64/acpi.rs` | new, 5 | ACPI S5. ONE `slice::from_raw_parts` turns a firmware table's address into a slice of its own stated length (bounded at 1 MiB), so every field and the whole `\_S5` scan are bounds-checked indexing; then the port I/O the FADT names: a 16-bit read and write of `PM1a/PM1b_CNT`, the 8-bit `SMI_CMD <- ACPI_ENABLE` handshake, and one `cli`. No kernel memory is written. |
+| `arch/aarch64/mod.rs` | 73 -> 74 (+1) | `power_off` (Pi 4): the BCM2711 power-management registers `hardware_reset` already writes, through the kernel's Device mapping, with the boot partition set to 63 (halt, Linux `bcm2835_power_off`) instead of cleared. Password-gated volatile writes, poked once. |
+| `arch/arm/mod.rs` | 52 -> 53 (+1) | `power_off` (Pi 2): the same for the BCM2836, in the Device-mapped peripheral window. |
+| `arch/aarch64/mod.rs` | 74 -> 75 (+1) | `power_off` (Pi 4), after the Pi 2 card: a bounded wait on the PL011 flag register's BUSY bit before the watchdog is armed, so the last line leaves the UART before the board halts. One volatile read through the Device mapping, as at UART init. |
+| `arch/arm/mod.rs` | 53 -> 54 (+1) | `power_off` (Pi 2): the same wait, after the TX ring is flushed; the Pi 2's last line was cut off mid-sentence without it. |
+| `arch/riscv64/sbi.rs` | 11 -> 12 (+1) | `system_shutdown`: SBI SRST with the specification's shutdown type, probed first; it does not return on success and answers an error otherwise, touching no kernel memory. |
+| `sdk/rust/src/service_context.rs` | 77 -> 79 (+2) | `power_off_call`: one `unsafe { raw_syscall(56, ..) }` call site behind the three safe wrappers `power_off`, `power_off_in` and `power_off_cancel`, two integers to a kernel that checks the capability before acting; and `power_off_pending`, one `unsafe { raw_syscall(13, 28, ..) }` read with no pointer. The single design consequence the `cpu_clock` entry below names. Floor amended at CLAUDE.md 18.5, 2026-10-14. |
 
 ## 2026-10-10 - the unused TLB shootdown deleted; P7 tests the property (backlog/fixed/80 K20)
 
@@ -2681,7 +2698,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 73 | permitted |
+| arch/aarch64/mod.rs | 75 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |
@@ -2717,11 +2734,11 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 17 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 52 | permitted |
+| arch/arm/mod.rs | 54 | permitted |
 | arch/loongarch64/mod.rs | 24 | permitted |
 | arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
-| arch/riscv64/sbi.rs | 11 | permitted |
+| arch/riscv64/sbi.rs | 12 | permitted |
 | arch/riscv64/sv39.rs | 29 | permitted |
 | arch/riscv64/trap.rs | 7 | permitted |
 | arch/riscv64/syscall.rs | 1 | permitted |
@@ -2737,6 +2754,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/fb.rs | 2 | permitted |
 | arch/x86_64/interrupts.rs | 26 | permitted |
 | arch/x86_64/ioapic.rs | 9 | permitted |
+| arch/x86_64/acpi.rs | 5 | permitted |
 | arch/x86_64/iommu.rs | 79 | permitted |
 | arch/x86_64/mod.rs | 38 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |

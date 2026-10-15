@@ -190,6 +190,13 @@ pub const DEVICE_POWER_RESOURCE: ResourceId = ResourceId(17);
 /// loaded that slowly (`docs/wifi.md` 55, `docs/power.md`).
 pub const CPU_CLOCK_RESOURCE: ResourceId = ResourceId(18);
 
+/// Authority to turn the machine off (`PowerOff`, syscall 56), now or at the one deadline the kernel holds -
+/// or, where the hardware cannot cut its own power, to halt every core so it is safe to switch off. Held by
+/// the SHELL, beside `REBOOT`: ending the session is the operator's. A privilege bit, delegatable, named by
+/// the supervisor in the spawn request. The kernel learns how each board turns off (`arch::imp::power_off`)
+/// and holds the deadline; when, and whether at all, are the holder's (26.10, `docs/shutdown.md`).
+pub const POWER_OFF_RESOURCE: ResourceId = ResourceId(19);
+
 pub fn init() {
     table::init_global();
     // Register stable kernel resources (generation 0 forever - §7.5).
@@ -214,5 +221,6 @@ pub fn init() {
     // first boot without this line proved it at wifi-driver's spawn.
     table::register_resource(DEVICE_POWER_RESOURCE);
     table::register_resource(CPU_CLOCK_RESOURCE);
+    table::register_resource(POWER_OFF_RESOURCE);
     crate::kprintln!("capability: subsystem ready");
 }

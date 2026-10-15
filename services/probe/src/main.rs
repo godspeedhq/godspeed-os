@@ -2157,7 +2157,23 @@ fn mode_adv_a12(ctx: &ServiceContext) -> ! {
         ctx.log("adv: A12 FAIL - reboot not denied without REBOOT cap (gate open or wrong error)");
         idle(ctx);
     }
-    ctx.log("adv: A12 pass - reboot denied without REBOOT cap (CapNotHeld); machine intact");
+    // And its sibling, PowerOff (56), gated by POWER_OFF, which only the shell holds. An open gate would not
+    // return either: the machine would turn off or halt, and the harness would see no pass marker.
+    if ctx.power_off() != CAP_NOT_HELD {
+        ctx.log("adv: A12 FAIL - power-off not denied without POWER_OFF cap (gate open or wrong error)");
+        idle(ctx);
+    }
+    // And the DEFERRED forms, which an open gate would not show at once: a deadline set now fires later. Each must be
+    // refused, and the kernel must hold nothing afterwards (query 28 is ungated, so this task can see it).
+    if ctx.power_off_in(5) != CAP_NOT_HELD || ctx.reboot_in(5) != CAP_NOT_HELD {
+        ctx.log("adv: A12 FAIL - a deferred power-off or reboot not denied without the cap");
+        idle(ctx);
+    }
+    if ctx.power_pending().is_some() {
+        ctx.log("adv: A12 FAIL - a refused deferred request left a deadline pending");
+        idle(ctx);
+    }
+    ctx.log("adv: A12 pass - reboot and power-off, now and deferred, denied without REBOOT / POWER_OFF (CapNotHeld); machine intact");
     idle(ctx)
 }
 

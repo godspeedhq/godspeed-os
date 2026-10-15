@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # The machine's power policy, as a service (docs/power.md).
 #
-# Today it owns one thing: the Arm cores' clock. The kernel can set the clock to the firmware's minimum
+# It owns two things: the Arm cores' clock (below), and a shutdown's warnings and the tidy-up three seconds
+# before it (docs/shutdown.md) - for which it holds no authority: it reads the deadline the kernel holds, and the
+# shell holds `POWER_OFF`. The kernel can set the clock to the firmware's minimum
 # or maximum and nothing else (`CpuClock`, syscall 55); this service decides which. The rule is a LEASE:
 # a service that needs the cores fast for a while asks for N seconds, gets a lease id, and releases it
 # when done. While any lease is open the clock is at its maximum; when none is, at its minimum. A lease
@@ -18,6 +20,9 @@ request = "4MiB"
 limit   = "8MiB"
 
 [capabilities]
+# The shutdown's tidy-up three seconds before it (docs/shutdown.md 4.3): `fs` flushes and stops taking writes, `copier`
+# stops a copy in flight. Nothing else; the leases still only ever answer.
+ipc_send    = ["fs", "copier"]
 ipc_receive = ["power"]
 log_write   = true
 cpu_clock   = true

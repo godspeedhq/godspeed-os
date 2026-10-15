@@ -656,3 +656,8 @@ WLAN_STATUS_REQUEST_DECLINED       # Linux mac80211 / rtl8xxxu (mlme.c, core.c, 
 XHCI_TRB_OVERFETCH                 # Linux xhci.h - the quirk (BIT_ULL 45) giving every ring segment a dummy page after it, enabled for the VIA VL805 - external, 26.14
 XHCI_AVOID_DQ_ON_LINK              # Linux xhci.h (Raspberry Pi kernel) - the VL805 cannot have an endpoint dequeue set to a Link TRB - external, 26.14
 alc_fill_eapd_coef                 # Linux patch_realtek.c - the probe-time coefficients audio-driver gives the Wyse's ALC225 (A6) - external, 26.14
+BytePrefix                         # ACPI Machine Language opcode 0x0A, named in the ACPI specification; cited by arch/x86_64/acpi.rs scanning \_S5 - external, 26.14
+NameOp                             # ACPI Machine Language opcode 0x08, named in the ACPI specification; cited by arch/x86_64/acpi.rs - external, 26.14
+PackageOp                          # ACPI Machine Language opcode 0x12, named in the ACPI specification; cited by arch/x86_64/acpi.rs - external, 26.14
+PM_RSTS_RASPBERRYPI_HALT           # Linux drivers/watchdog/bcm2835_wdt.c, the halt partition (0x555) the Pi firmware reads; cited by the Pis' power_off - external, 26.14
+bcm2835_power_off                  # Linux drivers/watchdog/bcm2835_wdt.c, the Pi power-off path the Pis' power_off follows (docs/shutdown.md 5) - external, 26.14

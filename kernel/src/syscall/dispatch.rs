@@ -105,6 +105,11 @@ pub enum SyscallNumber {
     /// the rate they read back in Hz. Gated by `CPU_CLOCK`, which the `power` service alone is spawned
     /// with. The kernel learns two rates and nothing about why one is wanted (`docs/power.md`).
     CpuClock               = 55,
+    /// Turn the machine off - now, or at a deadline the kernel holds - or, where the hardware cannot cut its
+    /// own power, halt every core so it is safe to switch off. Gated by `POWER_OFF`, which the shell holds for
+    /// the operator. The kernel learns how each board turns off and nothing about when or why
+    /// (`docs/shutdown.md`).
+    PowerOff               = 56,
 }
 
 /// Raw syscall dispatcher - the one neutral entry every port's trap path calls (`arch/<isa>/`:
@@ -177,6 +182,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::PciCfgRead as u64 => handle_pci_cfg_read(arg0, arg1),
         n if n == SyscallNumber::DevicePower as u64 => handle_device_power(arg0),
         n if n == SyscallNumber::CpuClock as u64 => handle_cpu_clock(arg0),
+        n if n == SyscallNumber::PowerOff as u64 => handle_power_off(arg0, arg1),
         _ => -1, // Unknown syscall.
     }
 }
@@ -279,7 +285,9 @@ fn handle_console_write(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // console's drain loop was not reaching its paint. That is fixed in the service, and the
     // counters used to find it are gone - a measurement kept after it has answered its question is
     // just a tax on the hot path (three rdtsc reads per write, here).
+    crate::log::console_write_begin();
     crate::arch::imp::console_write_bytes_gated(bytes, to_fb);
+    crate::log::console_write_end(bytes);
     // Serial is written FIRST and unconditionally above, so the log is complete and never duplicated
     // even though the call below can park this task. What the return value carries is the outcome of
     // the wait, not of the write: 0, or a negative code if the terminal died while we were blocked.
@@ -1881,14 +1889,15 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // and task-neutral board/transport facts that disclose nobody's state: the input-ready flag (10),
     // the RTC and timing reads (11, 12, 16, 17), NIC identity and BAR, driver-presence bits, a hardware random word, the
     // EMMC base clock, one byte off the COM2 operator channel and the board MAC (14, 15, 18, 19, 20,
-    // 21, 23). Every other query discloses another task's or system-wide state and requires the
+    // 21, 23). And one that IS system-wide, deliberately: 28, the seconds left on a pending power-off,
+    // ungated so a pending shutdown can never be hidden (`docs/shutdown.md` 6). Every other query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (docs/introspection-capability.md).
     //
     // 9 and 22 are not here: both queries were REMOVED (see the notes at their old arms below). They
     // were listed until 2026-10-10 as dead entries (`backlog/fixed/80` K18), which made an AUTHORITY list
     // name two things that do not exist; an unknown query now falls on the gated side like any other,
     // and answers -1 to a holder.
-    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23)
+    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23 | 28)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -2010,6 +2019,13 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // whole reason the splice cost two wrong diagnoses before it was understood. 0 means every
         // diagnostic this boot was emitted cleanly.
         26 => crate::arch::imp::serial_unlocked_emit_count() as i64,
+        // 28: the machine's pending power action (`PowerOff` with a delay), as `secs * 2 + kind` - the seconds
+        // until it, and 1 for a reboot or 0 for a power-off, in one answer so the two cannot disagree - or -1
+        // when none is pending. UNGATED, and that is the safeguard rather than a convenience: a deadline the
+        // kernel holds outlives every service, so it must be visible to anything that might report it -
+        // `power`'s warnings, `shutdown status` - and one planted by a compromised holder can never be hidden.
+        // It discloses no task's state and confers no authority (`docs/shutdown.md` 6).
+        28 => scheduler::power_pending().map_or(-1, |(s, reboot)| (s * 2 + reboot as u64) as i64),
         // 27: the BOOT RECORD - a fixed copy of the first bytes ever logged, which never wraps
         // (`log.rs`). arg2 = 0 asks its size: arg1 = 0 the bytes held, arg1 = 1 its capacity, so a
         // reader can tell a full record from a short boot. Otherwise arg1 = offset and arg2 = a user
@@ -2508,6 +2524,79 @@ fn handle_cpu_clock(max: u64) -> i64 {
                              if max != 0 { "maximum" } else { "minimum" });
             -1
         }
+    }
+}
+
+/// PowerOff (56): turn the machine off, now or at a deadline, or reboot it at a deadline. The power-off ops are
+/// gated by `POWER_OFF_RESOURCE` + WRITE, the reboot ops by `REBOOT_RESOURCE` + WRITE (a reboot NOW is `Reboot`,
+/// 18); without the right, `CapNotHeld` (-2) and nothing else happens.
+///
+/// - `arg0 = 0`: power off NOW. Does not return: the machine is off, or every core is halted
+///   (`scheduler::power_off_now`).
+/// - `arg0 = 1` / `3`, `arg1 = secs` (1 ..= 24 h): set the machine's one pending action - a power-off (1) or a
+///   reboot (3) - `secs` from now. 0 when this is now the pending one; 1 when one of the same kind already due at
+///   the same time or SOONER was kept (earliest wins, so nobody can postpone what somebody else asked for); 2 when
+///   the other kind is pending, which is kept; -1 for a time out of range.
+/// - `arg0 = 2` / `4`: cancel the pending power-off (2) or reboot (4). 0 when there was one, 1 when none is
+///   pending, 2 when the pending one is the other kind, which is kept.
+///
+/// Every set and cancel is logged with the caller's name, and the pending deadline and its kind are readable by
+/// anyone (InspectKernel query 28): an action planted by a compromised holder can never be silent.
+///
+/// MECHANISM, NOT A SEVENTH RESPONSIBILITY: turning the machine off is reboot's sibling, on the channels the
+/// kernel already owns for it, and the deadline is one more timed action on the scheduler's existing tick. When,
+/// and whether at all, are the holder's - the shell's, for the operator (26.10, CLAUDE.md 12.3).
+fn handle_power_off(op: u64, secs: u64) -> i64 {
+    let reboot = op == 3 || op == 4;
+    let (right, label, noun) = if reboot {
+        (crate::capability::REBOOT_RESOURCE, "REBOOT", "reboot")
+    } else {
+        (crate::capability::POWER_OFF_RESOURCE, "POWER_OFF", "power-off")
+    };
+    if !scheduler::current_task_holds_resource(right, Rights::WRITE) {
+        crate::kprintln!("{}: refused - caller does not hold {}", noun, label);
+        return cap_err_to_i64(CapError::CapNotHeld);
+    }
+    let name = scheduler::task_name(scheduler::current_task_slot());
+    let other = if reboot { "power-off" } else { "reboot" };
+    match op {
+        0 => scheduler::power_off_now(format_args!("'{}' asked to turn the machine off now", name)),
+        1 | 3 => {
+            if secs == 0 || secs > scheduler::POWER_OFF_MAX_SECS {
+                crate::kprintln!("{}: '{}' asked for {} s, outside 1 ..= {} - refused",
+                                 noun, name, secs, scheduler::POWER_OFF_MAX_SECS);
+                return -1;
+            }
+            match scheduler::power_arm(secs, reboot) {
+                scheduler::PowerChange::Done => {
+                    if reboot {
+                        crate::kprintln!("reboot: '{}' set the machine to reboot in {} s", name, secs);
+                    } else {
+                        crate::kprintln!("power-off: '{}' set the machine to turn off in {} s", name, secs);
+                    }
+                    0
+                }
+                scheduler::PowerChange::Unchanged => {
+                    crate::kprintln!("{}: '{}' asked for {} s; one is already due sooner ({} s) and is kept",
+                                     noun, name, secs, scheduler::power_pending().map_or(0, |p| p.0));
+                    1
+                }
+                scheduler::PowerChange::OtherKind => {
+                    crate::kprintln!("{}: '{}' asked for {} s; a {} is pending and is kept",
+                                     noun, name, secs, other);
+                    2
+                }
+            }
+        }
+        2 | 4 => match scheduler::power_disarm(reboot) {
+            scheduler::PowerChange::Done => {
+                crate::kprintln!("{}: '{}' cancelled the pending {}", noun, name, noun);
+                0
+            }
+            scheduler::PowerChange::Unchanged => 1,
+            scheduler::PowerChange::OtherKind => 2,
+        },
+        _ => -1,
     }
 }
 

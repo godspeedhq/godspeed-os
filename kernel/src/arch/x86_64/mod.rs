@@ -4,6 +4,7 @@
 //! All `unsafe` code in the kernel that touches hardware directly lives in
 //! this module or in `memory/`, `capability/`, `smp/`. Nowhere else.
 
+pub mod acpi;
 pub mod ap_boot;
 pub mod boot;
 pub mod context_switch;
@@ -492,6 +493,18 @@ pub fn halt_all_cores() -> ! {
         // SAFETY: hlt with IF=0 is safe; we never exit this loop.
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
     }
+}
+
+/// Turn the machine off (`PowerOff`, syscall 56): ACPI S5, the soft-off state (`acpi.rs`). Returns only if the
+/// machine is still running afterwards, with the reason - the caller then halts every core.
+///
+/// It also marks the halt that follows as ASKED FOR: the other cores then halt on their NMI without each printing a
+/// fault report, which on a panic says where every core was and on a requested halt was three reports run together
+/// after the line saying it is safe to switch off (the T630, 2026-10-14).
+pub fn power_off() -> &'static str {
+    let why = acpi::power_off();
+    boot::HALT_ASKED.store(true, core::sync::atomic::Ordering::SeqCst);
+    why
 }
 
 /// Issue an x86 hardware reset. Used by the Reboot syscall (18). Does not return.

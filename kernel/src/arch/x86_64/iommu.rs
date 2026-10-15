@@ -36,7 +36,7 @@ pub static IOMMU_MMIO_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// ACPI System Description Table header - the common 36-byte prefix on every
 /// ACPI table (RSDT, XSDT, IVRS, …).
-const SDT_HEADER_LEN: u64 = 36;
+pub(super) const SDT_HEADER_LEN: u64 = 36;
 
 /// Translate a physical address to its HHDM virtual address.
 #[inline]
@@ -83,6 +83,8 @@ unsafe fn read64(virt: u64) -> u64 {
 /// map base. On Limine base revision 6 `rsdp_addr` is already a virtual address;
 /// we normalise defensively so a physical address would also work.
 pub fn detect(rsdp_addr: u64, hhdm: u64) {
+    // The same tables say how to turn the machine off; `acpi` reads them only when asked to.
+    super::acpi::remember(rsdp_addr, hhdm);
     if rsdp_addr == 0 {
         crate::kprintln!("iommu: no ACPI RSDP from bootloader; IOMMU detection skipped");
         return;

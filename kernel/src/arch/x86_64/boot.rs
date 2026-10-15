@@ -200,6 +200,11 @@ static PERIODIC_TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Set (to 1) by the `exception_halt` stub before `cli`. Not read anywhere (see above).
 pub static EXCEPTION_HALT_REACHED: AtomicBool = AtomicBool::new(false);
 
+/// Set by `power_off` when the machine stayed on and every core is about to be halted ON REQUEST. Read by the
+/// `exception_halt` stub, the NMI's handler: a core that receives the halt then stops without a fault report,
+/// because it did not fault. Never cleared - nothing runs after it.
+pub static HALT_ASKED: AtomicBool = AtomicBool::new(false);
+
 /// Set (to 1) by `pf_stub` (before swapgs). Not read anywhere (see above).
 pub static PF_REACHED: AtomicBool = AtomicBool::new(false);
 
@@ -1913,7 +1918,11 @@ unsafe extern "C" fn exception_halt() -> ! {
     // EXCEPTION_HALT_REACHED set BEFORE cli (nothing reads it today - see the
     // flag's declaration).
     core::arch::naked_asm!(
-        // Raw '?' to COM1 as absolute first instruction - fires for every
+        // A halt ASKED FOR (`power_off`): stop here, silently - this core did not fault. Flags are
+        // clobbered, which nothing after a halt can observe.
+        "cmp byte ptr [{asked}], 0",
+        "jne 3f",
+        // Raw '?' to COM1 as the first output - fires for every
         // unhandled exception vector before cli or flag-set.
         "mov dx, 0x3fd",
         // Bounded THRE poll (mirrors SERIAL_THRE_NOLCK_CAP): a present-but-wedged COM1 (THRE stuck
@@ -1939,7 +1948,11 @@ unsafe extern "C" fn exception_halt() -> ! {
         "call exception_halt_handler",
         "2: hlt",
         "jmp 2b",
+        "3: cli",
+        "4: hlt",
+        "jmp 4b",
         flag = sym EXCEPTION_HALT_REACHED,
+        asked = sym HALT_ASKED,
     )
 }
 
