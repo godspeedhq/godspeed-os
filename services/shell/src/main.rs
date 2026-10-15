@@ -23907,13 +23907,15 @@ fn cmd_jobs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     refresh_jobs(ctx);
     // A pending shutdown or reboot is listed with the jobs, so one command shows everything pending
     // (`docs/shutdown.md` 4.2). A line, not a row: it is not a job, and the kernel - not `copier` - holds it.
-    if let Some(p) = ctx.power_pending() {
+    let pending = ctx.power_pending();
+    if let Some(p) = pending {
         let cmd = PowerAct { reboot: p.reboot }.cmd();
         out.line_fmt(ctx, format_args!("{} in {} (pending; `{} cancel` stops it)", cmd, Delay(p.secs), cmd));
     }
     let t = ctx.jobs.borrow();
     if !t.rows.iter().any(|r| r.used && !r.hidden) {
-        out.line(ctx, "no jobs");
+        // "no jobs" under the pending line read as if that line did not count (the operator, 2026-10-15).
+        out.line(ctx, if pending.is_some() { "no other jobs" } else { "no jobs" });
         return Ok(());
     }
     out.line(ctx, "JOB  STATE    PROGRESS  COMMAND");

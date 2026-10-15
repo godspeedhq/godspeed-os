@@ -10868,6 +10868,8 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
     check(s.contains("shutdown in 10m"), "`shutdown 10m` gives the prompt back and says when");
     let s = run!(b"jobs\r");
     check(s.contains("shutdown in ") && s.contains("pending"), "`jobs` lists the pending shutdown");
+    check(s.contains("no other jobs") && !s.contains("\nno jobs"),
+          "and says `no other jobs` under it, not `no jobs` as if the line did not count");
     let s = run!(b"shutdown 20m\r");
     check(s.contains("already due sooner"), "a LATER shutdown is refused - nobody can postpone one already set");
     let s = run!(b"shutdown status\r");
