@@ -234,7 +234,8 @@ service_configs = [
 # copy, never a drain, so no log line depends on a reader (the reason nothing drains the ring stands).
 # INTROSPECT-gated: the boot log names every service and device on the machine. Read by `events log boot`.
 #
-# 28 (added 2026-10-14) is the seconds until the machine's pending power-off (`PowerOff` with a delay), -1 for
+# 28 (added 2026-10-14) is the machine's pending power action (`PowerOff` with a delay): `secs * 2 + kind`, the
+# seconds until it and 1 for a reboot (since 2026-10-15, when `reboot` joined the one deadline), -1 for
 # none. UNGATED, deliberately: the deadline is the kernel's
 # own scheduled action, it outlives every service, and its visibility IS the safeguard - a shutdown planted by
 # a compromised holder must be seen by `power`'s warnings and `shutdown status`. It discloses no task's
@@ -666,6 +667,8 @@ CpuClock                 = 55
 # `Reboot`, and holding the ONE deadline where no service's death can lose it - one more timed action on
 # the scheduler's existing tick. Earliest wins, any holder cancels, every change logged with who; the
 # deadline is readable by all (query 28). Gated by POWER_OFF, the shell's. CLAUDE.md 12.3, 2026-10-14.
+# Ops 3 and 4 (2026-10-15) set and cancel a REBOOT on the same one deadline, gated by REBOOT, also the shell's;
+# the deadline records which of the two it is, and a request for the other kind is refused, never replaces it.
 PowerOff                 = 56
 Gpio                     = 45
 UsbDiskInfo              = 46

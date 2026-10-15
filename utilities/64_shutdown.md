@@ -34,6 +34,9 @@ shutdown cancel       stop a pending shutdown
   kernel logs every set and cancel with who asked, and anyone can read how long is left.
 - **Earliest wins.** A second `shutdown` for LATER than the pending one is refused and names it - nothing can
   postpone a shutdown already set. One for sooner moves it forward.
+- **One deadline, one action.** A pending `reboot <delay>` (`13_reboot.md`) rides the same deadline, so while one
+  is pending `shutdown <delay>` is refused and names it, and `shutdown status` and `shutdown cancel` say a reboot is
+  pending rather than that nothing is.
 - **Under a minute**, the countdown runs in the foreground on one line, rewritten each second, with `[q] quit` and
   `[b] background`. `q` cancels the shutdown (rule 11). `b` gives the prompt back and the shutdown goes on.
 - **A minute or more** gives the prompt back at once: `shutdown in 5m - shutdown cancel stops it`.

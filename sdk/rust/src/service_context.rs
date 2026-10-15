@@ -132,6 +132,16 @@ pub enum ClockSource {
     Floor,
 }
 
+/// The machine's one pending power action, as the kernel holds it (InspectKernel query 28, `docs/shutdown.md`).
+/// See [`ServiceContext::power_pending`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PowerPending {
+    /// Whole seconds until it falls due, rounded up.
+    pub secs: u64,
+    /// A reboot; otherwise a power-off.
+    pub reboot: bool,
+}
+
 /// Wall-clock date/time read from the hardware RTC, fully decoded (binary,
 /// 24-hour). See [`ServiceContext::datetime`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3987,14 +3997,28 @@ impl ServiceContext {
 
     /// Set the machine's one pending power-off `secs` from now (1 ..= 24 h), held by the KERNEL so it survives
     /// every service (`docs/shutdown.md` 6). `0`: this is now the pending one. `1`: one due sooner was kept
-    /// (earliest wins). `-1`: out of range. `-2`: refused (no `POWER_OFF`).
+    /// (earliest wins). `2`: a reboot is pending, and is kept. `-1`: out of range. `-2`: refused (no `POWER_OFF`).
     pub fn power_off_in(&self, secs: u64) -> i64 {
         self.power_off_call(1, secs)
     }
 
-    /// Cancel the pending power-off. `0`: there was one. `1`: there was none. `-2`: refused.
+    /// Cancel the pending power-off. `0`: there was one. `1`: none is pending. `2`: the pending one is a reboot,
+    /// and is kept. `-2`: refused.
     pub fn power_off_cancel(&self) -> i64 {
         self.power_off_call(2, 0)
+    }
+
+    /// Set the machine to reboot `secs` from now (1 ..= 24 h), on the same one kernel deadline as a power-off
+    /// (`PowerOff` op 3). Needs `REBOOT`. The answers are `power_off_in`'s, with `2` meaning a power-off is
+    /// pending. A reboot NOW is `reboot`.
+    pub fn reboot_in(&self, secs: u64) -> i64 {
+        self.power_off_call(3, secs)
+    }
+
+    /// Cancel the pending reboot (`PowerOff` op 4). The answers are `power_off_cancel`'s, with `2` meaning the
+    /// pending one is a power-off.
+    pub fn reboot_cancel(&self) -> i64 {
+        self.power_off_call(4, 0)
     }
 
     fn power_off_call(&self, op: u64, secs: u64) -> i64 {
@@ -4002,12 +4026,23 @@ impl ServiceContext {
         unsafe { crate::syscall::raw_syscall(56, op, secs, 0) }
     }
 
-    /// Whole seconds until the machine's pending power-off, rounded up, or `None` when none is pending
-    /// (InspectKernel query 28). Readable by every task, deliberately: a pending shutdown must never be hidden.
-    pub fn power_off_pending(&self) -> Option<u64> {
+    /// The machine's pending power action (InspectKernel query 28): whole seconds until it, rounded up, and
+    /// whether it is a reboot - or `None` when none is pending. Readable by every task, deliberately: a pending
+    /// shutdown or reboot must never be hidden.
+    pub fn power_pending(&self) -> Option<PowerPending> {
         // SAFETY: syscall(13) = InspectKernel; query 28 takes no pointer and is ungated.
         let r = unsafe { raw_syscall(13, 28, 0, 0) };
-        if r >= 0 { Some(r as u64) } else { None }
+        if r >= 0 { Some(PowerPending { secs: r as u64 / 2, reboot: r & 1 == 1 }) } else { None }
+    }
+
+    /// Whole seconds until the pending power-off, or `None` when none is pending - a pending reboot is not one.
+    pub fn power_off_pending(&self) -> Option<u64> {
+        self.power_pending().filter(|p| !p.reboot).map(|p| p.secs)
+    }
+
+    /// Whole seconds until the pending reboot, or `None` when none is pending - a pending power-off is not one.
+    pub fn reboot_pending(&self) -> Option<u64> {
+        self.power_pending().filter(|p| p.reboot).map(|p| p.secs)
     }
 
     /// Allocate `size` bytes of read/write memory within this task's budget.

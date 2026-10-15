@@ -1723,6 +1723,27 @@ The kernel validates these at spawn time and grants caps only for the specified 
 > surface Commandment I pins. It is mechanism on channels the kernel already owns - `reboot`'s sibling, and one
 > more timed action - not a seventh responsibility, the argument the `DevicePower` and `CpuClock` amendments above
 > make. MISCIS is unchanged.
+>
+> **Amendment 2026-10-15 (`reboot` on the deadline, S6): the one deadline also holds a REBOOT.** The operator asked
+> that `reboot` take `shutdown`'s forms - `reboot` counting down from 3, `reboot now`, `reboot 10m`. A delayed reboot
+> has exactly the problem a delayed shutdown had: held in a service, it dies with the service. So it rides the same
+> deadline. `PowerOff` gains two ops, 3 (reboot in `secs`) and 4 (cancel it), gated by `REBOOT` rather than
+> `POWER_OFF` - the right that already resets the machine, held by the shell alone (SEC-2) - and the deadline is one
+> word holding the tick and which of the two falls due, so a set, a cancel and the tick each see both together. A
+> reboot that falls due resets through `hardware_reset`, the path `Reboot` (18) already takes.
+>
+> **There is still ONE deadline, and it holds one action.** While a shutdown is pending a reboot is refused, and the
+> other way round, so neither can quietly replace the other and a shutdown can never be lost to a reboot that
+> happened to be asked for sooner. Earliest wins within a kind, as before. Query 28 now answers `secs * 2 + kind`
+> (1 for a reboot), still ungated, so what is pending and when are one answer that cannot disagree with itself.
+>
+> **What it does not add.** No syscall, no resource, no privilege bit, no seam member: two ops on a syscall this
+> section already records, gated by a right the shell already holds, firing a reset the kernel already performs on
+> its existing tick. Not a seventh responsibility, for the reason the amendment above gives; MISCIS is unchanged. What
+> grows is surface - two ops and a query's encoding - recorded here because Commandment I pins surface and the gate
+> counts syscalls and queries, not ops, so it would not have refused this. `reboot now` and Ctrl+Alt+Del stay the
+> immediate `Reboot` (18). QEMU-verified 2026-10-15 (`osdev test shutdown`, a reboot falling due and the machine back
+> at a prompt); hardware cards pending.
 
 ---
 

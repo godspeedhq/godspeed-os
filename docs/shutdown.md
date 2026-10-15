@@ -6,6 +6,11 @@
 QEMU RISC-V powers off through SBI SRST; the refusal without the capability is `osdev test adv` A12. The Wyse powers
 off; the T630, the Pis and the VisionFive halt and say so. The command is `utilities/64_shutdown.md`.
 
+**`reboot` on the same deadline (S6), built 2026-10-15, QEMU-verified; hardware cards pending.** `reboot` takes
+`shutdown`'s forms - a 3 s countdown, `reboot <delay>`, `reboot now`, `status`, `cancel` - and a countdown gets the
+same warnings and tidy-up, so a plain `reboot` now flushes the disk first. `osdev test shutdown` passes 55 of 55,
+including a reboot that falls due and comes back to a prompt. The command is `utilities/13_reboot.md`.
+
 ## 1. What is asked for
 
 The operator, 2026-10-14: `shutdown 5` shuts down in five seconds, counting down on screen; `shutdown now` shuts
@@ -117,6 +122,8 @@ same tick every timed wait already uses.
 - **No disk**: nothing here needs `fs`. The tidy-up still asks `fs` to quiesce; with no volume it answers that
   there is none, or - as on QEMU RISC-V, where it was waiting on the storage driver - does not answer in time.
 - **A reboot** clears it, as it clears all kernel memory. A shutdown can never persist across boots.
+- **A reboot of its own** rides the same deadline (S6, section 8): the deadline records which of the two it is,
+  and everything above holds for it unchanged.
 
 ## 5. What each board can do
 
@@ -138,18 +145,27 @@ board stopped), and **cannot** (the port has no route). The kernel says which be
 
 ## 6. The kernel's part
 
-One syscall, `PowerOff` (56), gated by `POWER_OFF` (resource 19), which the shell holds:
+One syscall, `PowerOff` (56). The power-off ops are gated by `POWER_OFF` (resource 19), the reboot ops by
+`REBOOT` (resource 8); the shell holds both:
 
-- **op 0, now**: does not return. The machine is off, or every core is halted.
-- **op 1, at `secs`** (1 ..= 24 h): set the machine's one pending power-off. **Earliest wins**: a request for
-  LATER than the pending one is refused (code 1) and names it, so no holder can postpone a shutdown another
-  asked for; one for sooner moves it forward.
-- **op 2, cancel**: any holder may clear it.
+- **op 0, now**: does not return. The machine is off, or every core is halted. (A reboot now is `Reboot`, 18.)
+- **op 1 / op 3, at `secs`** (1 ..= 24 h): set the machine's one pending action, a power-off (1) or a reboot (3).
+  **Earliest wins**: a request for LATER than a pending one of the same kind is refused (code 1) and names it, so
+  no holder can postpone what another asked for; one for sooner moves it forward. **One action**: while one kind
+  is pending, a request for the other is refused (code 2), so a reboot can never quietly swallow a shutdown or the
+  other way round.
+- **op 2 / op 4, cancel**: any holder of the right clears a pending power-off (2) or reboot (4); code 2 when the
+  pending one is the other kind, which is kept.
 - **Every set and cancel is logged** with the caller's name, from the task that called - nothing is looked up by
   name. The deadline counts in BSP ticks, never the wall clock, so a clock set from a spoofed network cannot move
-  it.
-- **Query 28** of InspectKernel returns the seconds left, or -1. UNGATED, deliberately: a deadline that outlives every service must be visible to everything that might report it, and
-  a shutdown planted by a compromised holder must never be hidden. It discloses no task's state.
+  it. It is one word, the tick and the kind together, so a set, a cancel and the tick that fires it each see both
+  at once.
+- **Query 28** of InspectKernel returns `secs * 2 + kind` (1 for a reboot), or -1 when none is pending - one answer,
+  so the time and the kind cannot disagree. UNGATED, deliberately: a deadline that outlives every service must be
+  visible to everything that might report it, and one planted by a compromised holder must never be hidden. It
+  discloses no task's state.
+- **A pending reboot that falls due** resets through `hardware_reset`, the path `Reboot` takes, after putting its
+  line straight on the wire: `reboot: the pending reboot fell due`.
 
 Behind it, one member of the `arch::imp` seam every port answers (`scripts/arch_seam_check.py`):
 
@@ -194,9 +210,12 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
    still exact (earliest wins, any holder cancels). A per-holder request list, where each cancels only its own, is
    the refinement; it needs an identity that survives a restart, which is a name, and the kernel keeps no
    name-keyed tables, so that is decided when the second holder arrives.
-3. **`reboot`** (S6): the same kernel deadline could hold "turn off or reboot at T", with the shell holding both
-   rights and `power` doing the tidy-up for either - which gives `reboot` the disk flush it lacks today (it resets
-   without flushing). A separate step, after `shutdown` has passed its cards.
+3. **`reboot`** (S6, built 2026-10-15): the same kernel deadline holds "turn off or reboot at T", with the shell
+   holding both rights and `power` doing the tidy-up for either - which gives a plain `reboot` the disk flush the
+   old immediate reset lacked. Asked by the operator: `reboot` counts down from 3, `reboot now` is immediate,
+   `reboot 10m` and so on. The two kinds share ONE deadline rather than having one each, so the machine can never
+   hold a shutdown and a reboot at once and have to choose; the second asked for is refused and names the first.
+   `reboot now` and Ctrl+Alt+Del stay immediate, with no tidy-up, as `shutdown now` does.
 4. **The name is `shutdown`, decided 2026-10-14.** It is the word other systems use, and it names the act - ending
    the session - rather than promising a mechanism: on the T630, the Pis and the VisionFive the machine halts and
    does not lose power (section 5), so `poweroff` would claim what does not happen. `poweroff` and `halt` are hints that answer `shutdown`.
@@ -212,7 +231,7 @@ deadline readable by all and announced by `power` whenever it starts, monotonic 
 | S3 | `power`: read the deadline, warnings, the tidy-up three seconds out, carry on after a restart | `osdev test shutdown`: the countdown and tidy-up lines |
 | S4 | The shell: `shutdown`, the countdown with `[q]` and `[b]`, the `jobs` line, the last-minute refusal; `shutdown` leaves `FOREIGN_HINTS` and CLAUDE.md Appendix B.4 says why | `osdev test shutdown` 37/0 |
 | S5 | Cards on all five boards | **done 2026-10-14**: each says off or halted truthfully, and its last line lands within about 0.1 s of a plain `shutdown`'s 3 s (section 5). The cards found four things QEMU could not show, fixed in turn: log lines joined onto the shell's line on serial; three cores' fault reports printed over the T630's halt; the Pis' last line cut off by their own watchdog; and the VisionFive never saying it was safe to switch off |
-| S6 | `reboot` on the same deadline, with the tidy-up | the jobs and quit suites, and a card per board |
+| S6 | `reboot` on the same deadline, with the tidy-up | **built 2026-10-15**: `osdev test shutdown` 55/0, a reboot falling due and the machine back at a prompt; the jobs and quit suites; a card per board pending |
 
 ### Recorded, not fixed: a log line can still join the shell's line on serial
 

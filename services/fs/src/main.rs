@@ -1582,8 +1582,8 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
         let op = p[0] & 0x7F;
         let writes = op_is_mutating(op) || matches!(op, OP_FLASH | OP_LABEL | OP_RESET | OP_CHECK);
         if writes && f.quiesced_until > gs::task::epoch_secs_monotonic(ctx) {
-            ctx.log("fs: write refused - the machine is shutting down");
-            send_res!(send, Err::<(), &str>("the machine is shutting down"));
+            ctx.log("fs: write refused - the machine is shutting down or rebooting");
+            send_res!(send, Err::<(), &str>("the machine is shutting down or rebooting"));
             return;
         }
     }
@@ -1596,14 +1596,14 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
                 Some(f) if p.get(2) == Some(&1) => {
                     let was = f.quiesced_until > gs::task::epoch_secs_monotonic(ctx);
                     f.quiesced_until = 0;
-                    if was { ctx.log("fs: quiesce ended - the shutdown was cancelled; writes are taken again"); }
+                    if was { ctx.log("fs: quiesce ended - the shutdown or reboot was cancelled; writes are taken again"); }
                     send(&[FS_OK]);
                 }
                 Some(f) => {
                     let durable = block_flush(ctx);
                     f.quiesced_until = gs::task::epoch_secs_monotonic(ctx) + QUIESCE_SECS;
                     ctx.log_fmt(format_args!(
-                        "fs: quiesced for a shutdown - the device {}; writes refused for {} s",
+                        "fs: quiesced for a shutdown or reboot - the device {}; writes refused for {} s",
                         if durable { "flushed" } else { "did NOT confirm a flush" }, QUIESCE_SECS));
                     send(&[FS_OK, durable as u8]);
                 }

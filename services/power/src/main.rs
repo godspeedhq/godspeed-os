@@ -29,7 +29,7 @@
 //!   notification is needed for that, which is why there is none.
 //!
 //! **Shutdown (`docs/shutdown.md`).** This service holds no `POWER_OFF`; the shell does. It READS the one pending
-//! power-off the kernel holds (InspectKernel query 28, `power_off_pending`), warns at 1 h, 30 m, 15 m, 5 m, 1 m and
+//! power-off or reboot the kernel holds (InspectKernel query 28, `power_pending`), warns at 1 h, 30 m, 15 m, 5 m, 1 m and
 //! each of the last ten seconds, and three seconds out (`TIDY_AT`) cancels a copy in flight and has `fs` quiesce. The
 //! kernel fires the deadline whether or not this service is alive. `OP_SHUTDOWN_CHANGED` and `OP_COPIER_CHANGED` are
 //! cues with no reply and no authority.
@@ -40,7 +40,7 @@
 
 // The stdlib for everything it covers - receiving, the reply capability, answering on it - and the
 // SDK only for what the stdlib does not wrap: `cpu_clock` (a privileged syscall, this service's alone) and
-// `power_off_pending` (query 28).
+// `power_pending` (query 28).
 use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
@@ -146,7 +146,8 @@ fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
     let _ = gs::ipc::reply(ctx, cap, &Message::from_bytes(body));
 }
 
-/// The machine's pending shutdown, as this service follows it (`docs/shutdown.md` 4). THE KERNEL HOLDS THE
+/// The machine's pending shutdown or reboot, as this service follows it (`docs/shutdown.md` 4). Both ride the one
+/// deadline, and the warnings and the tidy-up are the same for either; only the words differ. THE KERNEL HOLDS THE
 /// DEADLINE, and fires it whether or not this service is alive: a polite power cut becomes a plain one, never a
 /// lost one. What this adds is the warnings and the tidy-up in the last seconds. It holds no authority, keeps no
 /// clock of its own for the shutdown, and reads the deadline rather than trusting anyone's word for it.
@@ -157,6 +158,8 @@ fn reply(ctx: &ServiceContext, cap: gs::cap::Cap, body: &[u8]) {
 struct Shutdown {
     /// The seconds left when last read; `None` when none is pending.
     left: Option<u64>,
+    /// Whether the pending action, when last read, is a reboot rather than a power-off.
+    reboot: bool,
     /// The smallest threshold already said or already behind, so each is said once and none is said late.
     warned: u64,
     /// Whether the tidy-up has run for this deadline (and so whether a cancel must resume `fs`).
@@ -189,22 +192,31 @@ fn passed_threshold(left: u64) -> u64 {
 }
 
 impl Shutdown {
-    fn new() -> Self { Shutdown { left: None, warned: u64::MAX, tidied: false, copier: true } }
+    fn new() -> Self { Shutdown { left: None, reboot: false, warned: u64::MAX, tidied: false, copier: true } }
+
+    /// The words for the pending action: what it is, and what it is doing.
+    fn noun(&self) -> &'static str { if self.reboot { "reboot" } else { "shutdown" } }
+    fn doing(&self) -> &'static str { if self.reboot { "rebooting" } else { "shutting down" } }
 
     /// A cue, or this service's start: the deadline may be new, moved, or gone. Re-read it and say which.
     fn changed(&mut self, ctx: &ServiceContext) {
         let had = self.left;
         let was_tidied = self.tidied;
-        self.left = ctx.power_off_pending();
-        match self.left {
-            Some(secs) => {
-                self.warned = passed_threshold(secs);
+        let had_noun = self.noun();
+        let now = ctx.power_pending();
+        self.left = now.map(|p| p.secs);
+        match now {
+            Some(p) => {
+                self.reboot = p.reboot;
+                self.warned = passed_threshold(p.secs);
                 self.tidied = false;
-                let (n, u) = say_left(secs);
-                ctx.log_fmt(format_args!("power: the machine will shut down in {}{} - `shutdown cancel` stops it", n, u));
+                let (n, u) = say_left(p.secs);
+                let verb = if p.reboot { "reboot" } else { "shut down" };
+                ctx.log_fmt(format_args!("power: the machine will {} in {}{} - `{} cancel` stops it",
+                                         verb, n, u, self.noun()));
             }
             None if had.is_some() => {
-                ctx.log("power: the pending shutdown was cancelled");
+                ctx.log_fmt(format_args!("power: the pending {} was cancelled", had_noun));
                 // A cancel after the tidy-up: `fs` is refusing writes for a shutdown that is not coming.
                 if was_tidied {
                     match gs::fs::Fs::new(ctx).patience_secs(1).resume() {
@@ -230,7 +242,13 @@ impl Shutdown {
     /// Between cues: follow the countdown, warn at a threshold reached, and tidy up three seconds out.
     fn tick(&mut self, ctx: &ServiceContext) {
         if self.left.is_none() { return; }
-        match ctx.power_off_pending() {
+        let now = ctx.power_pending();
+        // The other kind than last read: one was cancelled and another set, with the cue lost - a new deadline.
+        if now.map_or(false, |p| p.reboot != self.reboot) {
+            self.changed(ctx);
+            return;
+        }
+        match now.map(|p| p.secs) {
             // Gone without a cue: the kernel fired it (it clears the deadline as it does), or a cancel whose cue was
             // lost - which `changed` says and acts on.
             None => {
@@ -244,12 +262,12 @@ impl Shutdown {
                     if t < self.warned {
                         self.warned = t;
                         let (n, u) = say_left(t);
-                        ctx.log_fmt(format_args!("power: shutting down in {}{}", n, u));
+                        ctx.log_fmt(format_args!("power: {} in {}{}", self.doing(), n, u));
                     }
                 }
                 if left <= TIDY_AT && !self.tidied {
                     self.tidied = true;
-                    tidy_up(ctx, self.copier);
+                    tidy_up(ctx, self.copier, self.noun());
                 }
             }
         }
@@ -259,8 +277,8 @@ impl Shutdown {
 /// The last seconds before the power goes (`docs/shutdown.md` 4.3): a copy in flight is cancelled, so its partial
 /// destination is removed, and `fs` flushes and stops taking writes. Each is bounded by about a second and an
 /// unanswered one is said and skipped; whatever is not done is left to recovery, which is what it is for.
-fn tidy_up(ctx: &ServiceContext, copier: bool) {
-    ctx.log("power: tidy-up - the last seconds before the shutdown");
+fn tidy_up(ctx: &ServiceContext, copier: bool, noun: &str) {
+    ctx.log_fmt(format_args!("power: tidy-up - the last seconds before the {}", noun));
     // `copier` FIRST, because a cancelled copy removes its partial destination through `fs`, which must still take
     // that write. It runs only while a job does, so it is asked only when the shell has said it is running
     // (`OP_COPIER_CHANGED`) and its name resolves.

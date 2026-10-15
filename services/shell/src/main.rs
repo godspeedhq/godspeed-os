@@ -865,7 +865,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // `Utf8In` above consumes those whole - and the chord is a deliberate three-key combination.
             gs::io::keys::CTRL_ALT_DEL_SIGNAL => {
                 gs::io::print(ctx, "\r\n");
-                cmd_reboot(&ctx);
+                reboot_now(&ctx);
             }
             // The audio shortcuts (`docs/audio.md`, "Keyboard shortcuts"): the keyboard driver only
             // signals the chord, as for Ctrl+Alt+Del, and the shell asks the audio driver. The result is
@@ -1365,7 +1365,7 @@ const CMDNAME_AFTER: &[(&str, &str)] = &[
 /// filesystem listing - they take no path). This is the info-command analogue of `NO_PATH_CMDS`:
 /// every one of these is a keyword command, so a new one belongs here (conventions rule 9).
 const INFO_CMDS: &[&str] = &[
-    "about", "version", "mem", "sock", "uptime", "status", "roster", "clear", "reboot",
+    "about", "version", "mem", "sock", "uptime", "status", "roster", "clear",
     "result", "selfcheck", "caps", "help",
     // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
     // absent on purpose - its argument is a path, so it keeps path completion; "repeat" has its own
@@ -2364,8 +2364,8 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
                 cmd_restart(ctx, args[1], core)
             }
         }
-        "reboot"  => cmd_reboot(ctx), // `-> !` coerces to the match arm's Result type
-        "shutdown" => cmd_shutdown(ctx, if argc >= 2 { args[1] } else { "" }),
+        "reboot"  => cmd_power(ctx, PowerAct::REBOOT, if argc >= 2 { args[1] } else { "" }),
+        "shutdown" => cmd_power(ctx, PowerAct::SHUTDOWN, if argc >= 2 { args[1] } else { "" }),
         "chaos"   => cmd_chaos(ctx, cwd, s["chaos".len()..].trim()),
         "drives" if typed && argc >= 2 && (args[1] == "check" || args[1] == "scrub") => drives_typed(ctx, &args, argc),
         "drives"  => cmd_drives(ctx, &args, argc),
@@ -5751,8 +5751,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("restart <name> <core>", "restart on core <core>", "restart pong 2"),
             ("restart <a>,<b>,...", "restart several, each per its own contract (no core override)", "restart fs,events"),
         ], true),
-        "reboot" => help_block(ctx, "reboot", "hardware reset", &[
-            ("reboot", "reset the machine", "reboot"),
+        "reboot" => help_block(ctx, "reboot", "reset the machine, now or after a delay", &[
+            ("reboot", "reboot in 3 s ([q] quits, [b] backgrounds)", "reboot"),
+            ("reboot <delay>", "after <delay>: 5, 5s, 5m, 5h; at most 24h", "reboot 10m"),
+            ("reboot now", "at once, with no countdown", "reboot now"),
+            ("reboot status", "whether one is pending, and how long is left", "reboot status"),
+            ("reboot cancel", "stop a pending reboot", "reboot cancel"),
         ], true),
         "shutdown" => help_block(ctx, "shutdown", "turn the machine off, now or after a delay", &[
             ("shutdown", "shut down in 3 s ([q] quits, [b] backgrounds)", "shutdown"),
@@ -6356,7 +6360,7 @@ static HELP: &[HelpRow] = &[
     Row("serve <port> [for]", "answer TCP connections, echoing each, until q"),
     Gap,
     Sec("Power"),
-    Row("reboot", "hardware reset"),
+    Row("reboot [<delay>|now]", "reset the machine, in 3 s, after a delay, or now"),
     Row("shutdown [<delay>|now]", "turn the machine off, in 3 s, after a delay, or now"),
     Row("chaos kill-storm <svc> [n]", "bounded resilience test: kill a service N times, verify it recovers"),
     Gap,
@@ -7506,7 +7510,8 @@ fn cmd_mem(ctx: &ServiceContext, out: &mut Out) -> Result<(), ShellError> {
     Ok(())
 }
 
-fn cmd_reboot(ctx: &ShellCtx) -> ! {
+/// `reboot now`, and the Ctrl+Alt+Del chord: reset the machine at once.
+fn reboot_now(ctx: &ShellCtx) -> ! {
     // SAY IT FIRST, THEN DO IT. Nothing goes between the command and the action.
     //
     // This used to make two round trips before printing anything - `time_floor` to the clock service,
@@ -7551,9 +7556,9 @@ fn shutdown_cue_power(ctx: &ShellCtx) {
     cue_power(ctx, 3);
 }
 
-/// `copier` was started or ended. Only a pending shutdown's tidy-up cares, so the cue is sent only then.
+/// `copier` was started or ended. Only a pending shutdown's or reboot's tidy-up cares, so the cue is sent only then.
 fn copier_cue_power(ctx: &ShellCtx) {
-    if ctx.power_off_pending().is_some() {
+    if ctx.power_pending().is_some() {
         cue_power(ctx, 4);
     }
 }
@@ -7565,13 +7570,51 @@ fn cue_power(ctx: &ShellCtx, op: u8) {
     }
 }
 
-/// `shutdown [<delay> | now | status | cancel]` - turn the machine off (`utilities/64_shutdown.md`).
+/// `shutdown` or `reboot`: the two actions the one kernel deadline can hold (`docs/shutdown.md`), and the words
+/// and calls that differ between them. Everything else - the delays, the countdown, `[q]` and `[b]`, `status`,
+/// `cancel`, `power`'s warnings and tidy-up - is the same for both.
+#[derive(Clone, Copy)]
+struct PowerAct {
+    reboot: bool,
+}
+
+impl PowerAct {
+    const SHUTDOWN: PowerAct = PowerAct { reboot: false };
+    const REBOOT: PowerAct = PowerAct { reboot: true };
+
+    /// The command, which is also the noun: `shutdown in 5s`, `reboot in 5s`.
+    fn cmd(self) -> &'static str { if self.reboot { "reboot" } else { "shutdown" } }
+    /// The other one, for a refusal that names it.
+    fn other(self) -> PowerAct { PowerAct { reboot: !self.reboot } }
+    /// The right the kernel checks, for a refusal that names it.
+    fn right(self) -> &'static str { if self.reboot { "REBOOT" } else { "POWER_OFF" } }
+    /// How the machine is said to do it: `the machine shuts down in 30s`.
+    fn does(self) -> &'static str { if self.reboot { "reboots" } else { "shuts down" } }
+
+    fn set(self, ctx: &ShellCtx, secs: u64) -> i64 {
+        if self.reboot { ctx.reboot_in(secs) } else { ctx.power_off_in(secs) }
+    }
+    fn cancel(self, ctx: &ShellCtx) -> i64 {
+        if self.reboot { ctx.reboot_cancel() } else { ctx.power_off_cancel() }
+    }
+    /// Seconds until this action, when it is the one pending.
+    fn pending(self, ctx: &ShellCtx) -> Option<u64> {
+        if self.reboot { ctx.reboot_pending() } else { ctx.power_off_pending() }
+    }
+}
+
+/// `shutdown [<delay> | now | status | cancel]` - turn the machine off (`utilities/64_shutdown.md`); `reboot` with
+/// the same forms - reset it (`utilities/13_reboot.md`).
 ///
-/// THE KERNEL HOLDS THE DEADLINE (`PowerOff`, syscall 56, `docs/shutdown.md` 6), so a shutdown survives the death
-/// of this shell and of `power`; this command sets it, shows it and cancels it. `power` gives the warnings and the
-/// tidy-up three seconds before it. The shell holds `POWER_OFF` for the operator, beside `REBOOT`.
-fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+/// THE KERNEL HOLDS THE DEADLINE (`PowerOff`, syscall 56, `docs/shutdown.md` 6), so a shutdown or a reboot survives
+/// the death of this shell and of `power`; this command sets it, shows it and cancels it. `power` gives the warnings
+/// and the tidy-up three seconds before it. The machine has ONE deadline: while a shutdown is pending a reboot is
+/// refused, and the other way round, so neither can quietly replace the other. The shell holds `POWER_OFF` and
+/// `REBOOT` for the operator.
+fn cmd_power(ctx: &ShellCtx, act: PowerAct, arg: &str) -> Result<(), ShellError> {
+    let cmd = act.cmd();
     match arg {
+        "now" if act.reboot => reboot_now(ctx),
         "now" => {
             // A copy in flight leaves a full-size file with an undefined tail when it is cut: say so.
             // Said as it is: `fs`'s journal keeps the filesystem consistent, but a copy cut part-way leaves its
@@ -7590,18 +7633,31 @@ fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             return Err(ShellError::Denied);
         }
         "status" => {
-            match ctx.power_off_pending() {
-                Some(s) => gs::io::println_fmt(ctx, format_args!(
-                    "a shutdown is pending, in {} - `shutdown cancel` stops it", Delay(s))),
-                None => gs::io::println(ctx, "no shutdown is pending"),
+            match ctx.power_pending() {
+                Some(p) if p.reboot == act.reboot => gs::io::println_fmt(ctx, format_args!(
+                    "a {} is pending, in {} - `{} cancel` stops it", cmd, Delay(p.secs), cmd)),
+                Some(p) => gs::io::println_fmt(ctx, format_args!(
+                    "no {} is pending; a {} is, in {} - `{} cancel` stops it",
+                    cmd, act.other().cmd(), Delay(p.secs), act.other().cmd())),
+                None => gs::io::println_fmt(ctx, format_args!("no {} is pending", cmd)),
             }
             return Ok(());
         }
         "cancel" => {
-            return match ctx.power_off_cancel() {
-                0 => { gs::io::println(ctx, "shutdown: cancelled"); shutdown_cue_power(ctx); Ok(()) }
-                1 => { gs::io::println(ctx, "shutdown: none is pending"); Err(ShellError::Unknown) }
-                rc => { gs::io::println_fmt(ctx, format_args!("shutdown: cancel refused ({})", rc)); Err(ShellError::Denied) }
+            return match act.cancel(ctx) {
+                0 => { gs::io::println_fmt(ctx, format_args!("{}: cancelled", cmd)); shutdown_cue_power(ctx); Ok(()) }
+                1 => { gs::io::println_fmt(ctx, format_args!("{}: none is pending", cmd)); Err(ShellError::Unknown) }
+                2 => {
+                    gs::io::println_fmt(ctx, format_args!(
+                        "{}: none is pending - a {} is, and is kept (`{} cancel` stops it)",
+                        cmd, act.other().cmd(), act.other().cmd()));
+                    Err(ShellError::Unknown)
+                }
+                -2 => {
+                    gs::io::println_fmt(ctx, format_args!("{}: refused - this shell does not hold {}", cmd, act.right()));
+                    Err(ShellError::Denied)
+                }
+                rc => { gs::io::println_fmt(ctx, format_args!("{}: cancel refused ({})", cmd, rc)); Err(ShellError::Denied) }
             };
         }
         _ => {}
@@ -7612,77 +7668,90 @@ fn cmd_shutdown(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         match parse_duration(arg) {
             Some(s) if (1..=SHUTDOWN_MAX_SECS).contains(&s) => s as u64,
             Some(0) => {
-                gs::io::println(ctx, "shutdown: a delay is at least 1s - or `shutdown now`");
+                gs::io::println_fmt(ctx, format_args!("{}: a delay is at least 1s - or `{} now`", cmd, cmd));
                 return Err(ShellError::Unknown);
             }
             Some(_) => {
-                gs::io::println(ctx, "shutdown: at most 24h - a shutdown further away is a calendar's job");
+                gs::io::println_fmt(ctx, format_args!(
+                    "{}: at most 24h - a {} further away is a calendar's job", cmd, cmd));
                 return Err(ShellError::Unknown);
             }
             None => {
-                gs::io::println(ctx, "usage: shutdown [<delay> | now | status | cancel]   e.g. shutdown 5m");
+                gs::io::println_fmt(ctx, format_args!(
+                    "usage: {} [<delay> | now | status | cancel]   e.g. {} 5m", cmd, cmd));
                 return Err(ShellError::Unknown);
             }
         }
     };
     // `power` is cued AFTER this shell's own line is out, not before: cued first, its announcement raced the line
     // onto serial and ran on from it (`docs/shutdown.md` 8). Once the line is written the kernel knows it is open.
-    match ctx.power_off_in(secs) {
+    match act.set(ctx, secs) {
         0 => {}
         1 => {
-            let sooner = ctx.power_off_pending().unwrap_or(0);
+            let sooner = act.pending(ctx).unwrap_or(0);
             gs::io::println_fmt(ctx, format_args!(
-                "shutdown: one is already due sooner, in {} - it is kept (`shutdown cancel` stops it)",
-                Delay(sooner)));
+                "{}: one is already due sooner, in {} - it is kept (`{} cancel` stops it)", cmd, Delay(sooner), cmd));
             return Ok(());
         }
+        2 => {
+            let other = act.other().cmd();
+            let when = act.other().pending(ctx).unwrap_or(0);
+            gs::io::println_fmt(ctx, format_args!(
+                "{}: refused - a {} is pending, in {}, and the machine has one deadline (`{} cancel` first)",
+                cmd, other, Delay(when), other));
+            return Err(ShellError::Unknown);
+        }
+        -2 => {
+            gs::io::println_fmt(ctx, format_args!("{}: refused - this shell does not hold {}", cmd, act.right()));
+            return Err(ShellError::Denied);
+        }
         rc => {
-            gs::io::println_fmt(ctx, format_args!("shutdown: refused ({})", rc));
+            gs::io::println_fmt(ctx, format_args!("{}: refused ({})", cmd, rc));
             return Err(ShellError::Denied);
         }
     }
     if secs >= SHUTDOWN_FOREGROUND_SECS {
         gs::io::println_fmt(ctx, format_args!(
-            "shutdown in {} - `shutdown cancel` stops it", Delay(secs)));
+            "{} in {} - `{} cancel` stops it", cmd, Delay(secs), cmd));
         shutdown_cue_power(ctx);
         return Ok(());
     }
-    // THE COUNTDOWN, in the foreground (rule 10): one line, rewritten each second. `q` cancels the shutdown
-    // (rule 11: quitting stops the task); `b` gives the prompt back and the shutdown goes on - it was never
-    // this loop's, the kernel holds it. The machine turns off under this loop when the deadline falls due.
+    // THE COUNTDOWN, in the foreground (rule 10): one line, rewritten each second. `q` cancels it (rule 11:
+    // quitting stops the task); `b` gives the prompt back and the countdown goes on - it was never this loop's, the
+    // kernel holds it. The machine turns off or resets under this loop when the deadline falls due.
     let mut shown = u64::MAX;
     loop {
-        let left = match ctx.power_off_pending() {
+        let left = match act.pending(ctx) {
             Some(l) => l,
             None => {
                 gs::io::println(ctx, "");
-                gs::io::println(ctx, "shutdown: cancelled");
+                gs::io::println_fmt(ctx, format_args!("{}: cancelled", cmd));
                 return Ok(());
             }
         };
         if left != shown {
             let first = shown == u64::MAX;
             shown = left;
-            gs::io::print_fmt(ctx, format_args!("\r\x1b[2Kshutdown in {}   [q] quit   [b] background",
-                                                 Delay(left)));
+            gs::io::print_fmt(ctx, format_args!("\r\x1b[2K{} in {}   [q] quit   [b] background",
+                                                 cmd, Delay(left)));
             if first { shutdown_cue_power(ctx); }
         }
         let key = if ctx.quit.get() { Some(b'q') } else { ctx.try_console_read() };
         match key {
             Some(b'q') | Some(b'Q') | Some(0x1b) => {
                 gs::io::println(ctx, "");
-                if ctx.power_off_cancel() == 0 {
-                    gs::io::println(ctx, "shutdown: cancelled");
+                if act.cancel(ctx) == 0 {
+                    gs::io::println_fmt(ctx, format_args!("{}: cancelled", cmd));
                     shutdown_cue_power(ctx);
                 } else {
-                    gs::io::println(ctx, "shutdown: it had already been cancelled");
+                    gs::io::println_fmt(ctx, format_args!("{}: it had already been cancelled", cmd));
                 }
                 return Ok(());
             }
             Some(b'b') | Some(b'B') => {
                 gs::io::println(ctx, "");
                 gs::io::println_fmt(ctx, format_args!(
-                    "[backgrounded] shutdown in {} - `shutdown cancel` stops it", Delay(left)));
+                    "[backgrounded] {} in {} - `{} cancel` stops it", cmd, Delay(left), cmd));
                 return Ok(());
             }
             Some(k) => ctx.keep_key(k),
@@ -23213,12 +23282,14 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
         gs::io::println(ctx, "usage: background copy <src> <dst> | delete <path> recursive | drives check | drives scrub | churn <seconds>");
         return Err(ShellError::Unknown);
     }
-    // NOTHING STARTS IN A SHUTDOWN'S LAST MINUTE (`docs/shutdown.md` 4.3): a job begun now would be cut part-way.
-    if let Some(left) = ctx.power_off_pending() {
-        if left <= 60 {
+    // NOTHING STARTS IN A SHUTDOWN'S OR REBOOT'S LAST MINUTE (`docs/shutdown.md` 4.3): a job begun now would be cut
+    // part-way.
+    if let Some(p) = ctx.power_pending() {
+        if p.secs <= 60 {
+            let act = PowerAct { reboot: p.reboot };
             gs::io::println_fmt(ctx, format_args!(
-                "background: refused - the machine shuts down in {}, before a job could finish (`shutdown cancel` stops it)",
-                Delay(left)));
+                "background: refused - the machine {} in {}, before a job could finish (`{} cancel` stops it)",
+                act.does(), Delay(p.secs), act.cmd()));
             return Err(ShellError::Unknown);
         }
     }
@@ -23834,10 +23905,11 @@ fn cmd_jobs_quit(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 /// 12, and §3 of the design note).
 fn cmd_jobs(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     refresh_jobs(ctx);
-    // A pending shutdown is listed with the jobs, so one command shows everything pending (`docs/shutdown.md`
-    // 4.2). A line, not a row: it is not a job, and the kernel - not `copier` - holds it.
-    if let Some(left) = ctx.power_off_pending() {
-        out.line_fmt(ctx, format_args!("shutdown in {} (pending; `shutdown cancel` stops it)", Delay(left)));
+    // A pending shutdown or reboot is listed with the jobs, so one command shows everything pending
+    // (`docs/shutdown.md` 4.2). A line, not a row: it is not a job, and the kernel - not `copier` - holds it.
+    if let Some(p) = ctx.power_pending() {
+        let cmd = PowerAct { reboot: p.reboot }.cmd();
+        out.line_fmt(ctx, format_args!("{} in {} (pending; `{} cancel` stops it)", cmd, Delay(p.secs), cmd));
     }
     let t = ctx.jobs.borrow();
     if !t.rows.iter().any(|r| r.used && !r.hidden) {

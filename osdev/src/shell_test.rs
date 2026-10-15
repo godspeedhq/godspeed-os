@@ -10822,7 +10822,9 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
             "-m",       "512M",
             "-serial",  &format!("tcp::{shell_port},server"),
             "-serial",  "null",
-            "-display", "none", "-no-reboot",
+            // No `-no-reboot`: a `reboot` resets the machine and it boots again, and `-no-shutdown` is left out so
+            // the final shutdown's ACPI S5 ends QEMU.
+            "-display", "none",
         ])
         .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
         .spawn().unwrap_or_else(|e| { eprintln!("shutdown-test: QEMU launch failed: {e}"); std::process::exit(1); });
@@ -10909,6 +10911,49 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
           &format!("`q` cancels the shutdown, and the prompt is back in {:.1} s", tq.elapsed().as_secs_f32()));
     let s = run!(b"shutdown status\r");
     check(s.contains("no shutdown is pending"), "after `q` nothing is pending");
+    // REBOOT, on the same one deadline (S6): the same forms, and neither kind can replace the other.
+    let s = run!(b"reboot status\r");
+    check(s.contains("no reboot is pending"), "`reboot status` with none pending says so");
+    let s = run!(b"reboot 10m\r");
+    check(s.contains("reboot in 10m"), "`reboot 10m` gives the prompt back and says when");
+    let s = run!(b"jobs\r");
+    check(s.contains("reboot in ") && s.contains("`reboot cancel`"), "`jobs` lists the pending reboot");
+    let s = run!(b"reboot 20m\r");
+    check(s.contains("already due sooner"), "a LATER reboot is refused");
+    let s = run!(b"shutdown 5m\r");
+    check(s.contains("refused - a reboot is pending"), "a shutdown is refused while a reboot is pending - one deadline");
+    let s = run!(b"shutdown status\r");
+    check(s.contains("no shutdown is pending; a reboot is"), "`shutdown status` names the reboot that is pending");
+    let s = run!(b"shutdown cancel\r");
+    check(s.contains("a reboot is, and is kept"), "`shutdown cancel` does not cancel a reboot");
+    let s = run!(b"reboot cancel\r");
+    check(s.contains("reboot: cancelled"), "`reboot cancel` clears it");
+    let s = run!(b"shutdown 10m\r");
+    let s2 = run!(b"reboot 5\r");
+    check(s.contains("shutdown in 10m") && s2.contains("refused - a shutdown is pending"),
+          "a reboot is refused while a shutdown is pending");
+    let _ = run!(b"shutdown cancel\r");
+    let s = run!(b"reboot 0\r");
+    check(s.contains("at least 1s - or `reboot now`"), "`reboot 0` is refused for what it is");
+    send(&mut write_half, b"reboot 5\r");
+    let shown = collect_until(&buf, &mut cursor, b"[b] background", Duration::from_secs(10)).unwrap_or_default();
+    check(shown.contains("reboot in "), "a reboot under a minute counts down with [q] and [b]");
+    send(&mut write_half, b"q");
+    let s = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(10)).unwrap_or_default();
+    check(s.contains("reboot: cancelled"), "`q` cancels the reboot");
+    // A plain `reboot`: 3 s, the tidy-up, the reset - and the machine comes back to a prompt.
+    let tr = Instant::now();
+    send(&mut write_half, b"reboot\r");
+    let r = collect_until(&buf, &mut cursor, b"reboot: hardware reset", Duration::from_secs(20)).unwrap_or_default();
+    let took = tr.elapsed().as_secs_f32();
+    check(r.contains("power: tidy-up - the last seconds before the reboot"), "`power` tidied up before the reboot");
+    check(r.contains("fs: quiesced for a shutdown or reboot"), "fs flushed before the reboot");
+    check(r.contains("reboot: the pending reboot fell due"), "the KERNEL fired the reboot, with nothing asking");
+    check(!r.is_empty() && took < 6.0, &format!("a plain `reboot` reset the machine {took:.1} s after it was typed (3 s asked)"));
+    let back = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(90));
+    check(back.is_some(), "the machine came back to a prompt after the reboot");
+    let s = run!(b"reboot status\r");
+    check(s.contains("no reboot is pending"), "nothing is pending after the reboot");
     // A countdown, backgrounded, then left to fall due.
     let t0 = Instant::now();
     send(&mut write_half, b"shutdown 20\r");
@@ -10945,7 +10990,7 @@ pub fn run_shutdown(image_path: &Path, persist_path: &str, smp: u32) {
           "a log line starts its own line on serial, not after the shell's open one");
     check(!log.contains("acquire: 'copier' is not in the name directory"),
           "the tidy-up asks for `copier` only when the shell says it is running");
-    check(log.contains("fs: quiesce ended - the shutdown was cancelled") && log.contains("power: fs takes writes again"),
+    check(log.contains("fs: quiesce ended - the shutdown or reboot was cancelled") && log.contains("power: fs takes writes again"),
           "a cancel after the tidy-up ended fs's quiesce");
     check(log.contains("fs: quiesced for a shutdown"), "fs flushed and stopped taking writes");
     check(log.contains("power-off: the pending power-off fell due"), "the KERNEL fired the deadline, with nothing asking");
