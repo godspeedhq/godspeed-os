@@ -1192,7 +1192,22 @@ pub fn halt_all_cores() -> ! {
 /// Reset the machine via the BCM2835 power-management watchdog (the shell `reboot` command + Ctrl+Alt+Del).
 /// Arm a short watchdog timeout and request a FULL reset in `PM_RSTC`; the SoC resets when the watchdog
 /// fires. Every PM write is gated by the `0x5A` password. (The prior stub just spun, so `reboot` hung.)
+/// Empty the UART - the transmit ring, then the FIFO and the shift register (BUSY) - before the watchdog is armed
+/// for a reset or a halt. The watchdog fires about 150 us after it is armed, and a line takes about 8 ms to leave at
+/// 115200 baud: the power-off line was cut off mid-sentence on the Pi 2 (2026-10-14), and the Pi 4 cut its reboot
+/// lines the same way (2026-10-15). Bounded, so a wedged UART delays the reset and never stops it.
+fn uart_drain() {
+    tx_ring_flush_blocking();
+    // SAFETY: a volatile read of the PL011 flag register, identity-mapped like every other read of it here.
+    unsafe {
+        let mut t = 0u32;
+        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 && t < 1_000_000 { t += 1; }
+    }
+}
+
 pub fn hardware_reset() -> ! {
+    // The last line first, for the reason `uart_drain` gives.
+    uart_drain();
     const PM_RSTC: usize = PERIPHERAL_BASE + 0x10_001c;
     const PM_RSTS: usize = PERIPHERAL_BASE + 0x10_0020;
     const PM_WDOG: usize = PERIPHERAL_BASE + 0x10_0024;
@@ -1280,15 +1295,7 @@ pub fn power_off() -> &'static str {
     const PM_RSTS_HALT: u32 = !PM_RSTS_PARTITION;
     const WDOG_TICKS: u32 = 10;
     crate::kprintln!("power-off: halting through the firmware (boot partition 63); the board stays powered");
-    // The watchdog fires about 150 us after it is armed, and that line takes about 8 ms to leave at 115200 baud: it
-    // was cut off mid-sentence on the Pi 2 (2026-10-14). So the UART is emptied first - the ring, then the FIFO and
-    // the shift register (BUSY) - bounded, so a wedged UART delays the halt and never stops it.
-    tx_ring_flush_blocking();
-    // SAFETY: a volatile read of the PL011 flag register, identity-mapped like every other read of it here.
-    unsafe {
-        let mut t = 0u32;
-        while PL011_FR.read_volatile() & PL011_FR_BUSY != 0 && t < 1_000_000 { t += 1; }
-    }
+    uart_drain();
     // SAFETY: the same BCM2835 power-management registers `hardware_reset` writes, in the Device-mapped
     // peripheral window; volatile 32-bit writes gated by the 0x5A password. Poked ONCE and then left to run
     // out - re-arming the watchdog restarts its countdown (see `hardware_reset`).
