@@ -569,6 +569,12 @@ or a full connection table - and releases the slot, so nothing is stranded. `gs:
 a `Stream` with `recv`, `send` and `close`; its first user is the package manager's TLS client
 (`services/godspeed-pm`, `utilities/61_godspeed.md`).
 
+**ARP is asked once.** The next hop is a neighbour if it answers ARP, as for op 21 - but op 21 asks six
+times, at up to 3 s each, and every address beyond the gateway costs that in full, 12 to 18 s before a SYN
+is sent. QEMU measured it: a `tcp 1.1.1.1 80` serve pass took 11.9 s, and the first op 23 waited longer
+than its client did. A neighbour answers in milliseconds, so op 23 asks once (`arp_resolve_tries`). Op 21
+is unchanged, and still slow to the internet; recorded here rather than changed under it.
+
 **What it does not change.** The table is still `MAX_CONNS = 2` and the receive buffer still 2 KiB, and the
 connection's data still moves on the 100 ms poll. That is ample for a registry's index and trust files and
 slow for a large package - roughly 20 KB/s at best - which is recorded here rather than discovered later.

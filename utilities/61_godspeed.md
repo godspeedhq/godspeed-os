@@ -13,8 +13,10 @@ crate is already called `godspeed`; it appears in `status` while a command runs 
 
 Built on `feat/tls`: the settings and the registry check. Searching for, fetching and keeping packages are
 **not built**: they need the registry's signed metadata format (the CLI repository's `godspeed-package`
-crate), and a machine that could fetch a package still could not run it (10.1). QEMU only; no board has
-run it yet.
+crate), and a machine that could fetch a package still could not run it (10.1). QEMU only, no board yet:
+`osdev test godspeed` (24 checks) runs every command against a real disk and reaches the real registry
+over verified TLS through QEMU's user network (its registry checks are skipped, not passed, when the
+machine running the test is offline).
 
 ## 1. The command
 

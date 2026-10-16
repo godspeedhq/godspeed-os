@@ -8305,7 +8305,10 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(live.contains("verified"), "`godspeed check` verifies the registry's chain to ISRG Root X2");
         check!(live.contains("HTTP/1.1 200"), "the registry answers HTTP 200 over the TLS connection");
         check!(live.contains("Godspeed package registry"), "and says what it is");
-        check!(live.contains("hardware clock"), "the certificate was checked against the hardware clock, and the row says so");
+        // The clock row names its source: `time` sets the clock from the network soon after boot, and the
+        // hardware clock stands in until then. Either is a clock; "unset" would have refused the check.
+        check!(live.contains("network time") || live.contains("hardware clock"),
+               "the row says which clock the certificate's dates were checked against");
     }
     let piped_check = if offline { String::new() } else { run!(b"godspeed check | where item=tls\r", 150) };
     if !offline {
@@ -8314,7 +8317,9 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
 
     let _ = child.kill();
     let _ = child.wait();
-    println!("\ngodspeed: {pass} passed, {fail} failed, {skipped} skipped");
+    // The whole serial transcript, for the failure a PASS/FAIL line cannot explain.
+    let _ = std::fs::write("build/tests/godspeed_serial.log", &*buf.lock().unwrap());
+    println!("\ngodspeed: {pass} passed, {fail} failed, {skipped} skipped (serial: build/tests/godspeed_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }
 

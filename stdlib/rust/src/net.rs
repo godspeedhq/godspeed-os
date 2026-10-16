@@ -363,12 +363,17 @@ impl<'a> Net<'a> {
         req[0] = OP_RESOLVE;
         req[1..1 + n].copy_from_slice(host.as_bytes());
         let r = self.call(&req[..1 + n], NET_SECS)?;
+        // `[status, ip(4), frames, udp, timeouts]` (net-stack's op 1): status 1 with the address, 2 when a
+        // server answered with no A record, 0 when no server answered. This read the STATUS as the first
+        // octet until 2026-10-16, so every address it returned was shifted by a byte - `1.172.67.222` for
+        // `172.67.222.x` - and nothing noticed, because nothing called it until the package manager did.
         let b = body(&r);
-        // A resolve that found nothing answers short or zeroed rather than with an error status.
-        if b.len() < 4 || b[..4] == [0, 0, 0, 0] {
-            return Err(Error::NotFound);
+        match b {
+            [1, a, b2, c, d, ..] if [*a, *b2, *c, *d] != [0, 0, 0, 0] => Ok(Ipv4([*a, *b2, *c, *d])),
+            [2, ..] => Err(Error::NotFound),
+            [0, ..] => Err(Error::Unavailable),
+            _ => Err(Error::Malformed),
         }
-        Ok(Ipv4([b[0], b[1], b[2], b[3]]))
     }
 
     /// Send one ICMP echo and wait for the reply.

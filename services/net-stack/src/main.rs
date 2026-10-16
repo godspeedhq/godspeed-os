@@ -1579,6 +1579,9 @@ fn tcp_open(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net
     if n > 0 {
         let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
         t.note_tx(&frame[..n], r.is_some());
+        if r.is_none() { ctx.log("net-stack: connect - nic-driver did not take the SYN"); }
+    } else {
+        ctx.log("net-stack: connect - no SYN could be built");
     }
     let mut empty: u32 = 0;
     for _ in 0..TCP_STEPS {
@@ -2062,6 +2065,15 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8;
 /// stalls (RTL8168 RDU recovery) and the deadline no longer glitches (deglitched RTC).
 fn arp_resolve(ctx: &ServiceContext, pending: &mut Displaced, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4],
                serve_status: Option<&[u8; 19]>) -> Option<[u8; 6]> {
+    arp_resolve_tries(ctx, pending, our_ip, our_mac, target, serve_status, DANCE_TRIES)
+}
+
+/// [`arp_resolve`] with the number of requests stated. One is enough to ask "is this a neighbour?": a host
+/// on the link answers within milliseconds, so a single request and its `DANCE_SECS` drain decide it,
+/// where the full `DANCE_TRIES` - meant for a gateway that must be found - spend 12 to 18 s on every
+/// address that is simply not local.
+fn arp_resolve_tries(ctx: &ServiceContext, pending: &mut Displaced, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4],
+                     serve_status: Option<&[u8; 19]>, tries: u32) -> Option<[u8; 6]> {
     let mut arp = [0u8; 42];
     for b in arp.iter_mut().take(6) { *b = 0xff; }   // eth dst = broadcast
     arp[6..12].copy_from_slice(our_mac);
@@ -2111,7 +2123,7 @@ fn arp_resolve(ctx: &ServiceContext, pending: &mut Displaced, our_ip: &[u8; 4], 
     // now answers nothing and there is one place a frame can arrive. The matcher stays factored anyway -
     // it is the protocol's definition of "is this our reply", and one copy of that is the right number.
     let mut result: Option<[u8; 6]> = None;
-    for _ in 0..DANCE_TRIES {
+    for _ in 0..tries {
         let mut scan = |f: &[u8], pending: &mut Displaced, result: &mut Option<[u8; 6]>| -> bool {
             seen += 1;
             if f.len() >= 6 && f[0..6] == our_mac[..] { unicast += 1; }
@@ -3673,8 +3685,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if pl.len() >= 7 && gw_known {
                 let dip = [pl[1], pl[2], pl[3], pl[4]];
                 let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
-                // The next hop is chosen exactly as for op 21: an address that answers ARP is on-link.
-                let peer_mac = arp_resolve(&ctx, pending, &our_ip, &our_mac, &dip, None).unwrap_or(gw_mac);
+                // An address that answers ARP is on-link and is reached directly, as for op 21 - but asked
+                // ONCE: a neighbour answers in milliseconds, and op 21's six tries cost 12 to 18 s on every
+                // address beyond the gateway, longer than a client will wait for the connection.
+                let on_link = arp_resolve_tries(&ctx, pending, &our_ip, &our_mac, &dip, None, 1);
+                let peer_mac = on_link.unwrap_or(gw_mac);
+                ctx.log_fmt(format_args!("net-stack: connect {}.{}.{}.{}:{} - {}",
+                    dip[0], dip[1], dip[2], dip[3], dport,
+                    if on_link.is_some() { "on-link, direct" } else { "via the gateway" }));
                 let net = tcp::Net { our_mac, peer_mac, our_ip };
                 match gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
                     Ok((crid, cap)) => {
@@ -3714,6 +3732,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             } else if !gw_known {
                 ctx.log("net-stack: connect asked for before the stack is configured");
+            } else {
+                ctx.log_fmt(format_args!("net-stack: connect refused - {} byte(s), not [23, ip(4), port(2)]", pl.len()));
             }
             if !granted { reply.send(&ctx, &[0]); }
         } else if pl.first() == Some(&1) {

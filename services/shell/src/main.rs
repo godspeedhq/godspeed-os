@@ -14656,6 +14656,14 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
         Stream::Bytes(cap)
     } else if is_record_producer(c0) || wifi_records || hardware_records || audio_records {
         let arg = split_first(stages[0]).1;
+        // An ACTION refuses here too: `godspeed config set ... | count` would otherwise run the set while
+        // looking like a report, which is the one thing a refusal exists to prevent.
+        if c0 == "godspeed" {
+            if let Some(why) = producer_refusal(c0, arg) {
+                gs::io::println(ctx, why);
+                return Err(ShellError::Unknown);
+            }
+        }
         let t = match c0 {
             "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "caps"    => match build_caps_table(ctx, arg)       { Some(t) => t, None => return Err(ShellError::Unknown) },
