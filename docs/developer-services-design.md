@@ -850,8 +850,8 @@ nothing reads the pin until the metadata check exists, and a `[y/N]` needs the c
 program's answer table does not have. The confirmation is built with the check that gives it a meaning. The full answer is
 folder capabilities, where only the package manager can write its own folder.
 
-**The same rule for the parameters other services compile in today.** `time`'s NTP server is a constant
-(`NTP_SERVER`, 162.159.200.123, `time.cloudflare.com`) in `services/time/src/main.rs`. Under this rule it
+**The same rule for the parameters other services compiled in.** `time`'s NTP server was a constant
+(162.159.200.123, `time.cloudflare.com`) in `services/time/src/main.rs`. Under this rule it
 moves to `/system/services/time/ntp`, read by `time` the way it reads its floor, with the constant as the
 default. That is a change to a running service, so it is its own reviewed change (QEMU first, one per
 flash), not part of this document. **Built 2026-10-16** (`services/time/src/ntp_file.rs`,
