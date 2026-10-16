@@ -775,6 +775,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Some(TAG_FLOOR_READ) => {
                         floor_settled = floor_adopt(&ctx, &mut clock, p);
                     }
+                    // A LATE ANSWER to an earlier paced read changes nothing once the setting is decided. At
+                    // boot the reads go out every 2 s while `fs` is still mounting, queue there, and are all
+                    // answered together; adopting each wrote the default three times for one decision.
+                    // Only a `date sync` re-read is taken after that.
+                    Some(TAG_NTP_CFG_READ) if ntp_cfg != NtpCfg::Unread && !sync_after_read => {}
                     Some(TAG_NTP_CFG_READ) => {
                         if let Some(cfg) = ntp_cfg_adopt(&ctx, p) {
                             ntp_cfg = cfg;
