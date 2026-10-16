@@ -242,12 +242,12 @@ fn config_show(ctx: &ServiceContext, key: Option<&str>, r: &mut Rows) {
 }
 
 fn config_set(ctx: &ServiceContext, key: &str, value: &str, r: &mut Rows) {
-    if !config::KEYS.iter().any(|k| k.name == key) {
-        return r.fail(key, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib");
-    }
     // A registry is a name, an address and the root it is signed by, so it is never one setting.
     if matches!(key, "registry" | "trust-root") {
         return r.fail(key, "not set here", "registries are `godspeed registry add`, `use` and `remove`");
+    }
+    if !config::KEYS.iter().any(|k| k.name == key) {
+        return r.fail(key, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib");
     }
     if let Err(why) = config::check(key, value) {
         return r.fail(key, value, why);
