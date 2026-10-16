@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! One HTTPS request: TLS 1.3 (`sdk/tls`) over one TCP connection held as a capability (`gs::net::Stream`).
 //!
-//! Every wait has a deadline, `timeout-secs` from the configuration (10.8), and every way it can end is
-//! a [`Fail`] that says where: the clock, the randomness, the name, the connection, the handshake (with
+//! Every wait has a deadline. The name and the connection keep `gs::net`'s own (`NET_SECS`, 10 s, and
+//! `TCP_SECS`, 20 s); everything after them is bounded by `timeout-secs` from the configuration (10.8),
+//! counted from the start of the request, so a value smaller than those two does not cut them short.
+//! Every way it can end is a [`Fail`] that says where: the clock, the randomness, the name, the connection, the handshake (with
 //! TLS's own reason, a certificate's included), or the server's answer.
 
 use godspeed::{self as gs, ServiceContext};

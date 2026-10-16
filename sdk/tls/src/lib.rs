@@ -11,12 +11,15 @@
 //!
 //! # What is ours and what is not
 //!
-//! - **Ours:** the TLS 1.3 key schedule ([`schedule`]), the record layer ([`record`]), and the
-//!   handshake and the connection after it ([`client`]). Certificate checking is the caller's, through
-//!   [`client::ServerVerifier`].
-//! - **Not ours:** the primitives. SHA-256, HMAC, HKDF and AES-128-GCM are RustCrypto's; X25519 is dalek's.
-//!   Constant-time field arithmetic is exactly the code that is easy to get subtly wrong, so it is taken
-//!   from libraries built and reviewed for it.
+//! - **Ours:** the TLS 1.3 key schedule ([`schedule`]), the record layer ([`record`]), the handshake
+//!   and the connection after it ([`client`]), and the verifier that joins them to certificate checking
+//!   ([`verify::WebPkiVerifier`]: the roots, the date and the name it is given, and the reason a chain
+//!   was refused, as a [`CertProblem`]). A caller may bring its own through [`client::ServerVerifier`].
+//! - **Not ours:** the primitives and the X.509 path building. SHA-256, HMAC, HKDF and AES-128-GCM are
+//!   RustCrypto's, X25519 is dalek's, the ECDSA P-256 and P-384 checks are RustCrypto's `p256` and
+//!   `p384`, and the chain itself is checked by `rustls-webpki`. Constant-time field arithmetic and
+//!   certificate parsing are exactly the code that is easy to get subtly wrong, so they are taken from
+//!   libraries built and reviewed for them.
 //!
 //! # Scope, deliberately narrow
 //!

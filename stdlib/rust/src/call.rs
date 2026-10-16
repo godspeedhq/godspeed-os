@@ -38,8 +38,9 @@
 //! it is a second delete whose failure looks like success. `ReplyDead` says the request was DELIVERED
 //! (CLAUDE.md 8.6), so it is the same case with a dead peer instead of a slow one.
 //!
-//! This diagram is [`request_within`]. [`request_within_notice`] with a callback cannot draw it: see
-//! its own documentation.
+//! This diagram is [`request_within`]. [`request_within_notice`] with a callback follows it with two
+//! differences - a peer that died holding the request reads as `OutcomeUnknown`, and a person can
+//! press `q` - which its own documentation explains.
 //!
 //! # ONE OF THESE IS SAFE FOR A SERVING CALLER, AND THE OTHER IS NOT
 //!
@@ -108,17 +109,16 @@ pub const NOTICE_AFTER_SECS: i64 = 2;
 /// same machinery as [`request_within`].
 ///
 /// With `notice` set to `None` this IS [`request_within`]. With a callback it rides the SDK's `_qhint`
-/// request, and three things differ:
+/// request, which reads its outcomes differently, so:
 ///
-/// - **No retry.** A stale capability is not reacquired, so after the peer restarts every call fails
-///   until something else reacquires the name ([`crate::cap::reacquire`]).
-/// - **A request that never left is retried once**, after reacquiring the peer by name, as
-///   [`request_within`] does; if it still cannot be sent the answer is [`Error::Unreachable`]. `_qhint`
-///   reports a failed send and a passed deadline as the same `Timeout`, but it reports the deadline only
-///   once it has passed, so a `Timeout` sooner than `secs` is the send that never left (as
-///   [`request_watched`] reads it). A deadline that passed is [`Error::OutcomeUnknown`] and is never
-///   re-sent.
-/// - **A peer that died holding the request is also [`Error::OutcomeUnknown`]**, never
+/// - **A request that never left is retried once, as in [`request_within`]**, after reacquiring the
+///   peer by name; if it still cannot be sent the answer is [`Error::Unreachable`]. What differs is how
+///   the failed send is recognised: `_qhint` reports a failed send and a passed deadline as the same
+///   `Timeout`, but it reports the deadline only once it has passed, so a `Timeout` sooner than `secs`
+///   is the send that never left (as [`request_watched`] reads it). A deadline that passed is
+///   [`Error::OutcomeUnknown`] and is never re-sent. (Until 2026-10-16 there was no retry at all, and a
+///   peer that started after the caller could not be reached until something else reacquired it.)
+/// - **A peer that died holding the request is [`Error::OutcomeUnknown`]**, never
 ///   [`Error::PeerDied`]: the wait is a timed receive, so no `ReplyDead` reaches it.
 ///
 /// It also adds [`Error::Cancelled`], for a person who pressed `q` - and it is not safe for a task

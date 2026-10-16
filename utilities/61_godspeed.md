@@ -13,10 +13,11 @@ crate is already called `godspeed`; it appears in `status` while a command runs 
 
 Built on `feat/tls`: the registries, the settings and the registry check. Searching for, fetching and
 keeping packages are **not built**: they need the registry's signed metadata format (the CLI repository's
-`godspeed-package` crate), and a machine that could fetch a package still could not run it (10.1). QEMU
-only, no board yet: `osdev test godspeed` runs every command against a real disk and reaches the real
-registry over verified TLS through QEMU's user network (its registry checks are skipped, not passed, when
-the machine running the test is offline).
+`godspeed-package` crate), and a machine that could fetch a package still could not run it (10.1).
+`osdev test godspeed` runs every command against a real disk and reaches the real registry over verified
+TLS through QEMU's user network (its registry checks are skipped, not passed, when the machine running the
+test is offline). On hardware, 2026-10-16: `godspeed check` verified the registry and got `HTTP/1.1 200 OK`
+on the HP T630 and the Dell Wyse 5070, the two x86 boards; the ARM and RISC-V boards are not tried yet.
 
 ## 1. The command
 
@@ -83,7 +84,7 @@ because the key is absent.
 | key | default | what it is |
 |---|---|---|
 | `tls-roots` | `/system/services/godspeed/roots/` | the certificate authorities TLS accepts, one DER file each. On first start the folder is given ISRG Root X2, the root the registry's chain reaches; a folder that exists is never refilled, so a root removed stays removed |
-| `timeout-secs` | 30 | how long one request may take, 1 to 100 |
+| `timeout-secs` | 30 | how long one request may take, 1 to 100, counted from its start. Looking the name up and connecting keep their own limits, 10 s and 20 s, so a smaller value does not shorten those |
 | `max-package-mib` | 64 | the largest package that will be downloaded, 1 to 4096. Nothing downloads yet |
 
 A registry is not a plain setting: `godspeed config set registry` is refused with the command that manages
@@ -107,7 +108,7 @@ One row per step, stopping at the first that fails and saying why:
 
 | item | value | note |
 |---|---|---|
-| `registry` | the address of the registry in use | its name |
+| `registry` | the address of the registry in use | its name, and `(in use)` |
 | `clock` | the date a certificate is checked against | its source: hardware clock, network time, or a floor from the last boot. No clock, no check: `date sync` first |
 | `roots` | how many | the folder they were read from |
 | `address` | the registry's IPv4 address | its name |

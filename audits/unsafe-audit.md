@@ -3766,3 +3766,9 @@ Retried at most ten times, Intel's documented bound for a transient underflow. A
 as Linux refuses it (`arch/x86/kernel/cpu/rdrand.c`): several AMD parts have reported success while
 returning 0xFFFFFFFF every time, and a constant handed back as randomness would become a key. A CPU without
 RDRAND answers `None`, as before. Which of the boards here have it is not checked yet; `random` says on each.
+
+*(Same day, later: both PCs have it - `random` answered on the T630's AMD GX-420GI and the Wyse 5070's Intel
+J5005, and `godspeed check` completed a TLS handshake on each. And the compiler reports the `__cpuid(1)`
+block as an unnecessary `unsafe` (`unused_unsafe`: the intrinsic is a safe function on this toolchain), so
+this count holds one block more than the code needs. Removing it is a code change, left to be made on its
+own; until then the count records the block that exists.)*

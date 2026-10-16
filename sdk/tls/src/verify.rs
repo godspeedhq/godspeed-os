@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The server's identity: its certificate chain checked to a pinned root, and its CertificateVerify
+//! The server's identity: its certificate chain checked to one of the caller's trusted roots, and its CertificateVerify
 //! signature checked with the leaf certificate's key.
 //!
 //! # What is checked, and by whom

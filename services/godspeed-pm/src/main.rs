@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK`s audited ABI. `deny` rather
+// 18.2: `unsafe` is FORBIDDEN outside the four kernel layers and the SDK's audited ABI. `deny` rather
 // than `forbid` for exactly one reason: the exported `service_main` symbol needs `#[allow(unsafe_code)]`.
 #![deny(unsafe_code)]
 //! `godspeed` - the native package manager (`docs/developer-services-design.md` 10, `utilities/61_godspeed.md`).
@@ -161,8 +161,9 @@ fn cell(args: core::fmt::Arguments<'_>) -> Cell {
     c
 }
 
-/// Make sure the folder, the file and the default roots exist, writing what is missing, and read the file
-/// into `buf`. `Ok(None)` cannot happen after a successful first start; `Err` is a sentence for the row.
+/// Make sure the folder and the file exist, writing the defaults where the file is missing, and read the
+/// file into `buf`: `Ok` is its length, `Err` a sentence for the row. The default roots are
+/// `default_roots`'s, written by the commands that read them.
 fn load<'b>(ctx: &ServiceContext, r: &mut Rows, buf: &'b mut [u8; config::FILE_MAX]) -> Result<usize, Cell> {
     let mut fs = gs::fs::Fs::new(ctx);
     if let Err(e) = fs.create_dir_all(config::DIR) {

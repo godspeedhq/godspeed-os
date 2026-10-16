@@ -333,8 +333,8 @@ pub fn map_fixed_device(_pt: &mut page_tables::PageTable, _kind: u32) -> Option<
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 /// One 32-bit word from the CPU's RDRAND, or `None` where there is none (CPUID.01H:ECX[30] clear) or it
 /// did not deliver in ten tries, the bound Intel documents for a transient underflow (Digital Random
-/// Number Generator guide, 5.2.1). Which of the PCs here have it is not yet checked: the shell's `random`
-/// says, on each.
+/// Number Generator guide, 5.2.1). Both PCs here have it, the T630's AMD GX-420GI and the Wyse 5070's
+/// Intel J5005 (the shell's `random`, 2026-10-16); on any other machine `random` says.
 ///
 /// **An all-ones word is refused and asked for again.** Several AMD parts have shipped an RDRAND that
 /// reports success while returning 0xFFFFFFFF every time (after a resume, or under a microcode bug), and

@@ -611,9 +611,10 @@ So a first version can be **fetch, verify, keep, list and remove**, and it must 
 package is not installed: the machine cannot run it until 9.2 exists. The CLI's contract already forbids
 presenting a development convenience as installation; the same holds here.
 
-**Built, 2026-10-16 (QEMU only): `godspeed config`, `godspeed config set` and `godspeed check`**
-(`services/godspeed-pm`, `utilities/61_godspeed.md`). The settings of 10.8 and the transport of 10.3, end
-to end: the file written on first start, a checked `set` that keeps the rest of the file, and the registry
+**Built, 2026-10-16: `godspeed registry` (with `add`, `use` and `remove`), `godspeed config`, `godspeed
+config set` and `godspeed check`** (`services/godspeed-pm`, `utilities/61_godspeed.md`), QEMU-verified and,
+for `check`, hardware-verified the same day on the T630 and the Wyse 5070 (the ARM and RISC-V boards not
+tried yet). The settings of 10.8 and the transport of 10.3, end to end: the file written on first start, a checked `set` that keeps the rest of the file, and the registry
 reached over TLS verified to the roots folder. Search, fetch and keep are not built; they need the
 registry's metadata format (10.6). Three things were missing on the way and were added: an outbound TCP
 connection held as a capability (`net-stack` op 23, `docs/tcp-design.md`); `gs::task::wall_clock` and
@@ -647,7 +648,8 @@ and the operator ruled that out. So the native package manager carries a TLS cli
 - **a trustworthy date** for certificate validity, which is 10.4;
 - **root certificates**, a handful, built into the service (the registry's custom domain is served by
   Cloudflare, whose certificates chain to one of a few public roots), and a way to update them with the
-  utility itself;
+  utility itself. *As built, they are not compiled in: they are files in a folder, `tls-roots` (10.8),
+  given ISRG Root X2 on first start, so adding or removing a root is adding or deleting a file;*
 - **fixed buffers**: a TLS record is up to 16 KiB, so about 16 to 20 KiB per connection plus room for the
   server's certificate chain, which fits the no-heap rule (26.6.1) as static arrays.
 

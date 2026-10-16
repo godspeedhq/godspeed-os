@@ -15279,8 +15279,9 @@ fn build_godspeed_table(ctx: &ShellCtx, arg: &str) -> Option<Table> {
     }
 }
 
-/// `godspeed config`, `godspeed config set <key> <value>`, `godspeed check` (`utilities/61_godspeed.md`).
-/// The table without its `status` row, as a grid; the command fails when the status says so.
+/// `godspeed registry [add | use | remove]`, `godspeed config [set]`, `godspeed check`
+/// (`utilities/61_godspeed.md`). The table without its `status` row, as a grid; the command fails when
+/// the status says so.
 #[inline(never)]
 fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim().is_empty() {

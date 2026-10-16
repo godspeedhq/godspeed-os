@@ -518,7 +518,9 @@ is the caller's to wait for: the e1000, GENET and dwmac drains never waited, and
 empty polls. The RTL8168's single-frame read and batch drain now return what the ring holds, as they do.
 Hardware-verified on the T630 the same day (`30932658`): five `tcp 1.1.1.1 80` runs, `godspeed check`,
 `ping 8.8.8.8` 5/5 and `ping 192.168.4.1` 10/10, with no op 9 timeout and no capless request in the boot,
-against 21 timeouts in five runs on `main`'s image an hour earlier.
+against 21 timeouts in five runs on `main`'s image an hour earlier. And on the Wyse 5070 the same day, on
+two images (`30932658`, then `0eac178f`): no op 9 timeout in any `tcp`, `godspeed check` or `ping`, nor
+through a ten-round `chaos max-carnage all-services` on the second.
 
 **Verified:** builds for every port, and in QEMU on 2026-10-03 for the e1000: `osdev test shell` 215 passed, 0 failed (the two skips are the EHCI flood, which this QEMU has no controller for); the e1000 came up 6 times, its reset never failed to self-clear, and ARP, ping to the gateway and continuous `ping` passed through it, as did `chaos max-carnage`. And on the T630 (RTL8168) the same day: the RTL8168 reset self-cleared on all 20 starts (boot and `chaos max-carnage all-services`, 50 rounds, 337 kills), no transmit timed out, and `ping 8.8.8.8` answered 4 of 4 before chaos and after it.
 
