@@ -677,8 +677,25 @@ So the proposed client is **ours, in three parts**:
   their MIT licence.
 
 ECDSA only, because RSA verification without a heap is the hard part, and an ECDSA-only client limits the
-registry to an ECDSA certificate chain. Whether the registry's custom domain serves one is to be checked
-against its real chain before this is chosen. Writing the handshake here makes it security-critical code
+registry to an ECDSA certificate chain. **Checked 2026-10-16 against the live registry**
+(`godspeed-registry.bankole-422.workers.dev`, the temporary address the CLI's README names), with
+`openssl s_client`, offering exactly what this client would - TLS 1.3, TLS_AES_128_GCM_SHA256, X25519 and
+ECDSA signatures only - and trusting ISRG Root X2 alone:
+
+| depth | certificate | key | signed with |
+|---|---|---|---|
+| 0 | `bankole-422.workers.dev` (valid to 2027-01-14) | ECDSA P-256 | ECDSA SHA-384, by YE2 |
+| 1 | Let's Encrypt YE2 | ECDSA P-384 | ECDSA SHA-384, by Root YE |
+| 2 | ISRG Root YE | ECDSA P-384 | ECDSA SHA-384, by ISRG Root X2 |
+| 3 | ISRG Root X2, self-signed, the trust anchor (valid to 2040-09-17) | ECDSA P-384 | - |
+
+The handshake completed and the chain verified, and the server proved its key with ecdsa_secp256r1_sha256.
+The server also sends ISRG Root X2 cross-signed by the RSA root X1; with X2 trusted directly that RSA
+signature is never checked. So the client needs ECDSA verification on P-256 (the handshake) and P-384 (the
+chain), SHA-256 and SHA-384, and no RSA at all. **Two caveats:** the registry moves to a custom domain,
+whose certificate Cloudflare may issue from a different authority, so this is checked again when it does
+(and the root list holds whatever anchors that chain needs); and a Let's Encrypt leaf lasts 90 days, which
+is fine because the client pins roots, never leaves. Writing the handshake here makes it security-critical code
 that nobody has audited, so it is tested against RFC 8448's traces, fuzzed as a parser, and kept to the one
 peer it serves.
 
