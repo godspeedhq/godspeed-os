@@ -549,8 +549,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // spawn. Count what chaos FIRED (one of each, every sweep), CONSISTENT with the kill-storm/flood-
         // storm columns above (also fired-counts) - so all four climb with the rounds. The system's RESPONSE
         // bounds the effect, NOT the counter: chaos's own alloc plateaus at its contract memory limit (later
-        // allocs return AllocDenied), and only the FIRST mem-pressure TASK survives before memory is
-        // exhausted (later spawns are refused). The system holding IS the point; the offense is what we count.
+        // allocs return AllocDenied), and only the FIRST mem-pressure TASK runs: it holds its memory until
+        // the cleanup below, and the kernel refuses every later spawn as `already running`, since one name is
+        // one task. So `N spawns (N-1 refused)` is the designed report, not a fault. The supervisor's line for
+        // each refusal says `InvalidArgument`; the kernel's `rejected: already running` before it says why.
+        // The system holding IS the point; the offense is what we count.
         // (Reclaimed at cleanup below.)
         let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1;
         if ctx.spawn("mem-pressure").is_err() { spawns_refused += 1; }
@@ -657,7 +660,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::io::println_fmt(&ctx, format_args!(
         "total: {} rounds, {} kills, {} flooded, {} mem-pressure, {} spawns ({} refused). kernel: alive (this command returned).",
         round, killed, flooded, mempr, spawns, spawns_refused));
-    // Later spawns are EXPECTED to be refused once a mem-pressure task holds memory; every one refused
+    // Later spawns are EXPECTED to be refused, as already running, while the first one holds its memory; every one refused
     // means none ever ran, and the memory-pressure dimension of this run was not exercised at all.
     if spawns != 0 && spawns_refused == spawns {
         gs::io::println(&ctx, "NOTE: every mem-pressure spawn was refused - no memory-pressure task ran, so that dimension was not exercised (see the kernel log for why).");
@@ -665,9 +668,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Reclaim any flood caps still cached, so the run leaves the cap table as it found it.
     for c in sv_floodcap.iter_mut() { if let Some(h) = c.take() { gs::cap::remove(&ctx, h); } }
-    // The sweep spawned one mem-pressure task per sweep (the spawn-storm dimension), so reclaim them ALL:
-    // kill one at a time until none remain, not just one, else a long run leaks the parked tasks + their
-    // held memory. Bounded so a kill racing a respawn cannot spin forever. This runs BEFORE the shell-wait
+    // The sweep fired one mem-pressure spawn per sweep (the spawn-storm dimension) and only the first ran,
+    // since the rest were refused as already running; reclaim ALL the same: kill until none remain, not
+    // just once, so a task that outlives one kill (or a prior run's orphan) cannot leak its held memory. Bounded so a kill racing a respawn cannot spin forever. This runs BEFORE the shell-wait
     // below, so freeing the task pool lets a killed shell respawn into a slot.
     let mut g = 0u32;
     while slot_of(&ctx, "mem-pressure").is_some() && g < 512 {
