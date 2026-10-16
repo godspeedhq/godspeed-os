@@ -10,7 +10,7 @@ Rules enforced (a "line" is a line containing the word `unsafe` that does not ST
   - services/: any unsafe line at all                                       -> FAIL
   - sdk/: unsafe outside SDK_PERMITTED (matched by FILE NAME) beyond the
     SDK_GRANDFATHERED floor                                                 -> FAIL
-  - services/examples/osdev/stdlib/sdk/wifi: a crate root without
+  - services/examples/osdev/stdlib/sdk/wifi/sdk/tls: a crate root without
     `#![deny(unsafe_code)]`, or an `#[allow(unsafe_code)]` not on `#[no_mangle]` -> FAIL
 
 What it does NOT check: whether a block carries a `// SAFETY:` comment (18.3 is enforced by review,
@@ -127,7 +127,8 @@ def parse_audit() -> dict[str, int]:
 # The attribute was already there; nothing checked it, so deleting it failed no gate.
 # `sdk/wifi` is a crate directory itself, which the walk below accepts as one crate. It is the one SDK
 # crate that is NOT the audited hardware/ABI layer (18.1), so it carries no `unsafe` and says so.
-DENY_ROOTS = ("services", "examples", "osdev", "stdlib", "sdk/wifi")
+# `sdk/tls` is the same: protocol and crypto over byte slices, with nothing to reach but its caller.
+DENY_ROOTS = ("services", "examples", "osdev", "stdlib", "sdk/wifi", "sdk/tls")
 DENY_ATTR = "#![deny(unsafe_code)]"
 
 
