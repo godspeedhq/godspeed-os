@@ -764,3 +764,46 @@ Nothing, for 10.1's first version: no syscall, no capability, no MISCIS change. 
 `net-stack` and `time` like any other service. `install` proper needs 9.2, and 9.2 is where the kernel and
 supervisor questions are. The suggested order in 9.7 gains a step between 1 and 3: **the native package
 manager's fetch, verify, keep, list and remove**, once 10.3 and 10.4 are decided.
+
+### 10.8 Configuration: nothing that can change is compiled in
+
+**Decided 2026-10-16 by the operator.** The registry's address, and every other parameter that can change,
+lives in a file on the machine, so changing one never means rebuilding a binary or an image.
+
+**The file** is `/system/services/godspeed/config`, in the service's own folder (`docs/filesystem-layout.md`,
+L2): one `key value` per line, `#` for a comment. The utility reads it at the start of every command, so an
+edit takes effect at the next one; there is no reload step to forget. A missing file is written out with
+the defaults on first start, so the file always shows what is in effect, and `godspeed config` prints every
+value with where it came from (the file, or the default because the key is absent). Nothing is a hidden
+default (26.4).
+
+| key | default | what it is |
+|---|---|---|
+| `registry` | `https://godspeed-registry.bankole-422.workers.dev` | where packages are read. `https://` only: anything else is refused with the reason, because the transport is TLS (10.3) |
+| `trust-root` | `sha256:d769d1a64c3105c8da0ffcc2f54aba1c3a16ce4ae707a6d206556f08824a146d` | the registry's trust root, pinned on first contact (the CLI README's own pin). After first contact the root the machine reached is remembered, and root rotation happens in-band, signed |
+| `tls-roots` | `/system/services/godspeed/roots/`, holding ISRG Root X2 | the certificate authorities TLS accepts, one file per root. Adding a CA is adding a file (10.3's table says why X2 suffices today) |
+| `timeout-secs` | 30 | how long one request may take before it is abandoned and said so (`[q] quit` still applies) |
+| `max-package-mib` | 64 | the largest package the utility will download, so a hostile index cannot fill the disk |
+
+**Edited through the utility**, not only by hand: `godspeed config set <key> <value>` checks the value first
+(a URL that parses, a fingerprint of the right form, a folder that exists) and refuses with the reason, so a
+typo is caught when it is made rather than at the next install. The file stays plain text, and `edit` works
+on it too.
+
+**What a hostile edit could do, recorded rather than hidden.** Until folder capabilities exist
+(`docs/filesystem-layout.md` phase 2), any service with a send cap to `fs` can write this file. Changing
+`registry` gains it nothing: the pinned trust root refuses metadata the registry did not sign. Adding a TLS
+root lets it read what the machine fetches (confidentiality), not change it, for the same reason.
+Changing `trust-root` is the real one: it is equivalent to trusting another registry, so
+`godspeed config set trust-root` asks `[y/N]` and shows both fingerprints, and the utility refuses a file
+whose pin disagrees with the root it has already reached until the operator confirms. The full answer is
+folder capabilities, where only the package manager can write its own folder.
+
+**The same rule for the parameters other services compile in today.** `time`'s NTP server is a constant
+(`NTP_SERVER`, 162.159.200.123, `time.cloudflare.com`) in `services/time/src/main.rs`. Under this rule it
+moves to `/system/services/time/ntp`, read by `time` the way it reads its floor, with the constant as the
+default. That is a change to a running service, so it is its own reviewed change (QEMU first, one per
+flash), not part of this document.
+
+**The TLS library takes all of this from its caller.** The server name, the root certificates and the
+current time are arguments, never constants, so the library has no address in it to change.
