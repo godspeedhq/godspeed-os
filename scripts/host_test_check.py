@@ -43,6 +43,7 @@ FILES = [
     # must and must not say for fixtures of source replies (docs/ask-design.md 8).
     "services/ask/src/know.rs",
     "services/godspeed-pm/src/config.rs",
+    "services/time/src/ntp_file.rs",
 ]
 
 

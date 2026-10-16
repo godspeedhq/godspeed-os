@@ -61,6 +61,25 @@ not a reading.
 - SDK: `Datetime::from_epoch_secs` and `Datetime::weekday()` do the leap-year-aware
   arithmetic.
 
+### 4.1 The NTP server is a setting
+
+`/system/services/time/ntp` names the server `time` asks: one IPv4 address, `#`
+starting a comment. An address, not a name, because a name would need a DNS lookup
+first. A missing file is written with the default, `162.159.200.123`
+(time.cloudflare.com), so the file always shows the server in effect.
+
+```
+gsh> write /system/services/time/ntp 192.168.4.1
+gsh> date sync
+```
+
+`time` reads the file when it starts, and again at every `date sync`, so an edit
+takes effect at the next `date sync` with nothing restarted. A file that does not
+hold exactly one address - a host name, two addresses, nothing - is refused and its
+line named in the log, and no network time is asked for until it is fixed: a typo is
+never quietly replaced by the default. Only with no disk to read at all (no answer
+from `fs` within the first ~30 s) is the default asked, and the log says so.
+
 ## 5. Capabilities
 
 - **A send capability to `time`.** No kernel query is made by `date` itself.

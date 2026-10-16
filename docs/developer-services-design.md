@@ -854,7 +854,9 @@ folder capabilities, where only the package manager can write its own folder.
 (`NTP_SERVER`, 162.159.200.123, `time.cloudflare.com`) in `services/time/src/main.rs`. Under this rule it
 moves to `/system/services/time/ntp`, read by `time` the way it reads its floor, with the constant as the
 default. That is a change to a running service, so it is its own reviewed change (QEMU first, one per
-flash), not part of this document.
+flash), not part of this document. **Built 2026-10-16** (`services/time/src/ntp_file.rs`,
+`utilities/2_date.md` 4.1): one IPv4 address, re-read at every `date sync`, a missing file written with
+the default, and a file that does not name one address refused by line rather than replaced by the default.
 
 **The TLS library takes all of this from its caller.** The server name, the root certificates and the
 current time are arguments, never constants, so the library has no address in it to change.

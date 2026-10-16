@@ -8398,6 +8398,34 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(piped_check.contains("verified") && !piped_check.contains("HTTP/1.1"), "`godspeed check` pipes as records");
     }
 
+    // ---- THE NTP SERVER IS A SETTING, `/system/services/time/ntp`, re-read by `date sync` (the same rule as
+    //      the package manager's, `docs/developer-services-design.md`). `time` logs what it decided after the
+    //      shell's answer, so each check looks in the command's output and in what follows it.
+    macro_rules! saw { ($out:expr, $needle:expr) => {{
+        let out: String = $out;
+        out.contains($needle)
+            || collect_until(&buf, &mut cursor, $needle.as_bytes(), Duration::from_secs(20)).is_some()
+    }}; }
+    let _ = run!(b"delete /system/services/time/ntp\r", 30);
+    let fresh = run!(b"date sync\r", 60);
+    check!(saw!(fresh, "asking the default NTP server 162.159.200.123, and writing it there"),
+           "with no NTP setting, `date sync` asks the default server and writes it to the file");
+    let ntpfile = run!(b"read /system/services/time/ntp\r", 30);
+    check!(ntpfile.contains("162.159.200.123") && ntpfile.contains("# time.cloudflare.com"),
+           "the file shows the server in effect");
+    let _ = run!(b"write /system/services/time/ntp time.cloudflare.com\r", 30);
+    let named = run!(b"date sync\r", 60);
+    check!(saw!(named, "/system/services/time/ntp line 1 is not an IPv4 address - no network time until it is"),
+           "a name in place of an address is refused by line, not replaced by the default");
+    let _ = run!(b"write /system/services/time/ntp 216.239.35.0\r", 30);
+    let other = run!(b"date sync\r", 60);
+    check!(saw!(other, "time: NTP server 216.239.35.0, from /system/services/time/ntp"),
+           "an edited server is taken at the next `date sync`, with no restart");
+    let _ = run!(b"write /system/services/time/ntp 162.159.200.123\r", 30);
+    let back = run!(b"date sync\r", 60);
+    check!(saw!(back, "time: NTP server 162.159.200.123, from /system/services/time/ntp"),
+           "and set back the same way");
+
     let _ = child.kill();
     let _ = child.wait();
     // The whole serial transcript, for the failure a PASS/FAIL line cannot explain.
