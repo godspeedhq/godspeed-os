@@ -11,8 +11,9 @@
 //!
 //! # What is ours and what is not
 //!
-//! - **Ours:** the TLS 1.3 key schedule ([`schedule`]), the record layer ([`record`]), and (in later
-//!   slices) the handshake messages and the client state machine.
+//! - **Ours:** the TLS 1.3 key schedule ([`schedule`]), the record layer ([`record`]), and the
+//!   handshake and the connection after it ([`client`]). Certificate checking is the caller's, through
+//!   [`client::ServerVerifier`].
 //! - **Not ours:** the primitives. SHA-256, HMAC, HKDF and AES-128-GCM are RustCrypto's; X25519 is dalek's.
 //!   Constant-time field arithmetic is exactly the code that is easy to get subtly wrong, so it is taken
 //!   from libraries built and reviewed for it.
@@ -39,14 +40,21 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+pub mod client;
+mod codec;
 pub mod ecdhe;
 pub mod record;
 pub mod schedule;
+
+pub use client::{CertificateChain, Client, Event, Hello, ServerVerifier};
+pub use record::record_len;
 
 #[cfg(test)]
 mod rfc8448;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod client_tests;
 
 /// Every way this crate refuses. Each is final for the connection it happened on: TLS has no "try again"
 /// at this layer, and a caller that carries on after one is carrying on with a broken connection.
@@ -70,4 +78,36 @@ pub enum TlsError {
     /// The X25519 shared secret came out all zero: the peer sent a low-order point. RFC 8446 7.4.2 says to
     /// abort.
     ZeroSharedSecret,
+    /// A handshake message that does not parse: short, overlong, or with bytes left over.
+    DecodeError,
+    /// The server chose something this client did not offer, or a value the RFC forbids.
+    IllegalParameter,
+    /// The server answered an extension this client did not send (RFC 8446 4.2).
+    UnsupportedExtension,
+    /// A message or record that does not belong at this point of the connection.
+    UnexpectedMessage,
+    /// The server asked for a different key share. This client offers X25519 alone, so there is nothing
+    /// else to send: the server does not support it.
+    HelloRetryRequest,
+    /// The server does not speak TLS 1.3.
+    ProtocolVersion,
+    /// A handshake message larger than the caller's handshake buffer.
+    HandshakeTooLarge,
+    /// The server's Finished did not match the handshake this client saw: something was altered in
+    /// flight, or the server does not hold the key it claims.
+    BadFinished,
+    /// The verifier refused the server's CertificateVerify signature.
+    BadSignature,
+    /// The verifier refused the server's certificate chain.
+    CertificateRejected,
+    /// The server sent an empty certificate list.
+    NoCertificate,
+    /// The server asked for a client certificate, which this client does not have.
+    CertificateRequested,
+    /// The server sent this alert (RFC 8446 6) and the connection is over.
+    AlertReceived(u8),
+    /// The server name given to [`client::Client::start`] is not a DNS name.
+    BadServerName,
+    /// Application data before the handshake finished, or after close.
+    NotConnected,
 }

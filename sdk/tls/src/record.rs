@@ -34,7 +34,7 @@ pub const MAX_PLAINTEXT: usize = 1 << 14;
 /// The largest protected record body: plaintext, content type, padding and tag (RFC 8446 5.2).
 pub const MAX_CIPHERTEXT: usize = MAX_PLAINTEXT + 256;
 /// The legacy version every TLS 1.3 record carries.
-const LEGACY_VERSION: [u8; 2] = [0x03, 0x03];
+pub(crate) const LEGACY_VERSION: [u8; 2] = [0x03, 0x03];
 
 /// How many bytes follow a protected record's 5-byte header, judged from the header alone.
 ///
@@ -57,6 +57,46 @@ pub fn protected_body_len(header: &[u8]) -> Result<usize, TlsError> {
     Ok(body_len)
 }
 
+/// The full length of one record received from the peer, header included, judged from its first five
+/// bytes. A reader calls this as soon as it has the header and then reads exactly that many bytes, so it
+/// never waits for more than one record and never accepts one longer than RFC 8446 5.1 and 5.2 allow.
+///
+/// Every record but the client's first carries legacy version 03 03 (5.1), and a record of any type but
+/// application data may not be empty.
+pub fn record_len(header: &[u8]) -> Result<usize, TlsError> {
+    if header.len() < HEADER_LEN || header[1..3] != LEGACY_VERSION {
+        return Err(TlsError::BadRecordHeader);
+    }
+    let body_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    let max = match header[0] {
+        content::APPLICATION_DATA => MAX_CIPHERTEXT,
+        content::CHANGE_CIPHER_SPEC | content::ALERT | content::HANDSHAKE => MAX_PLAINTEXT,
+        _ => return Err(TlsError::BadRecordHeader),
+    };
+    if body_len > max {
+        return Err(TlsError::RecordTooLarge);
+    }
+    if body_len == 0 {
+        return Err(TlsError::BadRecordHeader);
+    }
+    Ok(HEADER_LEN + body_len)
+}
+
+/// Write one plaintext record: the client's ClientHello, its compatibility change_cipher_spec, or an alert
+/// sent before any key exists.
+pub(crate) fn write_plaintext(content_type: u8, version: [u8; 2], body: &[u8], out: &mut [u8]) -> Result<usize, TlsError> {
+    let total = HEADER_LEN + body.len();
+    if body.len() > MAX_PLAINTEXT {
+        return Err(TlsError::RecordTooLarge);
+    }
+    let out = out.get_mut(..total).ok_or(TlsError::BufferTooSmall)?;
+    out[0] = content_type;
+    out[1..3].copy_from_slice(&version);
+    out[3..5].copy_from_slice(&(body.len() as u16).to_be_bytes());
+    out[HEADER_LEN..].copy_from_slice(body);
+    Ok(total)
+}
+
 /// One direction of protected records: its key, its nonce base and its sequence number.
 pub struct Protector {
     aead: Aes128Gcm,
@@ -67,6 +107,14 @@ pub struct Protector {
 impl Protector {
     pub fn new(keys: &TrafficKeys) -> Self {
         Self { aead: Aes128Gcm::new(&keys.key.into()), iv: keys.iv, seq: 0 }
+    }
+
+    /// A direction that has already carried `seq` records, for tests that play the server's side.
+    #[cfg(test)]
+    pub(crate) fn at_sequence(keys: &TrafficKeys, seq: u64) -> Self {
+        let mut p = Self::new(keys);
+        p.seq = seq;
+        p
     }
 
     /// How many records this direction has protected or opened.
