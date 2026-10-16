@@ -359,7 +359,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
             // (backlog/fixed/29). Every other candidate was eliminated by reading; this one cannot be, so it
             // is being measured rather than assumed.
             None => {
-                if matches!(m.payload_bytes().first(), Some(&21) | Some(&22))
+                if matches!(m.payload_bytes().first(), Some(&21) | Some(&22) | Some(&OP_CONNECT))
                     && !pending.ate_client_said
                 {
                     pending.ate_client_said = true;
@@ -1319,6 +1319,8 @@ const LOP_CLOSE: u8 = 1;
 /// The first byte of an op 21 (TCP transaction) reply (`backlog/fixed/80` D5).
 const TCP_OK: u8 = 0;
 const TCP_FAILED: u8 = 1;
+/// Op 23: open an outbound TCP connection and hand it to the caller as a capability.
+const OP_CONNECT: u8 = 23;
 const COP_RECV: u8 = 0;
 /// Connection: queue the rest of the payload for sending.
 const COP_SEND: u8 = 1;
@@ -1555,6 +1557,56 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
     t.forget(1);
 
     if got == 0 && fault != tcp::Fault::None { Err(fault) } else { Ok(got) }
+}
+
+/// Open an outbound connection owned by resource `rid` and drive it to Established, inside the request.
+///
+/// The first half of [`tcp_transact`], stopping where that one starts writing: from Established on the
+/// connection belongs to its capability, and `poll_step` moves it between requests exactly as it does
+/// an accepted one. Bounded by `budget_ms`, and by `connect`'s own 10 s handshake deadline. On failure
+/// the slot is released here, so a refused open strands nothing.
+#[inline(never)]
+fn tcp_open(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net,
+            rid: u64, dst: [u8; 4], dport: u16, budget_ms: u64) -> Result<usize, tcp::Fault> {
+    let mut frame = [0u8; 1600];
+    if !t.have_clock() {
+        ctx.log("net-stack: connect refused - no usable clock, so the handshake could not be bounded");
+        return Err(tcp::Fault::None);
+    }
+    let deadline = t.now_ms(ctx).unwrap_or(0) + budget_ms;
+    let i = match t.connect(ctx, rid, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
+    let n = t.syn_frame(ctx, net, i, &mut frame);
+    if n > 0 {
+        let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
+        t.note_tx(&frame[..n], r.is_some());
+    }
+    let mut empty: u32 = 0;
+    for _ in 0..TCP_STEPS {
+        match t.conns[i].state {
+            tcp::State::Established => return Ok(i),
+            tcp::State::Closed => break,
+            _ => {}
+        }
+        if t.now_ms(ctx).unwrap_or(0) >= deadline { break; }
+        // The same pass as `tcp_transact`'s: emit what the machine owes (the SYN's retransmission, the
+        // handshake's ACK), else drain, and pace an empty pass rather than spin.
+        let n = t.poll_one(ctx, net, i, &mut frame);
+        if n > 0 {
+            let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
+            t.note_tx(&frame[..n], r.is_some());
+            empty = 0;
+        } else {
+            let batch = nic_drain(ctx, pending);
+            if feed_batch(ctx, pending, t, net, batch) { empty = 0; } else { empty += 1; }
+        }
+        if empty > 0 {
+            if empty <= EMPTY_YIELDS { gs::task::yield_now(ctx); } else { gs::task::sleep_ms(ctx, RX_POLL_PACE_MS); }
+        }
+    }
+    let fault = t.conns[i].fault;
+    t.last_state = t.conns[i].state;
+    t.forget(rid);
+    Err(if fault == tcp::Fault::None { tcp::Fault::ConnectTimeout } else { fault })
 }
 
 /// Feed one RAW frame into the state machine. Returns true if it was ours.
@@ -1879,7 +1931,7 @@ impl UdpAsks {
     /// A source port no open ask is using, chosen at random in 50000..59999 (sockets use 40000 + n).
     fn pick_port(&self, ctx: &ServiceContext) -> u16 {
         loop {
-            let r = ctx.hw_random().unwrap_or(gs::driver::wait::ticks(ctx) as u32);
+            let r = gs::task::hw_random(ctx).unwrap_or(gs::driver::wait::ticks(ctx) as u32);
             let p = 50_000 + (r % 10_000) as u16;
             if !self.slots.iter().flatten().any(|a| a.src_port == p) { return p; }
         }
@@ -3100,7 +3152,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 _ => (pl_raw, Reply { cap: reply_cap, tag: None }),
             },
         };
-        // ARRIVAL RECEIPT for the two ops a person waits on, and ONLY those two.
+        // ARRIVAL RECEIPT for the ops a person waits on, and ONLY those: `tcp`, `serve`'s listen, and a
+        // connect (op 23), which opens one connection per conversation.
         //
         // `tcp` and `serve`'s listen are typed by hand and answered in one round trip, so one line
         // each is no flood - unlike the status and accept polls, which run ten times a second and are
@@ -3108,7 +3161,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // from "it reached dispatch and the work went wrong", which on a Wyse could not be told apart:
         // net-stack logged nothing for a `tcp ... big` while it went on answering ping, and every
         // silent loss path was eliminated by reading except one (backlog/fixed/29).
-        if matches!(pl.first(), Some(&21) | Some(&22)) {
+        if matches!(pl.first(), Some(&21) | Some(&22) | Some(&OP_CONNECT)) {
             ctx.log_fmt(format_args!("net-stack: op {} reached dispatch (from the {})",
                                      pl[0], if from_stash { "stash" } else { "queue" }));
         }
@@ -3609,6 +3662,60 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // that returns 0 has already said why in the log.
             resp[0] = if n > 0 { TCP_OK } else { TCP_FAILED };
             reply.send(&ctx, &resp[..1 + n]);
+        } else if pl.first() == Some(&OP_CONNECT) {
+            // TCP CONNECT (op 23): [23, ip(4), port_hi, port_lo]. Open a connection and hand it to the
+            // caller as a capability, the way an accepted one is (op 22): from then on it is read,
+            // written and closed with COP_RECV / COP_SEND / COP_CLOSE, and `poll_step` keeps it moving
+            // between requests. The one-shot transaction (op 21) cannot carry a conversation, and TLS
+            // is one: the client speaks, waits, speaks again (`docs/developer-services-design.md`
+            // 10.3). Reply `[1]` with the capability, or `[0]` alone with the reason in this log.
+            let mut granted = false;
+            if pl.len() >= 7 && gw_known {
+                let dip = [pl[1], pl[2], pl[3], pl[4]];
+                let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
+                // The next hop is chosen exactly as for op 21: an address that answers ARP is on-link.
+                let peer_mac = arp_resolve(&ctx, pending, &our_ip, &our_mac, &dip, None).unwrap_or(gw_mac);
+                let net = tcp::Net { our_mac, peer_mac, our_ip };
+                match gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
+                    Ok((crid, cap)) => {
+                        match tcp_open(&ctx, pending, &mut tcpst, &net, crid, dip, dport, 8_000) {
+                            Ok(_) => {
+                                granted = gs::cap::duplicate(&ctx, cap).ok()
+                                    .map(|c| reply.send_with_cap(&ctx, c, &[1]))
+                                    .unwrap_or(false);
+                                if granted {
+                                    ctx.log_fmt(format_args!("net-stack: connected to {}.{}.{}.{}:{} for a client",
+                                        dip[0], dip[1], dip[2], dip[3], dport));
+                                } else {
+                                    // The capability did not reach the client, so nobody holds the
+                                    // connection: release it rather than leave it owned by no one.
+                                    ctx.log("net-stack: connect succeeded but the capability could not be handed over - released");
+                                    tcpst.forget(crid);
+                                    let _ = gs::resource::revoke(&ctx, crid);
+                                }
+                            }
+                            Err(f) => {
+                                ctx.log_fmt(format_args!(
+                                    "net-stack: connect to {}.{}.{}.{}:{} failed - {} (reached '{}')",
+                                    dip[0], dip[1], dip[2], dip[3], dport,
+                                    match f {
+                                        tcp::Fault::Reset => "peer refused the connection",
+                                        tcp::Fault::RetxExhausted => "no acknowledgement after 6 retransmissions",
+                                        tcp::Fault::ConnectTimeout => "no answer to our SYN in time",
+                                        tcp::Fault::None => "the connection table is full",
+                                    },
+                                    tcpst.last_state.name()));
+                                let _ = gs::resource::revoke(&ctx, crid);
+                            }
+                        }
+                        gs::cap::remove(&ctx, cap);
+                    }
+                    Err(_) => ctx.log("net-stack: connect refused - no resource id could be minted"),
+                }
+            } else if !gw_known {
+                ctx.log("net-stack: connect asked for before the stack is configured");
+            }
+            if !granted { reply.send(&ctx, &[0]); }
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
             // Try the DHCP-learned server, then a public fallback (8.8.8.8). A home router may do DHCP +

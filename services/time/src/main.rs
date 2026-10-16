@@ -230,8 +230,8 @@ struct NtpAsk {
 /// Send an NTP query through `net-stack`, without waiting. `Some` if it went.
 fn ntp_ask(ctx: &ServiceContext) -> Option<NtpAsk> {
     let nonce: [u8; 8] = {
-        let hi = ctx.hw_random().unwrap_or((gs::driver::wait::ticks(ctx) >> 13) as u32);
-        let lo = ctx.hw_random().unwrap_or(gs::driver::wait::ticks(ctx) as u32);
+        let hi = gs::task::hw_random(ctx).unwrap_or((gs::driver::wait::ticks(ctx) >> 13) as u32);
+        let lo = gs::task::hw_random(ctx).unwrap_or(gs::driver::wait::ticks(ctx) as u32);
         let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
         [h[0], h[1], h[2], h[3], l[0], l[1], l[2], l[3]]
     };

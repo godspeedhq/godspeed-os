@@ -413,7 +413,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // repeat on demand.
     let seed = given_seed.unwrap_or((start_epoch as u64)
         ^ ((start_dt.minute as u64) << 24) ^ ((start_dt.second as u64) << 40)
-        ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
+        ^ ((gs::task::hw_random(&ctx).unwrap_or(0) as u64) << 8)
         ^ ((start_mono as u64) << 17));
     let mut rng = Rng::new(seed);
     if target_random {

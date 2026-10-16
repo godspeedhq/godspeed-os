@@ -186,7 +186,7 @@ fn main() {
     // not, because the Pi 2 has no PCI, so they stay placeholders. `probe` does not build for ARM
     // (x86-only fault module).
     let arm_built: &[&str] = &[
-        "events", "recorder", "copier", "ask", "console", "ping", "pong", "supervisor", "shell",
+        "events", "recorder", "copier", "ask", "godspeed-pm", "console", "ping", "pong", "supervisor", "shell",
         "observe", "chaos", "mem-pressure",
         "counter", "greet", "upper", "roster",
         "reply-server", "asker", "resource-server", "holder",
@@ -257,7 +257,7 @@ fn main() {
     // is the only way it learns the wall clock. `control` is inert on a board driven from its own
     // console, and is embedded so the service set does not differ per arch without a reason.
     let aarch64_built: &[&str] = if aarch64_demo {
-        &["events", "recorder", "copier", "ask", "console", "time", "control", "ping", "pong", "supervisor", "shell",
+        &["events", "recorder", "copier", "ask", "godspeed-pm", "console", "time", "control", "ping", "pong", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           // The Pi 4's onboard radio, over SDIO: on aarch64, the board with a WiFi part soldered to an SD
@@ -275,7 +275,7 @@ fn main() {
     } else {
         // `chaos` and `observe` are not demo services: chaos is how the port is proven to survive
         // carnage, and observe is how it is watched while it does. Both are arch-neutral.
-        &["events", "recorder", "copier", "ask", "console", "time", "control", "supervisor", "shell",
+        &["events", "recorder", "copier", "ask", "godspeed-pm", "console", "time", "control", "supervisor", "shell",
           "chaos", "observe", "mem-pressure",
           "block-driver", "fs", "nic-driver", "net-stack", "xhci", "hw-enumerator",
           // See the demo arm above. Present in BOTH arms because both can ship, which is the trap

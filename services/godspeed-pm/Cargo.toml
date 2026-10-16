@@ -1,0 +1,14 @@
+[package]
+name = "godspeed-pm"
+version = "0.1.0"
+description = "The native package manager: its settings, and the registry reached over verified TLS"
+edition = "2021"
+
+[[bin]]
+name = "godspeed-pm"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }
+godspeed-tls = { path = "../../sdk/tls" }

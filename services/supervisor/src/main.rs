@@ -293,6 +293,7 @@ static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
 static COPIER_ELF: &[u8] = include_bytes!(env!("SVC_COPIER_ELF"));
 static ASK_ELF: &[u8] = include_bytes!(env!("SVC_ASK_ELF"));
+static GODSPEED_PM_ELF: &[u8] = include_bytes!(env!("SVC_GODSPEED_PM_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -541,6 +542,13 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("ask", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
      board::ASK_PEERS,
      godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
+    // NOT in the boot set and not in `MANAGED`: the native package manager, started by the shell for ONE
+    // command (`godspeed ...`) and ended once its answer is in, as `ask` is
+    // (`docs/developer-services-design.md` 10.2). Its peers are exactly what that command uses: the shell
+    // for the answer, `fs` for its settings and roots (`/system/services/godspeed/`), `net-stack` for the
+    // registry's connection, `time` for the date a certificate is checked against. No privilege.
+    ("godspeed-pm", GODSPEED_PM_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, u32::MAX,
+     &["shell", "fs", "net-stack", "time"], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.

@@ -549,3 +549,26 @@ anything in the TCP close sequence, which is where the transmit-journal diagnost
   before the content line arrived, and later compared against a hand-computed length that was wrong
   by four bytes. Both are now commented at the site, and the expected length is derived rather than
   restated.
+
+## Outbound connections held as a capability: op 23 (2026-10-16)
+
+Until this, a client could only make the one-shot transaction (op 21: connect, send one request of up to
+493 bytes, read until the peer closes, close). That carries an HTTP GET and nothing that talks back and
+forth, and TLS is a conversation: the client speaks, waits, then speaks again. Accepted connections already
+had the right shape - a capability per connection, read, written and closed with `COP_RECV`, `COP_SEND` and
+`COP_CLOSE`, kept moving between requests by `poll_step` - and `tcp.rs` had anticipated the rest: its
+`pending_accept` comment already said "a connection opened by `connect` is minted with its client's
+resource id from the start".
+
+**Op 23, connect** (`[23, ip(4), port_hi, port_lo]`) is that, for the client's side: the next hop chosen as
+op 21 chooses it (an address that answers ARP is on-link), a resource minted first so the connection is
+born owned, the SYN sent and the handshake driven inside the request (`tcp_open`, op 21's first half,
+bounded by 8 s and by `connect`'s own 10 s handshake deadline), and the capability handed over exactly as
+accept hands one over. A refusal answers `[0]` with the reason in the log - refused, no answer to the SYN,
+or a full connection table - and releases the slot, so nothing is stranded. `gs::net::Net::connect` returns
+a `Stream` with `recv`, `send` and `close`; its first user is the package manager's TLS client
+(`services/godspeed-pm`, `utilities/61_godspeed.md`).
+
+**What it does not change.** The table is still `MAX_CONNS = 2` and the receive buffer still 2 KiB, and the
+connection's data still moves on the 100 ms poll. That is ample for a registry's index and trust files and
+slow for a large package - roughly 20 KB/s at best - which is recorded here rather than discovered later.

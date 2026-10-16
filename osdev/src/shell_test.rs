@@ -8179,6 +8179,145 @@ pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `osdev test godspeed` (`utilities/61_godspeed.md`): the package manager's settings on a real disk, its
+/// refusals, its pipes, and `godspeed check` reaching the real registry over verified TLS.
+///
+/// The CPU is `qemu64,+rdrand`: TLS refuses to run without a hardware random source, and QEMU's default x86
+/// model has none. The registry is reached through SLIRP, so the last checks need this machine online; when
+/// the name does not resolve they are counted as SKIPPED, never as passed.
+pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize; let mut skipped = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("godspeed: PASS - {}", $label); pass += 1; }
+        else { println!("godspeed: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-device",  "e1000,netdev=n0",
+        "-netdev",  "user,id=n0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("godspeed: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("godspeed: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("godspeed: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    // ---- the command explains itself.
+    let bare = run!(b"godspeed\r", 20);
+    check!(bare.contains("usage: godspeed config"), "a bare `godspeed` prints its usage");
+    let help = run!(b"godspeed help\r", 20);
+    check!(help.contains("godspeed check") && help.contains("godspeed config set"), "`godspeed help` lists every command");
+
+    // ---- FIRST START writes the file with every default, so it shows what is in effect.
+    let first = run!(b"godspeed config\r", 60);
+    check!(first.contains("written") && first.contains("/system/services/godspeed/config"),
+           "the first `godspeed config` writes the settings file and says so");
+    check!(first.contains("registry") && first.contains("https://godspeed-registry.bankole-422.workers.dev"),
+           "the registry setting shows its default address");
+    check!(first.contains("/system/services/godspeed/roots/isrg-root-x2.der"),
+           "the roots folder is given ISRG Root X2 on first start");
+    let file = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(file.contains("registry https://godspeed-registry.bankole-422.workers.dev") && file.contains("timeout-secs 30"),
+           "the file on disk holds the defaults as `key value` lines");
+    let again = run!(b"godspeed config\r", 60);
+    check!(!again.contains("written") && again.contains("file"),
+           "a second `godspeed config` writes nothing and reads every value from the file");
+
+    // ---- SET checks first and keeps the rest of the file.
+    let set = run!(b"godspeed config set timeout-secs 45\r", 60);
+    check!(set.contains("timeout-secs") && set.contains("45"), "`config set` writes a checked value");
+    let after = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(after.contains("timeout-secs 45") && after.contains("# how long one request may take"),
+           "the new value is in the file and the comments around it are kept");
+    let http = run!(b"godspeed config set registry http://registry.example/\r", 60);
+    check!(http.contains("https:// only"), "an http:// registry is refused with the reason");
+    let trust = run!(b"godspeed config set trust-root sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);
+    check!(trust.contains("not set here"), "`trust-root` is not set by a command");
+    let nokey = run!(b"godspeed config set speed 9\r", 60);
+    check!(nokey.contains("not a setting"), "an unknown key is refused, naming the settings");
+    let range = run!(b"godspeed config set timeout-secs 0\r", 60);
+    check!(range.contains("1 to 100"), "a value out of range is refused with the range");
+
+    // ---- PIPES: the reports are records; the action refuses.
+    let piped = run!(b"godspeed config | where item=timeout-secs\r", 60);
+    check!(piped.contains("45") && !piped.contains("registry "), "`godspeed config` pipes as records");
+    let refused = run!(b"godspeed config set timeout-secs 30 | count\r", 30);
+    check!(refused.contains("is an action, not a report"), "`godspeed config set` refuses to start a pipe");
+    let still = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(still.contains("timeout-secs 45"), "the refused pipe changed nothing");
+
+    // ---- A BROKEN FILE is refused whole, naming the line.
+    let _ = run!(b"write append /system/services/godspeed/config colour blue\r", 30);
+    let broken = run!(b"godspeed config\r", 60);
+    check!(broken.contains("no setting is called 'colour'"), "a file with an unknown key is named by line and refused");
+    let fixed = run!(b"godspeed config set timeout-secs 30\r", 60);
+    check!(fixed.contains("no setting is called 'colour'"), "a set on a broken file is refused rather than writing past it");
+    let _ = run!(b"delete /system/services/godspeed/config\r", 30);
+
+    // ---- THE ROOTS: an empty folder trusts nothing, and says so before any connection.
+    let _ = run!(b"mkdir /noroots\r", 30);
+    let _ = run!(b"godspeed config\r", 60);
+    let _ = run!(b"godspeed config set tls-roots /noroots/\r", 60);
+    let empty = run!(b"godspeed check\r", 60);
+    check!(empty.contains("no certificate authority is trusted"), "`check` with no roots refuses before connecting");
+    let _ = run!(b"godspeed config set tls-roots /system/services/godspeed/roots/\r", 60);
+
+    // ---- THE REGISTRY, over verified TLS. Needs the network.
+    let live = run!(b"godspeed check\r", 150);
+    let offline = live.contains("did not resolve");
+    if offline {
+        println!("godspeed: SKIP - the registry's name did not resolve; this machine is offline, so TLS was not tried");
+        skipped += 1;
+    } else {
+        check!(live.contains("verified"), "`godspeed check` verifies the registry's chain to ISRG Root X2");
+        check!(live.contains("HTTP/1.1 200"), "the registry answers HTTP 200 over the TLS connection");
+        check!(live.contains("Godspeed package registry"), "and says what it is");
+        check!(live.contains("hardware clock"), "the certificate was checked against the hardware clock, and the row says so");
+    }
+    let piped_check = if offline { String::new() } else { run!(b"godspeed check | where item=tls\r", 150) };
+    if !offline {
+        check!(piped_check.contains("verified") && !piped_check.contains("HTTP/1.1"), "`godspeed check` pipes as records");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    println!("\ngodspeed: {pass} passed, {fail} failed, {skipped} skipped");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");

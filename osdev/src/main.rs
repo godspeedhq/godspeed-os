@@ -783,7 +783,7 @@ fn stack_fit_check(services: &[&str]) {
 /// records: a MISSING binary is caught by a guard, and a STALE one is not, because a stale file is
 /// not missing. `scripts/embed_order_check.py` catches the ordering; nothing caught the omission.
 const SERVICE_CRATES: &[&str] = &[
-    "events", "recorder", "copier", "ask", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
+    "events", "recorder", "copier", "ask", "godspeed-pm", "console", "control", "time", "hw-enumerator", "mem-pressure", "chaos",
     "ping", "pong", "greet", "upper", "roster", "probe", "observe", "shell", "xhci", "ehci",
     "block-driver", "nic-driver", "net-stack", "fs", "counter", "reply-server", "asker",
     "resource-server", "holder", "power", "audio-driver", "wifi-usb",
@@ -1740,6 +1740,7 @@ fn cmd_test(suite: &str) {
         "fs-rtear"       => run_fs_rtear_test(),
         "fs-reuse"       => run_fs_reuse_test(),
         "jobs"           => run_jobs_test(),
+        "godspeed"       => run_godspeed_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
         "cross-isa"      => run_cross_isa_test(),
@@ -1919,7 +1920,10 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         "copier", "recorder",
         // `power`, so this path never embeds a stale build of it: it holds a shutdown's tidy-up, and an image
         // with a power from an older tree would warn and tidy by older rules.
-        "power"];
+        "power",
+        // `godspeed-pm`, the package manager the supervisor embeds: absent here, this path would embed
+        // whatever an older build left, or fail to link on a fresh tree.
+        "godspeed-pm"];
     for crate_name in &non_supervisor {
         let mut args = vec!["build", "--release", "-p", crate_name, "--target", "x86_64-unknown-none"];
         if *crate_name == "block-driver" && !bd_features.is_empty() {
@@ -3935,6 +3939,25 @@ fn run_fs_reuse_test() {
     format_superblock(persist);
     gsfs_add_file(persist, "canary.txt", b"do-not-disturb");
     crate::shell_test::run_fs_reuse(&image_path, persist, 4);
+}
+
+/// `osdev test godspeed`: the package manager against a real disk and the network
+/// (`utilities/61_godspeed.md`). The registry part reaches the real registry through SLIRP, so it needs this
+/// machine online; offline, those checks are reported as skipped rather than passed.
+fn run_godspeed_test() {
+    println!("
+=== godspeed: settings on a real disk, and the registry over verified TLS ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_godspeed.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    crate::shell_test::run_godspeed(&image_path, persist, 2);
 }
 
 fn run_jobs_test() {

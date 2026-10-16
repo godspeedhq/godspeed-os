@@ -2756,7 +2756,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ioapic.rs | 9 | permitted |
 | arch/x86_64/acpi.rs | 5 | permitted |
 | arch/x86_64/iommu.rs | 79 | permitted |
-| arch/x86_64/mod.rs | 38 | permitted |
+| arch/x86_64/mod.rs | 40 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 22 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
@@ -3750,3 +3750,19 @@ block returning the selftest's two frames to the allocator (`Frame::from_phys` a
 `unsafe`). Sound because both frames came from `alloc_frame` in the same selftest and their only mapping
 was the slot just cleared, so each is freed exactly once; it is called on the failure path after mapping
 as well as at the end.
+
+## `arch/x86_64/mod.rs` 38 -> 40 (2026-10-16): `hw_random` answers from RDRAND
+
+The x86 port answered InspectKernel query 19 with `None` ("x86 RDRAND is a trivial follow-up"), so nothing
+on a PC could make a secret: the TLS client the `godspeed` package manager uses (`sdk/tls`) refuses to run
+without a hardware random source rather than guess one. Two blocks, both in `hw_random`:
+
+| Block | Why it is sound |
+|---|---|
+| `__cpuid(1)` | Leaf 1 exists on every x86_64 CPU; CPUID is unprivileged, has no side effects and touches no memory. ECX bit 30 says whether RDRAND exists, and RDRAND is not executed unless it does |
+| `_rdrand32_step(&mut word)` | Executed only where CPUID says RDRAND exists. It writes one register and the carry flag; the only memory it touches is `word`, a local it holds the only reference to |
+
+Retried at most ten times, Intel's documented bound for a transient underflow. An all-ones word is refused,
+as Linux refuses it (`arch/x86/kernel/cpu/rdrand.c`): several AMD parts have reported success while
+returning 0xFFFFFFFF every time, and a constant handed back as randomness would become a key. A CPU without
+RDRAND answers `None`, as before. Which of the boards here have it is not checked yet; `random` says on each.

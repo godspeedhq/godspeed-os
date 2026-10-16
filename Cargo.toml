@@ -7,6 +7,7 @@ members = [
     "services/recorder",
     "services/copier",
     "services/ask",
+    "services/godspeed-pm",
     "services/console",
     "services/time",
     "services/hw-enumerator",

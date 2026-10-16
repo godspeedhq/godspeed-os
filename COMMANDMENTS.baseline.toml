@@ -744,6 +744,11 @@ SpawnImage               = 52
 # driver's status. The peers are chosen per BOARD at build time (`board::ASK_PEERS`, at most six), so
 # this line is their union across boards. No spawn, kill, console or write authority of any kind.
 "ask" = ["peer:block-driver", "peer:dwc2", "peer:fs", "peer:shell", "peer:supervisor", "peer:wifi-driver", "peer:wifi-usb", "peer:xhci", "priv:INTROSPECT"]
+# godspeed-pm (2026-10-16, docs/developer-services-design.md 10): the native package manager, a foreground
+# program for one `godspeed` command. The shell for its answer; `fs` for its own settings and roots under
+# /system/services/godspeed/; `net-stack` for the registry's TCP connection (op 23); `time` for the date a
+# certificate is checked against. No privilege of any kind.
+"godspeed-pm" = ["peer:fs", "peer:net-stack", "peer:shell", "peer:time"]
 # ask-net: the same program, started for a network question, with that question's peers instead
 # (`board::ASK_NET_PEERS`): the shell, the supervisor, `net-stack` (its status) and the board's radio.
 "ask-net" = ["peer:net-stack", "peer:shell", "peer:supervisor", "peer:wifi-driver", "peer:wifi-usb", "priv:INTROSPECT"]

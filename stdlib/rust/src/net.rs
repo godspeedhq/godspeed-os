@@ -55,6 +55,8 @@ const TAG_BASE: u8 = 0x80;
 const OP_OPEN_SOCKET: u8 = 2;
 /// Listen on a TCP port: `[22, port_hi, port_lo]`.
 const OP_LISTEN: u8 = 22;
+/// Open an outbound TCP connection held as a capability.
+const OP_CONNECT: u8 = 23;
 
 // Operations on a LISTENER capability.
 const LOP_ACCEPT: u8 = 0;
@@ -224,6 +226,31 @@ impl<'a> Net<'a> {
         }
         let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
         Ok(Listener { net: self, ctx, cap, held: Held::new(), closed: false })
+    }
+
+    /// Open a TCP connection to `ip:port` and receive a CAPABILITY to it.
+    ///
+    /// Unlike [`tcp`](Net::tcp), which is one request and one reply, the returned [`Stream`] is a
+    /// conversation: send, read, send again, for as long as both ends keep it open. That is what a
+    /// protocol with a handshake needs - TLS above all.
+    ///
+    /// **Blocks** until the connection is established or refused, up to [`TCP_SECS`]. **Authority:**
+    /// the caller's existing `net-stack` capability; the connection's capability grants only that
+    /// one connection.
+    ///
+    /// # Errors
+    /// - [`Error::Unavailable`] - `net-stack` could not connect: no answer, refused, no usable NIC,
+    ///   or its connection table is full. Its log says which.
+    /// - [`Error::Failed`] - it agreed and sent no capability.
+    pub fn connect<'n>(&'n mut self, ip: Ipv4, port: u16) -> Result<Stream<'n, 'a>, Error> {
+        let ctx = self.ctx;
+        let req = [OP_CONNECT, ip.0[0], ip.0[1], ip.0[2], ip.0[3], (port >> 8) as u8, port as u8];
+        let r = self.call(&req, TCP_SECS)?;
+        if body(&r).first() != Some(&1) {
+            return Err(Error::Unavailable);
+        }
+        let cap = ctx.take_pending_cap().ok_or(Error::Failed)?;
+        Ok(Stream { net: self, ctx, cap, held: Held::new(), closed: false })
     }
 
     /// Take a network handle. Cheap, allocates nothing, grants nothing.
@@ -693,6 +720,91 @@ impl<'c, 'n: 'c, 'a: 'n> Conn<'c, 'n, 'a> {
 }
 
 impl<'c, 'n: 'c, 'a: 'n> Drop for Conn<'c, 'n, 'a> {
+    fn drop(&mut self) {
+        let _ = self.close_inner();
+    }
+}
+
+/// One outbound TCP connection, held as a capability. See [`Net::connect`].
+///
+/// Borrows its [`Net`], so the tag counter has one owner while the connection is open.
+pub struct Stream<'n, 'a: 'n> {
+    net: &'n mut Net<'a>,
+    ctx: &'a ServiceContext,
+    cap: CapHandle,
+    held: Held,
+    closed: bool,
+}
+
+impl<'n, 'a: 'n> Stream<'n, 'a> {
+    fn call(&mut self, right: u8, body_bytes: &[u8]) -> Result<Message, Error> {
+        let tag = self.net.next_tag_pub();
+        resource::invoke(self.ctx, self.cap, right, tag, Some(NET_SECS as u8), body_bytes, NET_SECS, &mut self.held)
+    }
+
+    /// Read whatever has arrived, into `buf`, and return how many bytes.
+    ///
+    /// **Zero means nothing has arrived yet**, exactly as for [`Conn::recv`]: TCP delivers when it
+    /// delivers, and a caller that needs more waits a little and asks again. A connection the peer
+    /// closed and that has been read to the end is released by `net-stack`, after which this returns
+    /// [`Error::Revoked`] - that is the end of the stream.
+    ///
+    /// One call moves at most 2048 bytes. **Authority:** this connection's `READ` right.
+    pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        let max = buf.len().min(u16::MAX as usize) as u16;
+        let [lo, hi] = max.to_le_bytes();
+        let r = self.call(RIGHT_READ, &[COP_RECV, lo, hi])?;
+        let b = r.payload_bytes();
+        let data = if b.len() > 1 { &b[1..] } else { &[][..] };
+        if data.len() > buf.len() {
+            return Err(Error::Malformed);
+        }
+        buf[..data.len()].copy_from_slice(data);
+        Ok(data.len())
+    }
+
+    /// Send up to 1024 bytes and return how many were ACCEPTED, which may be fewer, or none while
+    /// `net-stack`'s send buffer is full. Send the rest on a later call; nothing is dropped silently.
+    ///
+    /// **Authority:** this connection's `WRITE` right.
+    pub fn send(&mut self, data: &[u8]) -> Result<usize, Error> {
+        let mut req = [0u8; 1 + 1024];
+        let n = data.len().min(1024);
+        req[0] = COP_SEND;
+        req[1..1 + n].copy_from_slice(&data[..n]);
+        let r = self.call(RIGHT_WRITE, &req[..1 + n])?;
+        let b = body(&r);
+        if b.len() < 2 {
+            return Err(Error::Malformed);
+        }
+        Ok(((b[1] as usize) << 8 | b[0] as usize).min(n))
+    }
+
+    /// Close the connection: `net-stack` sends what is still queued, then its FIN.
+    ///
+    /// Consumes the handle. Dropping also closes, and cannot report the outcome.
+    pub fn close(mut self) -> Result<(), Error> {
+        self.close_inner()
+    }
+
+    fn close_inner(&mut self) -> Result<(), Error> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+        let r = self.call(RIGHT_WRITE, &[COP_CLOSE]).map(|_| ());
+        self.ctx.remove_cap(self.cap);
+        r
+    }
+
+    /// Take one message that arrived during an operation and was NOT the reply. See
+    /// [`Socket::take_held`].
+    pub fn take_held(&mut self) -> Option<Message> {
+        self.held.take()
+    }
+}
+
+impl<'n, 'a: 'n> Drop for Stream<'n, 'a> {
     fn drop(&mut self) {
         let _ = self.close_inner();
     }

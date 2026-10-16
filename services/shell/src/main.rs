@@ -1154,6 +1154,8 @@ const NO_PATH_CMDS: &[&str] = &[
     "hardware",
     // A question, never a path.
     "ask",
+    // Settings and a check, never a path.
+    "godspeed",
     // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
     // directory listing for a position that accepts neither a path nor a keyword.
     "paginate",
@@ -1178,6 +1180,7 @@ const _: () = assert!(
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
+    ("godspeed", &["config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -2325,6 +2328,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
         "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
         "ask"     => cmd_ask(ctx, s["ask".len()..].trim()),
+        "godspeed" => cmd_godspeed(ctx, s["godspeed".len()..].trim()),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -5414,6 +5418,7 @@ const UTILS: &[&str] = &[
     "audio",
     "hardware",
     "ask",
+    "godspeed",
     "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5678,6 +5683,15 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
+        "godspeed" => help_block(ctx, "godspeed", "the native package manager - its settings, and the registry over verified TLS", &[
+            ("godspeed config", "every setting, its value, and whether it came from the file or the default", "godspeed config"),
+            ("godspeed config set <key> <value>", "change one setting, checked first; the rest of the file is kept", "godspeed config set timeout-secs 45"),
+            ("godspeed check", "reach the registry over TLS, verified to the trusted roots, one row per step", "godspeed check"),
+            ("the file", "/system/services/godspeed/config, one `key value` per line; `edit` works on it too", ""),
+            ("the roots", "/system/services/godspeed/roots/: the certificate authorities TLS accepts, one file each", ""),
+            ("not yet", "searching and fetching packages: they need the registry's signed metadata, not built yet", ""),
+            ("godspeed check | where item=tls", "a report is records: item, value, note", "godspeed config | where note=file"),
+        ], false),
         "ask" => help_block(ctx, "ask", "plain questions about this machine, answered from what its services know", &[
             ("ask \"<question>\"", "the answer: a verdict, and what it rests on", "ask \"is my system healthy?\""),
             ("ask \"what to say?\"", "what it can be asked, with suggestions from this machine as it is now", "ask \"what to say?\""),
@@ -6011,6 +6025,16 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi radio off hard", "cut the CHIP's power and stay powered down; `wifi radio on` brings it back cold (~20 s)", "wifi radio off hard"),
             ("wifi radio powercycle", "cut and restore the CHIP's power and restart the driver on it - the radio comes back from power-on and rejoins", "wifi radio powercycle"),
         ], false),
+        ("godspeed", "config") => help_block(ctx, "godspeed config", "the package manager's settings", &[
+            ("godspeed config", "each setting: item (the key), value, note (file or default); the file is written with the defaults on first start", "godspeed config"),
+            ("godspeed config set <key> <value>", "registry (https only), tls-roots (a folder ending in /), timeout-secs (1-100), max-package-mib (1-4096)", "godspeed config set timeout-secs 45"),
+            ("trust-root", "not set here: it decides which registry is trusted, so it is changed in the file, by hand", ""),
+        ], false),
+        ("godspeed", "check") => help_block(ctx, "godspeed check", "reach the registry, one row per step", &[
+            ("registry, clock, roots", "what the check used: the address, the date a certificate is checked against and its source, how many roots", ""),
+            ("address, tls, http, says", "the registry's address, the verified handshake, its HTTP status and the first line it said", ""),
+            ("a failure", "the step it stopped at and why: an expired certificate, an unknown root, no clock, no network", ""),
+        ], false),
         ("ask", "evidence") => help_block(ctx, "ask evidence", "the same answer, with every line labelled and its source named", &[
             ("ask evidence \"<question>\"", "FACT: a source said it; INFERENCE: concluded by the named rule; UNKNOWN: nothing available establishes it", "ask evidence \"what failed?\""),
         ], false),
@@ -6279,6 +6303,7 @@ static HELP: &[HelpRow] = &[
     Row("mem", "physical memory usage"),
     Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
     Row("ask \"<question>\"", "plain questions about this machine: health, what failed, why a service restarted"),
+    Row("godspeed config | check", "the package manager: its settings, and the registry reached over verified TLS"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("random [n]", "words from the hardware random number generator"),
@@ -14235,7 +14260,7 @@ fn cmd_random(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shel
         }
     };
     for _ in 0..n {
-        match ctx.hw_random() {
+        match gs::task::hw_random(ctx) {
             Some(v) => out.line_fmt(ctx, format_args!("{:#010x}  {}", v, v)),
             None => { out.line(ctx, "random: no hardware RNG on this machine"); return Err(ShellError::Unknown); }
         }
@@ -14310,7 +14335,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// (search hits), `observe now`, `uptime`, `jobs` and the record views of `events` and `trace` are
 /// built in the shell, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs" | "ask")
+    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs" | "ask" | "godspeed")
 }
 
 /// `dir` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -14645,6 +14670,9 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
                 let q = match split_first(arg) { ("evidence", rest) if !rest.is_empty() => rest, _ => arg };
                 match build_ask_table(ctx, q) { Some(t) => t, None => return Err(ShellError::Unknown) }
             }
+            // `godspeed config | where note=file`: the reports as records. `config set` is refused before
+            // here (`producer_refusal`): its value is its effect.
+            "godspeed" => match build_godspeed_table(ctx, arg) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
             "audio" if arg.trim() == "hardware" => build_audio_hardware_table(ctx),
             "audio" => match build_audio_outputs_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -15200,6 +15228,55 @@ fn cmd_ask(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         Some(_) => Err(ShellError::Unknown),
         None => { gs::io::println(ctx, "ask: the answer had no status - treat it as incomplete"); Err(ShellError::Unknown) }
     }
+}
+
+/// How long the package manager may take to send its answer: its own requests are bounded by
+/// `timeout-secs`, at most 100 (`services/godspeed-pm`), and this leaves it room to say why one ended.
+const GODSPEED_WAIT_SECS: i64 = 120;
+
+/// `godspeed <command>` as a record table (`item`, `value`, `note`) whose last row is `status`. Like `ask`, a
+/// FOREGROUND PROGRAM: started for one command, its answer read, then ended. Its peers are its supervisor
+/// row's (`fs`, `net-stack`, `time`, and this shell), never passed from here.
+fn build_godspeed_table(ctx: &ShellCtx, arg: &str) -> Option<Table> {
+    let line = arg.trim();
+    let mut cap = Cap::new();
+    let keep = |b: u8| ctx.keep_key(b);
+    match drain_service_with(ctx, "godspeed-pm", &[], Some(line.as_bytes()), &mut cap, GODSPEED_WAIT_SECS, Some(&keep)) {
+        Drained::Failed | Drained::Aborted => return None,
+        Drained::Eot | Drained::Overflow | Drained::NoEot => {}
+    }
+    match Table::decode(cap.bytes()) {
+        Ok(t) => Some(t),
+        Err(_) => {
+            gs::io::println(ctx, if cap.bytes().is_empty() {
+                "godspeed: no answer came, so the shell ended it"
+            } else {
+                "godspeed: what came back does not read as an answer"
+            });
+            None
+        }
+    }
+}
+
+/// `godspeed config`, `godspeed config set <key> <value>`, `godspeed check` (`utilities/61_godspeed.md`).
+/// The table without its `status` row, as a grid; the command fails when the status says so.
+#[inline(never)]
+fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+    if arg.trim().is_empty() {
+        gs::io::println(ctx, "usage: godspeed config | godspeed config set <key> <value> | godspeed check - `godspeed help` says what each does");
+        return Err(ShellError::Unknown);
+    }
+    let mut t = match build_godspeed_table(ctx, arg) { Some(t) => t, None => return Err(ShellError::Unknown) };
+    let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
+    let answered = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status");
+    t.filter("item", "!=", "status");
+    let mut o = Out::Console;
+    t.to_grid(&mut OutSink { ctx, out: &mut o });
+    if !answered {
+        gs::io::println(ctx, "godspeed: the answer had no status - treat it as incomplete");
+        return Err(ShellError::Unknown);
+    }
+    if failed { Err(ShellError::Unknown) } else { Ok(()) }
 }
 
 /// A fixed-size copy of a short cell, so a status can outlive the table it was read from.
@@ -18066,6 +18143,11 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
     match cmd {
         "wifi" => wifi_pipe_refusal(arg),
         "audio" => audio_pipe_refusal(arg),
+        "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
+            (Some("config"), None) | (Some("check"), None) => None,
+            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed config and godspeed check"),
+            _ => Some("pipe: pipe a report: godspeed config or godspeed check"),
+        },
         "churn" if arg.split_whitespace().next() == Some("verify") => None,
         "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),
         _ => None,
@@ -18988,7 +19070,7 @@ fn chaos_launch(
         None if target_all => {
             let dt = gs::task::datetime(ctx);
             let s = ((dt.minute as u64) << 24) ^ ((dt.second as u64) << 40)
-                ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
+                ^ ((gs::task::hw_random(ctx).unwrap_or(0) as u64) << 8)
                 ^ ((gs::task::epoch_secs_monotonic(ctx) as u64) << 17)
                 ^ (gs::task::uptime_secs(ctx) as u64);
             (Some(if s == 0 { 1 } else { s }), 2u8)

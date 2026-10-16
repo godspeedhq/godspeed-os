@@ -129,23 +129,42 @@ pub fn datetime(ctx: &ServiceContext) -> Datetime {
 /// is restartable, so an unanswered question is normal during a restart - and an unknown clock and an
 /// unset clock oblige a caller to do the same thing, which is not to quote the date as fact.
 pub fn clock_source(ctx: &ServiceContext) -> ClockSource {
+    wall_clock(ctx).map(|(_, source)| source).unwrap_or(ClockSource::Unset)
+}
+
+/// The `time` service's clock: epoch seconds, and where they came from ([`clock_source`] explains the
+/// four answers). `None` when there is no clock or `time` did not answer, which oblige a caller to the
+/// same thing: not to treat any number as the date.
+///
+/// For a program that must CHECK a date - a certificate's validity, a signature's freshness - rather
+/// than show one. A `Floor` reading is a lower bound: a date it calls "not yet valid" may be real, and
+/// a caller says which clock it used.
+pub fn wall_clock(ctx: &ServiceContext) -> Option<(i64, ClockSource)> {
     // OP_NOW -> [ok, epoch(8), source]. Bounded, and reacquiring: see `crate::call::request_within`.
     const OP_NOW: u8 = 1;
-    let reply = match crate::call::request_within(
-        ctx, "time", &godspeed_sdk::ipc::Message::from_bytes(&[OP_NOW]), 2) {
-        Ok(r) => r,
-        Err(_) => return ClockSource::Unset,
-    };
+    let reply = crate::call::request_within(ctx, "time", &godspeed_sdk::ipc::Message::from_bytes(&[OP_NOW]), 2).ok()?;
     let p = reply.payload_bytes();
     if p.len() < 10 || p[0] == 0 {
-        return ClockSource::Unset;
+        return None;
     }
-    match p[9] {
+    let epoch = i64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]);
+    let source = match p[9] {
         1 => ClockSource::Rtc,
         2 => ClockSource::Ntp,
         3 => ClockSource::Floor,
-        _ => ClockSource::Unset,
-    }
+        _ => return None,
+    };
+    Some((epoch, source))
+}
+
+/// A random 32-bit word from the hardware (InspectKernel query 19), or `None` on a machine whose port
+/// exposes no hardware random source. Ungated: entropy confers no authority.
+///
+/// **There is deliberately no fallback.** A program that needs secrets - a TLS key share - must refuse
+/// to run without this rather than reach for a timer or a counter, which would make a key an attacker
+/// can predict while everything appears to work.
+pub fn hw_random(ctx: &ServiceContext) -> Option<u32> {
+    ctx.hw_random()
 }
 
 /// Whether the `time` service's clock is worth showing as a date at all.

@@ -611,6 +611,15 @@ So a first version can be **fetch, verify, keep, list and remove**, and it must 
 package is not installed: the machine cannot run it until 9.2 exists. The CLI's contract already forbids
 presenting a development convenience as installation; the same holds here.
 
+**Built, 2026-10-16 (QEMU only): `godspeed config`, `godspeed config set` and `godspeed check`**
+(`services/godspeed-pm`, `utilities/61_godspeed.md`). The settings of 10.8 and the transport of 10.3, end
+to end: the file written on first start, a checked `set` that keeps the rest of the file, and the registry
+reached over TLS verified to the roots folder. Search, fetch and keep are not built; they need the
+registry's metadata format (10.6). Three things were missing on the way and were added: an outbound TCP
+connection held as a capability (`net-stack` op 23, `docs/tcp-design.md`); `gs::task::wall_clock` and
+`gs::task::hw_random`; and RDRAND behind x86's random seam, which had answered `None` - so on a PC whose
+CPU has no RDRAND, TLS refuses to run, and says so.
+
 ### 10.2 Where it lives
 
 Every utility today is a function inside `services/shell` (9.3). This one should not be: it downloads,
@@ -823,7 +832,10 @@ on it too.
 root lets it read what the machine fetches (confidentiality), not change it, for the same reason.
 Changing `trust-root` is the real one: it is equivalent to trusting another registry, so
 `godspeed config set trust-root` asks `[y/N]` and shows both fingerprints, and the utility refuses a file
-whose pin disagrees with the root it has already reached until the operator confirms. The full answer is
+whose pin disagrees with the root it has already reached until the operator confirms. **As built
+(2026-10-16), `config set trust-root` is refused outright** and the key is changed by editing the file:
+nothing reads the pin until the metadata check exists, and a `[y/N]` needs the console, which a foreground
+program's answer table does not have. The confirmation is built with the check that gives it a meaning. The full answer is
 folder capabilities, where only the package manager can write its own folder.
 
 **The same rule for the parameters other services compile in today.** `time`'s NTP server is a constant
