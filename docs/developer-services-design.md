@@ -6,7 +6,9 @@
 create, build, test, run in QEMU - "can be built now". Measured against this tree it cannot, without
 the CLI editing supervisor source, and that is the boundary the CLI's own contract forbids. This
 document is the three OS-side changes that would make it true, and what each one deliberately does
-not do.
+not do. Section 9 (2026-10-16) records what the CLI still needs beyond them, and section 10 the native
+`godspeed` utility on a Godspeed machine. Also 2026-10-16: 2.1 and 3.5 are corrected against the kernel
+verification (`audits/2026-10-16-kernel-verification.md`).
 
 No kernel change. No MISCIS change. No new syscall. No image loaded from disk.
 
@@ -109,6 +111,16 @@ not a grant. The kernel's own check that the supervisor cannot delegate what it 
 (`SUPERVISOR_DELEGATABLE`) still applies underneath, so the generator cannot widen authority even if
 it is wrong; it can only narrow it.
 
+**Corrected 2026-10-16: that backstop covers the privilege word and nothing else.** The kernel
+verification (`audits/2026-10-16-kernel-verification.md`, D22) found that `SpawnImage` checks only the
+request's privilege bits against what the spawner holds (`privileges_caller_lacks`). The request FLAGS
+are minted without any holdings check: `SPAWN_FLAG_REQ_CONSOLE` gives the child CONSOLE_READ, which the
+supervisor does not itself hold (`syscall/dispatch.rs:1150-1160`, `task/mod.rs:1791-1792`), and
+`SPAWN_FLAG_PEERS_GRANT` makes the name-wired peer caps grantable. Neither is in `SUPERVISOR_DELEGATABLE`.
+So for those two flags, and for the send peers themselves, **the generator's ceiling is the only check**:
+a generator that set them wrongly would grant, and the kernel would not stop it. That is why 3.3 refuses
+both flags by name, and why the generator's refusals are an authority boundary, not a convenience.
+
 ---
 
 ## 3. Change 1: developer services in a build
@@ -151,7 +163,7 @@ A developer service may be given:
 | `log_write = true` | the log |
 | `ipc_send = [names]` | send caps to those names, **from the public set only** (below) |
 | `ipc_receive = [name]` or an explicit endpoint (4.2) | its own endpoint |
-| `resources.memory.limit` | that limit, up to a ceiling (64 MiB proposed - the largest any example takes) |
+| `resources.memory.limit` | that limit, as written: there is no ceiling (decided 2026-10-16; question 1 in 7) |
 | `placement.core` | a preference, never strict |
 
 **A send peer is authority, not plumbing.** On Godspeed a service holds no file or socket until a server
@@ -183,7 +195,10 @@ server answers an arbitrary client safely:
 - **`events`** when its read ops are gated or scoped to the asker, and its write ops attribute
   by the kernel's badge rather than the name a client supplies;
 - **`time`** when the floor is set by a holder of storage alone, the way it is written and read on the way
-  down and up (its own comment calls it "persisted by whoever holds storage");
+  down and up (its own comment calls it "persisted by whoever holds storage"). Being done (2026-10-16,
+  branch `fix/time-floor`): `OP_FLOOR_SET` is retired and the floor is `time`'s alone. Once that merges,
+  `time` answers only `OP_NOW`, `OP_FLOOR_GET` and `OP_SYNC`, and joining the set is an amendment that
+  weighs `OP_SYNC` (a client can make it send an NTP query);
 - **`fs`** with folder capabilities, as a grant of the service's own `/system/services/<name>/` and
   nothing wider;
 - **`net-stack`** with a design for what an untrusted program may reach on the network.
@@ -205,7 +220,8 @@ defect for them, is for the operator to decide.
 
 **Everything else is refused at build time**: every privilege bit, every `hw_*` key, `console_push`,
 `resource_mint`, `service_control`, `pci_cfg`, `cpu_clock`, `power_off`, a non-zero `probe_mode`, any
-DMA pages. The refusal names the key and says why:
+DMA pages, and the two spawn flags the kernel does not check, `[spawn] console` and `[spawn]
+peers_grant` (4.2; 2.1 says why these two matter most). The refusal names the key and says why:
 
     Cannot build developer service hello
     Reason:
@@ -244,6 +260,22 @@ disk is out of its reach. So a developer image may be flashed (`godspeed run --t
 same terms as QEMU, and the boot line above is what tells anyone at that machine what it is carrying.
 **If the floor ever widens - `fs` joining the public set is the first likely case - this is decided
 again**, because a developer service with a send cap to `fs` on a real board touches a real disk.
+
+**What the floor does not bound (added 2026-10-16).** The floor limits a developer service's AUTHORITY.
+It does not limit what every task can already do, and the kernel verification found two things there
+(`audits/2026-10-16-kernel-verification.md`), both open in `backlog/90`:
+
+- **Ungated queries.** Any task may call the ungated `InspectKernel` queries. On x86, query 21 pops a byte
+  of the COM2 operator channel, so a floor service can read and delete the commands meant for `control`
+  (D23); queries 11 and 17 race on the unlocked CMOS index port and can return a date years ahead.
+- **Kernel defects reachable by any task.** A service that faults exercises the self-kill path, which has
+  a double-free window (D8), a page-table-root leak (D9, an L1 arena slot on the Pi 2) and a slot-reuse
+  race (D10). The restart loop in 3.4 repeats that path for a service that crashes on start, which is why
+  its backoff and "given up" state matter: they bound how often a broken developer service drives it.
+
+Neither changes the answer above: an in-tree service has the same exposure, and none of it reaches a
+disk, a network or a device. But "can harm nothing a QEMU run could not" is a statement about authority,
+and these are the places it is not the whole story. They are fixed in the kernel, not worked around here.
 
 ### 3.6 Untying the crate from the tree
 
@@ -383,7 +415,17 @@ the usual hardware cards, since the supervisor is on every board.
 
 ## 7. Questions for the operator
 
-1. The memory ceiling for a developer service: 64 MiB, or something else?
+1. ~~The memory ceiling for a developer service: 64 MiB, or something else?~~ **Answered 2026-10-16:
+   none.** The developer declares the limit they want. A limit is a budget, not a reservation (nothing is
+   set aside at spawn), so a large one costs nothing until it is used. A service whose image and stack
+   cannot be given memory is not started, which is what happens today and is logged. A running developer
+   service that asks for more than its limit is **told no and keeps running** (`AllocDenied`), exactly as
+   CLAUDE.md 10.4 defines for every service (decided 2026-10-16, after weighing killing it instead): the
+   refusal is a returned error, so it is loud, and the service decides whether to degrade or stop. No
+   amendment. **What no ceiling costs, recorded rather than hidden:** budgets are not reservations and are
+   not summed against RAM, so one developer service with a very large limit can take every free frame, and
+   then other services' allocations and the supervisor's spawns fail too. Services mostly use no heap
+   (26.6.1), which keeps this small in practice, and nothing here claims more than that.
 2. The maximum number of developer services in one image: four?
 3. ~~May a developer image be flashed to hardware?~~ **Proposed answer: yes, on the floor as it stands**,
    because that floor reaches no disk, network or device (3.5). Reopened if the floor widens.
@@ -408,3 +450,360 @@ the usual hardware cards, since the supervisor is on every board.
   from disk before that design exists would be exactly the trust shortcut it refuses.
 - **Letting a developer contract request anything and granting it.** 2.1. A build tool that turns a
   request into a grant is the "manifest grants" mistake the CLI's contract names first.
+
+---
+
+## 9. Beyond this proposal: what the CLI still needs from the OS
+
+**Added 2026-10-16, for the record. Not proposed here, not approved, and none of it is built.** Changes
+1 to 3 make `godspeed run` work for a service. The CLI (`godspeed-cli` 0.1.0, released) still refuses
+five more things, each because the OS does not provide what it would need. They are listed here so that
+the operator has one place to see the CLI's whole dependency on the OS. Each is the OS's to design, under
+its own constitution. The CLI follows; it never works around one.
+
+| the CLI refuses | because the OS lacks | where the OS already says so |
+|---|---|---|
+| `godspeed run` | developer services in a build | this document, changes 1 to 3 |
+| `godspeed install` (on a Godspeed machine) | images loaded from `fs`, signed, with a local grant policy | `docs/service-ownership.md`, step 2; the native side's own needs are section 10 |
+| `godspeed new utility` | a terminating task | `docs/stdlib-design.md` 1, option B |
+| `godspeed new driver` | device grants for a driver built outside the tree | the supervisor's spawn rows, by device kind |
+| `godspeed new app` | public application interfaces | nowhere yet |
+| anything but Rust | a stable, documented ABI below `gs` | CLAUDE.md Appendix B (non-normative) |
+
+### 9.1 What the floor (3.3) runs, measured against the CLI's own examples
+
+`godspeed-cli/examples/` holds three services, built for all four ISAs in that repository's CI. Against
+the floor as it stands, with the public send set empty:
+
+| example | asks for | under the floor |
+|---|---|---|
+| `heartbeat` | `log_write` | runs |
+| `shout` | `log_write`, `ipc_receive = ["shout"]` | runs; but no developer service can be its client, since `shout` is not in the public set |
+| `bootcount` | `log_write`, `ipc_send = ["fs"]` | refused by the build: `fs` is not at the floor until folder capabilities exist |
+
+That is the floor working as intended, not a defect. When the build refuses `bootcount`, the CLI will
+report the refusal as the build states it, with the reason this document gives.
+
+### 9.2 Installing: images from `fs`, signed
+
+This is step 2 of `docs/service-ownership.md`, and it is what turns a published package into something a
+Godspeed machine can run without being rebuilt. It needs three things. The CLI side of the first is
+already built.
+
+- **A verifier at spawn.** The package format is defined and versioned: `manifest.toml`, `manifest.sig`,
+  `contract.toml` and one ELF per ISA (the CLI repository's docs/package-format.md). So is the registry's trust
+  metadata: root, namespaces with active, retired and revoked keys, snapshot and timestamp
+  (docs/trust-metadata.md there, modelled on TUF). Both are verified by `godspeed-package`, a crate
+  that is `no_std` and allocator-free and is built for all four targets in CI, so the native package
+  manager and a loader can share the exact code the registry and the CLI use. Whether the loader checks
+  the publisher's signature, the registry's trust chain, or both, is the OS's decision.
+- **A loader:** the supervisor (or a service it trusts) reading an image from `fs` and spawning it.
+  `docs/service-ownership.md` is explicit that nothing reads an image from disk today.
+- **A local grant policy:** who decides what an installed package's requested capabilities become, and
+  how that decision is shown. It is not designed (2, last point but one). The developer grant policy
+  (3.3) is the build-time answer for one case. An installed package needs the runtime one.
+
+Then: `godspeed install`, `update` and `uninstall` on a Godspeed machine, and the Stranger Test's second
+half.
+
+### 9.3 `utility`: a terminating task
+
+`docs/stdlib-design.md` 1 already sets this out and recommends **option B**: an `Exit(status)` syscall
+and one supervisor arm, as a separate reviewed change with a CLAUDE.md amendment (8.2's `CallDeadline` is
+the precedent). For the CLI to ship a `utility` template, these are needed on top of the syscall:
+
+- **an entry point that may return:** `fn main()`, or whatever form `gs` settles on, with a status type;
+- **supervisor policy:** a finished task is not respawned, and its status goes to whoever started it;
+- **a way to start one on demand:** today the utilities are functions inside `services/shell`, so a
+  separately built utility needs the shell (or a launcher) to start an image by name, pass it
+  arguments, attach its output, and report its status. No argument-passing mechanism exists.
+
+Then: `godspeed new utility`, and `godspeed run` showing the utility's output and exit status. A
+terminating task also gives `godspeed test` a natural verdict for a service's tests: they run, end and
+report.
+
+### 9.4 `driver`: device grants from outside the tree
+
+`gs::driver` exists, but a device is granted only by the supervisor's compiled spawn rows, by device
+kind. The contract's hardware keys (`hw_device`, `hw_pci_class`, `hw_pci_irq`, ...) are stated for
+review, and nothing grants from them. The developer floor (3.3) refuses every one of them, rightly. A
+`driver` template needs a design for:
+
+- **who approves** a device going to a driver built outside the tree: the operator, explicitly, never a
+  contract;
+- **exclusivity:** one driver per device, and what happens to the in-tree driver it displaces;
+- **discovery:** how such a driver is matched to what `hw-enumerator` found, without the kernel
+  resolving anything from a name.
+
+Then: `godspeed new driver`. It is security-sensitive, so the design is the work. The code is small.
+
+### 9.5 `app`: public application interfaces
+
+Nothing exists to build on, and this is the largest of the five. The `console` service owns the
+framebuffer, and `console_push` is the keyboard ring the shell reads. An app needs, at minimum:
+
+- a surface it may draw on, shared or arbitrated with the console;
+- input delivered to whichever app has focus, rather than to the shell's ring;
+- a lifecycle: started, foregrounded, backgrounded, ended. That depends on 9.3.
+
+The first step is deciding what an "app" is on Godspeed. The interfaces come after.
+
+Then: `godspeed new app`.
+
+### 9.6 Other languages
+
+CLAUDE.md Appendix B.2 says any language producing a freestanding ELF "and call via that ABI" can run as
+a service, and that C "would need a `sdk/c/` of thin syscall wrappers". Two things stand in the way:
+
+- **The ABI is not documented as stable.** B.2 still says "System V AMD64", but `sdk/rust/src/syscall.rs`
+  documents four per-ISA conventions (x86-64 traps with `ud2`, rax plus rdi/rsi/rdx; aarch64 uses
+  `svc #0` with x16; riscv64 `ecall` with a7; armv7 `svc #0`, r0-r3). A non-Rust service would also
+  have to reproduce the service-context page and its magic, the capability-slot conventions, and the
+  `user.ld` layout, none of which is a public contract.
+- **A C interface to `gs` itself** (a header and a static library) would be safer than raw syscall
+  wrappers: it keeps the stdlib's error handling and outcome-unknown semantics, which raw calls lose.
+
+B.2 rules Go (and other languages with substantial runtimes) out of scope as multi-month ports. The CLI
+agrees, and its documentation says so. Then: a C or C++ build backend in the CLI. Packages and publishing
+do not change, because the package format does not care what compiled the ELF.
+
+### 9.7 Suggested order
+
+1. **This document, changes 1 to 3:** `godspeed run` for services. Everything below needs something
+   that runs.
+2. **`Exit` (9.3):** utilities. It is the smallest kernel change on this list, and the most useful.
+3. **Images from `fs`, signed (9.2):** installing. The verifier exists.
+4. **Device grants (9.4):** drivers.
+5. **Application interfaces (9.5):** apps. Design first.
+6. **A documented ABI (9.6):** whenever a second language is wanted. It is independent of the rest.
+
+For each step, the CLI's side is small once the OS's exists: a template, its CI build, and `run` or
+`install` support. A kind the OS cannot run stays refused until then, with the reason and a pointer here.
+
+---
+
+## 10. The native `godspeed` utility (the other half of the vocabulary)
+
+**Added 2026-10-16. A design note for the next piece of work, not a proposal: nothing here is approved or
+built.** The CLI's contract splits the `godspeed` vocabulary in two (the CLI repository's CLAUDE.md, "Host CLI and
+Native Package Manager"): the host CLI creates, builds, packages and publishes on a workstation, and the
+**native package manager** runs on a Godspeed machine and owns
+
+    godspeed search <query>     godspeed info <package>     godspeed list
+    godspeed install <package>  godspeed update <package>   godspeed uninstall <package>
+
+It is "an ordinary Godspeed program on public interfaces: no privileged kernel knowledge, no private
+supervisor protocol", and installing "never grants a requested capability by itself". The CLI side of
+the format is done: `godspeed-package` (`no_std`, no allocator, built for all four targets) defines the
+package, the manifest, the registry index and the trust metadata, and verifies all of them. This section
+is what the OS has to settle before the native side can be built, and what it can do before 9.2 exists.
+
+### 10.1 What it can do on today's OS, and what it cannot
+
+| command | needs | today |
+|---|---|---|
+| `search`, `info` | to read the registry's index and trust metadata, and verify them | blocked on transport (10.3) and the clock (10.4); no kernel change |
+| download and verify a package | the above, plus a place to keep it (10.5) | the same; no kernel change |
+| `list`, `uninstall` | a record of what is kept, and deleting it | possible once something is kept |
+| `install`, `update` (running the package) | a loader and a local grant policy (9.2) | blocked: nothing reads an image from disk |
+
+So a first version can be **fetch, verify, keep, list and remove**, and it must say plainly that a kept
+package is not installed: the machine cannot run it until 9.2 exists. The CLI's contract already forbids
+presenting a development convenience as installation; the same holds here.
+
+### 10.2 Where it lives
+
+Every utility today is a function inside `services/shell` (9.3). This one should not be: it downloads,
+hashes and verifies files that can be megabytes, holds the trust metadata while it works, and needs send
+caps to `fs` and to `net-stack`, while the shell's stack is already tight on long paths. The natural shape
+is **its own in-tree service**, `godspeed`, driven by a thin `godspeed` verb in the shell, the way `ask`
+is shaped (`services/ask`, `utilities/60_ask.md`). As an in-tree service its spawn row is hand-written and reviewed (1.1), so its
+send caps to `fs` and `net-stack` are an ordinary reviewed grant, not the developer floor's question. It
+obeys `utilities/0_conventions.md` like any utility: `help` at every depth, `[q] quit` on every wait over
+2 s, `list` and `search` as record producers that pipe, and the actions refusing in a pipe with a sentence.
+
+### 10.3 Transport: the registry is HTTPS, and Godspeed has no TLS
+
+The registry is static files read over HTTPS (the CLI repository's docs/publishing-design.md). Godspeed has TCP
+(`net-stack`, the `tcp` and `serve` utilities) and no TLS.
+
+**Decided 2026-10-16 by the operator: TLS, not plain HTTP.** The signed trust metadata would protect
+integrity and freshness over plain HTTP, but what a machine fetches would be visible to anyone on the path,
+and the operator ruled that out. So the native package manager carries a TLS client.
+
+**What it takes.** None of it is a kernel change; the TLS client lives in the `godspeed` service (10.2):
+
+- **TCP** from `net-stack`, which exists;
+- **randomness** for the key exchange: InspectKernel query 19, the hardware random word, which exists;
+- **a trustworthy date** for certificate validity, which is 10.4;
+- **root certificates**, a handful, built into the service (the registry's custom domain is served by
+  Cloudflare, whose certificates chain to one of a few public roots), and a way to update them with the
+  utility itself;
+- **fixed buffers**: a TLS record is up to 16 KiB, so about 16 to 20 KiB per connection plus room for the
+  server's certificate chain, which fits the no-heap rule (26.6.1) as static arrays.
+
+**The library, as surveyed 2026-10-16:**
+
+| candidate | fits the no-heap rule | the catch |
+|---|---|---|
+| `embedded-tls` (0.19.0, June 2026) | yes: `no_std`, no allocator except for its `rsa` feature; TLS 1.3 client; verifies the chain with `rustls-webpki` | **Apache-2.0 only**, and this tree is GPL-2.0-only, a combination the FSF considers incompatible. Its verifier checks one trusted root, so a few roots mean a few attempts |
+| `rustls` | needs a heap, as far as was checked (its `no_std` mode still uses `alloc`; not confirmed in its source) | the CLI's own TLS; licensing is fine (Apache-2.0 OR ISC OR MIT) |
+| BearSSL | yes, by design: no allocation at all | C, TLS 1.2 only, last released 2018; a C toolchain on every port's build |
+| a small TLS 1.3 client written here on RustCrypto primitives (MIT) | yes | one cipher suite, X25519, ECDSA P-256/P-384 and the X.509 checking the registry needs: security-critical code nobody has audited |
+
+The licence is the deciding question, and it is the operator's: ask `embedded-tls` for an MIT dual licence
+(the cheapest good outcome), accept the cost of writing the client here, or take on C. Until one is
+chosen the native package manager has no way to reach the registry.
+
+**How Linux does it, and the shape that suggests (proposed 2026-10-16, not decided).** On Linux, TLS is a
+userspace library: OpenSSL, GnuTLS, BoringSSL or rustls does the handshake and checks the certificates
+against a root store the distribution ships (the `ca-certificates` package). The kernel's part is
+optional and narrow: kTLS can take over encrypting and decrypting records once a library has finished the
+handshake, and since 6.5 a kernel that needs TLS for itself (NFS over TLS) asks a userspace daemon,
+`tlshd`, to do the handshake for it. The lesson is the split, and it matches this kernel's scope: TLS is a
+library in a service, and the kernel learns nothing about it. What is borrowed is that shape; the code is
+not, because OpenSSL and GnuTLS are Apache-2.0 and LGPL and are written for a heap (26.14). The authority
+is the specifications: RFC 8446 (TLS 1.3), RFC 5280 (certificates) and RFC 8448, which gives complete
+example TLS 1.3 handshakes, byte for byte, to test against.
+
+So the proposed client is **ours, in three parts**:
+
+- **the handshake and the record layer, written here** from RFC 8446: client only, TLS 1.3 only,
+  the cipher suite RFC 8446 makes mandatory, TLS_AES_128_GCM_SHA256, and X25519, with fixed buffers;
+- **certificate checking by `rustls-webpki`**, the verifier `rustls` itself uses: `alloc` and `std` are
+  default features it can be built without, its crypto is pluggable, and its licence is ISC (to be
+  confirmed), which GPL-2.0-only can include;
+- **the primitives from RustCrypto** (AES-GCM, SHA-256, HKDF, X25519, ECDSA P-256 and P-384), taken under
+  their MIT licence.
+
+ECDSA only, because RSA verification without a heap is the hard part, and an ECDSA-only client limits the
+registry to an ECDSA certificate chain. **Checked 2026-10-16 against the live registry**
+(`godspeed-registry.bankole-422.workers.dev`, the temporary address the CLI's README names), with
+`openssl s_client`, offering exactly what this client would - TLS 1.3, TLS_AES_128_GCM_SHA256, X25519 and
+ECDSA signatures only - and trusting ISRG Root X2 alone:
+
+| depth | certificate | key | signed with |
+|---|---|---|---|
+| 0 | `bankole-422.workers.dev` (valid to 2027-01-14) | ECDSA P-256 | ECDSA SHA-384, by YE2 |
+| 1 | Let's Encrypt YE2 | ECDSA P-384 | ECDSA SHA-384, by Root YE |
+| 2 | ISRG Root YE | ECDSA P-384 | ECDSA SHA-384, by ISRG Root X2 |
+| 3 | ISRG Root X2, self-signed, the trust anchor (valid to 2040-09-17) | ECDSA P-384 | - |
+
+The handshake completed and the chain verified, and the server proved its key with ecdsa_secp256r1_sha256.
+The server also sends ISRG Root X2 cross-signed by the RSA root X1; with X2 trusted directly that RSA
+signature is never checked. So the client needs ECDSA verification on P-256 (the handshake) and P-384 (the
+chain), SHA-256 and SHA-384, and no RSA at all. **Two caveats:** the registry moves to a custom domain,
+whose certificate Cloudflare may issue from a different authority, so this is checked again when it does
+(and the root list holds whatever anchors that chain needs); and a Let's Encrypt leaf lasts 90 days, which
+is fine because the client pins roots, never leaves. Writing the handshake here makes it security-critical code
+that nobody has audited, so it is tested against RFC 8448's traces, fuzzed as a parser, and kept to the one
+peer it serves.
+
+### 10.4 Time: verification needs a trustworthy date
+
+The timestamp role expires daily (the CLI repository's docs/trust-metadata.md), so verifying anything needs the
+wall clock to be right. Three facts from this tree bear on that:
+
+- the date comes from the `time` service, whose floor only ever rises and is persisted;
+- **any client of `time` could raise that floor without bound** (`OP_FLOOR_SET`, 3.3): one message could
+  push the machine's date years ahead for good, and every timestamp (and every certificate, 10.3) would
+  then look expired. That fails closed (no install, no forgery), but it is a lasting denial of the whole
+  package manager. **Being fixed (the operator agreed, 2026-10-16) on the branch `fix/time-floor`:**
+  `OP_FLOOR_SET` is retired, the floor is set by `time` alone from its own file and its own readings, and
+  `date sync` has `time` re-read that file when it never loaded. Not merged yet;
+- on x86 the RTC read behind `time` races across cores and can return a date years ahead
+  (`audits/2026-10-16-kernel-verification.md`, D23), which a lock around the CMOS pair would fix.
+
+A clock that is wrong in the other direction cannot replay an old index, because versions only increase.
+
+**Machines with no RTC already take the time from the network.** `time` runs the NTP exchange itself (every
+20 s until it has the time, then hourly), and the Pi 2, which has no clock of its own, gets its date that
+way. A machine that can reach the registry can reach a time server, so the package manager gets a correct
+date wherever it works at all. What NTP is not is authenticated: it is plain UDP, so something on the path
+could send a wrong time. Two things already bound the damage: the floor (a clock can never go back past
+the last time this machine recorded), and that a wrong date fails CLOSED in both checks that use it (an
+expired-looking timestamp or certificate refuses an install; it never accepts a forged one). Two ways to
+do better, for when it matters: NTS (RFC 8915), NTP whose keys come from a TLS handshake, which the TLS
+client above would make possible; or treating the registry's signed timestamp as an authenticated lower
+bound on the date.
+
+### 10.5 Where a kept package goes
+
+`docs/filesystem-layout.md` 10 reserves package storage for phase 4, "only when package management needs
+it". This is that moment. A proposal for the layout doc, not made here: `/system/packages/<publisher>/<name>/
+<version>/` holding the verified files as published, with the package manager the owner (L2) and nothing
+else writing there. Uninstall then deletes that folder and keeps the package's own data under
+`/system/services/<name>/` and `/users/`, as the CLI's contract requires; a `delete data` is separate and
+says what it destroys first. Until folder capabilities (phase 2) exist, the package manager's send cap to
+`fs` reaches the whole disk like every other `fs` client; that is acceptable for a reviewed in-tree service
+and is the reason it must not be a developer service.
+
+### 10.6 The shared crate
+
+`godspeed-package` is a library, not a program and not a package: it is the code that defines the package
+format and verifies it - the manifest, its signature, the file digests, the registry index and the trust
+metadata. The packages themselves are what contributors publish to the registry (the files in R2); the
+`godspeed` utility is the program on the machine. The CLI already uses this library to sign and check what
+it publishes, and the native utility would compile it in to verify what it downloads, so the same code
+does both. It lives in the CLI's repository (`crates/godspeed-package` there). Where it should live once
+this repository compiles it too, three options, the operator's to choose:
+
+1. a git dependency on a tagged release of `godspeed-cli`, the pattern 3.6 proposes for the stdlib in the
+   other direction;
+2. the crate moves to its own repository, depended on by both;
+3. the crate moves into this repository, beside the contract validator of 4.3, and the CLI depends on it.
+
+Option 3 matches 4.3's rule that the format a Godspeed machine verifies is defined where the machine is;
+option 1 is the smallest change. Whichever is chosen, `godspeed-package`'s own open question is answered
+here: "how the native side reads the text without a heap" (the CLI repository's docs/package-format.md, open question 1)
+is decided when the native package manager is, and that is now.
+
+### 10.7 What it needs from the kernel
+
+Nothing, for 10.1's first version: no syscall, no capability, no MISCIS change. It is a client of `fs`,
+`net-stack` and `time` like any other service. `install` proper needs 9.2, and 9.2 is where the kernel and
+supervisor questions are. The suggested order in 9.7 gains a step between 1 and 3: **the native package
+manager's fetch, verify, keep, list and remove**, once 10.3 and 10.4 are decided.
+
+### 10.8 Configuration: nothing that can change is compiled in
+
+**Decided 2026-10-16 by the operator.** The registry's address, and every other parameter that can change,
+lives in a file on the machine, so changing one never means rebuilding a binary or an image.
+
+**The file** is `/system/services/godspeed/config`, in the service's own folder (`docs/filesystem-layout.md`,
+L2): one `key value` per line, `#` for a comment. The utility reads it at the start of every command, so an
+edit takes effect at the next one; there is no reload step to forget. A missing file is written out with
+the defaults on first start, so the file always shows what is in effect, and `godspeed config` prints every
+value with where it came from (the file, or the default because the key is absent). Nothing is a hidden
+default (26.4).
+
+| key | default | what it is |
+|---|---|---|
+| `registry` | `https://godspeed-registry.bankole-422.workers.dev` | where packages are read. `https://` only: anything else is refused with the reason, because the transport is TLS (10.3) |
+| `trust-root` | `sha256:d769d1a64c3105c8da0ffcc2f54aba1c3a16ce4ae707a6d206556f08824a146d` | the registry's trust root, pinned on first contact (the CLI README's own pin). After first contact the root the machine reached is remembered, and root rotation happens in-band, signed |
+| `tls-roots` | `/system/services/godspeed/roots/`, holding ISRG Root X2 | the certificate authorities TLS accepts, one file per root. Adding a CA is adding a file (10.3's table says why X2 suffices today) |
+| `timeout-secs` | 30 | how long one request may take before it is abandoned and said so (`[q] quit` still applies) |
+| `max-package-mib` | 64 | the largest package the utility will download, so a hostile index cannot fill the disk |
+
+**Edited through the utility**, not only by hand: `godspeed config set <key> <value>` checks the value first
+(a URL that parses, a fingerprint of the right form, a folder that exists) and refuses with the reason, so a
+typo is caught when it is made rather than at the next install. The file stays plain text, and `edit` works
+on it too.
+
+**What a hostile edit could do, recorded rather than hidden.** Until folder capabilities exist
+(`docs/filesystem-layout.md` phase 2), any service with a send cap to `fs` can write this file. Changing
+`registry` gains it nothing: the pinned trust root refuses metadata the registry did not sign. Adding a TLS
+root lets it read what the machine fetches (confidentiality), not change it, for the same reason.
+Changing `trust-root` is the real one: it is equivalent to trusting another registry, so
+`godspeed config set trust-root` asks `[y/N]` and shows both fingerprints, and the utility refuses a file
+whose pin disagrees with the root it has already reached until the operator confirms. The full answer is
+folder capabilities, where only the package manager can write its own folder.
+
+**The same rule for the parameters other services compile in today.** `time`'s NTP server is a constant
+(`NTP_SERVER`, 162.159.200.123, `time.cloudflare.com`) in `services/time/src/main.rs`. Under this rule it
+moves to `/system/services/time/ntp`, read by `time` the way it reads its floor, with the constant as the
+default. That is a change to a running service, so it is its own reviewed change (QEMU first, one per
+flash), not part of this document.
+
+**The TLS library takes all of this from its caller.** The server name, the root certificates and the
+current time are arguments, never constants, so the library has no address in it to change.
