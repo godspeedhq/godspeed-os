@@ -408,3 +408,132 @@ the usual hardware cards, since the supervisor is on every board.
   from disk before that design exists would be exactly the trust shortcut it refuses.
 - **Letting a developer contract request anything and granting it.** 2.1. A build tool that turns a
   request into a grant is the "manifest grants" mistake the CLI's contract names first.
+
+---
+
+## 9. Beyond this proposal: what the CLI still needs from the OS
+
+**Added 2026-10-16, for the record. Not proposed here, not approved, and none of it is built.** Changes
+1 to 3 make `godspeed run` work for a service. The CLI (`godspeed-cli` 0.1.0, released) still refuses
+five more things, each because the OS does not provide what it would need. They are listed here so that
+the operator has one place to see the CLI's whole dependency on the OS. Each is the OS's to design, under
+its own constitution. The CLI follows; it never works around one.
+
+| the CLI refuses | because the OS lacks | where the OS already says so |
+|---|---|---|
+| `godspeed run` | developer services in a build | this document, changes 1 to 3 |
+| `godspeed install` (on a Godspeed machine) | images loaded from `fs`, signed, with a local grant policy | `docs/service-ownership.md`, step 2 |
+| `godspeed new utility` | a terminating task | `docs/stdlib-design.md` 1, option B |
+| `godspeed new driver` | device grants for a driver built outside the tree | the supervisor's spawn rows, by device kind |
+| `godspeed new app` | public application interfaces | nowhere yet |
+| anything but Rust | a stable, documented ABI below `gs` | CLAUDE.md Appendix B (non-normative) |
+
+### 9.1 What the floor (3.3) runs, measured against the CLI's own examples
+
+`godspeed-cli/examples/` holds three services, built for all four ISAs in that repository's CI. Against
+the floor as it stands, with the public send set empty:
+
+| example | asks for | under the floor |
+|---|---|---|
+| `heartbeat` | `log_write` | runs |
+| `shout` | `log_write`, `ipc_receive = ["shout"]` | runs; but no developer service can be its client, since `shout` is not in the public set |
+| `bootcount` | `log_write`, `ipc_send = ["fs"]` | refused by the build: `fs` is not at the floor until folder capabilities exist |
+
+That is the floor working as intended, not a defect. When the build refuses `bootcount`, the CLI will
+report the refusal as the build states it, with the reason this document gives.
+
+### 9.2 Installing: images from `fs`, signed
+
+This is step 2 of `docs/service-ownership.md`, and it is what turns a published package into something a
+Godspeed machine can run without being rebuilt. It needs three things. The CLI side of the first is
+already built.
+
+- **A verifier at spawn.** The package format is defined and versioned: `manifest.toml`, `manifest.sig`,
+  `contract.toml` and one ELF per ISA (`godspeed-cli/docs/package-format.md`). So is the registry's trust
+  metadata: root, namespaces with active, retired and revoked keys, snapshot and timestamp
+  (`docs/trust-metadata.md` there, modelled on TUF). Both are verified by `godspeed-package`, a crate
+  that is `no_std` and allocator-free and is built for all four targets in CI, so the native package
+  manager and a loader can share the exact code the registry and the CLI use. Whether the loader checks
+  the publisher's signature, the registry's trust chain, or both, is the OS's decision.
+- **A loader:** the supervisor (or a service it trusts) reading an image from `fs` and spawning it.
+  `docs/service-ownership.md` is explicit that nothing reads an image from disk today.
+- **A local grant policy:** who decides what an installed package's requested capabilities become, and
+  how that decision is shown. It is not designed (2, last point but one). The developer grant policy
+  (3.3) is the build-time answer for one case. An installed package needs the runtime one.
+
+Then: `godspeed install`, `update` and `uninstall` on a Godspeed machine, and the Stranger Test's second
+half.
+
+### 9.3 `utility`: a terminating task
+
+`docs/stdlib-design.md` 1 already sets this out and recommends **option B**: an `Exit(status)` syscall
+and one supervisor arm, as a separate reviewed change with a CLAUDE.md amendment (8.2's `CallDeadline` is
+the precedent). For the CLI to ship a `utility` template, these are needed on top of the syscall:
+
+- **an entry point that may return:** `fn main()`, or whatever form `gs` settles on, with a status type;
+- **supervisor policy:** a finished task is not respawned, and its status goes to whoever started it;
+- **a way to start one on demand:** today the utilities are functions inside `services/shell`, so a
+  separately built utility needs the shell (or a launcher) to start an image by name, pass it
+  arguments, attach its output, and report its status. No argument-passing mechanism exists.
+
+Then: `godspeed new utility`, and `godspeed run` showing the utility's output and exit status. A
+terminating task also gives `godspeed test` a natural verdict for a service's tests: they run, end and
+report.
+
+### 9.4 `driver`: device grants from outside the tree
+
+`gs::driver` exists, but a device is granted only by the supervisor's compiled spawn rows, by device
+kind. The contract's hardware keys (`hw_device`, `hw_pci_class`, `hw_pci_irq`, ...) are stated for
+review, and nothing grants from them. The developer floor (3.3) refuses every one of them, rightly. A
+`driver` template needs a design for:
+
+- **who approves** a device going to a driver built outside the tree: the operator, explicitly, never a
+  contract;
+- **exclusivity:** one driver per device, and what happens to the in-tree driver it displaces;
+- **discovery:** how such a driver is matched to what `hw-enumerator` found, without the kernel
+  resolving anything from a name.
+
+Then: `godspeed new driver`. It is security-sensitive, so the design is the work. The code is small.
+
+### 9.5 `app`: public application interfaces
+
+Nothing exists to build on, and this is the largest of the five. The `console` service owns the
+framebuffer, and `console_push` is the keyboard ring the shell reads. An app needs, at minimum:
+
+- a surface it may draw on, shared or arbitrated with the console;
+- input delivered to whichever app has focus, rather than to the shell's ring;
+- a lifecycle: started, foregrounded, backgrounded, ended. That depends on 9.3.
+
+The first step is deciding what an "app" is on Godspeed. The interfaces come after.
+
+Then: `godspeed new app`.
+
+### 9.6 Other languages
+
+CLAUDE.md Appendix B.2 says any language producing a freestanding ELF "and call via that ABI" can run as
+a service, and that C "would need a `sdk/c/` of thin syscall wrappers". Two things stand in the way:
+
+- **The ABI is not documented as stable.** B.2 still says "System V AMD64", but `sdk/rust/src/syscall.rs`
+  documents four per-ISA conventions (x86-64 traps with `ud2`, rax plus rdi/rsi/rdx; aarch64 uses
+  `svc #0` with x16; riscv64 `ecall` with a7; armv7 `svc #0`, r0-r3). A non-Rust service would also
+  have to reproduce the service-context page and its magic, the capability-slot conventions, and the
+  `user.ld` layout, none of which is a public contract.
+- **A C interface to `gs` itself** (a header and a static library) would be safer than raw syscall
+  wrappers: it keeps the stdlib's error handling and outcome-unknown semantics, which raw calls lose.
+
+B.2 rules Go (and other languages with substantial runtimes) out of scope as multi-month ports. The CLI
+agrees, and its documentation says so. Then: a C or C++ build backend in the CLI. Packages and publishing
+do not change, because the package format does not care what compiled the ELF.
+
+### 9.7 Suggested order
+
+1. **This document, changes 1 to 3:** `godspeed run` for services. Everything below needs something
+   that runs.
+2. **`Exit` (9.3):** utilities. It is the smallest kernel change on this list, and the most useful.
+3. **Images from `fs`, signed (9.2):** installing. The verifier exists.
+4. **Device grants (9.4):** drivers.
+5. **Application interfaces (9.5):** apps. Design first.
+6. **A documented ABI (9.6):** whenever a second language is wanted. It is independent of the rest.
+
+For each step, the CLI's side is small once the OS's exists: a template, its CI build, and `run` or
+`install` support. A kind the OS cannot run stays refused until then, with the reason and a pointer here.
