@@ -163,7 +163,7 @@ A developer service may be given:
 | `log_write = true` | the log |
 | `ipc_send = [names]` | send caps to those names, **from the public set only** (below) |
 | `ipc_receive = [name]` or an explicit endpoint (4.2) | its own endpoint |
-| `resources.memory.limit` | that limit, up to a ceiling (64 MiB proposed - the largest any example takes) |
+| `resources.memory.limit` | that limit, as written: there is no ceiling (decided 2026-10-16; question 1 in 7) |
 | `placement.core` | a preference, never strict |
 
 **A send peer is authority, not plumbing.** On Godspeed a service holds no file or socket until a server
@@ -195,7 +195,10 @@ server answers an arbitrary client safely:
 - **`events`** when its read ops are gated or scoped to the asker, and its write ops attribute
   by the kernel's badge rather than the name a client supplies;
 - **`time`** when the floor is set by a holder of storage alone, the way it is written and read on the way
-  down and up (its own comment calls it "persisted by whoever holds storage");
+  down and up (its own comment calls it "persisted by whoever holds storage"). Being done (2026-10-16,
+  branch `fix/time-floor`): `OP_FLOOR_SET` is retired and the floor is `time`'s alone. Once that merges,
+  `time` answers only `OP_NOW`, `OP_FLOOR_GET` and `OP_SYNC`, and joining the set is an amendment that
+  weighs `OP_SYNC` (a client can make it send an NTP query);
 - **`fs`** with folder capabilities, as a grant of the service's own `/system/services/<name>/` and
   nothing wider;
 - **`net-stack`** with a design for what an untrusted program may reach on the network.
@@ -412,7 +415,15 @@ the usual hardware cards, since the supervisor is on every board.
 
 ## 7. Questions for the operator
 
-1. The memory ceiling for a developer service: 64 MiB, or something else?
+1. ~~The memory ceiling for a developer service: 64 MiB, or something else?~~ **Answered 2026-10-16:
+   none.** The developer declares the limit they want. A limit is a budget, not a reservation (nothing is
+   set aside at spawn), so a large one costs nothing until it is used. A service whose image and stack
+   cannot be given memory is not started, which is what happens today and is logged. **Still open:** what
+   happens when a running developer service asks for more than its limit. Today it is told no
+   (`AllocDenied`) and keeps running, the recoverable failure CLAUDE.md 10.4 defines for every service; the
+   operator would rather it were killed. Killing it in the kernel would amend 10.4 for every service (the
+   kernel knows no service as a developer one); having the standard library treat the refusal as fatal for
+   developer services would not.
 2. The maximum number of developer services in one image: four?
 3. ~~May a developer image be flashed to hardware?~~ **Proposed answer: yes, on the floor as it stands**,
    because that floor reaches no disk, network or device (3.5). Reopened if the floor widens.
@@ -612,20 +623,35 @@ obeys `utilities/0_conventions.md` like any utility: `help` at every depth, `[q]
 ### 10.3 Transport: the registry is HTTPS, and Godspeed has no TLS
 
 The registry is static files read over HTTPS (the CLI repository's docs/publishing-design.md). Godspeed has TCP
-(`net-stack`, the `tcp` and `serve` utilities) and no TLS. Two ways out, and the choice is the operator's:
+(`net-stack`, the `tcp` and `serve` utilities) and no TLS.
 
-- **Plain HTTP, relying on the signatures.** The trust metadata is modelled on TUF exactly so that
-  integrity and freshness do not rest on the transport: every file is named by its digest from a signed
-  index, the timestamp expires daily, and versions only increase. Over plain HTTP an attacker on the path
-  can block or delay a fetch, and can see which packages a machine asks for; it cannot forge or roll back
-  one. This needs the registry to serve the same files over HTTP as well, which is the CLI repository's
-  decision, not this one's.
-- **A TLS client on Godspeed.** It would have to fit the no-heap rule (26.6.1), handle certificates, and
-  keep a trust store current. No candidate was evaluated here. It is much larger than the package manager
-  it would serve.
+**Decided 2026-10-16 by the operator: TLS, not plain HTTP.** The signed trust metadata would protect
+integrity and freshness over plain HTTP, but what a machine fetches would be visible to anyone on the path,
+and the operator ruled that out. So the native package manager carries a TLS client.
 
-The first is the smaller honest step, and it loses nothing the signatures protect. Confidentiality of
-what a machine fetches is the thing given up, and that should be said wherever the feature is described.
+**What it takes.** None of it is a kernel change; the TLS client lives in the `godspeed` service (10.2):
+
+- **TCP** from `net-stack`, which exists;
+- **randomness** for the key exchange: InspectKernel query 19, the hardware random word, which exists;
+- **a trustworthy date** for certificate validity, which is 10.4;
+- **root certificates**, a handful, built into the service (the registry's custom domain is served by
+  Cloudflare, whose certificates chain to one of a few public roots), and a way to update them with the
+  utility itself;
+- **fixed buffers**: a TLS record is up to 16 KiB, so about 16 to 20 KiB per connection plus room for the
+  server's certificate chain, which fits the no-heap rule (26.6.1) as static arrays.
+
+**The library, as surveyed 2026-10-16:**
+
+| candidate | fits the no-heap rule | the catch |
+|---|---|---|
+| `embedded-tls` (0.19.0, June 2026) | yes: `no_std`, no allocator except for its `rsa` feature; TLS 1.3 client; verifies the chain with `rustls-webpki` | **Apache-2.0 only**, and this tree is GPL-2.0-only, a combination the FSF considers incompatible. Its verifier checks one trusted root, so a few roots mean a few attempts |
+| `rustls` | needs a heap, as far as was checked (its `no_std` mode still uses `alloc`; not confirmed in its source) | the CLI's own TLS; licensing is fine (Apache-2.0 OR ISC OR MIT) |
+| BearSSL | yes, by design: no allocation at all | C, TLS 1.2 only, last released 2018; a C toolchain on every port's build |
+| a small TLS 1.3 client written here on RustCrypto primitives (MIT) | yes | one cipher suite, X25519, ECDSA P-256/P-384 and the X.509 checking the registry needs: security-critical code nobody has audited |
+
+The licence is the deciding question, and it is the operator's: ask `embedded-tls` for an MIT dual licence
+(the cheapest good outcome), accept the cost of writing the client here, or take on C. Until one is
+chosen the native package manager has no way to reach the registry.
 
 ### 10.4 Time: verification needs a trustworthy date
 
@@ -633,15 +659,16 @@ The timestamp role expires daily (the CLI repository's docs/trust-metadata.md), 
 wall clock to be right. Three facts from this tree bear on that:
 
 - the date comes from the `time` service, whose floor only ever rises and is persisted;
-- **any client of `time` can raise that floor without bound today** (`OP_FLOOR_SET`, 3.3): one message
-  could push the machine's date years ahead for good, and every timestamp would then look expired. That
-  fails closed (no install, no forgery), but it is a lasting denial of the whole package manager;
+- **any client of `time` could raise that floor without bound** (`OP_FLOOR_SET`, 3.3): one message could
+  push the machine's date years ahead for good, and every timestamp (and every certificate, 10.3) would
+  then look expired. That fails closed (no install, no forgery), but it is a lasting denial of the whole
+  package manager. **Being fixed (the operator agreed, 2026-10-16) on the branch `fix/time-floor`:**
+  `OP_FLOOR_SET` is retired, the floor is set by `time` alone from its own file and its own readings, and
+  `date sync` has `time` re-read that file when it never loaded. Not merged yet;
 - on x86 the RTC read behind `time` races across cores and can return a date years ahead
-  (`audits/2026-10-16-kernel-verification.md`, D23).
+  (`audits/2026-10-16-kernel-verification.md`, D23), which a lock around the CMOS pair would fix.
 
-So the `time` finding stops being hypothetical once a package manager exists: it should be settled (the
-floor set only by the holder of storage, as 3.3 proposes) before `search` ships. A clock that is wrong in
-the other direction cannot replay an old index, because versions only increase.
+A clock that is wrong in the other direction cannot replay an old index, because versions only increase.
 
 ### 10.5 Where a kept package goes
 
@@ -656,8 +683,13 @@ and is the reason it must not be a developer service.
 
 ### 10.6 The shared crate
 
-The native side depends on `godspeed-package`, which lives in the CLI's repository. Three options, the
-operator's to choose:
+`godspeed-package` is a library, not a program and not a package: it is the code that defines the package
+format and verifies it - the manifest, its signature, the file digests, the registry index and the trust
+metadata. The packages themselves are what contributors publish to the registry (the files in R2); the
+`godspeed` utility is the program on the machine. The CLI already uses this library to sign and check what
+it publishes, and the native utility would compile it in to verify what it downloads, so the same code
+does both. It lives in the CLI's repository (`crates/godspeed-package` there). Where it should live once
+this repository compiles it too, three options, the operator's to choose:
 
 1. a git dependency on a tagged release of `godspeed-cli`, the pattern 3.6 proposes for the stdlib in the
    other direction;
