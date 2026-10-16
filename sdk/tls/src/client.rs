@@ -37,7 +37,7 @@ use crate::codec::{Reader, Writer};
 use crate::ecdhe::{self, X25519_LEN};
 use crate::record::{self, content, Protector, HEADER_LEN, LEGACY_VERSION, MAX_PLAINTEXT};
 use crate::schedule::{self, Transcript, HASH_LEN};
-use crate::TlsError;
+use crate::{CertProblem, TlsError};
 
 /// Handshake message types (RFC 8446 4).
 mod msg {
@@ -105,7 +105,7 @@ pub struct CertificateChain<'a> {
 }
 
 impl<'a> CertificateChain<'a> {
-    fn parse(list: &'a [u8]) -> Result<Self, TlsError> {
+    pub(crate) fn parse(list: &'a [u8]) -> Result<Self, TlsError> {
         let mut r = Reader::new(list);
         let mut count = 0;
         while !r.is_empty() {
@@ -694,7 +694,12 @@ fn alert_description(e: TlsError) -> Option<u8> {
         TlsError::DecryptFailed => 20,
         TlsError::RecordTooLarge => 22,
         TlsError::HelloRetryRequest => 40,
-        TlsError::CertificateRejected | TlsError::NoCertificate => 42,
+        TlsError::CertificateRejected(CertProblem::Expired | CertProblem::NotYetValid) => 45,
+        TlsError::CertificateRejected(CertProblem::UnknownIssuer) => 48,
+        TlsError::CertificateRejected(CertProblem::UnsupportedAlgorithm) => 43,
+        // A verifier that was set up wrongly is this end's fault, not the server's.
+        TlsError::CertificateRejected(CertProblem::NoRoots | CertProblem::BadRoot) => 80,
+        TlsError::CertificateRejected(_) | TlsError::NoCertificate => 42,
         TlsError::IllegalParameter | TlsError::ZeroSharedSecret => 47,
         TlsError::DecodeError | TlsError::BadRecordHeader | TlsError::NoContentType => 50,
         TlsError::BadFinished | TlsError::BadSignature => 51,

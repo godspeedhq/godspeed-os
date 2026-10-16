@@ -40,14 +40,17 @@
 #![no_std]
 #![deny(unsafe_code)]
 
+
 pub mod client;
 mod codec;
 pub mod ecdhe;
 pub mod record;
 pub mod schedule;
+pub mod verify;
 
 pub use client::{CertificateChain, Client, Event, Hello, ServerVerifier};
 pub use record::record_len;
+pub use verify::WebPkiVerifier;
 
 #[cfg(test)]
 mod rfc8448;
@@ -55,6 +58,10 @@ mod rfc8448;
 mod tests;
 #[cfg(test)]
 mod client_tests;
+#[cfg(test)]
+mod certs;
+#[cfg(test)]
+mod verify_tests;
 
 /// Every way this crate refuses. Each is final for the connection it happened on: TLS has no "try again"
 /// at this layer, and a caller that carries on after one is carrying on with a broken connection.
@@ -98,8 +105,8 @@ pub enum TlsError {
     BadFinished,
     /// The verifier refused the server's CertificateVerify signature.
     BadSignature,
-    /// The verifier refused the server's certificate chain.
-    CertificateRejected,
+    /// The verifier refused the server's certificate chain, for this reason.
+    CertificateRejected(CertProblem),
     /// The server sent an empty certificate list.
     NoCertificate,
     /// The server asked for a client certificate, which this client does not have.
@@ -110,4 +117,32 @@ pub enum TlsError {
     BadServerName,
     /// Application data before the handshake finished, or after close.
     NotConnected,
+}
+
+/// Why a certificate chain was refused. Each names something a person can act on, because "the
+/// certificate was rejected" alone sends them looking in the wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertProblem {
+    /// A certificate on the path has expired, or the clock is ahead.
+    Expired,
+    /// A certificate on the path is not valid yet, or the clock is behind.
+    NotYetValid,
+    /// The chain does not reach any of the trusted roots.
+    UnknownIssuer,
+    /// The leaf certificate is for another name.
+    NameMismatch,
+    /// A signature in the chain does not verify.
+    BadChainSignature,
+    /// A certificate is signed with something other than ECDSA P-256 or P-384.
+    UnsupportedAlgorithm,
+    /// A certificate used outside its role: a CA as the server, a leaf as a CA, or one not for TLS servers.
+    WrongRole,
+    /// The server sent more certificates than [`verify::MAX_CHAIN`].
+    ChainTooLong,
+    /// The verifier was given no roots, or more than [`verify::MAX_ROOTS`].
+    NoRoots,
+    /// One of the trusted roots given to the verifier does not parse.
+    BadRoot,
+    /// A certificate does not parse.
+    Malformed,
 }

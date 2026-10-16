@@ -44,7 +44,7 @@ impl ServerVerifier for Recorder {
         self.leaf[..leaf.len()].copy_from_slice(leaf);
         self.leaf_len = leaf.len();
         if self.refuse_chain {
-            return Err(TlsError::CertificateRejected);
+            return Err(TlsError::CertificateRejected(crate::CertProblem::UnknownIssuer));
         }
         Ok(())
     }
@@ -227,8 +227,8 @@ fn an_altered_certificate_breaks_the_finished_even_if_the_verifier_accepts_it() 
 fn the_verifier_decides_the_certificate_and_the_signature() {
     let refuse_chain = Recorder { refuse_chain: true, ..Recorder::default() };
     let (r, alert, n) = read_altered_flight(|_| {}, refuse_chain);
-    assert_eq!(r, Err(TlsError::CertificateRejected));
-    assert_eq!(alert_of(&alert[..n], &CLIENT_HS), [2, 42]);
+    assert_eq!(r, Err(TlsError::CertificateRejected(crate::CertProblem::UnknownIssuer)));
+    assert_eq!(alert_of(&alert[..n], &CLIENT_HS), [2, 48]);
     let refuse_signature = Recorder { refuse_signature: true, ..Recorder::default() };
     let (r, alert, n) = read_altered_flight(|_| {}, refuse_signature);
     assert_eq!(r, Err(TlsError::BadSignature));
@@ -506,4 +506,98 @@ fn handshake_bytes_after_a_key_change_in_the_same_record_are_refused() {
     let (rec, n) = plaintext(content::HANDSHAKE, &body);
     let mut out = [0u8; 64];
     assert_eq!(read(&mut c, &rec[..n], &mut out), Err(TlsError::UnexpectedMessage));
+}
+
+/// A small deterministic generator, so a failure names the iteration that found it.
+struct XorShift(u64);
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Mutate `bytes` in place: flip bits, overwrite bytes with the values a parser finds most interesting, or
+/// cut the message short. Returns the new length.
+fn mutate(rng: &mut XorShift, bytes: &mut [u8], len: usize) -> usize {
+    let mut len = len;
+    for _ in 0..1 + rng.below(4) {
+        match rng.below(4) {
+            0 => bytes[rng.below(len)] ^= 1 << rng.below(8),
+            1 => bytes[rng.below(len)] = [0x00, 0xff, 0x7f, 0x80, 0x01][rng.below(5)],
+            2 => bytes[rng.below(len)] = rng.next() as u8,
+            _ => len = 1 + rng.below(len),
+        }
+    }
+    len
+}
+
+#[test]
+fn mutated_server_messages_never_panic_and_never_connect() {
+    // Every mutation reaches the parsers: the ServerHello is plaintext, and the encrypted flight is resealed
+    // after mutating, so it decrypts and is parsed rather than failing its tag. A mutation that happened to
+    // change nothing (a byte set to the value it had) is skipped, since the RFC's own bytes must connect.
+    let mut rng = XorShift(0x9e37_79b9_7f4a_7c15);
+    let mut refused = [0usize; 2]; // at the ServerHello, in the flight
+    for _ in 0..20_000 {
+        let mut buf = [0u8; 4096];
+        let mut c = rfc_client(Recorder::default(), &mut buf);
+        let mut out = [0u8; 256];
+        let mut sh = v::SERVER_HELLO;
+        let mutate_hello = rng.below(4) == 0;
+        let sh_len = if mutate_hello { mutate(&mut rng, &mut sh, 90) } else { 90 };
+        let mut flight = v::SERVER_HS_RECORD_PAYLOAD;
+        let full = flight.len();
+        let len = mutate(&mut rng, &mut flight, full);
+        if sh[..sh_len] == v::SERVER_HELLO[..] && flight[..len] == v::SERVER_HS_RECORD_PAYLOAD[..] {
+            continue;
+        }
+        let (rec, n) = plaintext(content::HANDSHAKE, &sh[..sh_len]);
+        if read(&mut c, &rec[..n], &mut out).is_err() {
+            refused[0] += 1;
+            continue;
+        }
+        let mut rec = [0u8; 1024];
+        let n = server_record(&SERVER_HS, 0, content::HANDSHAKE, &flight[..len], &mut rec);
+        let r = read(&mut c, &rec[..n], &mut out);
+        // The Finished covers every handshake byte, so no changed byte can leave the handshake complete.
+        assert!(!matches!(r, Ok((Event::Connected, _))), "a mutated handshake connected");
+        refused[1] += 1;
+        let mut alert = [0u8; 64];
+        c.failure_alert(&mut alert).unwrap();
+    }
+    assert!(refused[0] > 1000 && refused[1] > 10_000, "{refused:?}");
+}
+
+#[test]
+fn mutated_records_never_panic_and_never_open() {
+    // The framing and the record layer, with mutations anywhere in an encrypted record, header included.
+    let mut rng = XorShift(0x2545_f491_4f6c_dd1d);
+    let mut tried = 0;
+    for _ in 0..20_000 {
+        let mut buf = [0u8; 4096];
+        let mut c = rfc_client(Recorder::default(), &mut buf);
+        let mut out = [0u8; 256];
+        let (sh, n) = plaintext(content::HANDSHAKE, &v::SERVER_HELLO);
+        read(&mut c, &sh[..n], &mut out).unwrap();
+        let mut rec = v::SERVER_HS_RECORD;
+        let full = rec.len();
+        let len = mutate(&mut rng, &mut rec, full);
+        if rec[..len] == v::SERVER_HS_RECORD[..] {
+            continue;
+        }
+        tried += 1;
+        let r = match record::record_len(&rec[..len.min(5)]) {
+            Ok(total) if total == len => c.read_record(&mut rec[..len], &mut out),
+            Ok(_) => Err(TlsError::BadRecordHeader),
+            Err(e) => Err(e),
+        };
+        assert!(r.is_err(), "a changed record was accepted: {r:?}");
+    }
+    assert!(tried > 19_000, "{tried}");
 }

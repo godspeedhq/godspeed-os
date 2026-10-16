@@ -24,3 +24,11 @@ hmac = { version = "0.12", default-features = false }
 hkdf = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+# Certificate chains (`verify`). rustls-webpki is ISC and its `untrusted` dependency ISC; pki-types, p256, p384
+# and ecdsa are MIT OR Apache-2.0. webpki is built without `alloc` and without a crypto provider: the ECDSA
+# checks it asks for are the p256/p384 ones in `verify`.
+rustls-webpki = { version = "0.103", default-features = false }
+rustls-pki-types = { version = "1.12", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+ecdsa = { version = "0.16", default-features = false, features = ["der", "verifying"] }

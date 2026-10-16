@@ -652,8 +652,8 @@ and the operator ruled that out. So the native package manager carries a TLS cli
 | a small TLS 1.3 client written here on RustCrypto primitives (MIT) | yes | one cipher suite, X25519, ECDSA P-256/P-384 and the X.509 checking the registry needs: security-critical code nobody has audited |
 
 The licence is the deciding question, and it is the operator's: ask `embedded-tls` for an MIT dual licence
-(the cheapest good outcome), accept the cost of writing the client here, or take on C. Until one is
-chosen the native package manager has no way to reach the registry.
+(the cheapest good outcome), accept the cost of writing the client here, or take on C. **Decided
+2026-10-16: written here** - the operator asked for "ours", after how Linux does it (below).
 
 **How Linux does it, and the shape that suggests (proposed 2026-10-16, not decided).** On Linux, TLS is a
 userspace library: OpenSSL, GnuTLS, BoringSSL or rustls does the handshake and checks the certificates
@@ -671,8 +671,8 @@ So the proposed client is **ours, in three parts**:
 - **the handshake and the record layer, written here** from RFC 8446: client only, TLS 1.3 only,
   the cipher suite RFC 8446 makes mandatory, TLS_AES_128_GCM_SHA256, and X25519, with fixed buffers;
 - **certificate checking by `rustls-webpki`**, the verifier `rustls` itself uses: `alloc` and `std` are
-  default features it can be built without, its crypto is pluggable, and its licence is ISC (to be
-  confirmed), which GPL-2.0-only can include;
+  default features it can be built without, its crypto is pluggable, and its licence is ISC (confirmed
+  in its crate metadata, as is its `untrusted` dependency's), which GPL-2.0-only can include;
 - **the primitives from RustCrypto** (AES-GCM, SHA-256, HKDF, X25519, ECDSA P-256 and P-384), taken under
   their MIT licence.
 
@@ -698,6 +698,33 @@ whose certificate Cloudflare may issue from a different authority, so this is ch
 is fine because the client pins roots, never leaves. Writing the handshake here makes it security-critical code
 that nobody has audited, so it is tested against RFC 8448's traces, fuzzed as a parser, and kept to the one
 peer it serves.
+
+**Built, 2026-10-16: `sdk/tls` (`godspeed-tls`), a library, no service uses it yet.** The three parts
+above, as proposed. `no_std`, no heap, no `unsafe`; the caller owns the socket and every buffer, and hands
+the client one record at a time. What it was checked against:
+
+- **RFC 8448 section 3, byte for byte**: every secret and key, and the client's Finished, application
+  record and close_notify come out as the RFC's own records.
+- **Refusals**, each shown to fire: a ServerHello that picks anything not offered, a HelloRetryRequest, a
+  TLS 1.2 server, an extension never offered, handshake bytes after a key change, an altered Finished, an
+  altered certificate the verifier accepted (the Finished still catches it), a CertificateRequest, an
+  oversized message, application data before the handshake.
+- **The verifier, on the registry's real chain** (captured 2026-10-16) pinned to ISRG Root X2: accepted,
+  and refused for a wrong name, an expired or not-yet-valid clock, another root, a missing intermediate,
+  a flipped signature bit; a CA used as the server, an RSA certificate, a P-256 key under the P-384
+  scheme.
+- **Mutation**: 20,000 mutated server handshakes, resealed so each reaches the parsers, and 20,000
+  mutated encrypted records. None panics and none that changed a byte connects.
+- **Live, from a host harness** (not committed): against `openssl s_server` 3.5.7, which counts the
+  handshake as finished; and against the registry itself, verified for real - chain to ISRG Root X2,
+  CertificateVerify by the leaf's key - answering HTTP 200. Pinned to the wrong root it is refused, and a
+  wrong name is refused with an alert openssl receives (alert 42).
+- **Device builds**: all four targets; the emitted code of every crypto and certificate crate holds no
+  SIMD instruction, because the x86 kernel saves no SSE or AVX state (`.cargo/config.toml`).
+
+**Not yet**: a live KeyUpdate (unit-tested only; openssl's Windows server would not send one), revocation
+(no CRL or OCSP: both need a second fetch and a heap; the leaves this client meets last 90 days), and
+the service that uses it, which also measures its stack, since webpki builds the path recursively.
 
 ### 10.4 Time: verification needs a trustworthy date
 
