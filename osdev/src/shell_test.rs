@@ -8235,6 +8235,15 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
     }}; }
 
+    // ---- THE FIRST NETWORK COMMAND OF A BOOT IS A `tcp`. On the Wyse the shell starts before net-stack, and
+    //      a `tcp` before any other network command said "net-stack did not answer within 20s" in a few
+    //      seconds, having never reached it: the noticing wait did not reacquire a peer it could not send to
+    //      (`stdlib/rust/src/call.rs`, `request_within_notice`). Port 1 on the gateway refuses, so an answer
+    //      here is "connected to nothing" - net-stack answered - and never "did not answer".
+    let first_tcp = run!(b"tcp 10.0.2.2 1 hi\r", 60);
+    check!(!first_tcp.contains("did not answer"),
+           "the boot's first `tcp` reaches net-stack, whatever order the shell and net-stack started in");
+
     // ---- `drives flash ... yes` answers the confirmation in advance (`utilities/15_drives.md`), and the
     //      fresh volume is the one every check below runs on.
     let flashed = run!(b"drives flash data yes\r", 60);
