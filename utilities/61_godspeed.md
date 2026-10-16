@@ -11,55 +11,103 @@ crate is already called `godspeed`; it appears in `status` while a command runs 
 
 ## Status, as built and honest (2026-10-16)
 
-Built on `feat/tls`: the settings and the registry check. Searching for, fetching and keeping packages are
-**not built**: they need the registry's signed metadata format (the CLI repository's `godspeed-package`
-crate), and a machine that could fetch a package still could not run it (10.1). QEMU only, no board yet:
-`osdev test godspeed` (24 checks) runs every command against a real disk and reaches the real registry
-over verified TLS through QEMU's user network (its registry checks are skipped, not passed, when the
-machine running the test is offline).
+Built on `feat/tls`: the registries, the settings and the registry check. Searching for, fetching and
+keeping packages are **not built**: they need the registry's signed metadata format (the CLI repository's
+`godspeed-package` crate), and a machine that could fetch a package still could not run it (10.1). QEMU
+only, no board yet: `osdev test godspeed` runs every command against a real disk and reaches the real
+registry over verified TLS through QEMU's user network (its registry checks are skipped, not passed, when
+the machine running the test is offline).
 
 ## 1. The command
 
 ```
-godspeed config                       every setting, its value, and where it came from
-godspeed config set <key> <value>     change one setting, checked first
-godspeed check                        reach the registry over verified TLS, one row per step
-godspeed help                         what each does
+godspeed registry                                  the registries this machine knows; one is in use
+godspeed registry add <name> <url> <root> [yes]    know another; asks [y/N] before trusting its root
+godspeed registry use <name>                       search and install from that one from now on
+godspeed registry remove <name>                    forget one (not the one in use)
+godspeed config [<key>]                            the plain settings, or one, and where each came from
+godspeed config set <key> <value>                  change one setting, checked first
+godspeed check                                     reach the registry in use over verified TLS, one row per step
+godspeed help                                      what each does
 godspeed version
 ```
 
 A bare `godspeed` prints its usage and fails (rule 1). Every command reads the settings file first, so an
 edit takes effect at the next command; there is nothing to reload.
 
-## 2. The settings
+## 2. Registries
 
-`/system/services/godspeed/config`, one `key value` per line, `#` starting a comment. A missing file is
-written with every default on first start, so the file always shows what is in effect, and `godspeed
-config` says of each value whether it came from the `file` or is the `default` because the key is absent.
+A machine knows up to eight registries, and **exactly one is in use**: the one searched, and the one a new
+install comes from. There is no priority between registries because only one is ever asked, so a package
+is never found in two places at once.
+
+A registry is three things, kept together on one line of the file:
+
+- a **name** - what `use` and `remove` call it: 1 to 32 lower-case letters, digits and hyphens;
+- an **address** - `https://` only, because the transport is TLS;
+- a **signing root** - `sha256:` and 64 hex digits, the root its metadata must be signed by. Each registry
+  has its own, so switching registries switches which root is checked and never trusts one registry with
+  another's root. **Nothing checks it yet**: it is for the metadata check, which is not built.
+
+`godspeed registry add` shows the root and asks `[y/N]` before trusting it, because trusting a root is
+trusting whoever holds its key. `yes` as the last word answers in advance, as for `seal` and `chaos
+max-carnage`; the line naming the root still prints. A registry is added known, not in use, and the answer
+says `godspeed registry use <name>` to switch. `remove` refuses the one in use: switch first, so something
+is always in use.
+
+**An installed package will remember the registry it came from**, and an update will fetch from there,
+not from whichever registry is in use at the time. Otherwise switching registries would quietly change
+where installed packages update from, and a package with the same name on another registry, signed by
+another key, could replace one. If that registry has been removed, the update says so rather than trying
+another. This is the rule installing will follow; nothing installs yet.
+
+`godspeed registry` is one row per registry: `item` its name, `value` its address, `note` the root it is
+signed by and, for the one in use, `in use`.
+
+## 3. The settings
+
+`/system/services/godspeed/config`, `#` starting a comment:
+
+```
+registry default https://godspeed-registry.bankole-422.workers.dev sha256:d769...146d
+use default
+tls-roots /system/services/godspeed/roots/
+timeout-secs 30
+max-package-mib 64
+```
+
+A missing file is written with these defaults on first start, so the file always shows what is in effect,
+and `godspeed config` says of each plain setting whether it came from the `file` or is the `default`
+because the key is absent.
 
 | key | default | what it is |
 |---|---|---|
-| `registry` | `https://godspeed-registry.bankole-422.workers.dev` | where packages are read. `https://` only: the transport is TLS |
-| `trust-root` | `sha256:d769...146d` | the registry's signing root, pinned. **Nothing reads it yet**: it is for the metadata check |
 | `tls-roots` | `/system/services/godspeed/roots/` | the certificate authorities TLS accepts, one DER file each. On first start the folder is given ISRG Root X2, the root the registry's chain reaches; a folder that exists is never refilled, so a root removed stays removed |
 | `timeout-secs` | 30 | how long one request may take, 1 to 100 |
 | `max-package-mib` | 64 | the largest package that will be downloaded, 1 to 4096. Nothing downloads yet |
 
-A file with a problem - an unknown key, a key set twice, a value that does not check - is never half used:
-every command names the line and refuses until it is fixed.
+A registry is not a plain setting: `godspeed config set registry` is refused with the command that manages
+registries, and so is `trust-root`.
 
-`godspeed config set` checks the value before writing (a URL that parses as `https://`, a folder ending in
-`/`, a number in range), keeps every other line of the file as it was, and refuses a change that would
-leave the file unreadable. `trust-root` is **not** set here: it decides which registry is trusted, so it is
-changed in the file, by hand, on purpose. `edit` works on the file too.
+A file with a problem - an unknown key, a key set twice, a value that does not check, a `use` naming no
+registry, several registries and no `use` line - is never half used: every command names the line and
+refuses until it is fixed. Which registry is in use is never guessed.
 
-## 3. `godspeed check`
+**A file written before registries had names** - `registry <url>`, and perhaps `trust-root <root>` on its
+own line - reads as one registry called `default`, in use. The first registry command that changes the
+file rewrites it in the form above; every other line is kept as it was.
+
+`godspeed config set` checks the value before writing (a folder ending in `/`, a number in range), keeps
+every other line of the file as it was, and refuses a change that would leave the file unreadable. `edit`
+works on the file too.
+
+## 4. `godspeed check`
 
 One row per step, stopping at the first that fails and saying why:
 
 | item | value | note |
 |---|---|---|
-| `registry` | the address | `file` or `default` |
+| `registry` | the address of the registry in use | its name |
 | `clock` | the date a certificate is checked against | its source: hardware clock, network time, or a floor from the last boot. No clock, no check: `date sync` first |
 | `roots` | how many | the folder they were read from |
 | `address` | the registry's IPv4 address | its name |
@@ -71,21 +119,24 @@ A failure names the step and the reason in words a person can act on: an expired
 that is ahead), one not valid yet (or a clock behind), a chain that reaches no trusted root, a certificate
 for another name, no hardware random source, no network. TLS is never skipped: there is no `insecure` mode.
 
-## 4. Pipes
+## 5. Pipes
 
-`godspeed config` and `godspeed check` are reports, so they pipe as records (`item`, `value`, `note`), with
-a last row whose item is `status` and whose value is `ok` or `failed`:
+`godspeed registry`, `godspeed config` and `godspeed check` are reports, so they pipe as records (`item`,
+`value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```
+godspeed registry | where note~in use
 godspeed config | where note=file
 godspeed check | where item=tls
 ```
 
-`godspeed config set` is an action and refuses to start a pipe, with the sentence naming the reports.
+`godspeed config set` and `godspeed registry add`, `use` and `remove` are actions and refuse to start a
+pipe, with the sentence naming the reports.
 
-## 5. What it holds
+## 6. What it holds
 
 Its supervisor row grants exactly four peers - the shell for its answer, `fs` for its settings and roots,
 `net-stack` for the registry's connection, `time` for the date - and no privilege of any kind. Pinned in
 `COMMANDMENTS.baseline.toml`. The TLS client is `sdk/tls`; the connection is `net-stack`'s op 23, a TCP
-connection held as a capability (`gs::net::Net::connect`).
+connection held as a capability (`gs::net::Net::connect`). The `[y/N]` before a root is trusted is asked by
+the shell, which holds the console; the package manager is told only what to add.

@@ -1,35 +1,50 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The package manager's configuration (`docs/developer-services-design.md` 10.8): what each key is, its
-//! default, how a value is checked, and how the file is read and rewritten.
+//! The package manager's configuration (`docs/developer-services-design.md` 10.8): the registries it knows
+//! and the one in use, the plain settings, how each value is checked, and how the file is read and
+//! rewritten.
 //!
 //! Names nothing outside `core`, so `scripts/host_test_check.py` compiles this file on its own and runs
 //! its tests on the host. Everything that touches the machine is in `main.rs`.
+//!
+//! # The file
+//!
+//! ```text
+//! registry <name> <https url> <sha256:pin>     one line per registry this machine knows
+//! use <name>                                   the one in use: searched, installed from
+//! tls-roots /system/services/godspeed/roots/   plain settings, `key value`
+//! ```
+//!
+//! Exactly one registry is in use, so no package is ever found in two places at once and there is no
+//! priority to decide. A file written before registries had names - `registry <url>` and `trust-root
+//! <pin>` on separate lines - reads as one registry called `default`, and is rewritten in the new form the
+//! first time a registry command changes it.
 
 /// The file, in the service's own folder (`docs/filesystem-layout.md`, L2).
 pub const DIR: &str = "/system/services/godspeed";
 pub const PATH: &str = "/system/services/godspeed/config";
-/// The largest config file read. One line per key and a few comments fit many times over.
+/// The largest config file read. Eight registries and every setting fit with room to spare.
 pub const FILE_MAX: usize = 2048;
+/// The most registries one machine knows.
+pub const MAX_REGISTRIES: usize = 8;
+/// The longest registry name.
+pub const NAME_MAX: usize = 32;
 
-/// One key: its name, its default, and what it is (shown by `godspeed config`).
+/// The registry a new machine knows, and is using.
+pub const DEFAULT_REGISTRY: Registry<'static> = Registry {
+    name: "default",
+    url: "https://godspeed-registry.bankole-422.workers.dev",
+    pin: "sha256:d769d1a64c3105c8da0ffcc2f54aba1c3a16ce4ae707a6d206556f08824a146d",
+};
+
+/// One plain setting: its name, its default, and what it is (shown by `godspeed config`).
 pub struct Key {
     pub name: &'static str,
     pub default: &'static str,
     pub about: &'static str,
 }
 
-/// Every key, in the order the file and `godspeed config` show them.
-pub const KEYS: [Key; 5] = [
-    Key {
-        name: "registry",
-        default: "https://godspeed-registry.bankole-422.workers.dev",
-        about: "where packages are read; https only",
-    },
-    Key {
-        name: "trust-root",
-        default: "sha256:d769d1a64c3105c8da0ffcc2f54aba1c3a16ce4ae707a6d206556f08824a146d",
-        about: "the registry's signing root, pinned (not used until metadata is verified)",
-    },
+/// Every plain setting, in the order the file and `godspeed config` show them.
+pub const KEYS: [Key; 3] = [
     Key {
         name: "tls-roots",
         default: "/system/services/godspeed/roots/",
@@ -42,6 +57,14 @@ pub const KEYS: [Key; 5] = [
 /// The folder the default root is written to on first start, and the root itself.
 pub const DEFAULT_ROOTS: &str = "/system/services/godspeed/roots/";
 pub const DEFAULT_ROOT_FILE: &str = "/system/services/godspeed/roots/isrg-root-x2.der";
+
+/// A registry: what it is called here, where it is, and the root its metadata must be signed by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Registry<'f> {
+    pub name: &'f str,
+    pub url: &'f str,
+    pub pin: &'f str,
+}
 
 /// Where a value came from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -59,14 +82,21 @@ impl Source {
     }
 }
 
-/// The configuration as read: each key's value and where it came from, plus the first problem in the file,
-/// if any. A file with a problem is never half-used: `problem` makes every command refuse until it is fixed.
+/// The configuration as read. A file with a problem is never half used: `problem` makes every command
+/// refuse until it is fixed.
 pub struct Config<'f> {
-    pub values: [(&'f str, Source); 5],
+    pub values: [(&'f str, Source); 3],
+    regs: [Registry<'f>; MAX_REGISTRIES],
+    nregs: usize,
+    /// Which of `regs` is in use, and whether a `use` line said so.
+    using: usize,
+    pub using_source: Source,
+    /// The file is in the form written before registries had names.
+    pub legacy: bool,
     pub problem: Option<Problem<'f>>,
 }
 
-/// What is wrong with the file, and on which line.
+/// What is wrong with the file, and on which line (0 for the file as a whole).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Problem<'f> {
     pub line: usize,
@@ -79,67 +109,163 @@ pub enum Bad<'f> {
     NoValue(&'f str),
     Twice(&'f str),
     Invalid(&'f str, &'static str),
+    /// A `registry` line that is neither `<name> <url> <pin>` nor the old one-word form.
+    BadRegistry,
+    /// More than [`MAX_REGISTRIES`].
+    TooManyRegistries,
+    /// `use` names a registry the file does not have.
+    NoSuchRegistry(&'f str),
+    /// Several registries and no `use` line: which one is meant is not the program's to guess.
+    NoneInUse,
+    /// `trust-root` beside a named registry, where the pin belongs on the registry's own line.
+    StrayTrustRoot,
     NotText,
 }
 
-impl Config<'_> {
-    pub fn get(&self, key: &str) -> &str {
+impl<'f> Config<'f> {
+    pub fn get(&self, key: &str) -> &'f str {
         // Every caller names a key from `KEYS`; an unknown one reads as empty, which every check refuses.
         KEYS.iter().position(|k| k.name == key).map(|i| self.values[i].0).unwrap_or("")
+    }
+
+    pub fn registries(&self) -> &[Registry<'f>] {
+        &self.regs[..self.nregs]
+    }
+
+    /// The registry in use.
+    pub fn in_use(&self) -> Registry<'f> {
+        self.regs[self.using]
+    }
+
+    pub fn find(&self, name: &str) -> Option<Registry<'f>> {
+        self.registries().iter().copied().find(|r| r.name == name)
     }
 }
 
 /// Read `text` (the whole file, or `None` when it does not exist).
 pub fn parse(text: Option<&[u8]>) -> Config<'_> {
-    let mut c = Config { values: core::array::from_fn(|i| (KEYS[i].default, Source::Default)), problem: None };
-    let Some(bytes) = text else { return c };
+    let mut c = Config {
+        values: core::array::from_fn(|i| (KEYS[i].default, Source::Default)),
+        regs: [DEFAULT_REGISTRY; MAX_REGISTRIES],
+        nregs: 0,
+        using: 0,
+        using_source: Source::Default,
+        legacy: false,
+        problem: None,
+    };
+    let Some(bytes) = text else {
+        c.nregs = 1;
+        return c;
+    };
     let Ok(text) = core::str::from_utf8(bytes) else {
+        c.nregs = 1;
         c.problem = Some(Problem { line: 0, what: Bad::NotText });
         return c;
     };
+    let mut use_name: Option<(&str, usize)> = None;
+    let mut legacy_url: Option<&str> = None;
+    let mut legacy_pin: Option<(&str, usize)> = None;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
-        let (key, value) = match line.split_once(char::is_whitespace) {
-            Some((k, v)) => (k, v.trim()),
-            None => (line, ""),
-        };
+        let mut words = line.split_whitespace();
+        let key = words.next().unwrap_or("");
+        let (w1, w2, w3, w4) = (words.next(), words.next(), words.next(), words.next());
         let problem = |what| Some(Problem { line: n + 1, what });
-        let Some(i) = KEYS.iter().position(|k| k.name == key) else {
-            c.problem = c.problem.or(problem(Bad::UnknownKey(key)));
-            continue;
-        };
-        if value.is_empty() {
-            c.problem = c.problem.or(problem(Bad::NoValue(key)));
-            continue;
+        match key {
+            "registry" => match (w1, w2, w3, w4) {
+                (Some(name), Some(url), Some(pin), None) => {
+                    let reg = Registry { name, url, pin };
+                    if let Err(why) = check_registry(&reg) {
+                        c.problem = c.problem.or(problem(Bad::Invalid("registry", why)));
+                    } else if c.registries().iter().any(|r| r.name == name) {
+                        c.problem = c.problem.or(problem(Bad::Twice(name)));
+                    } else if c.nregs == MAX_REGISTRIES {
+                        c.problem = c.problem.or(problem(Bad::TooManyRegistries));
+                    } else {
+                        c.regs[c.nregs] = reg;
+                        c.nregs += 1;
+                    }
+                }
+                // The form written before registries had names: one address, its pin on its own line.
+                (Some(url), None, None, None) if legacy_url.is_none() => match url_check(url) {
+                    Ok(()) => legacy_url = Some(url),
+                    Err(why) => c.problem = c.problem.or(problem(Bad::Invalid("registry", why))),
+                },
+                (None, ..) => c.problem = c.problem.or(problem(Bad::NoValue("registry"))),
+                _ => c.problem = c.problem.or(problem(Bad::BadRegistry)),
+            },
+            "trust-root" => match (w1, w2) {
+                (Some(pin), None) if legacy_pin.is_none() => match pin_check(pin) {
+                    Ok(()) => legacy_pin = Some((pin, n + 1)),
+                    Err(why) => c.problem = c.problem.or(problem(Bad::Invalid("trust-root", why))),
+                },
+                (Some(_), None) => c.problem = c.problem.or(problem(Bad::Twice("trust-root"))),
+                (None, _) => c.problem = c.problem.or(problem(Bad::NoValue("trust-root"))),
+                _ => c.problem = c.problem.or(problem(Bad::Invalid("trust-root", "one value"))),
+            },
+            "use" => match (w1, w2, use_name) {
+                (Some(name), None, None) => use_name = Some((name, n + 1)),
+                (Some(_), None, Some(_)) => c.problem = c.problem.or(problem(Bad::Twice("use"))),
+                (None, ..) => c.problem = c.problem.or(problem(Bad::NoValue("use"))),
+                _ => c.problem = c.problem.or(problem(Bad::Invalid("use", "one registry's name"))),
+            },
+            _ => {
+                let Some(i) = KEYS.iter().position(|k| k.name == key) else {
+                    c.problem = c.problem.or(problem(Bad::UnknownKey(key)));
+                    continue;
+                };
+                let Some(value) = w1 else {
+                    c.problem = c.problem.or(problem(Bad::NoValue(key)));
+                    continue;
+                };
+                if w2.is_some() {
+                    c.problem = c.problem.or(problem(Bad::Invalid(key, "one value")));
+                } else if c.values[i].1 == Source::File {
+                    c.problem = c.problem.or(problem(Bad::Twice(key)));
+                } else if let Err(why) = check(key, value) {
+                    c.problem = c.problem.or(problem(Bad::Invalid(key, why)));
+                } else {
+                    c.values[i] = (value, Source::File);
+                }
+            }
         }
-        if c.values[i].1 == Source::File {
-            c.problem = c.problem.or(problem(Bad::Twice(key)));
-            continue;
+    }
+    // The old form is one registry called `default`, unless named ones exist too, which is a mix nobody wrote.
+    if let Some(url) = legacy_url {
+        if c.nregs > 0 {
+            c.problem = c.problem.or(Some(Problem { line: 0, what: Bad::BadRegistry }));
+        } else {
+            c.regs[0] = Registry { name: "default", url, pin: legacy_pin.map(|(p, _)| p).unwrap_or(DEFAULT_REGISTRY.pin) };
+            c.nregs = 1;
+            c.legacy = true;
         }
-        if let Err(why) = check(key, value) {
-            c.problem = c.problem.or(problem(Bad::Invalid(key, why)));
-            continue;
-        }
-        c.values[i] = (value, Source::File);
+    } else if let Some((_, line)) = legacy_pin {
+        c.problem = c.problem.or(Some(Problem { line, what: Bad::StrayTrustRoot }));
+    }
+    if c.nregs == 0 {
+        // A file that names no registry knows the default one, as a new machine does.
+        c.nregs = 1;
+    }
+    match use_name {
+        Some((name, line)) => match c.registries().iter().position(|r| r.name == name) {
+            Some(i) => {
+                c.using = i;
+                c.using_source = Source::File;
+            }
+            None => c.problem = c.problem.or(Some(Problem { line, what: Bad::NoSuchRegistry(name) })),
+        },
+        None if c.nregs > 1 => c.problem = c.problem.or(Some(Problem { line: 0, what: Bad::NoneInUse })),
+        None => {}
     }
     c
 }
 
-/// Whether `value` is acceptable for `key`, and if not, why, in words a person can act on.
+/// Whether `value` is acceptable for plain setting `key`, and if not, why, in words a person can act on.
 pub fn check(key: &str, value: &str) -> Result<(), &'static str> {
     match key {
-        "registry" => url(value).map(|_| ()),
-        "trust-root" => {
-            let hex = value.strip_prefix("sha256:").ok_or("a trust root is sha256: and 64 hex digits")?;
-            if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-                Ok(())
-            } else {
-                Err("a trust root is sha256: and 64 hex digits")
-            }
-        }
         "tls-roots" => {
             if value.starts_with('/') && value.ends_with('/') && value.len() > 1 && !value.contains("//") {
                 Ok(())
@@ -149,8 +275,32 @@ pub fn check(key: &str, value: &str) -> Result<(), &'static str> {
         }
         "timeout-secs" => number(value, 1, 100, "timeout-secs is a whole number of seconds, 1 to 100"),
         "max-package-mib" => number(value, 1, 4096, "max-package-mib is a whole number, 1 to 4096"),
-        _ => Err("no such key"),
+        _ => Err("no such setting"),
     }
+}
+
+/// Whether a registry can be added: a name, an `https://` address, a pin.
+pub fn check_registry(r: &Registry<'_>) -> Result<(), &'static str> {
+    name_check(r.name)?;
+    url_check(r.url)?;
+    pin_check(r.pin)
+}
+
+/// A registry's name: what `use` and `remove` call it. Letters, digits and hyphens.
+pub fn name_check(name: &str) -> Result<(), &'static str> {
+    let ok = !name.is_empty() && name.len() <= NAME_MAX && !name.starts_with('-')
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if ok { Ok(()) } else { Err("a registry's name is 1 to 32 lower-case letters, digits and hyphens") }
+}
+
+fn url_check(url: &str) -> Result<(), &'static str> {
+    self::url(url).map(|_| ())
+}
+
+/// The registry's signing root: `sha256:` and 64 hex digits.
+pub fn pin_check(pin: &str) -> Result<(), &'static str> {
+    let ok = pin.strip_prefix("sha256:").is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()));
+    if ok { Ok(()) } else { Err("a signing root is sha256: and 64 hex digits") }
 }
 
 fn number(value: &str, lo: u32, hi: u32, why: &'static str) -> Result<(), &'static str> {
@@ -177,7 +327,7 @@ pub struct Url<'u> {
 /// `https://host[:port][/path]`. Anything else is refused: the transport is TLS (10.3), so an `http://`
 /// address is a mistake to be named, never one to fall back to.
 pub fn url(s: &str) -> Result<Url<'_>, &'static str> {
-    let rest = s.strip_prefix("https://").ok_or("the registry is https:// only: the transport is TLS")?;
+    let rest = s.strip_prefix("https://").ok_or("a registry is https:// only: the transport is TLS")?;
     let (authority, base) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -230,12 +380,14 @@ pub fn civil(epoch: u64) -> (u64, u64, u64, u64, u64) {
     (year, month, day, secs / 3600, secs % 3600 / 60)
 }
 
-/// The file written on first start: every key at its default, with what each is, so the file always
-/// shows what is in effect and nothing is a hidden default (26.4).
+/// The file written on first start: the default registry in use and every setting at its default, with
+/// what each is, so the file always shows what is in effect and nothing is a hidden default (26.4).
 pub fn defaults_file(out: &mut [u8]) -> usize {
     let mut w = Out { buf: out, n: 0 };
-    w.put("# The godspeed package manager's settings. One `key value` per line; # starts a comment.\n");
-    w.put("# Read at the start of every command. `godspeed config` shows each value and where it came from.\n");
+    w.put("# The godspeed package manager's settings. # starts a comment.\n");
+    w.put("# Read at the start of every command. `godspeed config` and `godspeed registry` show them.\n");
+    w.put("\n");
+    registry_block(&mut w, &[DEFAULT_REGISTRY], DEFAULT_REGISTRY.name);
     for k in KEYS.iter() {
         w.put("\n# ");
         w.put(k.about);
@@ -248,8 +400,26 @@ pub fn defaults_file(out: &mut [u8]) -> usize {
     w.n
 }
 
-/// The file with `key` set to `value`: its line replaced where it is, or added at the end, every other
-/// line kept exactly as it was. `None` when the result would not fit `out`.
+/// The registries, and the one in use, as the file holds them.
+fn registry_block(w: &mut Out<'_>, regs: &[Registry<'_>], using: &str) {
+    w.put("# The registries this machine knows: name, address, the root their metadata is signed by.\n");
+    w.put("# Exactly one is in use (`godspeed registry use <name>`).\n");
+    for r in regs {
+        w.put("registry ");
+        w.put(r.name);
+        w.put(" ");
+        w.put(r.url);
+        w.put(" ");
+        w.put(r.pin);
+        w.put("\n");
+    }
+    w.put("use ");
+    w.put(using);
+    w.put("\n");
+}
+
+/// The file with plain setting `key` set to `value`: its line replaced where it is, or added at the end,
+/// every other line kept exactly as it was. `None` when the result would not fit `out`.
 pub fn with_value(text: &str, key: &str, value: &str, out: &mut [u8]) -> Option<usize> {
     let mut w = Out { buf: out, n: 0 };
     let mut done = false;
@@ -272,6 +442,35 @@ pub fn with_value(text: &str, key: &str, value: &str, out: &mut [u8]) -> Option<
         w.put(" ");
         w.put(value);
         w.put("\n");
+    }
+    (!w.overflow()).then_some(w.n)
+}
+
+/// The file with its registries replaced by `regs` and `using` in use. Every line that is not about
+/// registries is kept exactly as it was; the registry lines, the `use` line and an old `trust-root` line
+/// are replaced by one block where the first of them stood (or at the end, if there were none), so the
+/// comments around them survive. This is also how an old file moves to the new form.
+pub fn with_registries(text: &str, regs: &[Registry<'_>], using: &str, out: &mut [u8]) -> Option<usize> {
+    let mut w = Out { buf: out, n: 0 };
+    let mut placed = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        let first = line.split(char::is_whitespace).next().unwrap_or("");
+        let ours = matches!(first, "registry" | "use" | "trust-root");
+        // The block's own two comment lines are written with it, so they are not kept twice.
+        let block_comment = raw.starts_with("# The registries this machine knows") || raw.starts_with("# Exactly one is in use");
+        if ours || block_comment {
+            if !placed {
+                registry_block(&mut w, regs, using);
+                placed = true;
+            }
+        } else {
+            w.put(raw);
+            w.put("\n");
+        }
+    }
+    if !placed {
+        registry_block(&mut w, regs, using);
     }
     (!w.overflow()).then_some(w.n)
 }
@@ -300,10 +499,18 @@ impl Out<'_> {
 mod tests {
     use super::*;
 
+    const PIN_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn text(out: &[u8], n: usize) -> &str {
+        core::str::from_utf8(&out[..n]).unwrap_or("")
+    }
+
     #[test]
-    fn no_file_is_every_default() {
+    fn no_file_is_the_default_registry_and_every_default() {
         let c = parse(None);
         assert!(c.problem.is_none());
+        assert_eq!(c.registries(), &[DEFAULT_REGISTRY]);
+        assert_eq!(c.in_use(), DEFAULT_REGISTRY);
         for (i, k) in KEYS.iter().enumerate() {
             assert_eq!(c.values[i], (k.default, Source::Default));
         }
@@ -315,6 +522,9 @@ mod tests {
         let n = defaults_file(&mut buf);
         let c = parse(Some(&buf[..n]));
         assert!(c.problem.is_none(), "{:?}", c.problem);
+        assert_eq!(c.in_use(), DEFAULT_REGISTRY);
+        assert_eq!(c.using_source, Source::File);
+        assert!(!c.legacy);
         for (i, k) in KEYS.iter().enumerate() {
             assert_eq!(c.values[i], (k.default, Source::File));
         }
@@ -325,11 +535,61 @@ mod tests {
         for k in KEYS.iter() {
             assert_eq!(check(k.name, k.default), Ok(()), "{}", k.name);
         }
+        assert_eq!(check_registry(&DEFAULT_REGISTRY), Ok(()));
+    }
+
+    #[test]
+    fn several_registries_and_one_in_use() {
+        let file = ["registry default https://a.example/ ", DEFAULT_REGISTRY.pin, "\nregistry mirror https://b.example/ ",
+                    PIN_B, "\nuse mirror\n"].concat();
+        let c = parse(Some(file.as_bytes()));
+        assert!(c.problem.is_none(), "{:?}", c.problem);
+        assert_eq!(c.registries().len(), 2);
+        assert_eq!(c.in_use().name, "mirror");
+        assert_eq!(c.in_use().pin, PIN_B);
+        assert_eq!(c.find("default").map(|r| r.url), Some("https://a.example/"));
+    }
+
+    #[test]
+    fn which_registry_is_meant_is_never_guessed() {
+        let two = ["registry a https://a.example/ ", PIN_B, "\nregistry b https://b.example/ ", PIN_B, "\n"].concat();
+        assert_eq!(parse(Some(two.as_bytes())).problem, Some(Problem { line: 0, what: Bad::NoneInUse }));
+        let named = ["registry a https://a.example/ ", PIN_B, "\nuse c\n"].concat();
+        assert_eq!(parse(Some(named.as_bytes())).problem, Some(Problem { line: 2, what: Bad::NoSuchRegistry("c") }));
+        let dup = ["registry a https://a.example/ ", PIN_B, "\nregistry a https://b.example/ ", PIN_B, "\n"].concat();
+        assert_eq!(parse(Some(dup.as_bytes())).problem, Some(Problem { line: 2, what: Bad::Twice("a") }));
+        // One registry needs no `use` line.
+        let one = ["registry a https://a.example/ ", PIN_B, "\n"].concat();
+        let c = parse(Some(one.as_bytes()));
+        assert!(c.problem.is_none());
+        assert_eq!((c.in_use().name, c.using_source), ("a", Source::Default));
+    }
+
+    #[test]
+    fn a_file_from_before_named_registries_reads_as_default() {
+        let old = ["registry https://old.example/\ntrust-root ", PIN_B, "\ntimeout-secs 9\n"].concat();
+        let c = parse(Some(old.as_bytes()));
+        assert!(c.problem.is_none(), "{:?}", c.problem);
+        assert!(c.legacy);
+        assert_eq!(c.in_use(), Registry { name: "default", url: "https://old.example/", pin: PIN_B });
+        assert_eq!(c.get("timeout-secs"), "9");
+        // Rewritten in the new form, it reads the same and is no longer legacy.
+        let mut out = [0u8; FILE_MAX];
+        let n = with_registries(&old, c.registries(), "default", &mut out).unwrap_or(0);
+        let again = parse(Some(&out[..n]));
+        assert!(again.problem.is_none(), "{:?}", again.problem);
+        assert!(!again.legacy);
+        assert_eq!(again.in_use(), c.in_use());
+        assert!(!text(&out, n).contains("trust-root"));
+        assert!(text(&out, n).contains("timeout-secs 9"));
+        // A pin with no registry beside it is named, not silently ignored.
+        let stray = ["registry a https://a.example/ ", PIN_B, "\ntrust-root ", PIN_B, "\n"].concat();
+        assert_eq!(parse(Some(stray.as_bytes())).problem, Some(Problem { line: 2, what: Bad::StrayTrustRoot }));
     }
 
     #[test]
     fn a_file_with_a_problem_says_which_line() {
-        let c = parse(Some(b"registry https://a.example/\nspeed 9\n"));
+        let c = parse(Some(b"timeout-secs 5\nspeed 9\n"));
         assert_eq!(c.problem, Some(Problem { line: 2, what: Bad::UnknownKey("speed") }));
         let c = parse(Some(b"# x\ntimeout-secs 0\n"));
         assert!(matches!(c.problem, Some(Problem { line: 2, what: Bad::Invalid("timeout-secs", _) })));
@@ -337,17 +597,12 @@ mod tests {
         assert_eq!(c.problem, Some(Problem { line: 2, what: Bad::Twice("timeout-secs") }));
         let c = parse(Some(b"registry\n"));
         assert_eq!(c.problem, Some(Problem { line: 1, what: Bad::NoValue("registry") }));
+        let c = parse(Some(b"registry a https://a.example/\n"));
+        assert_eq!(c.problem, Some(Problem { line: 1, what: Bad::BadRegistry }));
+        let c = parse(Some(b"registry http://a.example/\n"));
+        assert!(matches!(c.problem, Some(Problem { line: 1, what: Bad::Invalid("registry", _) })));
         let c = parse(Some(&[0xff, 0xfe]));
         assert_eq!(c.problem, Some(Problem { line: 0, what: Bad::NotText }));
-    }
-
-    #[test]
-    fn a_value_from_the_file_wins_and_comments_are_ignored() {
-        let c = parse(Some(b"registry https://registry.example:8443/pkgs/   # moved\n"));
-        assert!(c.problem.is_none());
-        assert_eq!(c.get("registry"), "https://registry.example:8443/pkgs/");
-        assert_eq!(c.values[0].1, Source::File);
-        assert_eq!(c.get("timeout-secs"), "30");
     }
 
     #[test]
@@ -362,11 +617,44 @@ mod tests {
     }
 
     #[test]
+    fn registry_names_and_pins() {
+        for good in ["default", "mirror-2", "a"] {
+            assert_eq!(name_check(good), Ok(()), "{good}");
+        }
+        for bad in ["", "-x", "Upper", "has space", "dot.ted", &"a".repeat(33)] {
+            assert!(name_check(bad).is_err(), "{bad}");
+        }
+        assert!(pin_check("sha256:abc").is_err());
+        assert!(pin_check(PIN_B).is_ok());
+    }
+
+    #[test]
+    fn rewriting_the_registries_keeps_every_other_line() {
+        let mut buf = [0u8; FILE_MAX];
+        let n = defaults_file(&mut buf);
+        let file = text(&buf, n);
+        let regs = [DEFAULT_REGISTRY, Registry { name: "mirror", url: "https://b.example/", pin: PIN_B }];
+        let mut out = [0u8; FILE_MAX];
+        let m = with_registries(file, &regs, "mirror", &mut out).unwrap_or(0);
+        let c = parse(Some(&out[..m]));
+        assert!(c.problem.is_none(), "{:?}", c.problem);
+        assert_eq!(c.registries(), &regs);
+        assert_eq!(c.in_use().name, "mirror");
+        let new = text(&out, m);
+        assert!(new.contains("# how long one request may take\ntimeout-secs 30"));
+        assert_eq!(new.matches("# The registries this machine knows").count(), 1);
+        // Removing one keeps the rest.
+        let k = with_registries(new, &regs[..1], "default", &mut buf).unwrap_or(0);
+        let c = parse(Some(&buf[..k]));
+        assert_eq!(c.registries(), &regs[..1]);
+    }
+
+    #[test]
     fn setting_a_value_keeps_every_other_line() {
-        let text = "# keep me\nregistry https://old.example\ntimeout-secs 30  # note\n";
+        let text = "# keep me\ntimeout-secs 30  # note\n";
         let mut out = [0u8; 256];
         let n = with_value(text, "timeout-secs", "45", &mut out).unwrap_or(0);
-        assert_eq!(core::str::from_utf8(&out[..n]).unwrap_or(""), "# keep me\nregistry https://old.example\ntimeout-secs 45\n");
+        assert_eq!(core::str::from_utf8(&out[..n]).unwrap_or(""), "# keep me\ntimeout-secs 45\n");
         let n = with_value(text, "max-package-mib", "8", &mut out).unwrap_or(0);
         assert!(core::str::from_utf8(&out[..n]).unwrap_or("").ends_with("timeout-secs 30  # note\nmax-package-mib 8\n"));
         let mut tiny = [0u8; 8];
@@ -383,11 +671,9 @@ mod tests {
 
     #[test]
     fn checks_name_what_is_wrong() {
-        assert!(check("trust-root", "sha256:abc").is_err());
-        assert!(check("trust-root", &["sha256:", &"a".repeat(64)].concat()).is_ok());
         assert!(check("tls-roots", "/system/roots").is_err());
         assert!(check("tls-roots", "/system/roots/").is_ok());
         assert!(check("max-package-mib", "4097").is_err());
-        assert!(check("nope", "1").is_err());
+        assert!(check("registry", "https://a.example/").is_err(), "a registry is not a plain setting");
     }
 }

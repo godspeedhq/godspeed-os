@@ -8235,23 +8235,34 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
     }}; }
 
+    // ---- `drives flash ... yes` answers the confirmation in advance (`utilities/15_drives.md`), and the
+    //      fresh volume is the one every check below runs on.
+    let flashed = run!(b"drives flash data yes\r", 60);
+    check!(flashed.contains("yes (given on the command line)") && !flashed.contains("aborted"),
+           "`drives flash data yes` formats without asking, and says the answer came from the command line");
+    let listed = run!(b"drives\r", 30);
+    check!(listed.contains("data"), "the drive flashed with `yes` carries its label");
+
     // ---- the command explains itself.
     let bare = run!(b"godspeed\r", 20);
-    check!(bare.contains("usage: godspeed config"), "a bare `godspeed` prints its usage");
+    check!(bare.contains("usage: godspeed registry"), "a bare `godspeed` prints its usage");
     let help = run!(b"godspeed help\r", 20);
-    check!(help.contains("godspeed check") && help.contains("godspeed config set"), "`godspeed help` lists every command");
+    check!(help.contains("godspeed check") && help.contains("godspeed registry add") && help.contains("godspeed config set"),
+           "`godspeed help` lists every command");
 
     // ---- FIRST START writes the file with every default, so it shows what is in effect.
     let first = run!(b"godspeed config\r", 60);
     check!(first.contains("written") && first.contains("/system/services/godspeed/config"),
            "the first `godspeed config` writes the settings file and says so");
-    check!(first.contains("registry") && first.contains("https://godspeed-registry.bankole-422.workers.dev"),
-           "the registry setting shows its default address");
     check!(first.contains("/system/services/godspeed/roots/isrg-root-x2.der"),
            "the roots folder is given ISRG Root X2 on first start");
+    let regs = run!(b"godspeed registry\r", 60);
+    check!(regs.contains("default") && regs.contains("https://godspeed-registry.bankole-422.workers.dev") && regs.contains("in use"),
+           "`godspeed registry` lists the default registry, in use");
     let file = run!(b"read /system/services/godspeed/config\r", 30);
-    check!(file.contains("registry https://godspeed-registry.bankole-422.workers.dev") && file.contains("timeout-secs 30"),
-           "the file on disk holds the defaults as `key value` lines");
+    check!(file.contains("registry default https://godspeed-registry.bankole-422.workers.dev sha256:") && file.contains("use default")
+           && file.contains("timeout-secs 30"),
+           "the file on disk holds the registry line, the `use` line and the settings");
     let again = run!(b"godspeed config\r", 60);
     check!(!again.contains("written") && again.contains("file"),
            "a second `godspeed config` writes nothing and reads every value from the file");
@@ -8259,25 +8270,66 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     // ---- SET checks first and keeps the rest of the file.
     let set = run!(b"godspeed config set timeout-secs 45\r", 60);
     check!(set.contains("timeout-secs") && set.contains("45"), "`config set` writes a checked value");
+    let one = run!(b"godspeed config timeout-secs\r", 60);
+    check!(one.contains("45") && !one.contains("tls-roots"), "`godspeed config <key>` shows that one setting");
     let after = run!(b"read /system/services/godspeed/config\r", 30);
     check!(after.contains("timeout-secs 45") && after.contains("# how long one request may take"),
            "the new value is in the file and the comments around it are kept");
-    let http = run!(b"godspeed config set registry http://registry.example/\r", 60);
-    check!(http.contains("https:// only"), "an http:// registry is refused with the reason");
-    let trust = run!(b"godspeed config set trust-root sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);
-    check!(trust.contains("not set here"), "`trust-root` is not set by a command");
+    let notset = run!(b"godspeed config set registry https://registry.example/\r", 60);
+    check!(notset.contains("not set here") && notset.contains("godspeed registry"),
+           "a registry is not a plain setting, and the refusal names the command that manages it");
+    let notshown = run!(b"godspeed config registry\r", 60);
+    check!(notshown.contains("not a plain setting"), "`godspeed config registry` points at `godspeed registry`");
     let nokey = run!(b"godspeed config set speed 9\r", 60);
     check!(nokey.contains("not a setting"), "an unknown key is refused, naming the settings");
     let range = run!(b"godspeed config set timeout-secs 0\r", 60);
     check!(range.contains("1 to 100"), "a value out of range is refused with the range");
 
-    // ---- PIPES: the reports are records; the action refuses.
+    // ---- REGISTRIES: one in use, others known.
+    const PIN: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    send(&mut write_half, format!("godspeed registry add mirror https://mirror.example/ {PIN}\r").as_bytes());
+    let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20)).unwrap_or_default();
+    check!(asked.contains("anything signed by sha256:bbbb"), "`registry add` shows the root it would trust and asks");
+    let declined = run!(b"n\r", 30);
+    check!(declined.contains("cancelled - nothing was added"), "answering no adds nothing");
+    let none = run!(b"godspeed registry\r", 60);
+    check!(!none.contains("mirror"), "and the list is unchanged");
+    let added = run!(format!("godspeed registry add mirror https://mirror.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(added.contains("mirror") && added.contains("godspeed registry use mirror"),
+           "`registry add ... yes` adds it, not in use, and says how to use it");
+    let two = run!(b"godspeed registry\r", 60);
+    check!(two.contains("mirror") && two.contains("in use; signed by sha256:d769"),
+           "both are listed and the default is still the one in use");
+    let dup = run!(format!("godspeed registry add mirror https://other.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(dup.contains("already known"), "a name already taken is refused");
+    let http = run!(format!("godspeed registry add plain http://registry.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(http.contains("https:// only"), "an http:// registry is refused with the reason");
+    let badpin = run!(b"godspeed registry add short https://short.example/ sha256:abc yes\r", 60);
+    check!(badpin.contains("64 hex digits"), "a signing root of the wrong form is refused");
+    let used = run!(b"godspeed registry use mirror\r", 60);
+    check!(used.contains("mirror") && used.contains("in use"), "`registry use` switches to it");
+    let check_mirror = run!(b"godspeed check\r", 90);
+    check!(check_mirror.contains("https://mirror.example/") && check_mirror.contains("mirror (in use)"),
+           "`godspeed check` reaches the registry in use, not the first one listed");
+    let inuse = run!(b"godspeed registry remove mirror\r", 60);
+    check!(inuse.contains("in use"), "the registry in use cannot be removed");
+    let _ = run!(b"godspeed registry use default\r", 60);
+    let removed = run!(b"godspeed registry remove mirror\r", 60);
+    check!(removed.contains("removed"), "a registry not in use is removed");
+    let gone = run!(b"godspeed registry\r", 60);
+    check!(!gone.contains("mirror") && gone.contains("in use"), "and the default is the only one, in use");
+
+    // ---- PIPES: the reports are records; the actions refuse.
     let piped = run!(b"godspeed config | where item=timeout-secs\r", 60);
-    check!(piped.contains("45") && !piped.contains("registry "), "`godspeed config` pipes as records");
+    check!(piped.contains("45") && !piped.contains("tls-roots"), "`godspeed config` pipes as records");
+    let regpipe = run!(b"godspeed registry | count\r", 60);
+    check!(regpipe.contains('1'), "`godspeed registry` pipes as records");
     let refused = run!(b"godspeed config set timeout-secs 30 | count\r", 30);
     check!(refused.contains("is an action, not a report"), "`godspeed config set` refuses to start a pipe");
+    let refused2 = run!(b"godspeed registry use default | count\r", 30);
+    check!(refused2.contains("is an action, not a report"), "`godspeed registry use` refuses to start a pipe");
     let still = run!(b"read /system/services/godspeed/config\r", 30);
-    check!(still.contains("timeout-secs 45"), "the refused pipe changed nothing");
+    check!(still.contains("timeout-secs 45"), "the refused pipes changed nothing");
 
     // ---- A BROKEN FILE is refused whole, naming the line.
     let _ = run!(b"write append /system/services/godspeed/config colour blue\r", 30);
@@ -8285,6 +8337,19 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     check!(broken.contains("no setting is called 'colour'"), "a file with an unknown key is named by line and refused");
     let fixed = run!(b"godspeed config set timeout-secs 30\r", 60);
     check!(fixed.contains("no setting is called 'colour'"), "a set on a broken file is refused rather than writing past it");
+    let regbroken = run!(format!("godspeed registry add other https://other.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(regbroken.contains("no setting is called 'colour'"), "so is a registry change");
+
+    // ---- A FILE FROM BEFORE NAMED REGISTRIES reads as one called `default`, and moves to the new form.
+    let _ = run!(b"write /system/services/godspeed/config registry https://godspeed-registry.bankole-422.workers.dev\r", 30);
+    let old = run!(b"godspeed registry\r", 60);
+    check!(old.contains("default") && old.contains("in use") && old.contains("https://godspeed-registry.bankole-422.workers.dev"),
+           "an old `registry <url>` file reads as one registry called `default`, in use");
+    let _ = run!(format!("godspeed registry add other https://other.example/ {PIN} yes\r").as_bytes(), 60);
+    let migrated = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(migrated.contains("registry default https://godspeed-registry.bankole-422.workers.dev sha256:d769")
+           && migrated.contains("registry other https://other.example/") && migrated.contains("use default"),
+           "the first registry change rewrites it in the new form, the old address kept as `default`");
     let _ = run!(b"delete /system/services/godspeed/config\r", 30);
 
     // ---- THE ROOTS: an empty folder trusts nothing, and says so before any connection.

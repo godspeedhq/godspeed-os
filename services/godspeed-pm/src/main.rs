@@ -9,12 +9,15 @@
 //! and ends it. Nothing of it stays running and nothing restarts it.
 //!
 //! What it can do in this first version, and no more:
-//! - `godspeed config` - every setting, its value, and whether it came from the file or the default.
-//!   The file (`/system/services/godspeed/config`) is written with the defaults on first start, so it
-//!   always shows what is in effect (10.8).
-//! - `godspeed config set <key> <value>` - checked first, then written; the rest of the file is kept.
-//! - `godspeed check` - reach the configured registry over TLS, verified to the roots in `tls-roots`,
-//!   and say what it answered. Each step is a row, and a failure says which step and why.
+//! - `godspeed registry` - the registries this machine knows, and the one in use. `registry add`,
+//!   `registry use` and `registry remove` change them. Exactly one is in use, so a package is never
+//!   found in two places and there is no priority to decide (`utilities/61_godspeed.md` 2).
+//! - `godspeed config` - every plain setting, its value, and whether it came from the file or the
+//!   default; `godspeed config <key>` one of them; `godspeed config set <key> <value>` checked, then
+//!   written, the rest of the file kept. The file (`/system/services/godspeed/config`) is written with
+//!   the defaults on first start, so it always shows what is in effect (10.8).
+//! - `godspeed check` - reach the registry in use over TLS, verified to the roots in `tls-roots`, and
+//!   say what it answered. Each step is a row, and a failure says which step and why.
 //!
 //! Searching and fetching packages need the registry's metadata format and its signatures, which are
 //! not built yet; this program says so rather than pretending (10.1).
@@ -59,13 +62,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut words = text.split_whitespace();
     let mut r = Rows::new(&["item", "value", "note"]);
     match (words.next(), words.next()) {
-        (Some("config"), None) => config_show(&ctx, &mut r),
+        (Some("config"), None) => config_show(&ctx, None, &mut r),
         (Some("config"), Some("set")) => match (words.next(), words.next(), words.next()) {
             (Some(k), Some(v), None) => config_set(&ctx, k, v, &mut r),
             _ => r.fail("usage", "godspeed config set <key> <value>", "one key, one value"),
         },
+        (Some("config"), Some(key)) => match words.next() {
+            None => config_show(&ctx, Some(key), &mut r),
+            Some(_) => r.fail("usage", "godspeed config [<key>] | godspeed config set <key> <value>", "one key"),
+        },
+        (Some("registry"), None) => registry_list(&ctx, &mut r),
+        (Some("registry"), Some(verb)) => {
+            let (a, b, c, d) = (words.next(), words.next(), words.next(), words.next());
+            match (verb, a, b, c, d) {
+                ("add", Some(name), Some(url), Some(pin), None) => registry_add(&ctx, name, url, pin, &mut r),
+                ("use", Some(name), None, None, None) => registry_use(&ctx, name, &mut r),
+                ("remove", Some(name), None, None, None) => registry_remove(&ctx, name, &mut r),
+                _ => r.fail("usage", "godspeed registry [add <name> <url> <root> | use <name> | remove <name>]",
+                            "`godspeed registry help` says what each does"),
+            }
+        }
         (Some("check"), None) => check(&ctx, &mut r),
-        _ => r.fail("usage", "godspeed config | godspeed config set <key> <value> | godspeed check",
+        _ => r.fail("usage", "godspeed registry | godspeed config | godspeed check",
                     "`godspeed help` says what each does"),
     }
     r.send(&ctx);
@@ -186,22 +204,38 @@ fn problem_text(p: &config::Problem<'_>) -> Cell {
         Bad::NoValue(k) => cell(format_args!("line {}: '{}' has no value", p.line, k)),
         Bad::Twice(k) => cell(format_args!("line {}: '{}' is set twice", p.line, k)),
         Bad::Invalid(k, why) => cell(format_args!("line {}: {} ({})", p.line, why, k)),
+        Bad::BadRegistry => cell(format_args!("line {}: a registry is `registry <name> <https url> <sha256:root>`", p.line)),
+        Bad::TooManyRegistries => cell(format_args!("line {}: more than {} registries", p.line, config::MAX_REGISTRIES)),
+        Bad::NoSuchRegistry(n) => cell(format_args!("line {}: `use {}` names no registry in the file", p.line, n)),
+        Bad::NoneInUse => cell(format_args!("several registries and no `use` line - which one is in use is not guessed")),
+        Bad::StrayTrustRoot => cell(format_args!("line {}: a signing root belongs on its registry's line now", p.line)),
         Bad::NotText => cell(format_args!("the file is not text")),
     }
 }
 
-fn config_show(ctx: &ServiceContext, r: &mut Rows) {
+fn config_show(ctx: &ServiceContext, key: Option<&str>, r: &mut Rows) {
     let mut buf = [0u8; config::FILE_MAX];
     let n = match load(ctx, r, &mut buf) {
         Ok(n) => n,
         Err(why) => return r.fail("config", "unreadable", why.as_str()),
     };
     let c = config::parse(Some(&buf[..n]));
-    for (i, k) in config::KEYS.iter().enumerate() {
+    if let Some(k) = key {
+        if matches!(k, "registry" | "trust-root") {
+            return r.fail(k, "not a plain setting", "registries are `godspeed registry`: the list, and the one in use");
+        }
+        let Some(i) = config::KEYS.iter().position(|x| x.name == k) else {
+            return r.fail(k, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib");
+        };
         let (v, src) = c.values[i];
-        r.row(k.name, v, src.word());
+        r.row(k, v, src.word());
+    } else {
+        for (i, k) in config::KEYS.iter().enumerate() {
+            let (v, src) = c.values[i];
+            r.row(k.name, v, src.word());
+        }
+        default_roots(ctx, r, c.get("tls-roots"));
     }
-    default_roots(ctx, r, c.get("tls-roots"));
     if let Some(p) = c.problem {
         r.fail("problem", config::PATH, problem_text(&p).as_str());
     }
@@ -209,13 +243,11 @@ fn config_show(ctx: &ServiceContext, r: &mut Rows) {
 
 fn config_set(ctx: &ServiceContext, key: &str, value: &str, r: &mut Rows) {
     if !config::KEYS.iter().any(|k| k.name == key) {
-        return r.fail(key, "not a setting", "the settings are registry, trust-root, tls-roots, timeout-secs, max-package-mib");
+        return r.fail(key, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib");
     }
-    // The registry's signing root decides which registry is trusted. Nothing reads it until the metadata
-    // check is built, and changing it must not be one quick command when that exists (10.8), so for now it
-    // is changed in the file, by hand, on purpose.
-    if key == "trust-root" {
-        return r.fail(key, "not set here", "edit the file to change it; nothing uses it until metadata is verified");
+    // A registry is a name, an address and the root it is signed by, so it is never one setting.
+    if matches!(key, "registry" | "trust-root") {
+        return r.fail(key, "not set here", "registries are `godspeed registry add`, `use` and `remove`");
     }
     if let Err(why) = config::check(key, value) {
         return r.fail(key, value, why);
@@ -243,6 +275,126 @@ fn config_set(ctx: &ServiceContext, key: &str, value: &str, r: &mut Rows) {
     r.row(key, value, "file");
 }
 
+/// The file read and parsed, ready for a registry command to change. Refuses a file with a problem: a
+/// change must not be written over a file that does not say what it means.
+fn registries_for_change<'b>(ctx: &ServiceContext, r: &mut Rows, buf: &'b mut [u8; config::FILE_MAX])
+    -> Option<(config::Config<'b>, &'b str)> {
+    let n = match load(ctx, r, buf) {
+        Ok(n) => n,
+        Err(why) => { r.fail("config", "unreadable", why.as_str()); return None; }
+    };
+    let buf: &'b [u8; config::FILE_MAX] = buf;
+    let Ok(text) = core::str::from_utf8(&buf[..n]) else {
+        r.fail("config", config::PATH, "the file is not text; fix or delete it first");
+        return None;
+    };
+    let c = config::parse(Some(&buf[..n]));
+    if let Some(p) = c.problem {
+        r.fail("problem", config::PATH, problem_text(&p).as_str());
+        return None;
+    }
+    Some((c, text))
+}
+
+/// Write the registries back, checking first that the new file reads as what was meant.
+fn write_registries(ctx: &ServiceContext, r: &mut Rows, text: &str, regs: &[config::Registry<'_>], using: &str) -> bool {
+    let mut out = [0u8; config::FILE_MAX];
+    let Some(m) = config::with_registries(text, regs, using, &mut out) else {
+        r.fail("config", config::PATH, "the file would be larger than 2 KiB");
+        return false;
+    };
+    let after = config::parse(Some(&out[..m]));
+    if let Some(p) = after.problem {
+        r.fail("config", config::PATH, problem_text(&p).as_str());
+        return false;
+    }
+    if let Err(e) = gs::fs::Fs::new(ctx).write(config::PATH, &out[..m]) {
+        r.fail("config", config::PATH, cell(format_args!("could not be written: {:?}", e)).as_str());
+        return false;
+    }
+    true
+}
+
+fn registry_row(r: &mut Rows, reg: &config::Registry<'_>, in_use: bool) {
+    let note = cell(format_args!("{}signed by {}", if in_use { "in use; " } else { "" }, reg.pin));
+    r.row(reg.name, reg.url, note.as_str());
+}
+
+/// `godspeed registry`: every registry, one row each, the one in use said so.
+fn registry_list(ctx: &ServiceContext, r: &mut Rows) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let n = match load(ctx, r, &mut buf) {
+        Ok(n) => n,
+        Err(why) => return r.fail("config", "unreadable", why.as_str()),
+    };
+    let c = config::parse(Some(&buf[..n]));
+    if let Some(p) = c.problem {
+        return r.fail("problem", config::PATH, problem_text(&p).as_str());
+    }
+    let using = c.in_use().name;
+    for reg in c.registries() {
+        registry_row(r, reg, reg.name == using);
+    }
+}
+
+/// `godspeed registry add <name> <url> <root>`. The shell has already asked whether to trust the root;
+/// this checks every part and refuses a name that is taken. The new registry is known, not in use.
+fn registry_add(ctx: &ServiceContext, name: &str, url: &str, pin: &str, r: &mut Rows) {
+    let new = config::Registry { name, url, pin };
+    if let Err(why) = config::check_registry(&new) {
+        return r.fail(name, url, why);
+    }
+    let mut buf = [0u8; config::FILE_MAX];
+    let Some((c, text)) = registries_for_change(ctx, r, &mut buf) else { return };
+    if c.find(name).is_some() {
+        return r.fail(name, "already known", "remove it first, or add the new one under another name");
+    }
+    if c.registries().len() == config::MAX_REGISTRIES {
+        return r.fail(name, "not added", cell(format_args!("a machine knows at most {} registries", config::MAX_REGISTRIES)).as_str());
+    }
+    let mut regs = [config::DEFAULT_REGISTRY; config::MAX_REGISTRIES];
+    let k = c.registries().len();
+    regs[..k].copy_from_slice(c.registries());
+    regs[k] = new;
+    if write_registries(ctx, r, text, &regs[..k + 1], c.in_use().name) {
+        registry_row(r, &new, false);
+        r.row("next", cell(format_args!("godspeed registry use {}", name)).as_str(), "to search and install from it");
+    }
+}
+
+/// `godspeed registry use <name>`: the one searched and installed from from now on.
+fn registry_use(ctx: &ServiceContext, name: &str, r: &mut Rows) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let Some((c, text)) = registries_for_change(ctx, r, &mut buf) else { return };
+    let Some(reg) = c.find(name) else {
+        return r.fail(name, "not known", "`godspeed registry` lists the registries this machine knows");
+    };
+    if write_registries(ctx, r, text, c.registries(), name) {
+        registry_row(r, &reg, true);
+    }
+}
+
+/// `godspeed registry remove <name>`. The one in use is refused: something is always in use.
+fn registry_remove(ctx: &ServiceContext, name: &str, r: &mut Rows) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let Some((c, text)) = registries_for_change(ctx, r, &mut buf) else { return };
+    if c.find(name).is_none() {
+        return r.fail(name, "not known", "`godspeed registry` lists the registries this machine knows");
+    }
+    if c.in_use().name == name {
+        return r.fail(name, "in use", "use another one first: `godspeed registry use <name>`");
+    }
+    let mut regs = [config::DEFAULT_REGISTRY; config::MAX_REGISTRIES];
+    let mut k = 0usize;
+    for reg in c.registries().iter().filter(|x| x.name != name) {
+        regs[k] = *reg;
+        k += 1;
+    }
+    if write_registries(ctx, r, text, &regs[..k], c.in_use().name) {
+        r.row(name, "removed", "-");
+    }
+}
+
 /// Reach the registry over verified TLS, one row per step.
 #[inline(never)]
 fn check(ctx: &ServiceContext, r: &mut Rows) {
@@ -255,12 +407,12 @@ fn check(ctx: &ServiceContext, r: &mut Rows) {
     if let Some(p) = c.problem {
         return r.fail("config", config::PATH, problem_text(&p).as_str());
     }
-    let registry = c.get("registry");
-    let url = match config::url(registry) {
+    let using = c.in_use();
+    let url = match config::url(using.url) {
         Ok(u) => u,
-        Err(why) => return r.fail("registry", registry, why),
+        Err(why) => return r.fail("registry", using.url, why),
     };
-    r.row("registry", registry, c.values[0].1.word());
+    r.row("registry", using.url, cell(format_args!("{} (in use)", using.name)).as_str());
 
     // THE CLOCK. A certificate's dates are checked against it, so without one nothing is checked.
     let (now, source) = match gs::task::wall_clock(ctx) {

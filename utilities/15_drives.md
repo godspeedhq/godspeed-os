@@ -162,7 +162,7 @@ from the boot default - you might boot off drive 0 yet work on drive 1.)
 | Command | Effect | Persists? | Step |
 |---------|--------|-----------|------|
 | `drives` | list every drive: index, label, status (`GSFS` or `raw`), size, and free space when formatted | - | **3** |
-| `drives flash [drive] [label] [force]` | format the drive as a GSFS data drive (asks `[y/N]` - it ERASES); optional label; usable at once. `fs` REFUSES a disk whose block 0 holds a partition table or boot sector; the word `force` formats it anyway | data: yes | **3** |
+| `drives flash [drive] [label] [force] [yes]` | format the drive as a GSFS data drive (asks `[y/N]` - it ERASES); optional label; usable at once. `fs` REFUSES a disk whose block 0 holds a partition table or boot sector; the word `force` formats it anyway. The word `yes` answers the `[y/N]` in advance (the warning still prints), as for `seal`; like `force` it is recognised anywhere, so neither can be a label | data: yes | **3** |
 | `drives label <drive> <name>` | name / rename a drive - rewrites the superblock (duplicates allowed, §3) | data: yes | **3** |
 | `drives reset [drive] [force]` | un-format a drive back to raw (asks `[y/N]` - it ERASES the GSFS marker); the inverse of `flash`. NOT a secure wipe (data blocks remain) - a quick clean slate, mainly for re-testing the raw→flash path | data: yes | **3** |
 | `drives check [drive]` | verify (fsck): rebuild the bitmap/free count, report CRC failures | data: yes | **3** |

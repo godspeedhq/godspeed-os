@@ -821,6 +821,16 @@ default (26.4).
 | `timeout-secs` | 30 | how long one request may take before it is abandoned and said so (`[q] quit` still applies) |
 | `max-package-mib` | 64 | the largest package the utility will download, so a hostile index cannot fill the disk |
 
+**Changed 2026-10-16 by the operator: several registries, exactly one in use.** The `registry` and
+`trust-root` rows above became one line per registry - `registry <name> <url> <sha256:root>` - and a
+`use <name>` line, managed by `godspeed registry` (`add`, `use`, `remove`) rather than `config set`.
+There is no priority between registries, because only the one in use is ever asked; each keeps its own
+signing root, so switching never trusts one registry with another's key; and an installed package will
+remember the registry it came from, so switching does not change where it updates from
+(`utilities/61_godspeed.md` 2). A file in the form above still reads, as one registry called `default`,
+and is rewritten in the new form by the first registry change. `trust-root` as a key survives only in
+that old form.
+
 **Edited through the utility**, not only by hand: `godspeed config set <key> <value>` checks the value first
 (a URL that parses, a fingerprint of the right form, a folder that exists) and refuses with the reason, so a
 typo is caught when it is made rather than at the next install. The file stays plain text, and `edit` works

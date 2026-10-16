@@ -1180,7 +1180,7 @@ const _: () = assert!(
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
-    ("godspeed", &["config", "check"]),
+    ("godspeed", &["registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -5683,14 +5683,18 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
-        "godspeed" => help_block(ctx, "godspeed", "the native package manager - its settings, and the registry over verified TLS", &[
-            ("godspeed config", "every setting, its value, and whether it came from the file or the default", "godspeed config"),
+        "godspeed" => help_block(ctx, "godspeed", "the native package manager - its registries, its settings, the registry over verified TLS", &[
+            ("godspeed registry", "the registries this machine knows; exactly one is in use", "godspeed registry"),
+            ("godspeed registry add <name> <url> <root>", "know another registry; asks [y/N] before trusting its signing root", "godspeed registry add mirror https://mirror.example/ sha256:..."),
+            ("godspeed registry use <name>", "search and install from that one from now on", "godspeed registry use mirror"),
+            ("godspeed registry remove <name>", "forget one; the one in use is refused", "godspeed registry remove mirror"),
+            ("godspeed config [<key>]", "the plain settings, or one, and whether each came from the file or the default", "godspeed config timeout-secs"),
             ("godspeed config set <key> <value>", "change one setting, checked first; the rest of the file is kept", "godspeed config set timeout-secs 45"),
-            ("godspeed check", "reach the registry over TLS, verified to the trusted roots, one row per step", "godspeed check"),
+            ("godspeed check", "reach the registry in use over TLS, verified to the trusted roots, one row per step", "godspeed check"),
             ("the file", "/system/services/godspeed/config, one `key value` per line; `edit` works on it too", ""),
             ("the roots", "/system/services/godspeed/roots/: the certificate authorities TLS accepts, one file each", ""),
             ("not yet", "searching and fetching packages: they need the registry's signed metadata, not built yet", ""),
-            ("godspeed check | where item=tls", "a report is records: item, value, note", "godspeed config | where note=file"),
+            ("godspeed registry | where note~in use", "a report is records: item, value, note", "godspeed config | where note=file"),
         ], false),
         "ask" => help_block(ctx, "ask", "plain questions about this machine, answered from what its services know", &[
             ("ask \"<question>\"", "the answer: a verdict, and what it rests on", "ask \"is my system healthy?\""),
@@ -6025,10 +6029,18 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi radio off hard", "cut the CHIP's power and stay powered down; `wifi radio on` brings it back cold (~20 s)", "wifi radio off hard"),
             ("wifi radio powercycle", "cut and restore the CHIP's power and restart the driver on it - the radio comes back from power-on and rejoins", "wifi radio powercycle"),
         ], false),
-        ("godspeed", "config") => help_block(ctx, "godspeed config", "the package manager's settings", &[
+        ("godspeed", "config") => help_block(ctx, "godspeed config", "the package manager's plain settings", &[
             ("godspeed config", "each setting: item (the key), value, note (file or default); the file is written with the defaults on first start", "godspeed config"),
-            ("godspeed config set <key> <value>", "registry (https only), tls-roots (a folder ending in /), timeout-secs (1-100), max-package-mib (1-4096)", "godspeed config set timeout-secs 45"),
-            ("trust-root", "not set here: it decides which registry is trusted, so it is changed in the file, by hand", ""),
+            ("godspeed config <key>", "one setting", "godspeed config timeout-secs"),
+            ("godspeed config set <key> <value>", "tls-roots (a folder ending in /), timeout-secs (1-100), max-package-mib (1-4096)", "godspeed config set timeout-secs 45"),
+            ("registries", "not settings: a registry is a name, an address and its signing root - `godspeed registry`", ""),
+        ], false),
+        ("godspeed", "registry") => help_block(ctx, "godspeed registry", "the registries this machine knows, and the one in use", &[
+            ("godspeed registry", "one row each: item (its name), value (its address), note (in use, and the root it is signed by)", "godspeed registry"),
+            ("godspeed registry add <name> <url> <root> [yes]", "a name (lower-case, digits, hyphens), an https:// address, and sha256: plus 64 hex digits; asks [y/N] first unless `yes`", "godspeed registry add mirror https://mirror.example/ sha256:..."),
+            ("godspeed registry use <name>", "only the one in use is searched and installed from, so a package is never found in two places", "godspeed registry use mirror"),
+            ("godspeed registry remove <name>", "the one in use is refused; use another first", "godspeed registry remove mirror"),
+            ("what an install remembers", "the registry it came from: an update fetches from there, not from whichever is in use", ""),
         ], false),
         ("godspeed", "check") => help_block(ctx, "godspeed check", "reach the registry, one row per step", &[
             ("registry, clock, roots", "what the check used: the address, the date a certificate is checked against and its source, how many roots", ""),
@@ -6189,6 +6201,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("drives flash", "format the only drive, no label", "drives flash"),
             ("drives flash <label>", "format + name it", "drives flash data"),
             ("drives flash <drive> <label>", "format drive <drive>, name it", "drives flash 0 data"),
+            ("drives flash ... yes", "answer the y/N in advance; the warning still prints", "drives flash 0 data yes"),
         ], false),
         ("drives", "label") => help_block(ctx, "drives label", "name / rename a drive", &[
             ("drives label <name>", "name the only drive", "drives label archive"),
@@ -6303,7 +6316,7 @@ static HELP: &[HelpRow] = &[
     Row("mem", "physical memory usage"),
     Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
     Row("ask \"<question>\"", "plain questions about this machine: health, what failed, why a service restarted"),
-    Row("godspeed config | check", "the package manager: its settings, and the registry reached over verified TLS"),
+    Row("godspeed registry | config | check", "the package manager: its registries, its settings, the registry reached over verified TLS"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("random [n]", "words from the hardware random number generator"),
@@ -15271,10 +15284,47 @@ fn build_godspeed_table(ctx: &ShellCtx, arg: &str) -> Option<Table> {
 #[inline(never)]
 fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim().is_empty() {
-        gs::io::println(ctx, "usage: godspeed config | godspeed config set <key> <value> | godspeed check - `godspeed help` says what each does");
+        gs::io::println(ctx, "usage: godspeed registry | godspeed config | godspeed check - `godspeed help` says what each does");
         return Err(ShellError::Unknown);
     }
-    let mut t = match build_godspeed_table(ctx, arg) { Some(t) => t, None => return Err(ShellError::Unknown) };
+    // TRUSTING A NEW ROOT IS ASKED FIRST, here where the console is: the package manager answers in a
+    // table and cannot read a key. `yes` as a last word answers it, as for `seal`, so a script can.
+    let mut words: [&str; 8] = [""; 8];
+    let mut nw = 0usize;
+    for w in arg.split_whitespace() {
+        if nw == words.len() { break; }
+        words[nw] = w;
+        nw += 1;
+    }
+    let mut line_buf = [0u8; 512];
+    let mut line = arg.trim();
+    if nw >= 5 && words[0] == "registry" && words[1] == "add" {
+        let yes = nw == 6 && words[5] == "yes";
+        if nw > 6 || (nw == 6 && !yes) {
+            gs::io::println(ctx, "usage: godspeed registry add <name> <url> <root> [yes]");
+            return Err(ShellError::Unknown);
+        }
+        gs::io::println_fmt(ctx, format_args!(
+            "registry {} at {} - anything signed by {} will be trusted as coming from it.", words[2], words[3], words[4]));
+        if !yes {
+            gs::io::print(ctx, " Trust this root? [y/N]: ");
+            if !read_confirm(ctx) {
+                gs::io::println(ctx, "godspeed: cancelled - nothing was added");
+                return Ok(());
+            }
+        }
+        // The request without the `yes`: the package manager is never told a person agreed, only what to add.
+        let mut n = 0usize;
+        for (i, w) in words[..5].iter().enumerate() {
+            let b = w.as_bytes();
+            if n + b.len() + 1 > line_buf.len() { break; }
+            if i > 0 { line_buf[n] = b' '; n += 1; }
+            line_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
+    }
+    let mut t = match build_godspeed_table(ctx, line) { Some(t) => t, None => return Err(ShellError::Unknown) };
     let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
     let answered = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status");
     t.filter("item", "!=", "status");
@@ -18152,9 +18202,10 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
         "wifi" => wifi_pipe_refusal(arg),
         "audio" => audio_pipe_refusal(arg),
         "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
-            (Some("config"), None) | (Some("check"), None) => None,
-            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed config and godspeed check"),
-            _ => Some("pipe: pipe a report: godspeed config or godspeed check"),
+            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed registry, godspeed config and godspeed check"),
+            (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed registry, godspeed config and godspeed check"),
+            (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) => None,
+            _ => Some("pipe: pipe a report: godspeed registry, godspeed config or godspeed check"),
         },
         "churn" if arg.split_whitespace().next() == Some("verify") => None,
         "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),
@@ -25113,15 +25164,19 @@ fn cmd_drives(ctx: &ShellCtx, args: &[&str], argc: usize) -> Result<(), ShellErr
             // well as `drives flash data force`, and requiring a fixed position silently dropped the
             // override in the selector form - which then refused a disk the operator had just forced.
             let force = args[2..argc].iter().any(|a| *a == "force");
+            // `yes` answers the `[y/N]` in advance, as it does for `seal` and `chaos max-carnage`: the
+            // warning still prints, and a script or a person who has already decided is not asked twice.
+            // Recognised anywhere, like `force`, so neither word can be a drive's label.
+            let yes = args[2..argc].iter().any(|a| *a == "yes");
             let mut kept = [""; MAX_ARGS];
             let mut n = 0usize;
             for a in args[..argc].iter() {
-                if *a == "force" { continue; }
+                if *a == "force" || *a == "yes" { continue; }
                 kept[n] = a;
                 n += 1;
             }
             let (sel, label) = split_drive_value(&kept, n);
-            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label, force) } else { Err(ShellError::Unknown) }
+            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label, force, yes) } else { Err(ShellError::Unknown) }
         }
         "label"   => {
             // `drives label [drive] <name>` - selector optional; name required.
@@ -25286,15 +25341,19 @@ fn drives_list(ctx: &ShellCtx) -> Result<(), ShellError> {
 /// be the GSFS target), and a confirmation prompt cannot convey that - `drives` shows it as an
 /// unformatted raw disk either way. So the danger is named explicitly and the override is a word the
 /// operator has to type.
-fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellError> {
+fn drives_flash(ctx: &ShellCtx, label: &str, force: bool, yes: bool) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         gs::io::println_fmt(ctx, format_args!("drives: label too long (max {})", LABEL_MAX));
         return Err(ShellError::Unknown);
     }
-    gs::io::print(ctx, "This ERASES the drive. Continue? [y/N] ");
-    if !read_confirm(ctx) {
-        gs::io::println(ctx, "drives: aborted");
-        return Err(ShellError::Unknown); // the requested format did not happen
+    if yes {
+        gs::io::println(ctx, "This ERASES the drive. Continue? [y/N] yes (given on the command line)");
+    } else {
+        gs::io::print(ctx, "This ERASES the drive. Continue? [y/N] ");
+        if !read_confirm(ctx) {
+            gs::io::println(ctx, "drives: aborted");
+            return Err(ShellError::Unknown); // the requested format did not happen
+        }
     }
     let lb = label.as_bytes();
     let ll = lb.len().min(LABEL_MAX);
