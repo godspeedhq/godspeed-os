@@ -53,7 +53,12 @@ pub const OP_NOW: u8 = 1; // -> [ok, epoch(8, le), source, age(8, le)]  age = -1
 /// `net-stack` pushing an SNTP result, and this service now fetches and checks that result itself.
 pub const OP_SET: u8 = 2;
 pub const OP_FLOOR_GET: u8 = 3; // -> [ok, floor(8, le)]
-pub const OP_FLOOR_SET: u8 = 4; // [floor(8, le)] -> [ok]
+/// RETIRED 2026-10-16, answered `[0]`. It let any client of this service raise the clock floor to any
+/// value, and the floor only ever rises and is persisted, so one message could push the machine's date
+/// years ahead for good (`docs/developer-services-design.md` 3.3). Its only caller was the shell seeding
+/// the floor from `/system/services/time/floor` - this service's own file, which it already reads itself.
+/// The floor is now set by this service alone: from that file, and from the clock readings it takes.
+pub const OP_FLOOR_SET: u8 = 4;
 /// Fetch the network time NOW (`date sync`). -> `[1]` once a query is on its way (or already was), `[0]` if it
 /// could not be sent. The answer is NOT waited for: the caller watches the sync age in `OP_NOW` change.
 pub const OP_SYNC: u8 = 5;
@@ -782,6 +787,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             OP_SYNC => {
                 // `date sync`: ask NOW rather than at the next twenty-second tick. Answered at once - the
                 // caller watches the sync age in `OP_NOW` change, so nothing here waits on the network.
+                //
+                // A floor that never loaded - `fs` slower than the ~30 s of retries at boot - is read
+                // again here, because asking for the time is when it matters: a fetched time is checked
+                // against it. This replaces the shell's old seed, which read this same file itself and
+                // sent the value back over `OP_FLOOR_SET` (retired above). Non-blocking, like every
+                // floor read; the answer arrives tagged and a few more timed retries follow.
+                if !floor_settled {
+                    let _ = floor_load(&ctx);
+                    if tries_left == 0 {
+                        tries_left = 3;
+                    }
+                }
                 if ntp.is_none() {
                     ntp = ntp_ask(&ctx);
                     if ntp.is_some() {
@@ -797,16 +814,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 out[1..9].copy_from_slice(&clock.floor.to_le_bytes());
                 reply(&ctx, cap, &out);
             }
-            OP_FLOOR_SET if p.len() >= 9 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&p[1..9]);
-                let f = i64::from_le_bytes(b);
-                // The floor only ever rises. A floor that could fall is not a floor, and the whole
-                // point is that a fresh boot cannot report a time before the last one it recorded.
-                if f > clock.floor {
-                    clock.floor = f;
-                }
-                reply(&ctx, cap, &[1]);
+            OP_FLOOR_SET => {
+                ctx.log("time: OP_FLOOR_SET is retired - the clock floor is set only by this service, from its own file");
+                reply(&ctx, cap, &[0]);
             }
             other => {
                 ctx.log_fmt(format_args!("time: unknown op {} - answering, not ignoring", other));
