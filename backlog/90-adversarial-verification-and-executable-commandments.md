@@ -1,7 +1,10 @@
 # 90. Adversarial verification of the kernel, and the commandments made more executable
 
-**Status: OPEN, 2026-10-15.** Not started. Recorded at the operator's request as the brief for a
-future piece of work; nothing below has been examined yet, and no claim in it is a finding.
+**Status: OPEN, 2026-10-16.** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
+the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
+enforcement-layer defects are listed below, NOT fixed; four executable prototypes exist outside the tree
+and are NOT landed. Both wait on the operator. The brief, as recorded on 2026-10-15, follows; only its list of checker
+names was spelled out in full, because `scripts/doc_symbols_check.py` could not resolve the short forms.
 
 ## The brief
 
@@ -132,7 +135,9 @@ Not yet surveyed in detail; the starting list:
 
 - `scripts/commandments.py` and `scripts/commandments_redteam.py` (the commandments as gates, and
   probes that break each check), with `COMMANDMENTS.baseline.toml`.
-- The `arch_*`, `port_scope`, `shared_surface`, `unsafe_check`, `one_way` and `quit_wait` checkers.
+- The checkers `scripts/arch_boundary_check.py`, `scripts/arch_seam_check.py`, `scripts/port_scope_check.py`,
+  `scripts/shared_surface_check.py`, `scripts/unsafe_check.py`, `scripts/one_way_check.py` and
+  `scripts/quit_wait_check.py`.
 - `#![deny(unsafe_code)]` on every service, example and `osdev`.
 - The §22 suites in `osdev/src/validator.rs`: identity (24 cases), property P1-P10, fuzz F1-F8,
   adversarial A1-A15, chaos, stress.
@@ -141,7 +146,86 @@ Not yet surveyed in detail; the starting list:
 - `docs/ENGINEERING_ASSURANCE.md`, which already lists no formal verification and no independent
   review among its limitations.
 
+## Progress
+
+**2026-10-16, phases 1 and 2 (and most of phase 3), read-only.** Nine adversarial readers (two for
+capabilities, one each for IPC, scheduling, memory, and SMP with interrupts, plus the syscall surface, the
+traceability matrix and the existing tests), four prototype
+builders, up to three skeptics per finding, a completeness critic and eight follow-ups: 239 raw findings,
+184 upheld, 28 killed, 27 argued. No QEMU, no boards, no code changed. Nothing is machine-checked; no tool
+of that kind is installed. Deliverables A to D are sections 1 to 17 of the audit.
+
+**The verdict in one paragraph.** The capability TABLE holds: a reference model drove the real
+`capability/*.rs` through 8 x 40,000 generated operations with no mismatch outside two recorded,
+downstream-contained divergences (D25), and caught 16 of 16 injected faults. The defects are in waiting and dying: single-slot IPC wait records that are
+never withdrawn, three memory-safety windows in kill and reclaim, a tick clock that counts handler
+entries rather than time (it carries the v0.28.0 shutdown and reboot deadline), and failure paths that
+leak. The enforcement layer missed 28 of 32 injected violations, and the kernel host tests run on no
+automatic path.
+
+## Defects found (code; each is fixed separately, one change per flash, QEMU first)
+
+Ids match the audit, section 6, where each has its trace, the minimal correction and the check that would
+catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere, and this pass adds to it.
+
+| Id | Sev | Defect | Where |
+|---|---|---|---|
+| D1 | high | a second blocked sender erases the first: it never wakes, its message and any carried cap are destroyed | `ipc/routing.rs:445-449` |
+| D2 | high | `try_recv`, timed-out `recv_timeout` and CallDeadline leave the caller registered; a blocking send can return 0 for a message never queued | `syscall/dispatch.rs:516`, `:582`, `:1630-1640` |
+| D7 | high | a claim abort releases twice, drops `CORE_LEAVING`, and a concurrent kill frees a stack and root in use | `task/scheduler.rs:85-91`, `:2040`, `:2227`, `:3289` |
+| D8 | high | the deferred-free drain is re-entered by the timer on the same core and frees a stack and root twice | `task/scheduler.rs:1545`, `:1737`, `:2466-2469` |
+| D10 | high | a self-kill releases its slot before the core leaves it; a spawn into it lets the dead task run with the new task's caps | `task/scheduler.rs:3163-3166` |
+| D12 | high | `MONOTONIC_TICKS` counts handler entries: early on x86 (wake IPIs) and arm32, stalls on riscv64, drops ticks everywhere; every timeout and the power deadline | `task/scheduler.rs:452`, `arch/x86_64/boot.rs:1546` |
+| D19 | high | KNOWN A10-2 (user-copy guard per core), plus: a cross-killed copier leaves x86's guard stuck true | `arch/x86_64/syscall_entry.rs:155-260` |
+| D3 | med | a dead task's wait records (blocked sender on a peer, call-await, deadline, badge) reach the slot's next occupant | `task/scheduler.rs:2576-2640` |
+| D4 | med | CallDeadline's bound does not cover the send leg | `syscall/dispatch.rs:1557-1590` |
+| D5 | med | Call liveness, reply correlation, AcquireSendCap and ResourceInvoke key identity on a bare, LIFO-reused endpoint id (partly KNOWN) | `ipc/routing.rs:581-589`, `dispatch.rs:1312`/`:1350` |
+| D6 | med | a delivered reply loses to ReplyDead | `syscall/dispatch.rs:1638-1639` |
+| D9 | med | `CORE_PENDING_PML4` is one slot (leaks a root, an L1 slot on arm32); the pending-stack overflow branch frees the stack in use (a proof gap: nine undrained self-kills not shown reachable) | `task/scheduler.rs:852`, `:3107`, `:3156-3160` |
+| D11 | med | `run()` picks with interrupts on, then claims a different life of the slot: a kernel panic from userspace kill and spawn | `task/scheduler.rs:1569-1593` |
+| D14 | med | the kill path publishes the death before it releases device state, IRQ routes and the band | `task/scheduler.rs:2560-2903` |
+| D15 | med | a failed spawn never frees its reply endpoint id, leaves its IRQ route on a reused id, strands the framebuffer (IRQ and T1 parts KNOWN) | `task/mod.rs:1450-1457`, `:1677-1683` |
+| D16 | med | `FREE_IDS` is a plain lock held by the preemptible supervisor respawn: a core-0 wedge | `ipc/mod.rs:47`, `:74` |
+| D17 | med | `ready_count()` used as a core-id bound (placement onto a dead core, watchdog gap); aarch64 arenas sized by arrivals | `task/mod.rs:1308-1319`, `task/scheduler.rs:1799` |
+| D18 | med | a level interrupt masked and its notification skipped under queue pressure stays masked forever, silently | `interrupt/route.rs:142`, `:167-170` |
+| D20 | med | no kernel stack guards on riscv64; x86 overflow is a triple-fault reset; debug kernels exceed 64 KiB (riscv64 part KNOWN) | `arch/riscv64/mod.rs:2355` |
+| D21 | med | kernel W^X and the 6.4 DMA report exist only on x86 (aarch64 parts KNOWN, A10-9, SEC-34) | `arch/arm/mmu.rs:85-102`, `arch/riscv64/mod.rs:3691-3700` |
+| D24 | med | cross-core reads of unsynchronised per-task state, one feeding a panicking assertion in `handle_kill` | `invariants/assertions.rs:34-46` |
+| D26 | med | `fs`'s in-request remount leaves up to 64 band slots unrevoked per event (userspace; a site of KNOWN A10-5 the fix missed) | `services/fs/src/main.rs:1459-1460` |
+| D13 | low | arm32: the power path from the tick ISR takes `FB` with a plain lock while idle can hold it | `bootcon/mod.rs:302-311` |
+| D22 | low | SpawnImage mints CONSOLE_READ and grantable peer caps from flags the supervisor does not hold (14.1 step 4) | `syscall/dispatch.rs:1150-1160` |
+| D23 | low | x86: ungated query 21 pops the COM2 operator stream; queries 11 and 17 race on the CMOS index port, a candidate for the T630 "4383d" misread | `dispatch.rs:1900`, `arch/x86_64/rtc.rs:41-55` |
+| D25 | low | a cap minted on a dead record validates at the capability layer; no-resurrection rests on spawn order | `capability/table.rs:59-70`, `:261-265` |
+| D27 | low | results that do not reflect outcomes (SpawnImage error after success, AllocMem leak KNOWN A10-15, stub successes, arch-divergent codes) | `syscall/dispatch.rs:1144-1179` |
+| D28 | low | serial output under hot locks; panic path not re-entrant; `nomem` interrupt-mask asm | `ipc/routing.rs:776-779` |
+| D29 | low | KNOWN A5-10: the loader never bounds `p_vaddr`; on x86 that reaches the shared kernel half | `loader.rs:262-332` |
+
+## Enforcement-layer defects (scripts and tests; the audit's section 11)
+
+| Id | Defect |
+|---|---|
+| E1 | `I-irq-lock` never reads the three arch ISR files it declares (`os.walk` on a file path yields nothing) |
+| E2 | pins fail open on spelling; VII misses request flags and the probe table; no check pins syscall gates (15 gate mutations, 0 caught); IX passes on a comment; VI misses four `fs` statics; check-defining tables unratcheted; 10 of 21 checks have no red-team row |
+| E3 | `cargo test -p kernel --lib`, Miri and mutation run on no automatic path; `mutation.yml` ends `\|\| true`; results five months old |
+| E4 | the routing and naming host tests test models; the real `routing.rs` and `names.rs` host-compile with one constant stubbed |
+| E5 | P1, P3, P9, P10 test less than their rows; host tests credit dead code; nothing at any level checks that SEC-7 removes GRANT; every QEMU suite is x86 only |
+| E6 | KNOWN SEC-11: the guard is a `debug_assert`, absent from release images (argument holds today) |
+
+Specification and comment drift (the audit's section 12) is recorded there and not edited, including
+CLAUDE.md 10.5's quiescence claim, which D7 refutes.
+
+## Prototypes (outside the tree; the audit's section 15)
+
+C1 capability reference model (PROPERTY TEST on the real `capability/*.rs`), C2 IPC routing state machine
+(PROPERTY TEST on the real `routing.rs`), C3 kill and reclaim model checker (MODEL CHECK, sequential
+consistency), C4 syscall gate check (ARCHITECTURAL CHECK). All four were rerun at `537e6861` and
+reproduce their recorded results. They live in the session scratchpad, which is temporary; landing them is
+the operator's decision, and C2 needs a `kernel/src/lib.rs` seam to live in the repo.
+
 ## Next step
 
-Phase 1 only: read the kernel against the commandments and produce the traceability matrix and the
-capability state model, with the reviewed SHA recorded. Cost: a long session of reading, no code.
+The operator's choice, in two parts. Fixes: section 13 of the audit proposes D8, D7, D2, D1, D12 and D10
+first, each one change per flash, QEMU first. Checks: `cargo test -p kernel --lib` into the `osdev` gate and
+the syscall gate check first (no kernel change), then the capability and IPC harnesses as an
+expected-failure ledger. Still open from the brief: a concurrent model of IPC wake and block, weak memory
+on every port, and the remaining responsibilities at runtime on arm, aarch64 and riscv64.
