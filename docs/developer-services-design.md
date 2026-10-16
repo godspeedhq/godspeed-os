@@ -418,12 +418,14 @@ the usual hardware cards, since the supervisor is on every board.
 1. ~~The memory ceiling for a developer service: 64 MiB, or something else?~~ **Answered 2026-10-16:
    none.** The developer declares the limit they want. A limit is a budget, not a reservation (nothing is
    set aside at spawn), so a large one costs nothing until it is used. A service whose image and stack
-   cannot be given memory is not started, which is what happens today and is logged. **Still open:** what
-   happens when a running developer service asks for more than its limit. Today it is told no
-   (`AllocDenied`) and keeps running, the recoverable failure CLAUDE.md 10.4 defines for every service; the
-   operator would rather it were killed. Killing it in the kernel would amend 10.4 for every service (the
-   kernel knows no service as a developer one); having the standard library treat the refusal as fatal for
-   developer services would not.
+   cannot be given memory is not started, which is what happens today and is logged. A running developer
+   service that asks for more than its limit is **told no and keeps running** (`AllocDenied`), exactly as
+   CLAUDE.md 10.4 defines for every service (decided 2026-10-16, after weighing killing it instead): the
+   refusal is a returned error, so it is loud, and the service decides whether to degrade or stop. No
+   amendment. **What no ceiling costs, recorded rather than hidden:** budgets are not reservations and are
+   not summed against RAM, so one developer service with a very large limit can take every free frame, and
+   then other services' allocations and the supervisor's spawns fail too. Services mostly use no heap
+   (26.6.1), which keeps this small in practice, and nothing here claims more than that.
 2. The maximum number of developer services in one image: four?
 3. ~~May a developer image be flashed to hardware?~~ **Proposed answer: yes, on the floor as it stands**,
    because that floor reaches no disk, network or device (3.5). Reopened if the floor widens.
@@ -653,6 +655,33 @@ The licence is the deciding question, and it is the operator's: ask `embedded-tl
 (the cheapest good outcome), accept the cost of writing the client here, or take on C. Until one is
 chosen the native package manager has no way to reach the registry.
 
+**How Linux does it, and the shape that suggests (proposed 2026-10-16, not decided).** On Linux, TLS is a
+userspace library: OpenSSL, GnuTLS, BoringSSL or rustls does the handshake and checks the certificates
+against a root store the distribution ships (the `ca-certificates` package). The kernel's part is
+optional and narrow: kTLS can take over encrypting and decrypting records once a library has finished the
+handshake, and since 6.5 a kernel that needs TLS for itself (NFS over TLS) asks a userspace daemon,
+`tlshd`, to do the handshake for it. The lesson is the split, and it matches this kernel's scope: TLS is a
+library in a service, and the kernel learns nothing about it. What is borrowed is that shape; the code is
+not, because OpenSSL and GnuTLS are Apache-2.0 and LGPL and are written for a heap (26.14). The authority
+is the specifications: RFC 8446 (TLS 1.3), RFC 5280 (certificates) and RFC 8448, which gives complete
+example TLS 1.3 handshakes, byte for byte, to test against.
+
+So the proposed client is **ours, in three parts**:
+
+- **the handshake and the record layer, written here** from RFC 8446: client only, TLS 1.3 only,
+  the cipher suite RFC 8446 makes mandatory, TLS_AES_128_GCM_SHA256, and X25519, with fixed buffers;
+- **certificate checking by `rustls-webpki`**, the verifier `rustls` itself uses: `alloc` and `std` are
+  default features it can be built without, its crypto is pluggable, and its licence is ISC (to be
+  confirmed), which GPL-2.0-only can include;
+- **the primitives from RustCrypto** (AES-GCM, SHA-256, HKDF, X25519, ECDSA P-256 and P-384), taken under
+  their MIT licence.
+
+ECDSA only, because RSA verification without a heap is the hard part, and an ECDSA-only client limits the
+registry to an ECDSA certificate chain. Whether the registry's custom domain serves one is to be checked
+against its real chain before this is chosen. Writing the handshake here makes it security-critical code
+that nobody has audited, so it is tested against RFC 8448's traces, fuzzed as a parser, and kept to the one
+peer it serves.
+
 ### 10.4 Time: verification needs a trustworthy date
 
 The timestamp role expires daily (the CLI repository's docs/trust-metadata.md), so verifying anything needs the
@@ -669,6 +698,17 @@ wall clock to be right. Three facts from this tree bear on that:
   (`audits/2026-10-16-kernel-verification.md`, D23), which a lock around the CMOS pair would fix.
 
 A clock that is wrong in the other direction cannot replay an old index, because versions only increase.
+
+**Machines with no RTC already take the time from the network.** `time` runs the NTP exchange itself (every
+20 s until it has the time, then hourly), and the Pi 2, which has no clock of its own, gets its date that
+way. A machine that can reach the registry can reach a time server, so the package manager gets a correct
+date wherever it works at all. What NTP is not is authenticated: it is plain UDP, so something on the path
+could send a wrong time. Two things already bound the damage: the floor (a clock can never go back past
+the last time this machine recorded), and that a wrong date fails CLOSED in both checks that use it (an
+expired-looking timestamp or certificate refuses an install; it never accepts a forged one). Two ways to
+do better, for when it matters: NTS (RFC 8915), NTP whose keys come from a TLS handshake, which the TLS
+client above would make possible; or treating the registry's signed timestamp as an authenticated lower
+bound on the date.
 
 ### 10.5 Where a kept package goes
 
