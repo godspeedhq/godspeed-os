@@ -155,31 +155,35 @@ pub fn request_within_notice(
             Some(k) => ctx.request_with_reply_qhint_keeping(peer, msg, NOTICE_AFTER_SECS, secs, || notice(), k),
             None => ctx.request_with_reply_qhint(peer, msg, NOTICE_AFTER_SECS, secs, || notice()),
         };
-        match out {
-            ReqOutcome::Reply(r) => return Ok(r),
-            // A DEADLINE THAT PASSED: a live peer that is slow, so the request may have happened and is
-            // never re-sent. `ReqOutcome` answers a passed deadline and a send that never left with the
-            // same `Timeout`, but it reports the deadline only once it has passed - so a `Timeout` sooner
-            // than `secs` is the send that never left, and is told apart below, as `request_watched` does.
-            ReqOutcome::Timeout if ctx.epoch_secs_monotonic().saturating_sub(t0) >= secs => {
-                return Err(Error::OutcomeUnknown)
-            }
-            // THE SEND NEVER LEFT: no live capability to the peer - it restarted, or it started after the
-            // caller and was never acquired. Nothing happened, so the one safe retry: reacquire by name and
-            // send again. Until 2026-10-16 this answered `OutcomeUnknown` at once, and on the Wyse, where the
-            // shell starts before `net-stack`, the first `tcp` of a boot said "net-stack did not answer
-            // within 20s" after a few seconds, having never reached it.
-            ReqOutcome::Timeout => {
-                if attempt == 0 && ctx.reacquire_cap(peer).is_ok() {
-                    continue;
-                }
-                return Err(Error::Unreachable);
-            }
+        // Name the outcome before acting on it, as `request_watched` does. `ReqOutcome` answers a passed
+        // deadline and a send that never left with the same `Timeout`, but it reports the deadline only once
+        // it has passed - so a `Timeout` sooner than `secs` is the send that never left, and nothing else.
+        let outcome = match out {
+            ReqOutcome::Reply(r) => DeadlineOutcome::Reply(r),
             // The caller stopped waiting. Reported as ITSELF, not folded into the timeout: a person
             // pressing `q` and a service going silent are different facts and a caller will say
             // different things about them. Collapsing those two would be the same mistake this module
             // exists to stop the SDK's `Option` making.
             ReqOutcome::Aborted => return Err(Error::Cancelled),
+            ReqOutcome::Timeout if ctx.epoch_secs_monotonic().saturating_sub(t0) >= secs => DeadlineOutcome::Timeout,
+            ReqOutcome::Timeout => DeadlineOutcome::SendFailed,
+        };
+        match outcome {
+            DeadlineOutcome::Reply(r) => return Ok(r),
+            // A live peer that is slow: the request may have happened, so it is never re-sent.
+            DeadlineOutcome::Timeout => return Err(Error::OutcomeUnknown),
+            // THE SEND NEVER LEFT: no live capability to the peer - it restarted, or it started after the
+            // caller and was never acquired. Nothing happened, so the one safe retry: reacquire by name and
+            // send again. Until 2026-10-16 this answered `OutcomeUnknown` at once, and on the Wyse, where the
+            // shell starts before `net-stack`, the first `tcp` of a boot said "net-stack did not answer
+            // within 20s" after a few seconds, having never reached it.
+            DeadlineOutcome::SendFailed => {
+                if attempt == 0 && ctx.reacquire_cap(peer).is_ok() {
+                    continue;
+                }
+                return Err(Error::Unreachable);
+            }
+            DeadlineOutcome::QueueFull => return Err(Error::Busy),
         }
     }
     Err(Error::Unreachable)
