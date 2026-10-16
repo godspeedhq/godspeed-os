@@ -91,6 +91,8 @@ pub enum Error {
     Ipc(IpcError),
     NotFound,
     InvalidArgument,
+    /// A spawn named a task that is already running: one name is one task (`spawn_image`).
+    AlreadyRunning,
 }
 
 impl From<CapError> for Error {

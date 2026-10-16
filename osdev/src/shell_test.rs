@@ -2108,8 +2108,13 @@ pub fn run(image_path: &Path, smp: u32) {
             check!(r.contains("total:") && r.contains("rounds"), "chaos: max-carnage ran a bounded round count + self-terminated");
             check!(r.contains("kernel: alive"), "chaos: max-carnage - kernel survived the kill+flood carnage (shell included)");
             check!(r.contains("chaos: seed 4242 (given)") && r.contains("seed: 4242"), "chaos: a given seed is used, and said at the start and in the report");
+            // Rounds 2-5 fire a mem-pressure spawn while the first still runs; the supervisor names that
+            // refusal for what it is (the kernel's SPAWN_ALREADY_RUNNING), where it said InvalidArgument.
+            check!(r.contains("'mem-pressure' from image FAILED (AlreadyRunning)")
+                       && !r.contains("'mem-pressure' from image FAILED (InvalidArgument)"),
+                   "chaos: a mem-pressure spawn refused as already running is reported as AlreadyRunning");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 5; }
+        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 6; }
     }
     // After chaos, the (possibly respawned) shell prints a startup banner and/or a regain prompt, so the
     // first `gsh>` we hit can precede the `cores` response. Drain prompts until the response appears -

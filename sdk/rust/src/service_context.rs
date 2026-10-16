@@ -4364,7 +4364,8 @@ impl ServiceContext {
     /// step that ends that catalogue (`docs/service-ownership.md`). Requires the SPAWN capability,
     /// exactly as `spawn` does: supplying the image is not authority to start it - AND the caller
     /// must hold `IMAGE_SPAWN`, which only the supervisor has and cannot delegate (CLAUDE.md 14.1).
-    /// Every refusal comes back as `InvalidArgument`; the kernel's serial log says which it was.
+    /// A name already running comes back as `AlreadyRunning`; every other refusal as `InvalidArgument`,
+    /// and the kernel's serial log says which it was.
     ///
     /// `peers` are NUL-joined into a caller-owned buffer; each name still resolves through the
     /// kernel name directory, so this grants nothing a contract's `send_peers` would not.
@@ -4399,7 +4400,9 @@ impl ServiceContext {
                         core::mem::size_of::<SpawnRequest>() as u64, slot as u64)
         };
         // slot + 1, so 0 means "spawned, no recv endpoint" without colliding with slot 0.
-        if ret < 0 { Err(crate::Error::InvalidArgument) }
+        // -22 is the kernel's SPAWN_ALREADY_RUNNING.
+        if ret == -22 { Err(crate::Error::AlreadyRunning) }
+        else if ret < 0 { Err(crate::Error::InvalidArgument) }
         else if ret == 0 { Ok(None) }
         else { Ok(Some(CapHandle(ret as u32 - 1))) }
     }

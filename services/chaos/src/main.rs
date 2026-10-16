@@ -551,8 +551,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // bounds the effect, NOT the counter: chaos's own alloc plateaus at its contract memory limit (later
         // allocs return AllocDenied), and only the FIRST mem-pressure TASK runs: it holds its memory until
         // the cleanup below, and the kernel refuses every later spawn as `already running`, since one name is
-        // one task. So `N spawns (N-1 refused)` is the designed report, not a fault. The supervisor's line for
-        // each refusal says `InvalidArgument`; the kernel's `rejected: already running` before it says why.
+        // one task. So `N spawns (N-1 refused)` is the designed report, not a fault, and the supervisor's line
+        // for each refusal says `AlreadyRunning`.
         // The system holding IS the point; the offense is what we count.
         // (Reclaimed at cleanup below.)
         let _ = ctx.alloc_mem(MEMP_CHUNK); mempr += 1;

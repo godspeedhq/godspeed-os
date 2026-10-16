@@ -915,6 +915,11 @@ const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 /// largest real request (xHCI's scratchpad, 1168 KiB) and far below anything that could starve the
 /// frame allocator.
 const MAX_DMA_PAGES: u32 = 2048;
+/// A task of that name is already running, and one name is one task. Its own code because it is the one
+/// refusal a spawner can name to an operator - `chaos` refuses ten of these a run, and the supervisor
+/// said `InvalidArgument` for each, true of none of them. Clear of the cap range (-2..-7), as the
+/// acquire codes are. Every other refusal stays -1 and the kernel's own line says which it was.
+const SPAWN_ALREADY_RUNNING: i64 = -22;
 
 fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // The SPAWN capability gates this exactly as it gates `Spawn` (3.1): supplying an image does not
@@ -1175,6 +1180,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
             }
         }
         Ok(None) => 0,
+        Err(crate::task::SpawnError::AlreadyRunning) => SPAWN_ALREADY_RUNNING,
         Err(_)   => -1,
     }
 }

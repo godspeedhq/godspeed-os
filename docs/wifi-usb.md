@@ -3016,7 +3016,8 @@ instruments came out.
 - **`1000 spawns (999 refused)`** on every board is chaos's design, not a fault: the first `mem-pressure`
   task holds its memory until chaos ends, and every later spawn is refused as already running. The
   supervisor's line for each, `spawn 'mem-pressure' from image FAILED (InvalidArgument)`, does not say
-  why; the kernel's `already running` before it does.
+  why; the kernel's `already running` before it does. *(Since 2026-10-16 it does: `SpawnImage` answers
+  that refusal with its own code and the line reads `FAILED (AlreadyRunning)`.)*
 - **`reply send FAILED` lines** in the chaos runs are all inside them, from requesters chaos had killed.
 - **The Pi 4's `selfcheck` DNS check passes again** - the one it failed on 2026-10-07, section 49.
 
