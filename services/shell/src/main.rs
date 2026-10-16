@@ -9387,13 +9387,11 @@ fn build_hw_interrupts_table(ctx: &ShellCtx) -> Option<Table> {
     Some(t)
 }
 
-/// Where the last-known-good time is recorded. Deliberately a plain visible file, not a hidden one: it is
-/// a fact about this machine an operator may want to read or delete (§26.4 - keep the mechanism visible).
+/// Where the last-known-good time is recorded - the `time` service's own file, which only it reads and
+/// writes. Named here only so `date` can say where the floor it shows came from. Deliberately a plain
+/// visible file, not a hidden one: it is a fact about this machine an operator may want to read or delete
+/// (§26.4 - keep the mechanism visible).
 const CLOCK_FLOOR_PATH: &[u8] = b"/system/services/time/floor";
-/// Budget for the floor's disk I/O. The floor is best-effort by design, so a slow or still-mounting `fs`
-/// must cost a shrug, never a wedge: an UNBOUNDED request here would hang the boot prompt before the
-/// first `gsh>` (the exact hazard the history loader documents) and hang `date` with no q escape.
-const CLOCK_FS_SECS: i64 = 2;
 
 /// Render a duration the way a person reads one ("4m", "2h", "3d") for the clock's freshness note.
 struct HumanSecs(i64);
@@ -9425,27 +9423,6 @@ fn fs_read_file(ctx: &ShellCtx, path: &[u8], dst: &mut [u8], max_secs: i64) -> O
     r.ok()
 }
 
-/// Seed the kernel's clock floor from the last-known time on disk, at startup. The floor is a BOUND, never
-/// a reading: it is not shown as the time and no "estimate" is derived from it (a machine powered off for
-/// six months would otherwise display a six-month-old timestamp indistinguishable from a measured one).
-/// Its whole job is to let the kernel REFUSE a clock value from before we last ran.
-fn clock_floor_seed(ctx: &ShellCtx) {
-    let mut buf = [0u8; 24];
-    let n = match fs_read_file(ctx, CLOCK_FLOOR_PATH, &mut buf, CLOCK_FS_SECS) {
-        Some(n) if n > 0 => n,
-        _ => return,                   // no record yet / no fs - no floor this boot, which is the honest state
-    };
-    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-        if let Some(v) = parse_u32(s.trim()) {
-            if !time_floor_set(ctx, v as i64) {
-                // `time` keeps the higher floor and never refuses one, so false means it did not
-                // answer (`backlog/fixed/80` H12 - this said "refused").
-                gs::io::println(ctx, "shell: the time service did not answer with the recorded clock floor - not seeded");
-            }
-        }
-    }
-}
-
 /// Wall-clock date+time. Default renders a full timestamp with weekday AND where the time came from,
 /// e.g. `Sat 2026-06-06 22:05:09  (ntp, synced 4m ago)`; `date epoch` prints seconds since 1970-01-01 as a
 /// bare pipeable number; `date sync` fetches the time over the network. Deliberately these three forms -
@@ -9459,11 +9436,10 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     // `time` reaches the network on its own (about every 20 s until it has the time), or immediately by
     // this command.
     if arg == "sync" {
-        // Seed the floor HERE, where it is used: it exists to let the kernel refuse a fetched time from
-        // before we last ran, so the moment we are about to fetch one is exactly when it must be known.
-        // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
-        // in service_main for what that cost.
-        clock_floor_seed(ctx);
+        // The floor is the `time` service's alone (2026-10-16): it reads `/system/services/time/floor`
+        // itself, and re-reads it on this very request if it never loaded. The shell used to read that
+        // file and send the value to `time` over OP_FLOOR_SET, an op that let ANY client push the floor
+        // forward for good; it is retired (`docs/developer-services-design.md` 3.3).
         out.line_fmt(ctx, format_args!("Asking the network for the time now (NTP, by the time service)... (q aborts)"));
         // ASK `time`, THEN WATCH THE CLOCK (2026-10-01). The clock is the `time` service's, and so is
         // fetching it: `net-stack` no longer runs the exchange, so a `ping` never waits behind a time
@@ -19804,18 +19780,6 @@ fn time_floor(ctx: &ShellCtx) -> Option<i64> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&p[1..9]);
     Some(i64::from_le_bytes(b))
-}
-
-/// Raise the clock floor, via the `time` service. Returns false when it could not be reached or did
-/// not confirm: `time` keeps the higher of the two floors and confirms either way, so it never refuses.
-fn time_floor_set(ctx: &ShellCtx, epoch: i64) -> bool {
-    let mut body = [0u8; 9];
-    body[0] = 4;                                     // OP_FLOOR_SET
-    body[1..9].copy_from_slice(&epoch.to_le_bytes());
-    match time_rpc(ctx, &body) {
-        Some(r) => r.payload_bytes().first() == Some(&1),
-        None => false,
-    }
 }
 
 /// The wall clock's current reading, per the `time` service. `None` when it could not be asked - the
