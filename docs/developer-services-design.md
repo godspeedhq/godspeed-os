@@ -6,7 +6,9 @@
 create, build, test, run in QEMU - "can be built now". Measured against this tree it cannot, without
 the CLI editing supervisor source, and that is the boundary the CLI's own contract forbids. This
 document is the three OS-side changes that would make it true, and what each one deliberately does
-not do.
+not do. Section 9 (2026-10-16) records what the CLI still needs beyond them, and section 10 the native
+`godspeed` utility on a Godspeed machine. Also 2026-10-16: 2.1 and 3.5 are corrected against the kernel
+verification (`audits/2026-10-16-kernel-verification.md`).
 
 No kernel change. No MISCIS change. No new syscall. No image loaded from disk.
 
@@ -109,6 +111,16 @@ not a grant. The kernel's own check that the supervisor cannot delegate what it 
 (`SUPERVISOR_DELEGATABLE`) still applies underneath, so the generator cannot widen authority even if
 it is wrong; it can only narrow it.
 
+**Corrected 2026-10-16: that backstop covers the privilege word and nothing else.** The kernel
+verification (`audits/2026-10-16-kernel-verification.md`, D22) found that `SpawnImage` checks only the
+request's privilege bits against what the spawner holds (`privileges_caller_lacks`). The request FLAGS
+are minted without any holdings check: `SPAWN_FLAG_REQ_CONSOLE` gives the child CONSOLE_READ, which the
+supervisor does not itself hold (`syscall/dispatch.rs:1150-1160`, `task/mod.rs:1791-1792`), and
+`SPAWN_FLAG_PEERS_GRANT` makes the name-wired peer caps grantable. Neither is in `SUPERVISOR_DELEGATABLE`.
+So for those two flags, and for the send peers themselves, **the generator's ceiling is the only check**:
+a generator that set them wrongly would grant, and the kernel would not stop it. That is why 3.3 refuses
+both flags by name, and why the generator's refusals are an authority boundary, not a convenience.
+
 ---
 
 ## 3. Change 1: developer services in a build
@@ -205,7 +217,8 @@ defect for them, is for the operator to decide.
 
 **Everything else is refused at build time**: every privilege bit, every `hw_*` key, `console_push`,
 `resource_mint`, `service_control`, `pci_cfg`, `cpu_clock`, `power_off`, a non-zero `probe_mode`, any
-DMA pages. The refusal names the key and says why:
+DMA pages, and the two spawn flags the kernel does not check, `[spawn] console` and `[spawn]
+peers_grant` (4.2; 2.1 says why these two matter most). The refusal names the key and says why:
 
     Cannot build developer service hello
     Reason:
@@ -244,6 +257,22 @@ disk is out of its reach. So a developer image may be flashed (`godspeed run --t
 same terms as QEMU, and the boot line above is what tells anyone at that machine what it is carrying.
 **If the floor ever widens - `fs` joining the public set is the first likely case - this is decided
 again**, because a developer service with a send cap to `fs` on a real board touches a real disk.
+
+**What the floor does not bound (added 2026-10-16).** The floor limits a developer service's AUTHORITY.
+It does not limit what every task can already do, and the kernel verification found two things there
+(`audits/2026-10-16-kernel-verification.md`), both open in `backlog/90`:
+
+- **Ungated queries.** Any task may call the ungated `InspectKernel` queries. On x86, query 21 pops a byte
+  of the COM2 operator channel, so a floor service can read and delete the commands meant for `control`
+  (D23); queries 11 and 17 race on the unlocked CMOS index port and can return a date years ahead.
+- **Kernel defects reachable by any task.** A service that faults exercises the self-kill path, which has
+  a double-free window (D8), a page-table-root leak (D9, an L1 arena slot on the Pi 2) and a slot-reuse
+  race (D10). The restart loop in 3.4 repeats that path for a service that crashes on start, which is why
+  its backoff and "given up" state matter: they bound how often a broken developer service drives it.
+
+Neither changes the answer above: an in-tree service has the same exposure, and none of it reaches a
+disk, a network or a device. But "can harm nothing a QEMU run could not" is a statement about authority,
+and these are the places it is not the whole story. They are fixed in the kernel, not worked around here.
 
 ### 3.6 Untying the crate from the tree
 
@@ -422,7 +451,7 @@ its own constitution. The CLI follows; it never works around one.
 | the CLI refuses | because the OS lacks | where the OS already says so |
 |---|---|---|
 | `godspeed run` | developer services in a build | this document, changes 1 to 3 |
-| `godspeed install` (on a Godspeed machine) | images loaded from `fs`, signed, with a local grant policy | `docs/service-ownership.md`, step 2 |
+| `godspeed install` (on a Godspeed machine) | images loaded from `fs`, signed, with a local grant policy | `docs/service-ownership.md`, step 2; the native side's own needs are section 10 |
 | `godspeed new utility` | a terminating task | `docs/stdlib-design.md` 1, option B |
 | `godspeed new driver` | device grants for a driver built outside the tree | the supervisor's spawn rows, by device kind |
 | `godspeed new app` | public application interfaces | nowhere yet |
@@ -449,9 +478,9 @@ Godspeed machine can run without being rebuilt. It needs three things. The CLI s
 already built.
 
 - **A verifier at spawn.** The package format is defined and versioned: `manifest.toml`, `manifest.sig`,
-  `contract.toml` and one ELF per ISA (`godspeed-cli/docs/package-format.md`). So is the registry's trust
+  `contract.toml` and one ELF per ISA (the CLI repository's docs/package-format.md). So is the registry's trust
   metadata: root, namespaces with active, retired and revoked keys, snapshot and timestamp
-  (`docs/trust-metadata.md` there, modelled on TUF). Both are verified by `godspeed-package`, a crate
+  (docs/trust-metadata.md there, modelled on TUF). Both are verified by `godspeed-package`, a crate
   that is `no_std` and allocator-free and is built for all four targets in CI, so the native package
   manager and a loader can share the exact code the registry and the CLI use. Whether the loader checks
   the publisher's signature, the registry's trust chain, or both, is the OS's decision.
@@ -537,3 +566,112 @@ do not change, because the package format does not care what compiled the ELF.
 
 For each step, the CLI's side is small once the OS's exists: a template, its CI build, and `run` or
 `install` support. A kind the OS cannot run stays refused until then, with the reason and a pointer here.
+
+---
+
+## 10. The native `godspeed` utility (the other half of the vocabulary)
+
+**Added 2026-10-16. A design note for the next piece of work, not a proposal: nothing here is approved or
+built.** The CLI's contract splits the `godspeed` vocabulary in two (the CLI repository's CLAUDE.md, "Host CLI and
+Native Package Manager"): the host CLI creates, builds, packages and publishes on a workstation, and the
+**native package manager** runs on a Godspeed machine and owns
+
+    godspeed search <query>     godspeed info <package>     godspeed list
+    godspeed install <package>  godspeed update <package>   godspeed uninstall <package>
+
+It is "an ordinary Godspeed program on public interfaces: no privileged kernel knowledge, no private
+supervisor protocol", and installing "never grants a requested capability by itself". The CLI side of
+the format is done: `godspeed-package` (`no_std`, no allocator, built for all four targets) defines the
+package, the manifest, the registry index and the trust metadata, and verifies all of them. This section
+is what the OS has to settle before the native side can be built, and what it can do before 9.2 exists.
+
+### 10.1 What it can do on today's OS, and what it cannot
+
+| command | needs | today |
+|---|---|---|
+| `search`, `info` | to read the registry's index and trust metadata, and verify them | blocked on transport (10.3) and the clock (10.4); no kernel change |
+| download and verify a package | the above, plus a place to keep it (10.5) | the same; no kernel change |
+| `list`, `uninstall` | a record of what is kept, and deleting it | possible once something is kept |
+| `install`, `update` (running the package) | a loader and a local grant policy (9.2) | blocked: nothing reads an image from disk |
+
+So a first version can be **fetch, verify, keep, list and remove**, and it must say plainly that a kept
+package is not installed: the machine cannot run it until 9.2 exists. The CLI's contract already forbids
+presenting a development convenience as installation; the same holds here.
+
+### 10.2 Where it lives
+
+Every utility today is a function inside `services/shell` (9.3). This one should not be: it downloads,
+hashes and verifies files that can be megabytes, holds the trust metadata while it works, and needs send
+caps to `fs` and to `net-stack`, while the shell's stack is already tight on long paths. The natural shape
+is **its own in-tree service**, `godspeed`, driven by a thin `godspeed` verb in the shell, the way `ask`
+is shaped (`services/ask`, `utilities/60_ask.md`). As an in-tree service its spawn row is hand-written and reviewed (1.1), so its
+send caps to `fs` and `net-stack` are an ordinary reviewed grant, not the developer floor's question. It
+obeys `utilities/0_conventions.md` like any utility: `help` at every depth, `[q] quit` on every wait over
+2 s, `list` and `search` as record producers that pipe, and the actions refusing in a pipe with a sentence.
+
+### 10.3 Transport: the registry is HTTPS, and Godspeed has no TLS
+
+The registry is static files read over HTTPS (the CLI repository's docs/publishing-design.md). Godspeed has TCP
+(`net-stack`, the `tcp` and `serve` utilities) and no TLS. Two ways out, and the choice is the operator's:
+
+- **Plain HTTP, relying on the signatures.** The trust metadata is modelled on TUF exactly so that
+  integrity and freshness do not rest on the transport: every file is named by its digest from a signed
+  index, the timestamp expires daily, and versions only increase. Over plain HTTP an attacker on the path
+  can block or delay a fetch, and can see which packages a machine asks for; it cannot forge or roll back
+  one. This needs the registry to serve the same files over HTTP as well, which is the CLI repository's
+  decision, not this one's.
+- **A TLS client on Godspeed.** It would have to fit the no-heap rule (26.6.1), handle certificates, and
+  keep a trust store current. No candidate was evaluated here. It is much larger than the package manager
+  it would serve.
+
+The first is the smaller honest step, and it loses nothing the signatures protect. Confidentiality of
+what a machine fetches is the thing given up, and that should be said wherever the feature is described.
+
+### 10.4 Time: verification needs a trustworthy date
+
+The timestamp role expires daily (the CLI repository's docs/trust-metadata.md), so verifying anything needs the
+wall clock to be right. Three facts from this tree bear on that:
+
+- the date comes from the `time` service, whose floor only ever rises and is persisted;
+- **any client of `time` can raise that floor without bound today** (`OP_FLOOR_SET`, 3.3): one message
+  could push the machine's date years ahead for good, and every timestamp would then look expired. That
+  fails closed (no install, no forgery), but it is a lasting denial of the whole package manager;
+- on x86 the RTC read behind `time` races across cores and can return a date years ahead
+  (`audits/2026-10-16-kernel-verification.md`, D23).
+
+So the `time` finding stops being hypothetical once a package manager exists: it should be settled (the
+floor set only by the holder of storage, as 3.3 proposes) before `search` ships. A clock that is wrong in
+the other direction cannot replay an old index, because versions only increase.
+
+### 10.5 Where a kept package goes
+
+`docs/filesystem-layout.md` 10 reserves package storage for phase 4, "only when package management needs
+it". This is that moment. A proposal for the layout doc, not made here: `/system/packages/<publisher>/<name>/
+<version>/` holding the verified files as published, with the package manager the owner (L2) and nothing
+else writing there. Uninstall then deletes that folder and keeps the package's own data under
+`/system/services/<name>/` and `/users/`, as the CLI's contract requires; a `delete data` is separate and
+says what it destroys first. Until folder capabilities (phase 2) exist, the package manager's send cap to
+`fs` reaches the whole disk like every other `fs` client; that is acceptable for a reviewed in-tree service
+and is the reason it must not be a developer service.
+
+### 10.6 The shared crate
+
+The native side depends on `godspeed-package`, which lives in the CLI's repository. Three options, the
+operator's to choose:
+
+1. a git dependency on a tagged release of `godspeed-cli`, the pattern 3.6 proposes for the stdlib in the
+   other direction;
+2. the crate moves to its own repository, depended on by both;
+3. the crate moves into this repository, beside the contract validator of 4.3, and the CLI depends on it.
+
+Option 3 matches 4.3's rule that the format a Godspeed machine verifies is defined where the machine is;
+option 1 is the smallest change. Whichever is chosen, `godspeed-package`'s own open question is answered
+here: "how the native side reads the text without a heap" (the CLI repository's docs/package-format.md, open question 1)
+is decided when the native package manager is, and that is now.
+
+### 10.7 What it needs from the kernel
+
+Nothing, for 10.1's first version: no syscall, no capability, no MISCIS change. It is a client of `fs`,
+`net-stack` and `time` like any other service. `install` proper needs 9.2, and 9.2 is where the kernel and
+supervisor questions are. The suggested order in 9.7 gains a step between 1 and 3: **the native package
+manager's fetch, verify, keep, list and remove**, once 10.3 and 10.4 are decided.
