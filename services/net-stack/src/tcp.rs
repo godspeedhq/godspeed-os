@@ -661,6 +661,20 @@ impl Tcp {
         self.conns.iter().position(|c| !c.in_use())
     }
 
+    /// Is a slot free for a new connection now?
+    pub fn has_free_slot(&self) -> bool {
+        self.conns.iter().any(|c| !c.in_use())
+    }
+
+    /// Is a slot held by a connection on its way out: our FIN sent, both FINs exchanged, or closed and not yet
+    /// reaped? Each of those ends by itself within seconds (TIME_WAIT is 2 s here), so a connect that finds
+    /// the table full can wait for one. `CloseWait` is not among them: it waits for its owner to close, and
+    /// nothing says when that will be.
+    pub fn any_closing(&self) -> bool {
+        self.conns.iter().any(|c| c.in_use() && matches!(c.state,
+            State::FinWait1 | State::FinWait2 | State::LastAck | State::TimeWait | State::Closed))
+    }
+
     fn find(&mut self, lport: u16, rip: &[u8; 4], rport: u16) -> Option<&mut Conn> {
         self.conns.iter_mut().find(|c| {
             c.state != State::Closed && c.local_port == lport

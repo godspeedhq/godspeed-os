@@ -1649,6 +1649,10 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
 /// 200 ms. Ten wakes a second is also the ceiling on what this costs: each is ONE drain request to
 /// `nic-driver`, and only when nothing else woke us.
 const POLL_MS: u64 = 100;
+/// How long a connect waits for a closing connection's slot when the table is full (`OP_CONNECT`). TIME_WAIT
+/// here is 2 s, and a FIN exchange is a round trip or two, so 4 s covers both; a client asking for a
+/// connection waits 20 s for its answer.
+const CONNECT_SLOT_WAIT_MS: u64 = 4_000;
 
 /// How long ONE frame the poll step sends may wait on the driver.
 ///
@@ -3694,6 +3698,26 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     dip[0], dip[1], dip[2], dip[3], dport,
                     if on_link.is_some() { "on-link, direct" } else { "via the gateway" }));
                 let net = tcp::Net { our_mac, peer_mac, our_ip };
+                // A FULL TABLE THAT IS EMPTYING IS WAITED FOR, briefly. The connection before this one is
+                // often still closing when its client's next command asks for a new one - a client that
+                // ran `godspeed check` and then `godspeed list available` found both slots held by
+                // connections that were reaped two seconds later, and was told the table was full. A slot
+                // on its way out frees itself (`any_closing`), so this polls for up to CONNECT_SLOT_WAIT_MS
+                // and connects into it. A table full of connections that are NOT closing is still refused
+                // at once, as before.
+                if !tcpst.has_free_slot() && tcpst.any_closing() {
+                    let start = gs::driver::wait::ticks(&ctx);
+                    let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                    let poll_net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
+                    while !tcpst.has_free_slot()
+                        && gs::driver::wait::ticks(&ctx).wrapping_sub(start) < ticks_ms(&ctx, CONNECT_SLOT_WAIT_MS) {
+                        poll_step(&ctx, pending, &st, &mut tcpst, &poll_net, &mut asks);
+                        if !tcpst.has_free_slot() { gs::task::sleep_ms(&ctx, POLL_MS); }
+                    }
+                    let waited = gs::driver::wait::ticks(&ctx).wrapping_sub(start) / ticks_ms(&ctx, 1).max(1);
+                    ctx.log_fmt(format_args!("net-stack: connect waited {} ms for a closing connection's slot - {}", waited,
+                        if tcpst.has_free_slot() { "freed" } else { "still full" }));
+                }
                 match gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
                     Ok((crid, cap)) => {
                         match tcp_open(&ctx, pending, &mut tcpst, &net, crid, dip, dport, 8_000) {
