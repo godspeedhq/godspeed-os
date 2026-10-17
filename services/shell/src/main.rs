@@ -15565,7 +15565,7 @@ fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> 
                 if !install_one(ctx, spec, Some(have), yes, &mut q) { failed = true; }
             }
             _ => {
-                gs::io::print_fmt(ctx, format_args!("stop {} and no longer start it at boot? Its fetched copy stays. [y/N]: ", pkg));
+                gs::io::print_fmt(ctx, format_args!("uninstall {}? It stops, and no longer starts at boot or runs when typed; its fetched copy stays. [y/N]: ", pkg));
                 if yes { gs::io::println(ctx, "yes (given on the command line)"); }
                 else if !read_confirm(ctx) {
                     gs::io::println_fmt(ctx, format_args!("godspeed: {} left installed", pkg));
