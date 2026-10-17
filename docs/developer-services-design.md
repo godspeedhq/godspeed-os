@@ -8,7 +8,9 @@ the CLI editing supervisor source, and that is the boundary the CLI's own contra
 document is the three OS-side changes that would make it true, and what each one deliberately does
 not do. Section 9 (2026-10-16) records what the CLI still needs beyond them, and section 10 the native
 `godspeed` utility on a Godspeed machine. Also 2026-10-16: 2.1 and 3.5 are corrected against the kernel
-verification (`audits/2026-10-16-kernel-verification.md`).
+verification (`audits/2026-10-16-kernel-verification.md`). Section 11 (2026-10-17) proposes that each
+OS release publish the facts the CLI builds against as one file, so the CLI stops reading this
+repository's build files.
 
 No kernel change. No MISCIS change. No new syscall. No image loaded from disk.
 
@@ -288,6 +290,10 @@ and these are the places it is not the whole story. They are fixed in the kernel
   is tested rather than asserted.
 - **Toolchain.** Unchanged: the OS's `rust-toolchain.toml` is the toolchain. A developer crate copies
   it, and step 4 of 3.2 refuses a mismatch.
+
+The linker script and the toolchain pin are two of the six facts section 11 publishes per release.
+Shipping the linker script in the stdlib's package and publishing it in the release file are compatible,
+because both carry the same file from the same commit.
 
 ### 3.7 A headless run with a verdict
 
@@ -860,3 +866,105 @@ the default, and a file that does not name one address refused by line rather th
 
 **The TLS library takes all of this from its caller.** The server name, the root certificates and the
 current time are arguments, never constants, so the library has no address in it to change.
+
+---
+
+## 11. The platform file: what a release says to developer tooling
+
+**Added 2026-10-17. A proposal: nothing here is approved, and nothing in this repository is built.** The
+`godspeed` CLI no longer needs a clone of this repository (`godspeed-cli` 0.2.0, the CLI repository's
+docs/no-checkout.md). The first time it needs a release, it fetches six files from the release's tag,
+resolved first to one commit, and caches them with their digests. That works today with nothing changed
+here, but it reads this repository's own build inputs at their paths. Moving `services/user.ld`, or
+renaming a key in `.cargo/config.toml`, would break every installed CLI. Those files are not a contract,
+and this section proposes the contract. One fact the CLI needs is in none of the six files at all, so
+it can only be hard-coded today (the last row of 11.1).
+
+### 11.1 What the CLI reads, and from where
+
+| fact | read today from | why the CLI needs it |
+|---|---|---|
+| the OS version | `Cargo.toml`, `[workspace.package] version` | the stdlib tag a new project depends on |
+| the stdlib crate exists and is named `godspeed` | `stdlib/rust/Cargo.toml` | the generated dependency |
+| the toolchain pin and the targets the OS builds | `rust-toolchain.toml` | `--arch`, `--all`, and the project's own pin |
+| per-target compiler flags | `.cargo/config.toml` | building a service the way the OS builds its own |
+| the service linker script | `services/user.ld` | the same, at link time |
+| the contract schema | `contracts/schema/service.schema.json` | `godspeed check` |
+| the entry symbol and the link arguments | each service's own `build.rs` (`-T` the linker script, `--entry=service_main`) | linking at all: the kernel starts a service at `service_main` |
+
+The last row is the reason a file is better than a list of paths. No file holds it: every service's
+`build.rs` repeats it, so the CLI cannot fetch it and must hard-code `service_main`. Renaming the entry
+point here would build and boot every service in this repository and break every service the CLI builds,
+with nothing on either side to say so.
+
+Only the targets `rust-toolchain.toml` lists are platform targets. `.cargo/config.toml` also carries
+flags for the stub ISAs (`riscv32`, `loongarch64`, `s390x`), which no release builds; they are the
+arch-boundary demarcation test, not something a developer can target, and the file leaves them out.
+
+### 11.2 The proposal
+
+The release workflow, which already builds the images and writes `SHA256SUMS-<tag>`, also writes and
+attaches **`godspeed-platform.toml`**: one versioned TOML file carrying the seven facts above. The linker
+script and the schema are carried as strings, not as paths. Its digest goes in `SHA256SUMS-<tag>` like
+every other asset, and the workflow's existing rule applies to it: a published release's assets are
+never replaced.
+
+    format = 1
+    os = "0.28.0"
+    stdlib = { crate = "godspeed", tag = "v0.28.0" }
+    toolchain = { channel = "nightly-2026-05-16", targets = ["x86_64-unknown-none", ...] }
+
+    [link]
+    entry = "service_main"
+    script = "user.ld"          # a key of [files]
+
+    [rustflags]
+    "x86_64-unknown-none" = ["..."]
+
+    [files]
+    "user.ld" = """..."""
+    "service.schema.json" = """..."""
+
+Illustrative only: the exact keys are decided when it is built. `format` gets the compatibility policy
+the package format already has. A new key is ignored by an older CLI, and a removed or renamed one is a
+new format number.
+
+**It is generated from the files it describes, never written by hand**, in the same workflow step and
+from the same commit that built the images. There is still one source for each fact, the file the OS
+builds from, and no second declaration to drift from it. That is CLAUDE.md 13.6's rule about contracts
+applied to the platform. The entry symbol is the one fact with no single source today; the generator
+reads it from the services' `build.rs` files and refuses to write the file unless every one of them
+names the same symbol and the same linker script, so a disagreement there fails the release rather than
+being published as whichever service was read first.
+
+**What it does not do.** It grants nothing and describes no service. It needs no kernel, MISCIS,
+supervisor or syscall change. It changes no file it describes, and the OS's own build reads them exactly
+as before. It is not signed beyond the release's checksums; signing OS releases is a separate decision,
+and this file would be covered by it.
+
+### 11.3 Old releases
+
+v0.28.0 and every earlier release have no platform file, and their assets are not changed after
+publication. So the CLI uses the file when a release has one, and otherwise falls back to the six files
+at the tag, as it does today. It drops the fallback when no supported release lacks the file. That is
+the CLI's own change, behind its src/kit.rs, and needs nothing further here.
+
+### 11.4 What it unblocks, and what it costs
+
+- **The CLI** reads one published file per release instead of six private ones. This repository can
+  move or reshape its build files freely, as long as the generator keeps producing the same facts.
+- **Other tools**, such as an editor plugin or a second CLI, get the same facts the same way.
+- **The cost:** one new script in `scripts/`, with two modes. The release workflow runs it to
+  write the TOML. With `--check` it writes nothing and fails if any fact cannot be found, or if the
+  services disagree about the entry symbol or the linker script; that mode goes in `osdev`'s
+  `EXTRA_CHECKS`, so a rename fails the next local build rather than a developer's machine. Not in
+  `build.yml`: that workflow is manual-only and paused, so a check there would run when someone
+  remembers it, which is how the documentation checkers once ran only at release (CLAUDE.md 5).
+  Small, and independent of changes 1 to 3: it can land first.
+
+### 11.5 Question for the operator
+
+1. Should the release workflow publish `godspeed-platform.toml` (11.2), starting with the next release?
+
+   *Recommended: yes, with the entry symbol (11.1) and the `--check` mode in `EXTRA_CHECKS` (11.4). It
+   needs no kernel change, grants nothing, and is the one item here the CLI is already waiting on.*
