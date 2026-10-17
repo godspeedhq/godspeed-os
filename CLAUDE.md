@@ -1995,6 +1995,24 @@ Required capability: `service_control` (held only by supervisor).
 
 Kill is for misbehaving services and for restart. It is not a graceful shutdown mechanism.
 
+> **Amendment 2026-10-17 (`Exit`, syscall 57): a program may END ITSELF, with a status, and the death notice
+> says so.** Until now nothing ended a task but the `kill` syscall or a fault, so every program was a service
+> that never returns, and a program that does one job - a `utility` - could not exist outside the shell
+> (`docs/stdlib-design.md` 1, option B, chosen by the operator). `Exit(status)` ends the caller by the path a
+> task that kills itself already takes (`handle_kill`'s tail), with a third cause: the notice carries `E` and the
+> status, beside `K` (killed by) and `F` (a fault) (6.2 amendment 2026-10-11).
+>
+> **It takes no capability, and that is deliberate, not an oversight against 21.** The rule there - a syscall
+> that does not validate a capability is rejected - exists so that no syscall reaches authority without one.
+> `Exit` reaches nothing: the one task it can end is the caller, as `Yield` and `Park` act on the caller and
+> take none. A program could already end itself by faulting; this makes the same end deliberate and says how.
+>
+> **What the kernel learns, and what it does not.** A number, said in the notice. What an exit MEANS is the
+> supervisor's (26.10): an installed package that ends itself is not restarted, because it finished; a service
+> in `MANAGED` that exits is restarted as any death is, because it is meant to run. The kernel keeps no record.
+> No responsibility is added: ending a task is the scheduler's already (4.3). Pinned in
+> `COMMANDMENTS.baseline.toml`; one more SDK call site (18.5, `exit`).
+
 ---
 
 ## 15. State and Persistence
@@ -2168,7 +2186,12 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 and to 80 on 2026-10-17 by the amendments below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+
+> **Amendment 2026-10-17 (`Exit`): `sdk/rust/src/service_context.rs` 79 -> 80.** One call site, `exit`: one
+> `unsafe { raw_syscall(57, ..) }` behind the safe `ServiceContext::exit` and `gs::program::exit`, for the 14.5
+> amendment of the same date. Necessity: a program cannot reach a syscall any other way. Safety: one integer and
+> no pointer, and the syscall does not return.
 
 > **Amendment 2026-10-14 (`PowerOff`): `sdk/rust/src/service_context.rs` 77 -> 79.** Two call sites behind
 > the §12.3 amendment of the same date: `power_off_call`, one `unsafe { raw_syscall(56, ..) }` behind the three

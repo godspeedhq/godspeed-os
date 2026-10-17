@@ -85,6 +85,11 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     let mut spawned_cap: Option<CapHandle> = None;
     // ...and when that cap is one the supervisor does not keep, it is SENT rather than copied (below).
     let mut handed: Option<CapHandle> = None;
+    // The reply capability, taken BEFORE the command runs. The kernel keeps one pending capability per task - the
+    // one that came with the last message received - and a command that makes requests of its own (an install
+    // reads the package from `fs`) receives replies that replace it. Taken after, an install's answer had nowhere
+    // to go and `godspeed install` waited out its deadline on a package that had started.
+    let reply = gs::ipc::take_sent_cap(ctx);
     let status = if payload.len() == 2 && payload[1] == supcmd::DEVICES {
         body_len = devices_answer(usb, &mut body);
         supcmd::OK
@@ -143,9 +148,11 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
             // does: `producer\0sink` is how a pipe arrives. A pipe is not a special kind of spawn -
             // it is a spawn whose producer is given its downstream as a peer, which is precisely what
             // the kernel's by-name pipe spawn did before it was retired (backlog/fixed/80 K14).
-            Ok(spec) if !spec.is_empty() => {
+            // A name first. An empty one is UNKNOWN below, not an early return, which would drop the reply cap
+            // taken at the top.
+            Ok(spec) if !spec.is_empty() && !spec.starts_with('\0') => {
                 let mut it = spec.split('\0');
-                let name = match it.next() { Some(n) if !n.is_empty() => n, _ => return true };
+                let name = it.next().unwrap_or("");
                 let mut peers: [&str; 6] = [""; 6];
                 let mut np = 0usize;
                 for pr in it { if !pr.is_empty() && np < peers.len() { peers[np] = pr; np += 1; } }
@@ -234,7 +241,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     // A copy is DERIVED for the caller and the supervisor keeps its own (it needs it to wire
     // dependents later) - for a service the map keeps. One it does not is sent itself (`handed`). If the send fails the derived copy is reclaimed - an orphaned cap is a
     // table slot leaked per request (26.6).
-    if let Some(reply_cap) = gs::ipc::take_sent_cap(ctx) {
+    if let Some(reply_cap) = reply {
         let msg = if body_len > 0 { Message::from_bytes(&body[..body_len]) } else { Message::from_bytes(&[status]) };
         // A cap the supervisor does not keep goes as it is: copying it would leave the supervisor holding
         // the original, which is what `map_keeps` exists to stop.
@@ -1485,7 +1492,8 @@ const DEATHS: usize = 32;
 /// One service's newest death notice: when, how many, and how (the kernel's words, `death`).
 #[derive(Clone, Copy)]
 struct Death {
-    name: [u8; 16],
+    /// 32, not 16: an installed package runs as `publisher/name`, and two of those cut to 16 collide.
+    name: [u8; 32],
     nlen: u8,
     count: u32,
     secs: u32,
@@ -1499,7 +1507,7 @@ struct Death {
 impl DevEvents {
     fn new(ctx: &ServiceContext) -> Self {
         let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; 16], nlen: 0 };
-        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let none = Death { name: [0; 32], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
         DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32,
                     deaths: [none; DEATHS] }
     }
@@ -1508,7 +1516,7 @@ impl DevEvents {
     /// fault kind and the address. A notice without it (none should arrive) is kept as `how` 0.
     fn note_death(&mut self, ctx: &ServiceContext, name: &str, how: &[u8]) {
         let nb = name.as_bytes();
-        let nl = nb.len().min(16);
+        let nl = nb.len().min(32);
         let secs = gs::task::uptime_secs(ctx).max(0) as u32;
         // This name's entry, else an empty one, else the oldest.
         let i = match self.deaths.iter().position(|d| d.nlen as usize == nl && d.name[..nl] == nb[..nl]) {
@@ -1524,7 +1532,7 @@ impl DevEvents {
             },
         };
         let d = &mut self.deaths[i];
-        d.name = [0; 16];
+        d.name = [0; 32];
         d.name[..nl].copy_from_slice(&nb[..nl]);
         d.nlen = nl as u8;
         d.count = d.count.wrapping_add(1);
@@ -1546,6 +1554,11 @@ impl DevEvents {
                 a.copy_from_slice(&how[2..10]);
                 d.addr = u64::from_le_bytes(a);
             }
+            // An exit's status rides in `addr`, the one numeric field: `how` says which it is.
+            Some(&death::EXITED) if how.len() >= 5 => {
+                d.how = death::EXITED;
+                d.addr = u32::from_le_bytes([how[1], how[2], how[3], how[4]]) as u64;
+            }
             _ => {}
         }
     }
@@ -1553,8 +1566,8 @@ impl DevEvents {
     /// `[OK, since, deaths, secs, how, kind, addr, by_len, by...]`, as `supcmd::DEATH` documents.
     fn death_answer(&self, name: &str, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
         let nb = name.as_bytes();
-        let nl = nb.len().min(16);
-        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let nl = nb.len().min(32);
+        let none = Death { name: [0; 32], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
         let d = self.deaths.iter().find(|d| d.nlen != 0 && d.nlen as usize == nl && d.name[..nl] == nb[..nl])
             .copied().unwrap_or(none);
         out[0] = supcmd::OK;
@@ -2484,6 +2497,8 @@ impl core::fmt::Display for How<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self.0.first() {
             Some(&death::KILLED) => write!(f, " - killed by {}", core::str::from_utf8(&self.0[1..]).unwrap_or("?")),
+            Some(&death::EXITED) if self.0.len() >= 5 =>
+                write!(f, " - exited with status {}", u32::from_le_bytes([self.0[1], self.0[2], self.0[3], self.0[4]])),
             Some(&death::FAULT) if self.0.len() >= 10 => {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(&self.0[2..10]);
@@ -2518,7 +2533,7 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
     let name = core::str::from_utf8(nb).unwrap_or("");
     if !name.is_empty() && (is_watched(name) || inst.has(name)) { events.note_death(ctx, name, how); }
     // An installed package's death is that module's: it restarts it from the disk, a bounded number of times.
-    if !name.is_empty() && inst.has(name) { inst.on_death(ctx, name, &How(how)); return; }
+    if !name.is_empty() && inst.has(name) { inst.on_death(ctx, name, &How(how), how.first() == Some(&death::EXITED)); return; }
     // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
     // ALREADY respawned this service before its queued death notification reached us. If it is
     // already alive, a restart here hits the kernel singleton guard ("already running") and logs a

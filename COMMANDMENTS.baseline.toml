@@ -670,6 +670,13 @@ CpuClock                 = 55
 # Ops 3 and 4 (2026-10-15) set and cancel a REBOOT on the same one deadline, gated by REBOOT, also the shell's;
 # the deadline records which of the two it is, and a request for the other kind is refused, never replaces it.
 PowerOff                 = 56
+# EXIT - end the CALLING task, with a status (`utility`, docs/stdlib-design.md 1 option B). Why isn't this a
+# service? Nothing above the kernel can end a task's own execution: ending is the scheduler's (4.3). It takes
+# no capability because the one task it ends is the caller, as Yield and Park take none. The kernel learns a
+# number and says it in the death notice (`E`, beside `K` and `F`); what an exit MEANS - restart or not, whom
+# to tell - is the supervisor's (26.10). It is the self-kill path the `kill` syscall already takes, with a
+# different cause. CLAUDE.md 14.5 amendment, 2026-10-17.
+Exit                     = 57
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47

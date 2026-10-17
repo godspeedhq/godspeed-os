@@ -2495,8 +2495,9 @@ fn drain_pending_kstack(cid: usize) {
 const DEATH_NOTE_MAX: usize = 2 * 64 + 16;
 
 /// Build the death notice for `name` into `note`, returning its length: the name, a NUL, then how
-/// it ended - `K` and the name of the task that called `kill`, or `F`, the fault kind and the address
-/// (8 bytes LE). The supervisor reads the name up to the NUL (CLAUDE.md 6.2, amendment 2026-10-11).
+/// it ended - `K` and the name of the task that called `kill`, `F`, the fault kind and the address
+/// (8 bytes LE), or `E` and the status the task gave `Exit` (4 bytes LE). The supervisor reads the name up
+/// to the NUL (CLAUDE.md 6.2, amendment 2026-10-11; `E`, 14.5 amendment 2026-10-17).
 fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_MAX]) -> usize {
     let nb = name.as_bytes();
     let mut n = nb.len().min(64);
@@ -2517,6 +2518,11 @@ fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_
             note[n + 1] = kind;
             note[n + 2..n + 10].copy_from_slice(&addr.to_le_bytes());
             n + 10
+        }
+        crate::task::Cause::Exited { status } => {
+            note[n] = crate::task::death::EXITED;
+            note[n + 1..n + 5].copy_from_slice(&status.to_le_bytes());
+            n + 5
         }
     }
 }

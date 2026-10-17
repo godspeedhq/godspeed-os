@@ -87,6 +87,7 @@ pub mod driver;
 #[cfg(not(test))] pub mod net;
 #[cfg(not(test))] pub mod resource;
 #[cfg(not(test))] pub mod memory;
+#[cfg(not(test))] pub mod program;
 
 pub use error::Error;
 

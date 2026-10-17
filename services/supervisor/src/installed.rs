@@ -214,11 +214,16 @@ impl Installed {
         true
     }
 
-    /// An installed package died: start it again from the disk, up to [`RESTARTS_MAX`] times.
-    pub fn on_death(&mut self, ctx: &ServiceContext, task: &str, how: &dyn core::fmt::Display) {
+    /// An installed package died: start it again from the disk, up to [`RESTARTS_MAX`] times - unless it ENDED
+    /// ITSELF (`exited`), which is a program that finished, not one that failed, and is not started again.
+    pub fn on_death(&mut self, ctx: &ServiceContext, task: &str, how: &dyn core::fmt::Display, exited: bool) {
         let Some(i) = self.find(task) else { return };
         let Some(mut e) = self.e[i] else { return };
         if alive(ctx, task) { return; }
+        if exited {
+            ctx.log_fmt(format_args!("supervisor: installed {} ended{} - not restarted", task, how));
+            return;
+        }
         if e.restarts >= RESTARTS_MAX {
             ctx.log_fmt(format_args!("supervisor: installed {} died{} - restarted {} times already, left down",
                 task, how, RESTARTS_MAX));

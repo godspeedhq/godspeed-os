@@ -20,7 +20,7 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
 | `sdk/rust/src/memory.rs` | 2 | permitted (§18.1 - a task's own memory, 2026-10-17 amendment) |
-| `sdk/rust/src/service_context.rs` | **79** | **grandfathered floor** (§18.5; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
+| `sdk/rust/src/service_context.rs` | **80** | **grandfathered floor** (§18.5; +1 `exit`, 2026-10-17 amendment; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 87 (79 + 8) are not 87 defects.** 84 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12 and moved with `power_off`, 2026-10-14; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
@@ -39,6 +39,17 @@ instead of attempted in the same change that made it visible (§26.7).
 
 Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and either floor growing
 FAILS. They may decrease freely.
+
+---
+
+## 2026-10-17 - Exit: a program ends itself (feat/packages)
+
+A new syscall (57), with the constitution amended at 14.5 and the floor at 18.5. The kernel's handler adds NO
+unsafe: it is the self-kill path `handle_kill` already takes, with a new cause.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 79 -> 80 (+1) | `exit`: one `unsafe { raw_syscall(57, ..) }` call site behind the safe `ServiceContext::exit`, one integer to a syscall that ends the caller and does not return. The single design consequence the `cpu_clock` entry names. Floor amended at CLAUDE.md 18.5, 2026-10-17. |
 
 ---
 

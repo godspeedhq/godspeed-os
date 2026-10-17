@@ -86,16 +86,17 @@ pub fn installed_version(ctx: &ServiceContext, pkg: &str, out: &mut [u8; 24]) ->
 }
 
 /// `godspeed install <pkg>[@ver]` with no answer yet: what the contract requests, for the shell to ask about. Columns
-/// `peer note`, one row per send peer; none is no rows, and the shell installs straight away.
+/// `peer gives note`, one row per send peer, and the release in the status note; none is no rows. Three columns, so
+/// the status row has a note to carry the release in.
 pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     let f = match pick(ctx, which) { Ok(f) => f, Err(why) => return r.fail("fetched", which, why.as_str()) };
     let checked = match check::package(ctx, f.publisher(), f.name(), f.version(), packages::this_arch().map(|a| a.as_str()), &mut |_, _| true) {
         Ok(c) => c,
         Err(why) => return r.fail("check", cell(format_args!("{}/{} {}", f.publisher(), f.name(), f.version())).as_str(), why.as_str()),
     };
-    r.columns(&["peer", "note"]);
+    r.columns(&["peer", "gives", "note"]);
     for p in checked.contract.peers() {
-        r.entry(&[C::S(p), C::S(if p == "supervisor" { "never granted to a package" } else { "a send capability to it" })]);
+        r.entry(&[C::S(p), C::S("a send capability to it"), C::S(if p == "supervisor" { "never granted to a package" } else { "" })]);
     }
     r.note(format_args!("{}/{} {} requests these; the operator answers each", f.publisher(), f.name(), f.version()));
 }

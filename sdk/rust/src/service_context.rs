@@ -518,6 +518,8 @@ pub mod death {
     pub const KILLED: u8 = b'K';
     /// Ended by a user-mode CPU fault; the kind below and the address (u64 LE) follow.
     pub const FAULT: u8 = b'F';
+    /// Ended itself with `exit`; the status it gave (u32 LE) follows.
+    pub const EXITED: u8 = b'E';
     /// A fault the port does not classify.
     pub const F_OTHER: u8 = 0;
     /// A load or store its page tables do not allow; the address is the data address.
@@ -4111,6 +4113,20 @@ impl ServiceContext {
         // SAFETY: syscall(18) = Reboot; no arguments. On success it never returns; on denial it
         // returns the error code, which we hand back to the caller.
         unsafe { raw_syscall(18, 0, 0, 0) }
+    }
+
+    /// End this program, with `status`: 0 for success, anything else for a failure it has already said.
+    ///
+    /// The kernel ends the caller and no one else - it takes no capability - and tells the supervisor how
+    /// it ended (`death::EXITED` and the status), which is how a program that FINISHED is told apart from one
+    /// that crashed. A service the supervisor keeps running is restarted all the same: exiting is for a
+    /// program that does one job (CLAUDE.md 14.5 amendment).
+    pub fn exit(&self, status: u32) -> ! {
+        // SAFETY: syscall(57) = Exit; one integer, no pointer. It does not return.
+        unsafe { raw_syscall(57, status as u64, 0, 0); }
+        // Unreachable unless the kernel refused, which it never does for the caller itself: park rather than
+        // return into code that believes it has ended.
+        self.park()
     }
 
     /// Advisory yield (§9.3).

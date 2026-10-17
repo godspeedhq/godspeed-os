@@ -110,6 +110,11 @@ pub enum SyscallNumber {
     /// the operator. The kernel learns how each board turns off and nothing about when or why
     /// (`docs/shutdown.md`).
     PowerOff               = 56,
+    /// End the CALLING task, with a status (`arg0`, the low 32 bits). Never returns. The one task it can
+    /// end is the caller, so it holds no authority over anything else and takes no capability, as `Yield`
+    /// and `Park` take none: a program that has done its job may stop. The death notice says `E` and the
+    /// status, so the supervisor tells a finished program from a crashed one (CLAUDE.md 14.5 amendment).
+    Exit                   = 57,
 }
 
 /// Raw syscall dispatcher - the one neutral entry every port's trap path calls (`arch/<isa>/`:
@@ -183,6 +188,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::DevicePower as u64 => handle_device_power(arg0),
         n if n == SyscallNumber::CpuClock as u64 => handle_cpu_clock(arg0),
         n if n == SyscallNumber::PowerOff as u64 => handle_power_off(arg0, arg1),
+        n if n == SyscallNumber::Exit as u64 => handle_exit(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -1241,6 +1247,21 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         }
         0
     } else { -1 }
+}
+
+/// `Exit` (57): end the caller, saying `status` in its death notice.
+///
+/// The same path a task that kills ITSELF takes (`handle_kill`'s tail): marked Dead with its cause, the cap
+/// table checked, then switched away from for good. Only the cause differs, so a finished program is
+/// reclaimed exactly as a killed one is and nothing new can go wrong in between.
+fn handle_exit(status: u64) -> i64 {
+    let slot = scheduler::current_task_slot();
+    scheduler::kill_task_by_slot(slot, crate::task::Cause::Exited { status: status as u32 });
+    crate::invariants::assertions::assert_cap_table_consistent();
+    scheduler::yield_current();
+    // A Dead task is never scheduled again; reaching here would be a scheduler bug, said loudly.
+    crate::kprintln!("task: Exit returned to slot {} - it should never run again", slot);
+    -1
 }
 
 /// Has this name already been reported as absent from the directory? Records it if not.

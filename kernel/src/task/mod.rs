@@ -2680,6 +2680,8 @@ pub mod death {
     pub const KILLED: u8 = b'K';
     /// Ended by a CPU fault in user mode: the notice carries the kind below and the address.
     pub const FAULT: u8 = b'F';
+    /// Ended ITSELF with the `Exit` syscall: the notice carries the status it gave (u32 LE).
+    pub const EXITED: u8 = b'E';
 
     /// A fault the port does not classify (x86's shared exception stub does not know its vector).
     pub const F_OTHER: u8 = 0;
@@ -2703,6 +2705,8 @@ pub enum Cause {
     Killed { by: usize },
     /// A user-mode CPU fault, `death::F_*`, and the address the port has for it.
     Fault { kind: u8, addr: u64 },
+    /// The `Exit` syscall: the task ended itself, with this status.
+    Exited { status: u32 },
 }
 
 /// Kill all running tasks with the given name.
