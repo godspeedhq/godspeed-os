@@ -8415,7 +8415,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(again.contains("godspeed/hello") && again.contains("against the root this machine already trusts"),
                "a search filters by word and verifies against the root this machine kept");
         let none = run!(b"godspeed search zzzz\r", 180);
-        check!(none.contains("0 packages") && !none.contains("FAIL"), "a word nothing matches is an empty list, not a failure");
+        check!(none.contains("0 packages") && none.contains("verified: root"), "a word nothing matches is an empty list, not a failure, with the chain it was checked by");
         let info = run!(b"godspeed info godspeed/hello\r", 180);
         check!(info.contains("0.1.0") && info.contains("the latest") && info.contains("bankole"),
                "`godspeed info` lists the versions from the verified index, by whom, and the latest");
