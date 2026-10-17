@@ -308,7 +308,7 @@ pub fn show(ctx: &ServiceContext, r: &mut crate::Rows, regs: &[Registry<'_>], us
     for reg in regs {
         let dir = store_dir(reg);
         let at = |name: &str| { let mut p = dir; p.push(name); p };
-        let in_use = if reg.name == using { " (in use)" } else { "" };
+        let in_use = if reg.name == using { "in use; " } else { "" };
         let mut pin_buf = [0u8; 128];
         let pin = match fs.read_into(at("pin").as_str(), &mut pin_buf) {
             Ok(n) => core::str::from_utf8(&pin_buf[..n]).unwrap_or("").trim(),

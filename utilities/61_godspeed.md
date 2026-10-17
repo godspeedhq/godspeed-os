@@ -27,12 +27,16 @@ RNG and RNG200, the JH7110's TRNG).
 
 ```
 godspeed search <word>                             the packages the registry vouches for whose name holds the word
-godspeed info <publisher/name>                     one package's published versions
+godspeed info <publisher/name>[@version]           its versions, then what it is: description, licence, release, what it ships and requests, who signed it
 godspeed fetch <publisher/name>[@version]          verify a package end to end and fetch it here - fetched, not installed
 godspeed list available                            every package the registry in use offers
-godspeed list fetched                              the packages fetched here
+godspeed list fetched                              the packages fetched here, with their sizes
 godspeed list installed                            the packages installed: none yet, and why
+godspeed list updates                              each fetched package against the registry it came from
+godspeed verify [<publisher/name>[@version]]       check fetched copies again from the disk alone
 godspeed remove <publisher/name>[@version]         delete a fetched copy, one version or every one
+godspeed trust                                     what this machine has accepted from each registry, and the publishers' keys
+godspeed trust reset <registry> [yes]              forget it, so the next command meets it again from root 1; asks [y/N]
 godspeed install | uninstall                       not built: says why
 godspeed registry                                  the registries this machine knows; one is in use
 godspeed registry add <name> <url> <root> [yes]    know another; asks [y/N] before trusting its root
@@ -153,11 +157,20 @@ the shared crate's):
 | command | rows |
 |---|---|
 | `search`, `list available` | a `package` row per name; the chain's versions, and whether this was first contact, in the status note |
-| `info` | a `version` row per release: when, by whom, and which is the latest; the chain in the status note |
+| `info` | a `version` row per release (when, by whom, the latest, the one described), then `description`, `license`, `built for` (the release, beside this machine's), `ships` (its architectures, and whether this machine's is one), `requests`, `signed` (the key and its standing); the chain in the status note. Checked as `fetch` checks it |
 | `fetch` | `verified`, `package`, `signed` (the key, active or retired), `binary` (this machine's architecture and its size), `requests` (what the contract asks for; nothing is granted), `fetched` (the folder), `installed no` |
-| `list fetched` | a row per fetched `publisher/name@version`, with the registry it came from |
+| `list fetched` | a row per fetched `publisher/name@version`, with the registry it came from and its size; the count and total in the status note |
 | `list installed` | none yet: the status note says why |
+| `list updates` | a row per fetched package: `<fetched> -> <newer>` with the command that fetches it, `up to date on <registry>`, or no longer listed there. Each is asked of the registry it came from, not the one in use |
+| `verify` | a row per fetched version, `intact` or `DAMAGED` and what is wrong; the count in the status note |
+| `trust` | a row per registry (its root, timestamp and namespaces versions, the root's expiry, and whether the pin it was reached under is the configuration's), then a row per publisher key and its standing |
+| `trust reset` | `forgotten`, or `nothing to forget` |
 | `remove` | `removed` and the folder |
+
+**`verify` works from the disk alone**: the signature over the manifest, the signing key against the one
+recorded when it was fetched, the manifest against its folder, and the contract and the binary against the
+manifest's digests and sizes. Whether the registry still vouches for the key needs the network; `list
+updates` asks the registry, and a fresh `fetch` checks it again.
 
 **A list is its entries and nothing else**, so `count` counts them; what a list's rows do not say about
 themselves (the chain it was verified by, why it is empty) is the status row's note, which the console prints
@@ -172,8 +185,9 @@ only once every file is verified, so a half-fetched package is never listed. Fet
 fetched leaves it as it is.
 
 **A pin that changed** since this machine first reached a registry is refused - changing it is trusting
-another registry - until the operator removes `/system/services/godspeed/trust/<registry>/`, after which the
-registry is met again from root 1.
+another registry - until the operator runs `godspeed trust reset <registry>` (which asks `[y/N]`; it removes
+`/system/services/godspeed/trust/<registry>/`), after which the registry is met again from root 1. The
+record also keeps the last namespaces document accepted, which is what `godspeed trust` lists the keys from.
 
 **Limits, refused by name, never cut**: the snapshot 16 KiB (about 150 packages), an index 8 KiB (about 40
 releases), a manifest or a contract 4 KiB, a binary `max-package-mib`. They are on the stack, which is
@@ -185,7 +199,7 @@ nothing is said twice.
 
 ## 5. Pipes
 
-`godspeed search`, `info`, `list available | fetched | installed`, `registry`, `config` and `check` are reports, so they pipe as records
+`godspeed search`, `info`, `list available | fetched | installed | updates`, `verify`, `trust`, `registry`, `config` and `check` are reports, so they pipe as records
 (`item`, `value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```
@@ -196,7 +210,7 @@ godspeed config | where note=file
 godspeed check | where item=tls
 ```
 
-`godspeed fetch`, `remove`, `install` and `uninstall`, `godspeed config set` and `godspeed registry add`, `use` and
+`godspeed fetch`, `remove`, `install`, `uninstall` and `trust reset`, `godspeed config set` and `godspeed registry add`, `use` and
 `remove` are actions and refuse to start a pipe, with the sentence naming the reports.
 
 ## 6. What it holds

@@ -627,7 +627,7 @@ connection held as a capability (`net-stack` op 23, `docs/tcp-design.md`); `gs::
 CPU has no RDRAND, TLS refuses to run, and says so.
 
 **Built, 2026-10-17 (branch `feat/packages`): `godspeed search`, `info`, `fetch`, `list available | fetched |
-installed` and `remove`** (the operator's names, 2026-10-17: `list` with what to list, `fetched` for a verified
+installed | updates`, `verify`, `remove` and `trust`** (the operator's names, 2026-10-17: `list` with what to list, `fetched` for a verified
 copy that is not installed, an empty list an answer rather than a refusal, `uninstall` kept for when install
 exists) -
 10.1's first version, fetch, verify, keep, list and remove. Every answer is verified on the machine by the
