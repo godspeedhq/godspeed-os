@@ -291,7 +291,7 @@ and these are the places it is not the whole story. They are fixed in the kernel
 - **Toolchain.** Unchanged: the OS's `rust-toolchain.toml` is the toolchain. A developer crate copies
   it, and step 4 of 3.2 refuses a mismatch.
 
-The linker script and the toolchain pin are two of the six facts section 11 publishes per release.
+The linker script and the toolchain pin are two of the seven facts section 11 publishes per release.
 Shipping the linker script in the stdlib's package and publishing it in the release file are compatible,
 because both carry the same file from the same commit.
 
