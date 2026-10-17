@@ -1275,9 +1275,17 @@ the stop and the new version registering its name nothing answers it; a client s
 A restart is never side by side: two instances of a service not written for it could write the same files at once, and
 declaring `handover` is how a service says it can overlap with its successor.
 
-**A driver is always a restart.** A handover runs two instances for a moment, and two drivers would both program one
-device. The shared check refuses a driver whose contract declares `handover`, so such a package is never started, and
-`godspeed verify` says why.
+**Only a service is replaced live.** A driver never is: a handover runs two instances for a moment, and two drivers
+would both program one device (`backlog/91` records how a driver could be, if it is ever needed). A utility runs for one
+command, so its next run is simply the new version. An app is reloaded by its user, since a new version may bring a new
+interface. So `handover` is the one key a contributor sets, and only on a service: `godspeed check` in the CLI refuses it
+on any other kind before it is built, and the shared check refuses it at every start, so such a package is never started
+and `godspeed verify` says why.
+
+**An app's notice, recorded and not built.** An app could be told a newer version is installed, and offer to reload as
+Chrome does - automatic, nothing to declare. Nothing can deliver it yet: `godspeed upgrade` is typed at the shell, and
+the shell waits while an app holds the console, so no upgrade can happen while an app is open. It is pulled in by the
+first thing that can upgrade while an app is open - an automatic update, a second session, an upgrade over the network.
 
 ### 14.3 Why an offer is checked
 
