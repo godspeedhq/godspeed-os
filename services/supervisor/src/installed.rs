@@ -141,6 +141,8 @@ impl Installed {
             Ok(x) => x,
             Err(why) => { gs::cap::remove(ctx, old); return Err(why); }
         };
+        // The new version cannot take over: nothing was started, and the caller stops and starts instead.
+        if !can.0 { gs::cap::remove(ctx, old); return Ok(false); }
         let Some(succ) = successor else {
             gs::cap::remove(ctx, old);
             return Err(text(format_args!("the successor started with no endpoint to hand to")));
@@ -361,8 +363,14 @@ impl Installed {
         let key = key.unwrap_or(0);
         if can_hand_over { req.probe_mode = godspeed::handover::mode(key, successor); }
         if successor {
-            if !can_hand_over { return Err(text(format_args!("a handover needs a key from the hardware's random source, which this machine does not have"))); }
-            req.flags |= SPAWN_FLAG_HANDOVER;
+            // A version that cannot take over - its contract does not declare `handover`, or there is no key - is NOT
+            // started here: the caller stops the running one and starts this one instead, and says so.
+            if !can_hand_over {
+                ctx.log_fmt(format_args!("supervisor: installed {} {} cannot take over live ({}) - stopped and started instead", pkg, version,
+                    if checked.contract.handover { "no hardware random source for a key" } else { "its contract does not declare `handover`" }));
+                return Ok(((utility, app), None, (false, 0)));
+            }
+            req.flags |= SPAWN_FLAG_HANDOVER | SPAWN_FLAG_REQ_RECV;
         }
         req.privileges = 0;
         let mut out = [0u8; 128];

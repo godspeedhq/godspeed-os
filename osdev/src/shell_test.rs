@@ -8562,7 +8562,15 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         // A LIVE HANDOVER: upgraded while it runs, its count carried to the new version, nothing stopped.
         let _ = run!(b"date\r", 30);
         let _ = run!(b"date\r", 30);
-        let up = run!(b"godspeed upgrade godspeed/hello-service yes\r", 300);
+        let mut up = run!(b"godspeed upgrade godspeed/hello-service yes\r", 300);
+        // The supervisor answers once the offer is SENT; the successor says it took over when the state arrives,
+        // which can be just after the prompt. So that line is waited for, not assumed to be before the prompt.
+        if !up.contains("took over, live, at") {
+            if let Some(t) = collect_until(&buf, &mut cursor, b"took over, live, at", Duration::from_secs(15)) {
+                up.push_str(&t);
+                up.push_str(&collect_until(&buf, &mut cursor, b"\n", Duration::from_secs(5)).unwrap_or_default());
+            }
+        }
         check!(up.contains("upgrade from 0.5.0") && up.contains("0.6.0"), "`godspeed upgrade` offers 0.6.0 in place of 0.5.0");
         check!(up.contains("task: spawn 'godspeed/hello-service' beside the running one: a live handover"),
                "the kernel starts the new version beside the running one, under the same name");
