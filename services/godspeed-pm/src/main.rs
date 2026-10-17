@@ -18,16 +18,25 @@
 //!   the defaults on first start, so it always shows what is in effect (10.8).
 //! - `godspeed check` - reach the registry in use over TLS, verified to the roots in `tls-roots`, and
 //!   say what it answered. Each step is a row, and a failure says which step and why.
-//!
-//! Searching and fetching packages need the registry's metadata format and its signatures, which are
-//! not built yet; this program says so rather than pretending (10.1).
+//! - `godspeed search [<word>]`, `godspeed info <publisher/name>`, `godspeed fetch <publisher/name>[@version]`,
+//!   `godspeed list` and `godspeed uninstall <publisher/name>[@version]` - the packages the registry's signed
+//!   metadata vouches for, verified on this machine by the shared crate's own checks, and a verified copy
+//!   KEPT under `/system/packages/` (`packages.rs`, `chain.rs`).
+//! - `godspeed install` - refused, with the reason: this machine cannot start a program from disk yet (9.2),
+//!   so a package can be kept here, verified, and not run. Calling a kept package installed would be the
+//!   development convenience the CLI's contract forbids presenting as installation.
 
 #![no_std]
 #![no_main]
 
+mod chain;
 mod config;
 mod default_root;
+mod http;
 mod https;
+mod meta;
+mod packages;
+mod toml_lines;
 
 use core::fmt::Write as _;
 
@@ -41,7 +50,7 @@ const EOT: u8 = 0x04;
 /// The longest command line taken.
 const LINE_MAX: usize = 512;
 /// The most roots read from `tls-roots`, and the largest one. A root certificate is under 2 KiB.
-const MAX_ROOTS: usize = 8;
+pub(crate) const MAX_ROOTS: usize = 8;
 const ROOT_MAX: usize = 2048;
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -83,7 +92,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         (Some("check"), None) => check(&ctx, &mut r),
-        _ => r.fail("usage", "godspeed registry | godspeed config | godspeed check",
+        (Some("search"), word) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::search(&ctx, r, ready, roots, word)),
+        (Some("info"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::info(&ctx, r, ready, roots, name)),
+        (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name)),
+        (Some("list"), None) => packages::list(&ctx, &mut r),
+        (Some("uninstall"), Some(name)) if words.clone().next().is_none() => packages::uninstall(&ctx, &mut r, name),
+        (Some("install"), _) => r.fail("install", "not built",
+            "this machine cannot start a program from disk yet (design 9.2); `godspeed fetch` keeps a verified copy"),
+        _ => r.fail("usage", "godspeed search | info | fetch | list | uninstall | registry | config | check",
                     "`godspeed help` says what each does"),
     }
     r.send(&ctx);
@@ -92,7 +108,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 }
 
 /// The answer being built: a record table whose last row is `status`, `ok` or `failed`.
-struct Rows {
+pub(crate) struct Rows {
     t: Table,
     failed: bool,
 }
@@ -102,12 +118,12 @@ impl Rows {
         Rows { t: Table::new(cols), failed: false }
     }
 
-    fn row(&mut self, item: &str, value: &str, note: &str) {
+    pub(crate) fn row(&mut self, item: &str, value: &str, note: &str) {
         let cells: [Value; 3] = [self.t.intern(item.as_bytes()), self.t.intern(value.as_bytes()), self.t.intern(note.as_bytes())];
         self.t.add_row(&cells);
     }
 
-    fn fail(&mut self, item: &str, value: &str, note: &str) {
+    pub(crate) fn fail(&mut self, item: &str, value: &str, note: &str) {
         self.row(item, value, note);
         self.failed = true;
     }
@@ -142,10 +158,10 @@ impl RecordSink for BufSink {
 }
 
 /// A short formatted string, for a table cell.
-struct Cell { b: [u8; 160], n: usize }
+pub(crate) struct Cell { b: [u8; 160], pub(crate) n: usize }
 impl Cell {
-    fn new() -> Cell { Cell { b: [0; 160], n: 0 } }
-    fn as_str(&self) -> &str { core::str::from_utf8(&self.b[..self.n]).unwrap_or("") }
+    pub(crate) fn new() -> Cell { Cell { b: [0; 160], n: 0 } }
+    pub(crate) fn as_str(&self) -> &str { core::str::from_utf8(&self.b[..self.n]).unwrap_or("") }
 }
 impl core::fmt::Write for Cell {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -155,7 +171,7 @@ impl core::fmt::Write for Cell {
         Ok(())
     }
 }
-fn cell(args: core::fmt::Arguments<'_>) -> Cell {
+pub(crate) fn cell(args: core::fmt::Arguments<'_>) -> Cell {
     let mut c = Cell::new();
     let _ = c.write_fmt(args);
     c
@@ -415,25 +431,72 @@ fn check(ctx: &ServiceContext, r: &mut Rows) {
     };
     r.row("registry", using.url, cell(format_args!("{} (in use)", using.name)).as_str());
 
-    // THE CLOCK. A certificate's dates are checked against it, so without one nothing is checked.
+    let Some((now, source_word)) = clock(ctx, r) else { return };
+    let (y, mo, d, h, mi) = config::civil(now);
+    r.row("clock", cell(format_args!("{:04}-{:02}-{:02} {:02}:{:02} UTC", y, mo, d, h, mi)).as_str(), source_word);
+
+    let folder = c.get("tls-roots");
+    let mut store = Roots::new();
+    if !read_roots(ctx, r, folder, &mut store) { return; }
+    let mut roots: [&[u8]; MAX_ROOTS] = [&[]; MAX_ROOTS];
+    for i in 0..store.count { roots[i] = &store.store[i][..store.lens[i]]; }
+    let count = store.count;
+    r.row("roots", cell(format_args!("{}", count)).as_str(), folder);
+
+    // THE REQUEST.
+    let timeout = config::number_of(c.get("timeout-secs"));
+    match https::get(ctx, url.host, url.port, url.base, &roots[..count], now, timeout) {
+        Ok(a) => {
+            r.row("address", cell(format_args!("{}.{}.{}.{}", a.ip[0], a.ip[1], a.ip[2], a.ip[3])).as_str(), url.host);
+            r.row("tls", "verified", "TLS 1.3; the server's certificate chain reaches a trusted root and names it");
+            let status = cell(format_args!("HTTP/1.1 {}{}", a.status, if a.status == 200 { " OK" } else { "" }));
+            let size = cell(format_args!("{} bytes", a.total));
+            if a.status == 200 { r.row("http", status.as_str(), size.as_str()); } else { r.fail("http", status.as_str(), size.as_str()); }
+            if a.status == 200 && a.kept_len > 0 {
+                r.row("says", first_line(&a.kept[..a.kept_len]), "the first line of the registry's answer");
+            }
+        }
+        Err(f) => {
+            let (step, why) = failure(&f, folder, source_word);
+            r.fail(step, url.host, why.as_str());
+        }
+    }
+}
+
+/// THE CLOCK. A certificate's dates, and the trust metadata's expiries, are checked against it, so without
+/// one nothing is checked.
+fn clock(ctx: &ServiceContext, r: &mut Rows) -> Option<(u64, &'static str)> {
     let (now, source) = match gs::task::wall_clock(ctx) {
         Some((now, source)) if now > 0 => (now as u64, source),
-        _ => return r.fail("clock", "not set", "a certificate's dates cannot be checked - `date sync` first"),
+        _ => {
+            r.fail("clock", "not set", "a certificate's dates cannot be checked - `date sync` first");
+            return None;
+        }
     };
-    let source_word = match source {
+    Some((now, match source {
         ClockSource::Rtc => "hardware clock",
         ClockSource::Ntp => "network time",
         ClockSource::Floor => "floor from the last boot (a lower bound)",
         ClockSource::Unset => "unset",
-    };
-    let (y, mo, d, h, mi) = config::civil(now);
-    r.row("clock", cell(format_args!("{:04}-{:02}-{:02} {:02}:{:02} UTC", y, mo, d, h, mi)).as_str(), source_word);
+    }))
+}
 
-    // THE ROOTS, read from their folder: adding a CA is adding a file (10.8).
-    let folder = c.get("tls-roots");
+/// The certificate authorities TLS accepts, read from their folder: adding one is adding a file (10.8).
+pub(crate) struct Roots {
+    pub(crate) store: [[u8; ROOT_MAX]; MAX_ROOTS],
+    pub(crate) lens: [usize; MAX_ROOTS],
+    pub(crate) count: usize,
+}
+
+impl Roots {
+    fn new() -> Roots { Roots { store: [[0; ROOT_MAX]; MAX_ROOTS], lens: [0; MAX_ROOTS], count: 0 } }
+}
+
+/// Read every root in `folder` into `out`, writing ISRG Root X2 there on first start. `false` after a row
+/// saying why there are none to use.
+#[inline(never)]
+fn read_roots(ctx: &ServiceContext, r: &mut Rows, folder: &str, out: &mut Roots) -> bool {
     default_roots(ctx, r, folder);
-    let mut store = [[0u8; ROOT_MAX]; MAX_ROOTS];
-    let mut lens = [0usize; MAX_ROOTS];
     let mut count = 0usize;
     let mut too_many = false;
     let mut names = [[0u8; 64]; MAX_ROOTS];
@@ -450,53 +513,63 @@ fn check(ctx: &ServiceContext, r: &mut Rows) {
         true
     });
     if listed.is_err() {
-        return r.fail("roots", folder, "the folder could not be listed - it holds the certificate authorities TLS accepts");
+        r.fail("roots", folder, "the folder could not be listed - it holds the certificate authorities TLS accepts");
+        return false;
     }
     if too_many {
-        return r.fail("roots", folder, cell(format_args!("more than {} files; TLS takes at most {}", MAX_ROOTS, MAX_ROOTS)).as_str());
+        r.fail("roots", folder, cell(format_args!("more than {} files; TLS takes at most {}", MAX_ROOTS, MAX_ROOTS)).as_str());
+        return false;
     }
     if count == 0 {
-        return r.fail("roots", folder, "no certificate authority is trusted, so no server can be");
+        r.fail("roots", folder, "no certificate authority is trusted, so no server can be");
+        return false;
     }
     for i in 0..count {
         let mut path = Cell::new();
         let _ = write!(path, "{}{}", folder, core::str::from_utf8(&names[i][..name_lens[i]]).unwrap_or("?"));
-        match fs.read_into(path.as_str(), &mut store[i]) {
-            Ok(n) => lens[i] = n,
+        match fs.read_into(path.as_str(), &mut out.store[i]) {
+            Ok(n) => out.lens[i] = n,
             Err(gs::Error::BufferTooSmall) => {
-                return r.fail("roots", path.as_str(), "larger than 2 KiB, which no root certificate is")
+                r.fail("roots", path.as_str(), "larger than 2 KiB, which no root certificate is");
+                return false;
             }
-            Err(e) => return r.fail("roots", path.as_str(), cell(format_args!("could not be read: {:?}", e)).as_str()),
-        }
-    }
-    let mut roots: [&[u8]; MAX_ROOTS] = [&[]; MAX_ROOTS];
-    for i in 0..count { roots[i] = &store[i][..lens[i]]; }
-    r.row("roots", cell(format_args!("{}", count)).as_str(), folder);
-
-    // THE REQUEST.
-    let timeout = config::number_of(c.get("timeout-secs"));
-    match https::get(ctx, url.host, url.port, url.base, &roots[..count], now, timeout) {
-        Ok(a) => {
-            r.row("address", cell(format_args!("{}.{}.{}.{}", a.ip[0], a.ip[1], a.ip[2], a.ip[3])).as_str(), url.host);
-            r.row("tls", "verified", "TLS 1.3; the server's certificate chain reaches a trusted root and names it");
-            let kept = &a.kept[..a.kept_len];
-            let status = first_line(kept);
-            let ok = status.starts_with("HTTP/1.1 200") || status.starts_with("HTTP/1.0 200");
-            let size = cell(format_args!("{} bytes", a.total));
-            if ok { r.row("http", status, size.as_str()); } else { r.fail("http", status, size.as_str()); }
-            if let Some(body) = find(kept, b"\r\n\r\n").map(|i| &kept[i + 4..]) {
-                r.row("says", first_line(body), "the first line of the registry's answer");
+            Err(e) => {
+                r.fail("roots", path.as_str(), cell(format_args!("could not be read: {:?}", e)).as_str());
+                return false;
             }
         }
-        Err(f) => {
-            let (step, why) = failure(&f, folder, source_word);
-            r.fail(step, url.host, why.as_str());
-        }
     }
+    out.count = count;
+    true
 }
 
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
+/// The configuration, the registry in use, the clock and the roots, then `f`: what every registry command
+/// needs before it connects. Each that is missing is a row saying so, and `f` does not run.
+#[inline(never)]
+fn with_ready(ctx: &ServiceContext, r: &mut Rows, f: impl FnOnce(&packages::Ready<'_>, &Roots, &mut Rows)) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let n = match load(ctx, r, &mut buf) {
+        Ok(n) => n,
+        Err(why) => return r.fail("config", "unreadable", why.as_str()),
+    };
+    let c = config::parse(Some(&buf[..n]));
+    if let Some(p) = c.problem {
+        return r.fail("config", config::PATH, problem_text(&p).as_str());
+    }
+    let reg = c.in_use();
+    let url = match config::url(reg.url) {
+        Ok(u) => u,
+        Err(why) => return r.fail("registry", reg.url, why),
+    };
+    let Some((now, _)) = clock(ctx, r) else { return };
+    let mut roots = Roots::new();
+    if !read_roots(ctx, r, c.get("tls-roots"), &mut roots) { return; }
+    let ready = packages::Ready {
+        reg, url, now,
+        timeout: config::number_of(c.get("timeout-secs")),
+        max_bytes: config::number_of(c.get("max-package-mib")) as u64 * 1024 * 1024,
+    };
+    f(&ready, &roots, r);
 }
 
 fn first_line(b: &[u8]) -> &str {
@@ -505,7 +578,7 @@ fn first_line(b: &[u8]) -> &str {
 }
 
 /// Which step failed, and why, in words a person can act on.
-fn failure(f: &https::Fail, folder: &str, clock: &str) -> (&'static str, Cell) {
+pub(crate) fn failure(f: &https::Fail, folder: &str, clock: &str) -> (&'static str, Cell) {
     use https::Fail::*;
     match *f {
         NoRandom => ("tls", cell(format_args!("this machine has no hardware random source, and a key share must not be guessable"))),
@@ -513,6 +586,9 @@ fn failure(f: &https::Fail, folder: &str, clock: &str) -> (&'static str, Cell) {
         Connect => ("connect", cell(format_args!("no TCP connection - net-stack's log says why"))),
         Transport => ("connect", cell(format_args!("the connection broke before the answer was complete"))),
         Timeout => ("connect", cell(format_args!("no answer within timeout-secs"))),
+        Closed => ("connect", cell(format_args!("the server closed the connection before the answer was complete"))),
+        Http(why) => ("http", cell(format_args!("the answer is not HTTP this client reads: {}", why))),
+        Refused => ("http", cell(format_args!("the answer was refused part way (too large, or not what was asked for)"))),
         Framing(e) | Tls(e) => ("tls", match e {
             TlsError::CertificateRejected(p) => match p {
                 CertProblem::Expired => cell(format_args!("the server's certificate has expired - or the clock is ahead ({})", clock)),
