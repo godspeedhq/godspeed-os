@@ -110,7 +110,7 @@ A deliberately small, fully-understood capability microkernel, built to internal
 > are always the bytes the supervisor checked from the disk (14.1). What is now allowed is the observable half of
 > Erlang's feature, made out of mechanisms the system already has: the new version is a separate, isolated program,
 > started BESIDE the running one under the same name; the running one hands it its state over IPC and ends itself
-> (`gs::handover`, `docs/developer-services-design.md` 14). Erlang's `code_change` is the successor reading the old
+> (`gs::handover`, `docs/developer-services-design.md` 14). What Erlang calls code change is the successor reading the old
 > version's state - written by the package, explicitly.
 >
 > **What the kernel learns: one spawn flag, `SPAWN_FLAG_HANDOVER`.** `SpawnImage` (which only the supervisor can call,
