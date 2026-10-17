@@ -10,7 +10,7 @@
 //!    the name now answers to the new one.
 //! 2. It sends the running one an OFFER naming its successor. The running one finishes what is already in its queue,
 //!    sends its state to the successor, and ends itself.
-//! 3. The successor takes the state and carries on. Its `code_change` is yours: it reads the old version's state and
+//! 3. The successor takes the state and carries on. What Erlang calls code change is yours: it reads the old version's state and
 //!    turns it into its own.
 //!
 //! A service opts in by declaring `handover = true` in its contract and doing both halves:
