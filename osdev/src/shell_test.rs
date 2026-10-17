@@ -8417,6 +8417,11 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     let named = run!(b"date sync\r", 60);
     check!(saw!(named, "/system/services/time/ntp line 1 is not an IPv4 address - no network time until it is"),
            "a name in place of an address is refused by line, not replaced by the default");
+    check!(named.contains("date sync: /system/services/time/ntp does not name one IPv4 address")
+               && !named.contains("is the cable in"),
+           "`date sync` says the setting is refused, not that the cable is out");
+    check!(named.matches("[q] quit").count() <= 1 && !named.contains("(q aborts)"),
+           "`date sync` offers `[q] quit` once at most, from the shell's watch");
     let _ = run!(b"write /system/services/time/ntp 216.239.35.0\r", 30);
     let other = run!(b"date sync\r", 60);
     check!(saw!(other, "time: NTP server 216.239.35.0, from /system/services/time/ntp"),

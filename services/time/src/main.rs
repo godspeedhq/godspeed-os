@@ -912,11 +912,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the two would let a clock that was never set read as freshly authoritative.
                 let age = if clock.source == SRC_NTP { gs::task::epoch_secs_monotonic(&ctx) - clock.synced_at }
                           else { -1 };
-                let mut out = [0u8; 18];
+                // Byte 18, appended the same way: 1 when the NTP setting is REFUSED and no re-read of it is
+                // pending, so no network time will be asked until the file is fixed. `date sync` reads it to
+                // say that at once, rather than waiting out its bound and blaming the cable. While a
+                // `date sync` re-read is outstanding it is 0, since the file may just have been fixed.
+                let mut out = [0u8; 19];
                 out[0] = 1;
                 out[1..9].copy_from_slice(&now.to_le_bytes());
                 out[9] = clock.source;
                 out[10..18].copy_from_slice(&age.to_le_bytes());
+                out[18] = u8::from(ntp_cfg == NtpCfg::Refused && !sync_after_read);
                 reply(&ctx, cap, &out);
             }
             OP_SET => {

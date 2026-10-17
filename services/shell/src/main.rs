@@ -6168,7 +6168,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("fcap gsreuse", "as fcap reuse, holding the file through gs::cap", "fcap gsreuse"),
         ], false),
         ("date", "sync") => help_block(ctx, "date sync", "sync the clock from the internet NOW", &[
-            ("date sync", "the clock already syncs itself once the network is up - the clock service asks about every 20 s while it is unset; this asks for it immediately instead of waiting (q aborts)", "date sync"),
+            ("date sync", "the clock already syncs itself once the network is up - the clock service asks about every 20 s while it is unset; this asks for it immediately instead of waiting", "date sync"),
         ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (the DNS server DHCP named)", "net dns example.com"),
@@ -9478,7 +9478,7 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         // itself, and re-reads it on this very request if it never loaded. The shell used to read that
         // file and send the value to `time` over OP_FLOOR_SET, an op that let ANY client push the floor
         // forward for good; it is retired (`docs/developer-services-design.md` 3.3).
-        out.line_fmt(ctx, format_args!("Asking the network for the time now (NTP, by the time service)... (q aborts)"));
+        out.line_fmt(ctx, format_args!("Asking the network for the time now (NTP, by the time service)..."));
         // ASK `time`, THEN WATCH THE CLOCK (2026-10-01). The clock is the `time` service's, and so is
         // fetching it: `net-stack` no longer runs the exchange, so a `ping` never waits behind a time
         // server. `time` answers at once - "a query is on its way" - and the result shows up as the
@@ -9504,29 +9504,28 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         }
         let t0 = gs::task::epoch_secs_monotonic(ctx);
         let mut synced = false;
-        let mut sync_noticed = false;
         loop {
             let waited = gs::task::epoch_secs_monotonic(ctx) - t0;
+            let (age, refused) = time_sync_state(ctx);
             // Synced SINCE WE ASKED: an age no older than the wait so far. An older sync is not this one.
-            if matches!(time_synced_secs_ago(ctx), Some(age) if age <= waited) {
+            if matches!(age, Some(a) if a <= waited) {
                 synced = true;
                 break;
             }
-            if waited >= SYNC_WAIT_SECS { break; }
-            // Say it once the wait lingers (rule 10): `q` was always taken here, and never offered.
-            if !sync_noticed && waited >= gs::call::NOTICE_AFTER_SECS {
-                sync_noticed = true;
-                gs::io::println(ctx, "  [q] quit");
+            // `time` read the setting again and refused it: no query will be sent, so waiting longer only
+            // delays the reason - and "is the cable in?" would be the wrong one.
+            if refused {
+                out.line_fmt(ctx, format_args!(
+                    "date sync: /system/services/time/ntp does not name one IPv4 address, so no network time is asked (the log names the line)"));
+                return Err(ShellError::Unknown);
             }
-            // The console itself, not the type-ahead: a key that is not `q` is KEPT for the prompt, and
-            // reading the buffer it goes into would hand it straight back.
-            if let Some(b) = ctx.inner.try_console_read() {
-                // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
-                if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
-                    out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
-                    return Err(ShellError::Unknown);
-                }
-                ctx.keep_key(b);
+            if waited >= SYNC_WAIT_SECS { break; }
+            // The command's watch offers `[q] quit` once 2 s have passed, like every wait in the shell, and
+            // takes the key. An abort is the USER's decision, not a network failure - blaming the cable for
+            // it is a lie.
+            if gs::call::Watch::stopped(ctx) {
+                out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
+                return Err(ShellError::Unknown);
             }
             gs::task::sleep_ms(ctx, SYNC_POLL_MS);
         }
@@ -19933,6 +19932,18 @@ fn time_now(ctx: &ShellCtx) -> Option<i64> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&p[1..9]);
     Some(i64::from_le_bytes(b))
+}
+
+/// For `date sync`, from ONE `OP_NOW`: seconds since the network last set the clock (`None` if it never
+/// did this boot), and whether `time` has refused its NTP setting with no re-read pending (byte 18).
+fn time_sync_state(ctx: &ShellCtx) -> (Option<i64>, bool) {
+    let Some(r) = time_rpc(ctx, &[1]) else { return (None, false) };
+    let p = r.payload_bytes();
+    if p.len() < 18 || p[0] == 0 { return (None, false); }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[10..18]);
+    let age = match i64::from_le_bytes(b) { a if a < 0 => None, a => Some(a) };
+    (age, p.len() > 18 && p[18] == 1)
 }
 
 /// Seconds since the network last set the clock, or `None` if it never did this boot. Rides on OP_NOW
