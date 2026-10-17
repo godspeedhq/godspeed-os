@@ -8710,6 +8710,17 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     check!(saw!(back, "time: NTP server 162.159.200.123, from /system/services/time/ntp"),
            "and set back the same way");
 
+    // ---- `selfcheck packages`: the lifecycle again, as a board runs it - its own `godspeed/selfcheck-*`
+    //      packages only, from nothing to nothing. QEMU has the driver's `edu`, so here nothing is skipped.
+    if !offline {
+        let sc = run!(b"selfcheck packages\r", 900);
+        check!(sc.contains("failed 0") && !sc.contains("FAIL "), "`selfcheck packages` runs with no failure");
+        check!(sc.contains("replaced live, with no restart"), "its service upgrade 0.2.0 -> 0.3.0 is hot");
+        check!(sc.contains("stopped and started"), "and its replacement by 0.1.0 is cold");
+        check!(!sc.contains("selfcheck-driver - its device"), "with QEMU's edu here, the driver is started, not skipped");
+        check!(!sc.contains("registry is not reachable"), "the registry was reached, so nothing was skipped for it");
+    }
+
     let _ = child.kill();
     let _ = child.wait();
     // The whole serial transcript, for the failure a PASS/FAIL line cannot explain.

@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 8 of 10: delete and delete recursive, proved by removing what the suite made
+# GodspeedOS self-check, part 8 of 11: delete and delete recursive, proved by removing what the suite made
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck cleanup` runs THIS part alone; `selfcheck` runs them all

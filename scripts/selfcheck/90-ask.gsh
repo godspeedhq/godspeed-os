@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 10 of 10: ask - plain questions, answered from what the services know
+# GodspeedOS self-check, part 10 of 11: ask - plain questions, answered from what the services know
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck ask` runs THIS part alone. The command is

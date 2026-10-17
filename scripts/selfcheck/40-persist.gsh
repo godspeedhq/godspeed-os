@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 5 of 10: events persist: capture to disk, through a service that is NOT events
+# GodspeedOS self-check, part 5 of 11: events persist: capture to disk, through a service that is NOT events
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck persist` runs THIS part alone; `selfcheck` runs them all

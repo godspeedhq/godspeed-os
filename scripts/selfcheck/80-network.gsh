@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 9 of 10: the network: receive, a lease, and name resolution
+# GodspeedOS self-check, part 9 of 11: the network: receive, a lease, and name resolution
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck network` runs THIS part alone; `selfcheck` runs them all

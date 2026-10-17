@@ -5089,6 +5089,7 @@ const SELFCHECK_PARTS: &[(&str, &str)] = &[
     ("cleanup",  include_str!("../../../scripts/selfcheck/70-cleanup.gsh")),
     ("network",  include_str!("../../../scripts/selfcheck/80-network.gsh")),
     ("ask",      include_str!("../../../scripts/selfcheck/90-ask.gsh")),
+    ("packages", include_str!("../../../scripts/selfcheck/95-packages.gsh")),
 ];
 
 /// The whole suite's size, for the line `selfcheck` prints before it starts.

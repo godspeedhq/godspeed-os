@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 4 of 10: the events metric table and the observability reader
+# GodspeedOS self-check, part 4 of 11: the events metric table and the observability reader
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck events` runs THIS part alone; `selfcheck` runs them all
