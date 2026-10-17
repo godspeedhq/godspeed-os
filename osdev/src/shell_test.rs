@@ -8553,42 +8553,42 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
 
         // A SERVICE, by its own name: installed, started now and kept running. 0.3.0 and 0.4.0 declare `handover`.
-        let _ = run!(b"godspeed fetch godspeed/hello-service@0.3.0\r", 240);
-        let si = run!(b"godspeed install godspeed/hello-service@0.3.0 yes\r", 180);
-        check!(si.contains("godspeed/hello-service 0.3.0 asks for nothing (no peers, no privilege) and starts at every boot"),
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.5.0\r", 240);
+        let si = run!(b"godspeed install godspeed/hello-service@0.5.0 yes\r", 180);
+        check!(si.contains("godspeed/hello-service 0.5.0 asks for nothing (no peers, no privilege) and starts at every boot"),
                "installing a service says it starts at every boot");
-        check!(si.contains("hello-service 0.3.0: started") && si.contains("running, as the task godspeed/hello-service"),
+        check!(si.contains("hello-service 0.5.0: started") && si.contains("running, as the task godspeed/hello-service"),
                "`godspeed/hello-service` is started by the supervisor and runs");
         // A LIVE HANDOVER: upgraded while it runs, its count carried to the new version, nothing stopped.
         let _ = run!(b"date\r", 30);
         let _ = run!(b"date\r", 30);
         let up = run!(b"godspeed upgrade godspeed/hello-service yes\r", 300);
-        check!(up.contains("upgrade from 0.3.0") && up.contains("0.4.0"), "`godspeed upgrade` offers 0.4.0 in place of 0.3.0");
+        check!(up.contains("upgrade from 0.5.0") && up.contains("0.6.0"), "`godspeed upgrade` offers 0.6.0 in place of 0.5.0");
         check!(up.contains("task: spawn 'godspeed/hello-service' beside the running one: a live handover"),
                "the kernel starts the new version beside the running one, under the same name");
-        check!(up.contains("hello-service 0.3.0: handing over at") && up.contains("hello-service 0.4.0: took over, live, at"),
+        check!(up.contains("hello-service 0.5.0: handing over at") && up.contains("hello-service 0.6.0: took over, live, at"),
                "the running version hands its state over, and the new one takes it");
         let carried = up.split("took over, live, at ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
         check!(carried > 0, "the count it took over is the one the old version had, not zero: the state carried across");
-        check!(up.contains("live, with no restart") && !up.contains("died, restarting") && !up.contains("hello-service 0.4.0: started"),
+        check!(up.contains("live, with no restart") && !up.contains("died, restarting") && !up.contains("hello-service 0.6.0: started") && !up.contains("wrong key"),
                "it was replaced live: no death, no restart, no fresh start");
         let lr = run!(b"godspeed list installed\r", 60);
-        check!(lr.contains("godspeed/hello-service") && lr.contains("0.4.0") && lr.contains("running"), "0.4.0 is the installed one, running");
+        check!(lr.contains("godspeed/hello-service") && lr.contains("0.6.0") && lr.contains("running"), "0.6.0 is the installed one, running");
         // VERSIONS: every release, newest first, and what each is here. Then an older one installed by its version.
         let lv = run!(b"godspeed list versions godspeed/hello-service\r", 180);
-        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.4.0") && lv.contains("0.1.0")
-               && lv.contains("installed") && lv.contains("4 versions, the latest 0.4.0"),
+        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.6.0") && lv.contains("0.1.0")
+               && lv.contains("installed") && lv.contains("6 versions, the latest 0.6.0"),
                "`godspeed list versions` lists every release, newest first, the installed one marked");
-        check!(lv.find("0.4.0").unwrap_or(usize::MAX) < lv.find("0.1.0").unwrap_or(0), "newest first");
+        check!(lv.find("0.6.0").unwrap_or(usize::MAX) < lv.find("0.1.0").unwrap_or(0), "newest first");
         let _ = run!(b"godspeed fetch godspeed/hello-service@0.1.0\r", 240);
         let dg = run!(b"godspeed install godspeed/hello-service@0.1.0 yes\r", 180);
-        check!(dg.contains("a DOWNGRADE from the installed 0.4.0, whose data stays as that version left it"),
+        check!(dg.contains("a DOWNGRADE from the installed 0.6.0, whose data stays as that version left it"),
                "installing an older version says it is a downgrade, and what that means for its data");
         check!(dg.contains("installed godspeed/hello-service 0.1.0 started") && dg.contains("stopped and started"),
-               "0.1.0 cannot hand over, so it replaces 0.4.0 by a stop and start - and says so");
+               "0.1.0 cannot hand over, so it replaces 0.6.0 by a stop and start - and says so");
         let lv2 = run!(b"godspeed list installed\r", 60);
-        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.1.0") && !lv2.contains("0.4.0"), "the older version is the installed one now");
-        for v in ["0.3.0", "0.4.0"] {
+        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.1.0") && !lv2.contains("0.6.0"), "the older version is the installed one now");
+        for v in ["0.5.0", "0.6.0"] {
             let _ = run!(format!("godspeed remove godspeed/hello-service@{}\r", v).as_bytes(), 60);
         }
         let su = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);

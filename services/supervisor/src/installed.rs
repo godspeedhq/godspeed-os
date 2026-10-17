@@ -70,6 +70,8 @@ struct Entry {
     pci_class: Option<u32>,
     /// The running version's contract declares `handover`: it can hand its state to a successor and end.
     handover: bool,
+    /// The key it was started with (`gs::handover::mode`): an offer must carry it, so nobody else can make it hand over.
+    key: u32,
 }
 
 impl Entry {
@@ -117,10 +119,10 @@ impl Installed {
     /// Is `task` an installed package's? Its death is this module's to answer.
     pub fn has(&self, task: &str) -> bool { self.find(task).is_some() }
 
-    /// Record whether the version of `pkg` now running can hand over.
-    fn note_handover(&mut self, pkg: &str, can: bool) {
+    /// Record whether the version of `pkg` now running can hand over, and the key it was started with.
+    fn note_handover(&mut self, pkg: &str, (can, key): (bool, u32)) {
         if let Some(i) = self.find(pkg) {
-            if let Some(mut e) = self.e[i] { e.handover = can; self.e[i] = Some(e); }
+            if let Some(mut e) = self.e[i] { e.handover = can; e.key = key; self.e[i] = Some(e); }
         }
     }
 
@@ -133,20 +135,25 @@ impl Installed {
         let Some(e) = self.e[i] else { return Ok(false) };
         if e.utility || !e.handover || !alive(ctx, pkg) { return Ok(false); }
         // The running one's endpoint, by its name, BEFORE the successor takes the name.
-        let Some(old) = ctx.acquire_send_cap(pkg) else { return Ok(false) };
+        let Ok(old) = gs::cap::acquire(ctx, pkg) else { return Ok(false) };
         let started = self.run_as(ctx, publisher, name, pkg, version, None, true);
         let (_, successor, can) = match started {
             Ok(x) => x,
-            Err(why) => { gs::cap::remove(ctx, old.into()); return Err(why); }
+            Err(why) => { gs::cap::remove(ctx, old); return Err(why); }
         };
         let Some(succ) = successor else {
-            gs::cap::remove(ctx, old.into());
+            gs::cap::remove(ctx, old);
             return Err(text(format_args!("the successor started with no endpoint to hand to")));
         };
-        // The offer, with the successor's endpoint attached: the running one sends its state there and ends.
-        let sent = gs::ipc::send_granting(ctx, old.into(), succ.into(), &gs::ipc::Message::from_bytes(godspeed::handover::OFFER)).is_ok();
+        // The offer, with the successor's endpoint attached: the running version's key, which it checks, and the
+        // successor's, which the state must carry.
+        let mut offer = [0u8; 16];
+        offer[..8].copy_from_slice(godspeed::handover::OFFER);
+        offer[8..12].copy_from_slice(&e.key.to_le_bytes());
+        offer[12..16].copy_from_slice(&can.1.to_le_bytes());
+        let sent = gs::ipc::send_granting(ctx, old, succ.into(), &gs::ipc::Message::from_bytes(&offer)).is_ok();
         if !sent { gs::cap::remove(ctx, succ.into()); }
-        gs::cap::remove(ctx, old.into());
+        gs::cap::remove(ctx, old);
         let restarts = e.restarts;
         let slot = i;
         self.remember(slot, pkg, version, restarts, (false, false));
@@ -225,8 +232,9 @@ impl Installed {
     fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32, (utility, app): (bool, bool)) {
         let pci_class = self.e[slot].and_then(|x| x.pci_class);
         let handover = self.e[slot].is_some_and(|x| x.handover);
+        let key = self.e[slot].map_or(0, |x| x.key);
         let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility, app, pci_class,
-                            handover };
+                            handover, key };
         e.name[..pkg.len()].copy_from_slice(pkg.as_bytes());
         e.version[..version.len()].copy_from_slice(version.as_bytes());
         self.e[slot] = Some(e);
@@ -237,7 +245,10 @@ impl Installed {
     /// otherwise only checked.
     fn run(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str,
            first: Option<&[&str]>) -> Result<(bool, bool), Text> {
-        self.run_as(ctx, publisher, name, pkg, version, first, false).map(|(k, _, _)| k)
+        // Every start records its handover key, a restart's included: an offer to it must carry the key it runs with.
+        let (kind, _, handover) = self.run_as(ctx, publisher, name, pkg, version, first, false)?;
+        self.note_handover(pkg, handover);
+        Ok(kind)
     }
 
     /// [`run`](Installed::run), and when `successor` is set, started BESIDE the running version as its successor
@@ -245,7 +256,7 @@ impl Installed {
     #[allow(clippy::too_many_arguments)]
     fn run_as(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str,
               first: Option<&[&str]>, successor: bool)
-        -> Result<((bool, bool), Option<godspeed_sdk::capability::CapHandle>, bool), Text> {
+        -> Result<((bool, bool), Option<godspeed_sdk::capability::CapHandle>, (bool, u32)), Text> {
         let arch = this_arch().ok_or_else(|| text(format_args!("this machine's architecture has no package spelling")))?;
         if self.image.is_none() {
             self.image = Some(Region::alloc(ctx, IMAGE_MAX)
@@ -277,7 +288,7 @@ impl Installed {
         if utility && first.is_none() {
             ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - {}, run when typed", pkg, version,
                 if app { "an app" } else { "a utility" }));
-            return Ok(((utility, app), None, false));
+            return Ok(((utility, app), None, (false, 0)));
         }
         // The console: for an app, and only when the operator's answer gave it. The device, likewise, for a driver.
         let mut console = false;
@@ -338,10 +349,13 @@ impl Installed {
             req.dma_pages = 0;
         }
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
+        // A handover-capable start carries a fresh KEY in its spawn mode, which only this supervisor can set: an offer
+        // must carry it, so no client of the service can make it hand its state away (`gs::handover`).
+        let key = if checked.contract.handover { handover_key(ctx) } else { 0 };
+        if checked.contract.handover { req.probe_mode = godspeed::handover::mode(key, successor); }
         if successor {
             if !checked.contract.handover { return Err(text(format_args!("its contract does not declare `handover`"))); }
             req.flags |= SPAWN_FLAG_HANDOVER;
-            req.probe_mode = godspeed::handover::MODE;
         }
         req.privileges = 0;
         let mut out = [0u8; 128];
@@ -353,7 +367,7 @@ impl Installed {
                 ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s){}, checked from disk)",
                     pkg, version, checked.size, np, if driver { ", its device" } else { "" }));
                 if driver { self.class_of(pkg, checked.contract.pci_class); }
-                Ok(((utility, app), kept, checked.contract.handover))
+                Ok(((utility, app), kept, (checked.contract.handover, key)))
             }
             Err(e) => Err(text(format_args!("the kernel refused to start it: {:?}", e))),
         }
@@ -413,3 +427,11 @@ impl Installed {
 }
 
 fn gs_ok() -> u8 { godspeed_sdk::service_context::supcmd::OK }
+
+/// A fresh handover key: the hardware's random source where there is one, mixed with the clock, 30 bits.
+fn handover_key(ctx: &ServiceContext) -> u32 {
+    let r = gs::task::hw_random(ctx).unwrap_or(0);
+    let t = gs::task::uptime_secs(ctx) as u32;
+    let k = (r ^ t.wrapping_mul(0x9E37_79B9)) & godspeed::handover::KEY_MASK;
+    if k == 0 { 1 } else { k }
+}

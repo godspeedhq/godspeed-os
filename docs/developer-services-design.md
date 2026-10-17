@@ -1232,19 +1232,57 @@ stopped - built from two isolated programs and an explicit handover.
 6. The new version, started in the handover mode, waits up to 10 s for the state (`take_over`), keeping up to two
    ordinary requests that arrive first, and carries on from it.
 
+The same sequence as a picture: time runs down, and the name `godspeed/hello-service` answers to whoever holds the
+arrow on the left.
+
+```
+ operator      godspeed-pm       supervisor               kernel                v1 (running)        v2 (new)
+    |               |                 |                       |                     |                   |
+    | upgrade ----->|                 |                       |                     |  serving, key K1  |
+    |               |-- HANDOVER ---->|                       |                     |                   |
+    |               |                 | check v2 from disk    |                     |                   |
+    |               |                 | acquire cap to v1 --->|                     |                   |
+    |               |                 | SpawnImage + HANDOVER |                     |                   |
+    |               |                 |   mode(K2, successor)>|-- start beside v1 ------------------->|
+    |               |                 |                       | name -> v2          |                   | take_over: waits
+ name ===========================================================================================> v2   |  (keeps 2 early)
+    |               |                 |-- OFFER [K1, K2] + cap(v2) -------------->|                   |
+    |               |                 |                       |                     | key == K1? yes    |
+    |               |                 |                       |                     | drain own queue   |
+    |               |                 |                       |                     |-- STATE [K2,..] ->|
+    |               |                 |                       |                     | exit(0)           | key == K2? yes
+    |               |                 |<-- death notice: v1 exited ----------------|                   | carries on from
+    |               |                 | name still alive (v2): no restart          x                   | v1's state
+    |               |<-- [OK, 'H'] ---|                       |                                         |
+    |<-- "replaced: live, with no restart"                    |                                         |
+```
+
+A wrong key at either step is refused and counted; after three, that side takes no more (14.3). Where either contract
+lacks `handover`, the supervisor answers `[OK, 'R']` after an ordinary stop and start instead.
+
 ### 14.2 When it falls back
 
 A restart, said in the answer (`replaced: stopped and started`), when the running version's contract or the new one's
 does not declare `handover`, or nothing is running. A successor that will not start leaves the running version running.
 A state that never arrives (the old version does not answer the offer) is said by the successor, which starts fresh.
 
-### 14.3 What it does not do
+### 14.3 Why an offer is checked
+
+The offer arrives on the service's public endpoint, which every client can send to, and the kernel does not say who sent
+a message. Unchecked, anyone could make a service hand its state to them and end (found by the commit's security review).
+So every handover-capable start carries a random 30-bit KEY in its spawn mode, which only the supervisor can set (only it
+calls `SpawnImage`); the offer carries the running version's key and names the successor's; the state carries the
+successor's. Each side refuses a wrong one and, after three, stops listening, saying so. A key cannot be guessed in three
+tries; a sender who keeps trying can only make a later upgrade fall back to a stop and start, which is loud and no worse
+than before handovers.
+
+### 14.4 What it does not do
 
 Capabilities do not travel. A request sent to the old version after its drain is lost with it, reported to its caller as
 `OutcomeUnknown`. The state is one message (4088 bytes); more stays on disk. Apps are not covered: an app's handover
 would move the screen with the state, and is not built. The kernel's part is one flag (2.5 amendment).
 
-### 14.4 Shown
+### 14.5 Shown
 
-`godspeed/hello-service` 0.3.0 and 0.4.0 count the seconds they run; upgraded from one to the other in QEMU, the new
+`godspeed/hello-service` 0.5.0 and 0.6.0 count the seconds they run (0.3.0 and 0.4.0 speak the earlier, unchecked offer, and are refused); upgraded from one to the other in QEMU, the new
 version logs `took over, live, at N seconds` with the old version's count, and nothing died or restarted.
