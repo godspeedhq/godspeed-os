@@ -181,8 +181,8 @@ nothing is said twice.
 
 ```
 godspeed search | where item=package
-godspeed list | where item~hello | count
-godspeed registry | where note~in use
+godspeed search | where item=package | count
+godspeed registry | where item=default
 godspeed config | where note=file
 godspeed check | where item=tls
 ```

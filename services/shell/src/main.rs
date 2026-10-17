@@ -5717,7 +5717,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("godspeed check", "reach the registry in use over TLS, verified to the trusted roots, one row per step", "godspeed check"),
             ("the file", "/system/services/godspeed/config, one `key value` per line; `edit` works on it too", ""),
             ("the roots", "/system/services/godspeed/roots/: the certificate authorities TLS accepts, one file each", ""),
-            ("godspeed registry | where note~in use", "a report is records: item, value, note", "godspeed config | where note=file"),
+            ("godspeed search | where item=package", "a report is records: item, value, note", "godspeed config | where note=file"),
         ], false),
         "ask" => help_block(ctx, "ask", "plain questions about this machine, answered from what its services know", &[
             ("ask \"<question>\"", "the answer: a verdict, and what it rests on", "ask \"is my system healthy?\""),

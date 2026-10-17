@@ -8434,8 +8434,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(twice.contains("already kept"), "fetching a kept version again leaves it as it is");
         let listed = run!(b"godspeed list\r", 60);
         check!(listed.contains("godspeed/hello@0.1.0") && listed.contains("from default"), "`godspeed list` shows it and its registry");
-        let piped = run!(b"godspeed list | where item~hello | count\r", 60);
-        check!(piped.contains('1'), "`godspeed list` pipes as records");
+        let piped = run!(b"godspeed search | where item=package | count\r", 180);
+        check!(piped.lines().any(|l| l.trim() == "1") && !piped.contains("where:"), "`godspeed search` pipes as records: one package row");
         let refused = run!(b"godspeed fetch godspeed/hello | count\r", 30);
         check!(refused.contains("are actions, not reports"), "`godspeed fetch` refuses to start a pipe");
         let missing = run!(b"godspeed fetch godspeed/hello@9.9.9\r", 240);
