@@ -1053,3 +1053,48 @@ The file, as `scripts/platform_file.py` writes it for 0.28.0 (the two `[files]` 
   they contain.
 - **Where it runs:** `osdev build` (`EXTRA_CHECKS`), and the release workflow's Package step, into `dist/`
   before `SHA256SUMS-<tag>` is written.
+
+## 12. Installing: a fetched service started by the supervisor (decided and built 2026-10-17)
+
+The operator's four decisions, asked when `godspeed install` was next: **the supervisor loads it**; **the operator
+approves peers**, never a privilege; **utilities get option B** (9.3: an `Exit(status)` syscall); **drivers and
+apps stay design only** (9.4, 9.5) until a design is approved. This section is the first of them, which is 9.2.
+
+### 12.1 What happens
+
+1. `godspeed install <pkg>` - `godspeed-pm` checks the fetched copy from the disk (`check.rs`, the code `verify` runs)
+   and answers the send peers its contract requests.
+2. The shell asks once per package, naming all of them and that no privilege is given; `yes` answers in advance,
+   `grant <peer>,...` gives a subset.
+3. `godspeed-pm` writes the answer to the package's `grant` file, adds `publisher/name version` to
+   `/system/packages/installed`, and sends the supervisor `supcmd::INSTALL`.
+4. The supervisor runs the same `check.rs` again (by `#[path]`), reading the binary ONCE into a `Region` as it is
+   hashed, narrows the grant to the contract, and starts those bytes with `SpawnImage`: privilege 0, the approved
+   peers, `SPAWN_FLAG_WATCHED`, the contract's memory limit up to 64 MiB, under the name `publisher/name`.
+5. At boot it starts what the list names, the same way, after `supervisor: ready`; a respawned supervisor adopts
+   what is still running. A death is restarted from the disk up to 5 times a boot.
+
+`upgrade` is fetch-then-install of the newest release; `uninstall` takes it off the list and `supcmd::UNINSTALL`
+stops it, forgotten first so its death notice restarts nothing. The fetched copy stays.
+
+### 12.2 What it needed
+
+- **`Region`** (`sdk/rust/src/memory.rs`), the task's own `AllocMem` pages as a slice: a fourth permitted SDK
+  module (CLAUDE.md 18.1 amendment). One 1 MiB region, asked for at the first install and reused; no free exists.
+- **Three supervisor commands** (`supcmd::INSTALL`, `UNINSTALL`, `INSTALLED`) and `supervisor` as a peer of
+  `godspeed-pm`.
+- **`check.rs`** shared by both, so "intact" means one thing; `godspeed verify` uses it too, and now also checks the
+  signing key's standing in the trust record, which it did not before. `fetch` records the release's publication
+  date in `origin`, so a key retired since still vouches for a release published before.
+- **String arrays** in the heapless TOML reader, for a contract's `ipc_send = [...]`.
+- No kernel change and no syscall. The CLAUDE.md 14.1 amendment records the widening: the supervisor now starts code
+  read from the disk, signed.
+
+### 12.3 What is not closed
+
+The trust record and the grant file live on `/system`, which any `fs` holder can write (folder capabilities are
+`docs/filesystem-layout.md` phase 2, not built). So the check proves the image is what a key IN THIS MACHINE'S RECORD
+signed, and the grant is narrowed to what the signed contract requests - but a writer to `/system` can change the
+record or widen a grant up to that. The supervisor cannot tell an operator's answer from a forged one; it can only
+refuse anything beyond what the publisher signed. Also unchecked offline: whether the registry has since revoked the
+key - `godspeed list updates` and every fetch refresh the record, and a revoked key is refused once it is there.

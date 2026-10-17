@@ -38,7 +38,7 @@ const ORIGIN_MAX: usize = 512;
 /// How many times a command is tried on a fresh connection when the server closed the last one part way.
 const ATTEMPTS: u32 = 3;
 /// The most fetched versions one listing reads. More are said, not dropped in silence.
-const MAX_FETCHED: usize = 32;
+pub const MAX_FETCHED: usize = 32;
 
 /// The GodspeedOS release this machine runs, as the workspace says (`build.rs`).
 pub const OS_RELEASE: &str = env!("GODSPEED_OS_RELEASE");
@@ -579,7 +579,8 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
             }
             let mut origin = Path::new();
             origin.push("registry ").push(ready.reg.name).push(" ").push(ready.reg.url).push("\nfetched ").push(now)
-                  .push("\narch ").push(arch.as_str()).push("\nsigned-by ").push(key.as_str()).push("\n");
+                  .push("\narch ").push(arch.as_str()).push("\nsigned-by ").push(key.as_str())
+                  .push("\npublished ").push(release.published).push("\n");
             let mut op = staging;
             op.push("/origin");
             fs.write(op.as_str(), &origin.b[..origin.n]).map_err(Why::Store)?;
@@ -594,7 +595,7 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
         r.row("built for", built.as_str(), os_note.as_str());
         r.row("requests", req.as_str(), "what its contract asks for; fetching grants nothing");
         r.row("signed", short_key(&c.key).as_str(), key_status.as_str());
-        r.row("installed", "no", "this machine cannot start a program from disk yet (design 9.2)");
+        r.row("installed", "no", "`godspeed install` starts it, and at every boot");
         let _ = key;
         chain_note_through(r, &v, "", " -> index -> manifest -> signature -> contract -> binary");
         Ok(())
@@ -711,7 +712,10 @@ pub fn list_fetched(ctx: &ServiceContext, r: &mut Rows) {
     let mut total = 0u64;
     for f in all.iter().take(n) {
         let pkg = cell(format_args!("{}/{}", f.publisher(), f.name()));
-        r.entry(&[C::S(pkg.as_str()), C::S(f.version()), C::S(f.registry()), C::N(f.bytes), C::S("fetched, not installed")]);
+        let mut iv = [0u8; 24];
+        let installed = crate::install::installed_version(ctx, pkg.as_str(), &mut iv).is_some_and(|n| &iv[..n] == f.version().as_bytes());
+        r.entry(&[C::S(pkg.as_str()), C::S(f.version()), C::S(f.registry()), C::N(f.bytes),
+                  C::S(if installed { "installed" } else { "fetched, not installed" })]);
         total += f.bytes;
     }
     if n == 0 {
@@ -729,10 +733,6 @@ fn bar(filled: usize, width: usize) -> Cell {
     c
 }
 
-/// `godspeed list installed`: none, and why - nothing can be installed yet (9.2). An empty list, not a refusal.
-pub fn list_installed(r: &mut Rows) {
-    r.note(format_args!("nothing can be installed on this machine yet (design 9.2); `godspeed list fetched` shows what has been fetched"));
-}
 
 /// The fetched versions `which` names: every one, one package's, or one version.
 fn select(all: &[Fetched], which: Option<&str>) -> Result<[bool; MAX_FETCHED], &'static str> {
@@ -793,58 +793,9 @@ pub fn verify(ctx: &ServiceContext, r: &mut Rows, which: Option<&str>) {
 
 /// One fetched version, checked from disk. The architecture of its binary, or what is wrong.
 fn verify_one(ctx: &ServiceContext, f: &Fetched) -> Result<&'static str, Cell> {
-    let mut fs = gs::fs::Fs::new(ctx);
-    let dir = f.dir();
-    let read = |fs: &mut gs::fs::Fs<'_>, file: &str, buf: &mut [u8]| -> Result<usize, Cell> {
-        let mut p = dir;
-        p.push("/").push(file);
-        fs.read_into(p.as_str(), buf).map_err(|e| cell(format_args!("{} could not be read: {:?}", file, e)))
-    };
-    let mut m = [0u8; MANIFEST_MAX];
-    let ml = read(&mut fs, "manifest.toml", &mut m)?;
-    let mut s = [0u8; MSIG_MAX];
-    let sl = read(&mut fs, "manifest.sig", &mut s)?;
-    let mut c = [0u8; CONTRACT_MAX];
-    let cl = read(&mut fs, godspeed_package::CONTRACT_FILE, &mut c)?;
-    let mut o = [0u8; ORIGIN_MAX];
-    let ol = read(&mut fs, "origin", &mut o)?;
-    let sig_text = core::str::from_utf8(&s[..sl]).map_err(|_| cell(format_args!("manifest.sig is not text")))?;
-    let sig = ManifestSignature::parse(sig_text).and_then(|g| g.verify(&m[..ml]).map(|()| g))
-        .map_err(|e| cell(format_args!("the signature does not verify over manifest.toml ({:?})", e)))?;
-    let origin = core::str::from_utf8(&o[..ol]).unwrap_or("");
-    let recorded = origin.lines().find_map(|l| l.strip_prefix("signed-by ")).unwrap_or("");
-    if recorded != cell(format_args!("{}", sig.key)).as_str() {
-        return Err(cell(format_args!("signed by another key than the one recorded when it was fetched")));
-    }
-    let mtext = core::str::from_utf8(&m[..ml]).map_err(|_| cell(format_args!("manifest.toml is not text")))?;
-    let mut arts = Artifacts::new();
-    let man = meta::manifest(mtext, &mut arts).map_err(|b| cell(format_args!("manifest.toml line {}: {}", b.line, b.why)))?.manifest;
-    if man.name.publisher() != f.publisher() || man.name.name() != f.name()
-        || cell(format_args!("{}", man.version)).as_str() != f.version() {
-        return Err(cell(format_args!("the manifest names another package or version than its folder")));
-    }
-    if godspeed_package::Sha256Digest::of(&c[..cl]) != man.contract {
-        return Err(cell(format_args!("contract.toml is not the contract the manifest names")));
-    }
-    let arch_name = origin.lines().find_map(|l| l.strip_prefix("arch ")).unwrap_or("");
-    let Some(artifact) = man.artifacts.iter().find(|a| a.arch.as_str() == arch_name).copied() else {
-        return Err(cell(format_args!("the manifest has no binary for the architecture recorded ({})", arch_name)));
-    };
-    let mut bin = dir;
-    bin.push("/").push(artifact.arch.artifact_file());
-    let mut verifier = ArtifactVerifier::new(artifact);
-    let mut chunk = [0u8; gs::fs::IO_CHUNK];
-    let mut off = 0u64;
-    loop {
-        let got = fs.read_at(bin.as_str(), off, &mut chunk)
-            .map_err(|e| cell(format_args!("{} could not be read: {:?}", artifact.arch.artifact_file(), e)))?;
-        if got == 0 { break; }
-        verifier.update(&chunk[..got])
-            .map_err(|_| cell(format_args!("{} is longer than the manifest says", artifact.arch.artifact_file())))?;
-        off += got as u64;
-    }
-    verifier.finish().map_err(|_| cell(format_args!("{} is not the size or digest the manifest names", artifact.arch.artifact_file())))?;
-    Ok(artifact.arch.as_str())
+    crate::check::package(ctx, f.publisher(), f.name(), f.version(), None, &mut |_, _| true)
+        .map(|c| c.arch)
+        .map_err(|why| cell(format_args!("{}", why.as_str())))
 }
 
 /// `godspeed list updates`, for the fetched packages from one registry: the newest version each has there,
@@ -926,6 +877,15 @@ pub fn remove(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     if let Some(v) = version {
         let vt = cell(format_args!("{}", v));
         target.push("/").push(vt.as_str());
+    }
+    // An installed copy is the one the supervisor starts at boot: uninstall it first.
+    let mut iv = [0u8; 24];
+    let pkg = cell(format_args!("{}", name));
+    if let Some(n) = crate::install::installed_version(ctx, pkg.as_str(), &mut iv) {
+        let vt = version.map(|v| cell(format_args!("{}", v)));
+        if vt.as_ref().is_none_or(|v| v.as_str().as_bytes() == &iv[..n]) {
+            return r.fail("installed", which, "it is installed: `godspeed uninstall` it first");
+        }
     }
     match fs.exists(target.as_str()) {
         Ok(true) => {}

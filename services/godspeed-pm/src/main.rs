@@ -23,15 +23,17 @@
 //!   packages the registry's signed metadata vouches for, verified on this machine by the shared crate's own
 //!   checks, and a verified copy FETCHED to `/system/packages/` (`packages.rs`, `chain.rs`). A list answers
 //!   with its packages only; an empty one is no rows, not a failure.
-//! - `godspeed install` and `uninstall` - refused, with the reason: this machine cannot start a program from
-//!   disk yet (9.2), so a package can be fetched here, verified, and not run, and `list installed` is empty.
-//!   Calling a fetched package installed would be the development convenience the CLI's contract forbids
-//!   presenting as installation.
+//! - `godspeed install <publisher/name>[@version]` and `uninstall` - a fetched package started by the supervisor,
+//!   at once and at every boot, with the send peers the operator approved of those its contract requests and no
+//!   privilege (`install.rs`; `docs/developer-services-design.md` 12). The supervisor checks the copy from the
+//!   disk again, by the same code, before it starts it.
 
 #![no_std]
 #![no_main]
 
 mod chain;
+mod check;
+mod install;
 mod config;
 mod default_root;
 mod http;
@@ -100,7 +102,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name)),
         (Some("list"), Some("available")) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, None)),
         (Some("list"), Some("fetched")) if words.clone().next().is_none() => packages::list_fetched(&ctx, &mut r),
-        (Some("list"), Some("installed")) if words.clone().next().is_none() => packages::list_installed(&mut r),
+        (Some("list"), Some("installed")) if words.clone().next().is_none() => install::list(&ctx, &mut r),
         (Some("list"), Some("updates")) if words.clone().next().is_none() => list_updates(&ctx, &mut r),
         (Some("list"), _) => r.fail("usage", "godspeed list available | fetched | installed | updates", "say which"),
         (Some("verify"), which) if words.clone().next().is_none() => packages::verify(&ctx, &mut r, which),
@@ -110,10 +112,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             _ => r.fail("usage", "godspeed trust reset <registry>", "one registry, by the name `godspeed registry` lists"),
         },
         (Some("remove"), Some(name)) if words.clone().next().is_none() => packages::remove(&ctx, &mut r, name),
-        (Some("install"), _) => r.fail("install", "not built",
-            "this machine cannot start a program from disk yet (design 9.2); `godspeed fetch` keeps a verified copy"),
-        (Some("uninstall"), _) => r.fail("uninstall", "not built",
-            "nothing is installed, because nothing can be yet (design 9.2); `godspeed remove` deletes a fetched copy"),
+        // The shell asks the operator about each requested peer between the two forms (`install.rs`).
+        (Some("install"), Some(name)) => match (words.next(), words.next(), words.next()) {
+            (None, _, _) => install::requests(&ctx, &mut r, name),
+            (Some("grant"), Some(peers), None) => install::install(&ctx, &mut r, name, peers),
+            _ => r.fail("usage", "godspeed install <publisher/name>[@version] [grant <peer>,... | grant none]",
+                        "the shell asks about each peer the contract requests"),
+        },
+        (Some("install"), None) => r.fail("usage", "godspeed install <publisher/name>[@version]", "a fetched package to install"),
+        (Some("uninstall"), Some(name)) if words.clone().next().is_none() => install::uninstall(&ctx, &mut r, name),
+        (Some("uninstall"), _) => r.fail("usage", "godspeed uninstall <publisher/name>", "one installed package"),
         _ => r.fail("usage", "godspeed search | info | fetch | list | verify | remove | trust | registry | config | check",
                     "`godspeed help` says what each does"),
     }

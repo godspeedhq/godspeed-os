@@ -5,8 +5,9 @@
 //! them only with a heap (its `toml` feature). This is the native side's answer to that crate's open
 //! question 1, "how the native side reads the text without a heap" (`docs/developer-services-design.md` 10.6):
 //! the subset those files use, and nothing more. Comments, blank lines, `[table]`, `[[array]]`, and
-//! `key = "string"`, `key = integer` or `key = true|false`, each on one line. Anything else - an array, an inline table, a float,
-//! a multi-line string - is refused with its line number rather than guessed at.
+//! `key = "string"`, `key = integer`, `key = true|false` or `key = ["string", ...]`, each on one line. Anything else - an
+//! array of anything but strings, an array over several lines, an inline table, a float, a multi-line string - is refused
+//! with its line number rather than guessed at. (The array is a contract's: `ipc_send = ["fs"]`.)
 //!
 //! **A string is returned as written, between its quotes, and must not need unescaping.** A backslash is
 //! reported as [`Val::Escaped`] so the caller decides: a field that must match exactly (a name, a version, a
@@ -37,6 +38,38 @@ pub enum Val<'a> {
     Int(u64),
     /// `true` or `false` (a contract's capabilities are booleans).
     Bool(bool),
+    /// An array of strings with no backslash in any, as written between its brackets; [`strings`] walks it.
+    /// Checked when the line is read, so walking it cannot fail.
+    Strings(&'a str),
+}
+
+/// The strings of a [`Val::Strings`], in order.
+pub fn strings(inner: &str) -> impl Iterator<Item = &str> {
+    let mut rest = inner;
+    core::iter::from_fn(move || {
+        let s = rest.trim_start().strip_prefix(',').unwrap_or(rest).trim_start().strip_prefix('"')?;
+        let end = s.find('"')?;
+        rest = &s[end + 1..];
+        Some(&s[..end])
+    })
+}
+
+/// `"a", "b"` (the inside of an array), checked: strings only, comma-separated, a trailing comma allowed.
+fn array_ok(inner: &str) -> bool {
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        let Some(s) = rest.strip_prefix('"') else { return false };
+        let Some(end) = s.find('"') else { return false };
+        let item = &s[..end];
+        if item.bytes().any(|b| b == b'\\' || (b < 0x20 && b != b'\t')) { return false; }
+        rest = s[end + 1..].trim_start();
+        match rest.strip_prefix(',') {
+            Some(r) => rest = r.trim_start(),
+            None if rest.is_empty() => {}
+            None => return false,
+        }
+    }
+    true
 }
 
 /// The lines of `text`, numbered from 1, each one `Ok(line)` or `Err(why)`.
@@ -81,6 +114,12 @@ fn line(l: &str) -> Result<Line<'_>, &'static str> {
         return Err("a key is not a bare key");
     }
     let value = value.trim_start();
+    if let Some(a) = value.strip_prefix('[') {
+        let (inner, rest) = a.split_once(']').ok_or("an array is not closed on its line")?;
+        if !tail_ok(rest) { return Err("something follows an array on its line"); }
+        if !array_ok(inner) { return Err("an array is not strings, each between quotes, separated by commas"); }
+        return Ok(Line::Pair(key, Val::Strings(inner)));
+    }
     if let Some(s) = value.strip_prefix('"') {
         // The closing quote is the first one not escaped by a backslash.
         let b = s.as_bytes();
@@ -149,11 +188,23 @@ mod tests {
 
     #[test]
     fn refuses_what_it_does_not_read() {
-        for bad in ["k = [1, 2]", "k = { a = 1 }", "k = 1.5", "k = \"open", "k = \"x\" y", "[t", "k = 01", "= 3", "k = -1",
+        for bad in ["k = [1, 2]", "k = [\"a\" \"b\"]", "k = [\"a\"", "k = [\"a\\b\"]", "k = { a = 1 }", "k = 1.5", "k = \"open", "k = \"x\" y", "[t", "k = 01", "= 3", "k = -1",
                     "k = \"\u{1}\""] {
             let mut it = lines(bad);
             assert!(it.next().is_some_and(|x| x.1.is_err()), "{}", bad);
         }
+    }
+
+    #[test]
+    fn arrays_of_strings() {
+        let mut it = lines("ipc_send = [\"fs\", \"events\",]  # peers
+none = []
+");
+        let Some((_, Ok(Line::Pair("ipc_send", Val::Strings(inner))))) = it.next() else { panic!("not an array") };
+        let got: [Option<&str>; 3] = { let mut s = strings(inner); [s.next(), s.next(), s.next()] };
+        assert_eq!(got, [Some("fs"), Some("events"), None]);
+        let Some((_, Ok(Line::Pair("none", Val::Strings(empty))))) = it.next() else { panic!("not an empty array") };
+        assert_eq!(strings(empty).next(), None);
     }
 
     #[test]

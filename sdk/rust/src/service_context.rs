@@ -587,6 +587,17 @@ pub mod supcmd {
     /// `death::FAULT`), the fault kind and address, and the name of the task that called `kill`. The
     /// kernel says how, in the death notice; the supervisor only keeps the newest per name. `ask`.
     pub const DEATH:   u8 = b'X';
+    /// Start an installed package: `[MARKER, INSTALL, "publisher/name version"]`. The supervisor checks the fetched
+    /// copy from the disk, grants the send peers its `grant` file names and its contract requests, and starts it
+    /// under the task name `publisher/name` (`services/supervisor/src/installed.rs`). Answered `[OK]`, or
+    /// `[FAILED, reason...]` - the reason is a sentence.
+    pub const INSTALL: u8 = b'I';
+    /// Stop an installed package and forget it: `[MARKER, UNINSTALL, "publisher/name"]`. `[OK]`, or `[UNKNOWN]` when
+    /// it was not installed.
+    pub const UNINSTALL: u8 = b'O';
+    /// Which packages has this supervisor started from the disk? Read only: `[MARKER, INSTALLED]`, answered with
+    /// `[OK, count, (len, name, running 0/1)*]`. `godspeed list installed`.
+    pub const INSTALLED: u8 = b'L';
     /// A device's driver died and was restarted.
     pub const EV_RESTARTED: u8 = 1;
     /// A device's driver died and its restart failed.

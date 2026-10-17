@@ -39,7 +39,7 @@ SDK         = REPO_ROOT / "sdk"
 # file's count was never compared with anything: the audit's table says how many each holds, and a
 # new `unsafe` in `mmio.rs` changed no number this script looked at (backlog/fixed/80 T6).
 SDK_PERMITTED = {"sdk/rust/src/syscall.rs", "sdk/rust/src/mmio.rs", "sdk/rust/src/dma.rs",
-                 "sdk/rust/src/adversarial.rs"}
+                 "sdk/rust/src/adversarial.rs", "sdk/rust/src/memory.rs"}
 
 # ...and the files that hold `unsafe` anyway, frozen at their counts (18.5's grandfathering, applied
 # to the SDK). These are NOT 85 separate defects: 82 of the 85 are `unsafe { raw_syscall(..) }` call

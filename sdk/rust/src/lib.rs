@@ -68,6 +68,7 @@ pub mod churn;
 pub mod dma;
 pub mod hid;
 pub mod ipc;
+pub mod memory;
 pub mod mmio;
 pub mod record;
 pub mod service_context;

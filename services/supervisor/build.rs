@@ -15,6 +15,9 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{}", ld.display());
     println!("cargo:rerun-if-changed={}", ld.display());
     println!("cargo:rustc-link-arg=--entry=service_main");
+    // This machine's architecture, for the installed-package check (`installed.rs`): a package's binary for another
+    // cannot run here. Asked once, here, rather than by `target_arch` at the site.
+    println!("cargo:rustc-env=SUPERVISOR_TARGET={}", std::env::var("TARGET").unwrap());
 
     // The images this supervisor carries.
     const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure",

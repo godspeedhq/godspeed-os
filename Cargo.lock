@@ -2058,6 +2058,7 @@ version = "0.1.0"
 dependencies = [
  "godspeed",
  "godspeed-audio",
+ "godspeed-package",
  "godspeed-sdk",
 ]
 

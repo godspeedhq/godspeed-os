@@ -1923,6 +1923,28 @@ Every syscall checks the calling task's capability table, populated at spawn tim
 > worth being exact about which: **narrower for the dozen `SPAWN` holders**, who lost the ability to
 > introduce code at all, and **wider for the supervisor alone**, as the paragraph above records.
 
+> **Amendment 2026-10-17 (install): the supervisor starts an image READ FROM THE DISK, for an installed package,
+> and only after checking its signature.** Step 1 above holds for every built-in service; an installed package
+> (`godspeed install`, `utilities/61_godspeed.md` 4b) is the one exception, and it is the step-2 shape the
+> amendment above names. The supervisor reads a fetched package from `/system/packages/`, checks it with the code
+> `godspeed verify` runs - the publisher's signature over its manifest, the signing key's standing in this
+> machine's trust record, the contract and this machine's binary against the manifest's digests - and hands the
+> kernel the very bytes it hashed, through `SpawnImage` as for any other image (`services/supervisor/src/installed.rs`).
+> It does so at install, at every boot and at every restart, with nothing cached between.
+>
+> **What an installed package is given, and why it is safe to give:** no privilege at all - none is asked for and
+> none can be granted - and send peers only where its signed contract requests them AND the operator approved them,
+> never `supervisor`. It runs under its package name, `publisher/name`, which no built-in service can hold, so it can
+> never stand in for one when a client reacquires a name (14.3). Restarts are bounded: five a boot, then it is left
+> down, loudly.
+>
+> **What is NOT closed, recorded rather than hidden (26.7).** The signature is checked against the trust record and
+> the grant read from the package's folder, and both are on `/system`, which every `fs` holder can write: something
+> that can write there can replace the trust record or widen a grant, up to what the signed contract requests. The
+> narrowing to the contract is what keeps a forged grant from reaching further. `IMAGE_SPAWN` stays the supervisor's
+> alone and undelegated; `godspeed-pm` asks over IPC (`supcmd::INSTALL`). No kernel change, no new syscall, and no
+> responsibility added: the supervisor already starts images and already decides with what.
+
 ### 14.2 Restart and Cap Rebinding (Possibly Cross-Core)
 
 ```text
@@ -2044,6 +2066,19 @@ block carrying a `// SAFETY:` comment - keeps the *driver services themselves*
 `unsafe`-free behind safe wrappers (`Mmio::read32`, `Dma::write32`, etc.), exactly
 as the kernel isolates its `unsafe` to the four layers above. This is a recognition
 of what the syscall ABI already required, extended to the hardware access §12 needs.
+
+> **Amendment 2026-10-17 (install): the SDK's `memory.rs` is a fourth permitted module, for a task's OWN
+> memory.** `AllocMem` (syscall 6) returns an address, and an address becomes something a service can read
+> and write only through `unsafe`. Until now nothing outside the tests needed that - every working set fit
+> a stack (26.6.1) - and the one case that did, P7's stamped pages, lives in `adversarial.rs`. The install
+> loader is the first production case: the supervisor reads a package's image from `fs`, checks its digest
+> and signature, and hands the kernel those same bytes, and an image is larger than any stack. `Region`
+> is two blocks (`bytes`, `bytes_mut`) over exactly the pages a successful `AllocMem` mapped, and the
+> supervisor stays `unsafe`-free behind it, as a driver does behind `Mmio`.
+>
+> **What it is not:** an allocator. There is no free - the kernel reclaims a task's memory at its death
+> (10.5) - so a region is asked for once, its size is the bound, and it is reused. No syscall and no
+> kernel change; the rule that new `unsafe` lives in a permitted layer (18.5) is met by naming this one.
 
 **Plus the SDK's audited adversarial test module (`sdk/rust/src/adversarial.rs`).** The §22 red-team /
 fuzz / chaos suite must reach the raw ABI with *fuzzed* syscall numbers and arguments, and must execute

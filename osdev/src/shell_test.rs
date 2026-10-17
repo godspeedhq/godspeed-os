@@ -8435,8 +8435,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
                "it keeps this machine's binary, checked against the manifest");
         check!(fetched.contains("an active key of the publisher's"), "the manifest's signature is by a key the signed namespaces vouch for");
         check!(fetched.contains("log_write"), "it says what the contract requests");
-        check!(fetched.contains("installed") && fetched.contains("not installed") && fetched.contains("cannot start a program from disk yet"),
-               "and that it is fetched, not installed");
+        check!(fetched.contains("installed") && fetched.contains("not installed") && fetched.contains("`godspeed install` starts it"),
+               "and that it is fetched, not installed, and how to install it");
         check!(fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
                "`godspeed fetch` draws a progress bar while the binary downloads");
         check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
@@ -8459,8 +8459,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(trust.contains("root") && trust.contains("expires 2028") && trust.contains("the configuration's") && trust.contains("key godspeed/")
                && trust.contains("active"), "`godspeed trust` is a card: the root, the pin, and the publishers' keys, from this machine's record");
         let installed = run!(b"godspeed list installed\r", 60);
-        check!(installed.contains("0 packages") && installed.contains("nothing can be installed on this machine yet"),
-               "`godspeed list installed` is an empty list with the reason, not a refusal");
+        check!(installed.contains("0 packages") && installed.contains("installs a fetched package"),
+               "`godspeed list installed` is an empty list with the way to install one, not a refusal");
         let piped = run!(b"godspeed search | where item=package | count\r", 60);
         check!(piped.contains("a word is needed") || piped.lines().any(|l| l.trim() == "0"), "a bare search refuses in a pipe too");
         let piped = run!(b"godspeed list available | where package=godspeed/hello | count\r", 180);
@@ -8471,10 +8471,37 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(refused.contains("are actions, not reports"), "`godspeed fetch` refuses to start a pipe");
         let missing = run!(b"godspeed fetch godspeed/hello@9.9.9\r", 240);
         check!(missing.contains("not published") && missing.contains("0.1.0"), "a version not published is refused, naming the ones that are");
-        let install = run!(b"godspeed install godspeed/hello\r", 60);
-        check!(install.contains("cannot start a program from disk yet"), "`godspeed install` says why it is not built");
-        let uninstall = run!(b"godspeed uninstall godspeed/hello\r", 60);
-        check!(uninstall.contains("nothing is installed") && uninstall.contains("godspeed remove"), "`godspeed uninstall` says why, and names `remove`");
+
+        // INSTALL: the supervisor checks the fetched copy from the disk again and starts it, under its package name.
+        let notfetched = run!(b"godspeed install godspeed/nothing-here yes\r", 60);
+        check!(notfetched.contains("not fetched here"), "installing what is not fetched is refused, naming `godspeed fetch`");
+        let inst = run!(b"godspeed install godspeed/hello yes\r", 180);
+        check!(inst.contains("godspeed/hello 0.1.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
+               "`godspeed install` asks once, naming everything the package would be given, and `yes` answers it");
+        check!(inst.contains("installed") && inst.contains("running, as the task godspeed/hello") && inst.contains("privilege"),
+               "the supervisor started it, under its package name, with no privilege");
+        check!(inst.contains("installed godspeed/hello 0.1.0 started") && inst.contains("checked from disk"),
+               "the supervisor says it checked the copy from the disk before starting it");
+        check!(inst.contains("hello: started"), "and the installed program ran");
+        let li = run!(b"godspeed list installed\r", 60);
+        check!(li.contains("godspeed/hello") && li.contains("running") && li.contains("1 package"), "`godspeed list installed` lists it, running");
+        let lf = run!(b"godspeed list fetched\r", 60);
+        check!(lf.contains("installed") && !lf.contains("fetched, not installed"), "`godspeed list fetched` says the copy is the installed one");
+        let rm = run!(b"godspeed remove godspeed/hello\r", 60);
+        check!(rm.contains("`godspeed uninstall` it first"), "an installed copy is not removed");
+        let k = run!(b"kill godspeed/hello\r", 60);
+        check!(k.contains("installed godspeed/hello died") && k.contains("restarting (1 of 5)"),
+               "an installed package that dies is restarted from the disk, counted");
+        let li2 = run!(b"godspeed list installed\r", 60);
+        check!(li2.contains("running") && !li2.contains("NOT running"), "and is running again");
+        let un = run!(b"godspeed uninstall godspeed/hello yes\r", 60);
+        check!(un.contains("[y/N]: yes (given on the command line)") && un.contains("uninstalled") && un.contains("stopped"),
+               "`godspeed uninstall` asks, and stops it");
+        check!(un.contains("installed godspeed/hello stopped and forgotten"), "the supervisor forgets it, so it is not restarted");
+        let li3 = run!(b"godspeed list installed\r", 60);
+        check!(li3.contains("0 packages"), "and it is no longer listed");
+        let un2 = run!(b"godspeed uninstall godspeed/hello yes\r", 60);
+        check!(un2.contains("not installed here"), "uninstalling what is not installed says so");
 
         // A CHANGED PIN is trusting another registry: refused until the operator clears what this machine kept.
         let _ = run!(b"write /system/services/godspeed/trust/default/pin sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);

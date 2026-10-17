@@ -13,9 +13,10 @@ crate is already called `godspeed`; it appears in `status` while a command runs 
 
 Built: the registries, the settings, the registry check, and (2026-10-17, branch `feat/packages`) **search,
 info, fetch, list and remove**, every answer verified on this machine against the registry's signed
-metadata by the shared package crate's own checks (the CLI repository's `godspeed-package`). **Install and
-uninstall are not built**: a fetched package is verified and kept under `/system/packages/`, and cannot run,
-because the supervisor starts only the programs built into the image (design 9.2). `osdev test godspeed` runs every
+metadata by the shared package crate's own checks (the CLI repository's `godspeed-package`). And (the same day)
+**install, upgrade and uninstall** for a SERVICE: the supervisor checks the fetched copy from the disk again and
+starts it, now and at every boot, with the send peers the operator approved and no privilege (section 4b; design 12).
+A `utility` package, which ends, is not built yet. `osdev test godspeed` runs every
 command against a real disk and the real registry over verified TLS through QEMU's user network, fetching
 `godspeed/hello` (its registry checks are skipped, not passed, when the machine running the test is
 offline). Packages are QEMU-verified only, x86; no hardware card yet. On hardware: `godspeed check` verified the registry and got `HTTP/1.1 200 OK` on all five
@@ -31,13 +32,16 @@ godspeed info <publisher/name>[@version]           its versions, then what it is
 godspeed fetch <publisher/name>[@version]          verify a package end to end and fetch it here - fetched, not installed
 godspeed list available                            every package the registry in use offers
 godspeed list fetched                              the packages fetched here, with their sizes
-godspeed list installed                            the packages installed: none yet, and why
+godspeed list installed                            the packages installed, and whether each is running
 godspeed list updates                              each fetched package against the registry it came from
 godspeed verify [<publisher/name>[@version]]       check fetched copies again from the disk alone
 godspeed remove <publisher/name>[@version]         delete a fetched copy, one version or every one
 godspeed trust                                     what this machine has accepted from each registry, and the publishers' keys
 godspeed trust reset <registry> [yes]              forget it, so the next command meets it again from root 1; asks [y/N]
-godspeed install | uninstall                       not built: says why
+godspeed install <publisher/name>[,...] [yes]      start fetched packages, now and at every boot; asks [y/N] for each
+godspeed install <publisher/name> grant <p>,...    the same with the peers named, and no question
+godspeed upgrade <publisher/name>[,...] | all [yes] fetch the newest release of what is installed and install it; asks
+godspeed uninstall <publisher/name>[,...] [yes]    stop them, and no longer start them at boot; asks [y/N] for each
 godspeed registry                                  the registries this machine knows; one is in use
 godspeed registry add <name> <url> <root> [yes]    know another; asks [y/N] before trusting its root
 godspeed registry use <name>                       search and install from that one from now on
@@ -201,6 +205,37 @@ releases), a manifest or a contract 4 KiB, a binary `max-package-mib`. They are 
 **One connection** carries a command's requests, kept alive; a server that closes it part way is asked
 again on a fresh one, up to three times, and a command writes its rows only after its last request, so
 nothing is said twice.
+
+## 4b. Installing
+
+`godspeed install godspeed/hello` asks one question per package, with everything the package would be given in it:
+
+```
+godspeed/hello 0.1.0 asks for nothing (no peers, no privilege) and starts at every boot. Install it? [y/N]:
+bankole/notes 0.2.0 asks for: fs, events (no privilege) and starts at every boot. Install it and grant them? [y/N]:
+```
+
+The peers are the send peers its contract requests, read from the fetched copy after it is checked from the disk.
+`yes` as the last word answers every question, and approves only what the questions name; `grant <peer>,...` (or
+`grant none`) gives some of them, for one package, with no question. A comma list installs several, each asked on
+its own; one that fails does not stop the rest, and the command fails if any did.
+
+**What happens on yes.** `godspeed-pm` writes the answer to `grant` in the package's folder, adds the package to
+`/system/packages/installed`, and asks the supervisor to start it. The supervisor checks the fetched copy again
+from the disk, by the same code `godspeed verify` runs, narrows the grant to what the signed contract requests, and
+starts the bytes it checked, under the task name `publisher/name`. A start that fails takes the package off the list
+again, so the list holds only what runs. At every boot the supervisor starts what the list names, checked the same
+way; a package that dies is restarted from the disk up to 5 times a boot and then left down, with a line that says so.
+
+**What it is given:** the approved peers, never `supervisor`, an endpoint if its contract declares `ipc_receive`, its
+contract's memory limit up to 64 MiB, and **no privilege**, which is not asked and cannot be granted.
+
+`godspeed upgrade <pkg>` (or `all`) looks up the newest release of each installed package on the registry it came
+from, fetches and verifies it, and installs it in the old one's place with the same question, now naming the
+version change: a new release may ask for more. One already newest is said to be up to date. `godspeed uninstall`
+asks, stops it and takes it off the list; its fetched copy stays, and `godspeed remove` refuses an installed copy.
+
+`list installed` is `package version state`, `state` being what the supervisor says: `running` or `NOT running`.
 
 ## 5. Pipes
 

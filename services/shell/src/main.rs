@@ -1198,7 +1198,7 @@ const _: () = assert!(
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
-    ("godspeed", &["search", "info", "fetch", "list", "verify", "remove", "install", "uninstall", "trust", "registry", "config", "check"]),
+    ("godspeed", &["search", "info", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "trust", "registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -5705,11 +5705,13 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("godspeed search <word>", "the packages whose name holds the word, from the registry's verified snapshot", "godspeed search hello"),
             ("godspeed info <publisher/name>[@version]", "its versions, then what it is: description, licence, the release it was built for, what it ships and requests, who signed it", "godspeed info godspeed/hello"),
             ("godspeed fetch <publisher/name>[@version]", "verify a package end to end and fetch it to /system/packages/ - fetched, not installed", "godspeed fetch godspeed/hello"),
-            ("godspeed list available | fetched | installed | updates", "what the registry offers, what has been fetched here (with sizes), what is installed (none yet), what is newer", "godspeed list updates"),
+            ("godspeed list available | fetched | installed | updates", "what the registry offers, what has been fetched here (with sizes), what is installed and running, what is newer", "godspeed list updates"),
             ("godspeed verify [<publisher/name>[@version]]", "check fetched copies again from the disk alone: the signature, the contract, the binary", "godspeed verify"),
             ("godspeed remove <publisher/name>[@version]", "delete a fetched copy, one version or every one", "godspeed remove godspeed/hello"),
             ("godspeed trust [reset <registry>]", "what this machine has accepted from each registry, and the publishers' keys; reset forgets one (asks [y/N])", "godspeed trust"),
-            ("godspeed install | uninstall", "not built: this machine cannot start a program from disk yet, so a package is fetched, not run", ""),
+            ("godspeed install <publisher/name>[,...] [yes]", "start a fetched package now and at every boot; asks [y/N], naming what it would be given", "godspeed install godspeed/hello"),
+            ("godspeed upgrade <publisher/name>[,...] | all [yes]", "fetch the newest release of what is installed and install it in its place; asks [y/N]", "godspeed upgrade all"),
+            ("godspeed uninstall <publisher/name>[,...] [yes]", "stop it and no longer start it at boot; the fetched copy stays", "godspeed uninstall godspeed/hello"),
             ("godspeed registry", "the registries this machine knows; exactly one is in use", "godspeed registry"),
             ("godspeed registry add <name> <url> <root>", "know another registry; asks [y/N] before trusting its signing root", "godspeed registry add mirror https://mirror.example/ sha256:..."),
             ("godspeed registry use <name>", "search and install from that one from now on", "godspeed registry use mirror"),
@@ -6094,12 +6096,12 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("godspeed fetch <publisher/name>[@version]", "the latest, or the version named", "godspeed fetch godspeed/hello@0.1.0"),
             ("what is checked", "the manifest by the index's digest, its signature by a key the signed namespaces vouch for, the contract and this machine's binary by the manifest's digests and sizes", ""),
             ("where it goes", "/system/packages/<publisher>/<name>/<version>/: the binary, manifest, signature, contract and where it came from", ""),
-            ("what it does not do", "run it, or grant what its contract requests: this machine cannot start a program from disk yet", ""),
+            ("what it does not do", "run it, or grant what its contract requests: `godspeed install` does that, and asks first", ""),
         ], false),
         ("godspeed", "list") => help_block(ctx, "godspeed list", "packages: say which list", &[
             ("godspeed list available", "every package the registry in use offers, from its verified snapshot", "godspeed list available"),
             ("godspeed list fetched", "the packages fetched here: publisher/name@version, the registry it came from and its size; the total under the list", "godspeed list fetched"),
-            ("godspeed list installed", "what is installed: none yet, because nothing can be installed yet (design 9.2)", "godspeed list installed"),
+            ("godspeed list installed", "what is installed, and whether the supervisor has each running", "godspeed list installed"),
             ("godspeed list updates", "each fetched package against the registry it came from: newer there, up to date, or no longer listed", "godspeed list updates"),
             ("an empty list", "no rows, and not a failure: the console says `0 packages`; piped, only the status row is left", ""),
         ], false),
@@ -6107,13 +6109,20 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("godspeed remove <publisher/name>", "every fetched version of it", "godspeed remove godspeed/hello"),
             ("godspeed remove <publisher/name>@<version>", "that version only", "godspeed remove godspeed/hello@0.1.0"),
         ], false),
-        ("godspeed", "uninstall") => help_block(ctx, "godspeed uninstall", "not built yet", &[
-            ("why", "nothing is installed, because nothing can be yet (design 9.2)", ""),
-            ("meanwhile", "`godspeed remove` deletes a fetched copy", "godspeed remove godspeed/hello"),
+        ("godspeed", "uninstall") => help_block(ctx, "godspeed uninstall", "stop an installed package, and no longer start it at boot", &[
+            ("godspeed uninstall <publisher/name>[,<publisher/name>...] [yes]", "each asked [y/N], unless `yes`", "godspeed uninstall godspeed/hello"),
+            ("what stays", "the fetched copy: `godspeed remove` deletes it", "godspeed remove godspeed/hello"),
         ], false),
-        ("godspeed", "install") => help_block(ctx, "godspeed install", "not built yet", &[
-            ("why", "the supervisor starts only the programs built into this image, so nothing can start one from disk (design 9.2)", ""),
-            ("meanwhile", "`godspeed fetch` verifies a package and keeps it, so installing it later needs nothing fetched again", "godspeed fetch godspeed/hello"),
+        ("godspeed", "install") => help_block(ctx, "godspeed install", "start a fetched package, now and at every boot", &[
+            ("godspeed install <publisher/name>[@version][,...] [yes]", "the newest fetched version, or the one named; each asked [y/N], naming what it would be given, unless `yes`", "godspeed install godspeed/hello"),
+            ("godspeed install <publisher/name> grant <peer>,... | grant none", "give only some of the peers its contract requests, without the question", "godspeed install godspeed/hello grant none"),
+            ("what it is given", "the send peers its contract requests and you approve, never `supervisor`, and no privilege", ""),
+            ("what is checked", "the copy on disk, again, by the supervisor, before every start: signature, key, contract, binary", ""),
+            ("if it dies", "restarted from the disk, up to 5 times a boot, then left down and said so", ""),
+        ], false),
+        ("godspeed", "upgrade") => help_block(ctx, "godspeed upgrade", "the newest release of what is installed, in its place", &[
+            ("godspeed upgrade <publisher/name>[,...] [yes]", "fetch and verify the newest release, then install it; asks [y/N], naming the version change and what it asks for", "godspeed upgrade godspeed/hello"),
+            ("godspeed upgrade all [yes]", "every installed package; one already newest is said to be up to date", "godspeed upgrade all"),
         ], false),
         ("godspeed", "check") => help_block(ctx, "godspeed check", "reach the registry, one row per step", &[
             ("registry, clock, roots", "what the check used: the address, the date a certificate is checked against and its source, how many roots", ""),
@@ -15382,7 +15391,7 @@ fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>)
 #[inline(never)]
 fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim().is_empty() {
-        gs::io::println(ctx, "usage: godspeed search | info | fetch | list | verify | remove | trust | registry | config | check - `godspeed help` says what each does");
+        gs::io::println(ctx, "usage: godspeed search | info | fetch | install | upgrade | uninstall | list | verify | remove | trust | registry | config | check - `godspeed help` says what each does");
         return Err(ShellError::Unknown);
     }
     // TRUSTING A NEW ROOT IS ASKED FIRST, here where the console is: the package manager answers in a
@@ -15448,6 +15457,206 @@ fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
     }
+    // INSTALL AND UNINSTALL are asked first too, one package at a time: `grant` names the answer outright.
+    if nw >= 2 && (words[0] == "install" || words[0] == "uninstall" || words[0] == "upgrade") && !(nw >= 3 && words[2] == "grant") {
+        return godspeed_lifecycle(ctx, &words[..nw]);
+    }
+    godspeed_show(ctx, line)
+}
+
+/// `godspeed install|uninstall|upgrade <pkg>[,<pkg>...] [yes]`, and `upgrade all`: each package asked about once,
+/// [y/N], unless `yes`.
+///
+/// Install asks with everything the package would be given in the question - the send peers its contract requests
+/// (the package manager answers them, checked from the disk) and that it gets no privilege - so `yes` approves only
+/// what was shown. `grant <peer>,...` instead of the question gives some of them; that form is passed straight on.
+/// Upgrade is fetch-then-install of the newest release of something installed, with the version change in the
+/// question, since a new release may ask for more. Every package gets its own answer and one that fails does not
+/// stop the rest; the command fails if any did.
+fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> {
+    let verb = words[0];
+    let yes = words.len() == 3 && words[2] == "yes";
+    if words.len() > 3 || (words.len() == 3 && !yes) {
+        gs::io::println_fmt(ctx, format_args!("usage: godspeed {} <publisher/name>[,<publisher/name>...]{} [yes]", verb,
+            if verb == "upgrade" { " | all" } else { "" }));
+        return Err(ShellError::Unknown);
+    }
+    let mut failed = false;
+    let mut q = [0u8; 512];
+    // An upgrade asks two things once, before any package: what is installed, and what the registry has newest.
+    let (installed, updates) = if verb == "upgrade" {
+        let i = build_godspeed_table(ctx, "list installed", None);
+        let u = build_godspeed_table(ctx, "list updates", None);
+        if i.is_none() || u.is_none() {
+            gs::io::println(ctx, "godspeed: the package manager did not answer");
+            return Err(ShellError::Unknown);
+        }
+        (i, u)
+    } else { (None, None) };
+    let mut every = [[0u8; 80]; 8];
+    let mut lens = [0usize; 8];
+    let mut ne = 0usize;
+    let all = verb == "upgrade" && words[1] == "all";
+    if all {
+        if let Some(t) = installed.as_ref() {
+            if let Some(k) = table_col(t, b"package") {
+                for r in 0..t.nrows() {
+                    let b = t.cell_bytes(r, k);
+                    if b == b"status" || ne == every.len() || b.len() > 80 { continue; }
+                    every[ne][..b.len()].copy_from_slice(b);
+                    lens[ne] = b.len();
+                    ne += 1;
+                }
+            }
+        }
+        if ne == 0 { gs::io::println(ctx, "  nothing is installed, so nothing to upgrade"); return Ok(()); }
+    }
+    let listed = if all { None } else { Some(words[1]) };
+    let names = listed.into_iter().flat_map(|l| l.split(',')).map(str::trim).filter(|p| !p.is_empty())
+        .chain((0..ne).map(|i| core::str::from_utf8(&every[i][..lens[i]]).unwrap_or("")));
+    for pkg in names {
+        match verb {
+            "install" => { if !install_one(ctx, pkg, None, yes, &mut q) { failed = true; } }
+            "upgrade" => {
+                let Some(have) = table_lookup(&installed, pkg, b"version") else {
+                    gs::io::println_fmt(ctx, format_args!("godspeed: {} is not installed: `godspeed install` it", pkg));
+                    failed = true;
+                    continue;
+                };
+                let have = core::str::from_utf8(have.as_bytes()).unwrap_or("?");
+                let latest = table_lookup(&updates, pkg, b"latest");
+                let latest = latest.as_ref().map(|l| core::str::from_utf8(l.as_bytes()).unwrap_or("-")).unwrap_or("-");
+                if latest == "-" {
+                    let why = table_lookup(&updates, pkg, b"status");
+                    gs::io::println_fmt(ctx, format_args!("godspeed: no newer {} can be found: {}", pkg,
+                        why.as_ref().map(|w| core::str::from_utf8(w.as_bytes()).unwrap_or("")).unwrap_or("the registry did not list it")));
+                    failed = true;
+                    continue;
+                }
+                if semver(latest) <= semver(have) {
+                    gs::io::println_fmt(ctx, format_args!("  {} {} is up to date", pkg, have));
+                    continue;
+                }
+                let mut sb = [0u8; 128];
+                let n = {
+                    let spec = fmt_into(&mut q, format_args!("{}@{}", pkg, latest));
+                    let n = spec.len().min(sb.len());
+                    sb[..n].copy_from_slice(&spec.as_bytes()[..n]);
+                    n
+                };
+                let spec = core::str::from_utf8(&sb[..n]).unwrap_or("");
+                if godspeed_show(ctx, fmt_into(&mut q, format_args!("fetch {}", spec))).is_err() { failed = true; continue; }
+                if !install_one(ctx, spec, Some(have), yes, &mut q) { failed = true; }
+            }
+            _ => {
+                gs::io::print_fmt(ctx, format_args!("stop {} and no longer start it at boot? Its fetched copy stays. [y/N]: ", pkg));
+                if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+                else if !read_confirm(ctx) {
+                    gs::io::println_fmt(ctx, format_args!("godspeed: {} left installed", pkg));
+                    continue;
+                }
+                if godspeed_show(ctx, fmt_into(&mut q, format_args!("uninstall {}", pkg))).is_err() { failed = true; }
+            }
+        }
+    }
+    if failed { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// `MAJOR.MINOR.PATCH` as numbers, for ordering; anything else orders first.
+fn semver(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// The column of `t` called `name`.
+fn table_col(t: &Table, name: &[u8]) -> Option<usize> { (0..t.ncols()).find(|&c| t.col_name(c) == name) }
+
+/// The `field` of the row of `t` whose `package` is `key`.
+fn table_lookup(t: &Option<Table>, key: &str, field: &[u8]) -> Option<String8L> {
+    let t = t.as_ref()?;
+    let (k, f) = (table_col(t, b"package")?, table_col(t, field)?);
+    let r = (0..t.nrows()).find(|&r| t.cell_bytes(r, k) == key.as_bytes())?;
+    let mut out = String8L::new();
+    out.set(t.cell_bytes(r, f));
+    Some(out)
+}
+
+/// One `install`: what the release asks for, the question, then the install with the answer. False when it failed;
+/// a "no" is not a failure. `from`, for an upgrade, is the version installed now.
+fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> bool {
+    let Some(t) = build_godspeed_table(ctx, fmt_into(q, format_args!("install {}", spec)), None) else { return false };
+    let status = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status");
+    if status.is_none_or(|r| t.cell_bytes(r, 1) == b"failed") {
+        // Not fetched, or the copy did not check out: the answer says which.
+        let _ = godspeed_show(ctx, fmt_into(q, format_args!("install {}", spec)));
+        return false;
+    }
+    // `<pkg> <version> requests these; ...`: the release the question is about.
+    let note = status.map(|r| core::str::from_utf8(t.cell_bytes(r, 2)).unwrap_or("")).unwrap_or("");
+    let release = note.split(" requests").next().unwrap_or(spec);
+    let mut peers = [0u8; 256];
+    let mut pn = 0usize;
+    for r in 0..t.nrows() {
+        if Some(r) == status { continue; }
+        let p = t.cell_bytes(r, 0);
+        if pn + p.len() + 2 > peers.len() { break; }
+        if pn > 0 { peers[pn] = b','; pn += 1; }
+        peers[pn..pn + p.len()].copy_from_slice(p);
+        pn += p.len();
+    }
+    let peers = core::str::from_utf8(&peers[..pn]).unwrap_or("");
+    let mut head = [0u8; 512];
+    let head = match from {
+        Some(h) => fmt_into(&mut head, format_args!("{} (upgrade from {})", release, h)),
+        None => fmt_into(&mut head, format_args!("{}", release)),
+    };
+    let act = if from.is_some() { "Upgrade it" } else { "Install it" };
+    if peers.is_empty() {
+        gs::io::print_fmt(ctx, format_args!("{} asks for nothing (no peers, no privilege) and starts at every boot. {}? [y/N]: ", head, act));
+    } else {
+        gs::io::print_fmt(ctx, format_args!("{} asks for: {} (no privilege) and starts at every boot. {} and grant them? [y/N]: ",
+            head, Commas(peers), act));
+    }
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+    else if !read_confirm(ctx) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} not {}", spec, if from.is_some() { "upgraded" } else { "installed" }));
+        return true;
+    }
+    let grant = if peers.is_empty() { "none" } else { peers };
+    let mut line = [0u8; 512];
+    let cmd = fmt_into(&mut line, format_args!("install {} grant {}", spec, grant));
+    godspeed_show(ctx, cmd).is_ok()
+}
+
+/// `a,b,c` shown as `a, b, c`.
+struct Commas<'a>(&'a str);
+impl core::fmt::Display for Commas<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        for (i, p) in self.0.split(',').enumerate() { if i > 0 { f.write_str(", ")?; } f.write_str(p)?; }
+        Ok(())
+    }
+}
+
+/// `args` written into `buf`, as text (cut short at its length).
+fn fmt_into<'b>(buf: &'b mut [u8; 512], args: core::fmt::Arguments<'_>) -> &'b str {
+    struct W<'a>(&'a mut [u8; 512], usize);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let take = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + take].copy_from_slice(&s.as_bytes()[..take]);
+            self.1 += take;
+            Ok(())
+        }
+    }
+    let mut w = W(buf, 0);
+    let _ = core::fmt::Write::write_fmt(&mut w, args);
+    let n = w.1;
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
+/// Run one `godspeed` command and show its answer: progress while it works, then the card or the list.
+#[inline(never)]
+fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
     // PROGRESS, drawn in place on one line until the answer comes, then cleared.
     let drawn = core::cell::Cell::new(false);
     // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
@@ -18484,7 +18693,7 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
         "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
             (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
             (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("fetch" | "remove" | "install" | "uninstall"), _) | (Some("trust"), Some("reset")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall' and 'trust reset' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, list, verify, trust, registry, config and check"),
+            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade' and 'trust reset' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, list, verify, trust, registry, config and check"),
             (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) | (Some("search"), _) | (Some("info"), _) | (Some("list"), _)
                 | (Some("verify"), _) | (Some("trust"), None) => None,
             _ => Some("pipe: pipe a report: godspeed search, info, list, registry, config or check"),

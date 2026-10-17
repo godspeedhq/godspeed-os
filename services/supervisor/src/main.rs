@@ -72,7 +72,8 @@ use godspeed_sdk::service_context::usbdev;
 /// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
 /// must never block the supervisor, which is the one service everything else depends on, and a
 /// retained return address burns a cap-table slot per request (the `events` leak, §26.6).
-fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &DevEvents, payload: &[u8]) -> bool {
+fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &DevEvents,
+                  inst: &mut installed::Installed, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
 
     // `supcmd::DEVICES`, `EVENTS` and `WHY` answer with a body rather than a status byte; everything else
@@ -93,6 +94,31 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     } else if payload.len() > 2 && payload[1] == supcmd::DEATH {
         let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
         body_len = events.death_answer(name, &mut body);
+        supcmd::OK
+    } else if payload.len() > 2 && payload[1] == supcmd::INSTALL {
+        // `publisher/name version`: an installed package, checked from the disk and started (`installed.rs`).
+        let spec = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        let mut it = spec.split(' ');
+        match (it.next(), it.next(), it.next()) {
+            (Some(pkg), Some(version), None) => match inst.start(ctx, pkg, version) {
+                Ok(()) => supcmd::OK,
+                Err(why) => {
+                    ctx.log_fmt(format_args!("supervisor: installed {} {} NOT started: {}", pkg, version, why.as_str()));
+                    let w = why.as_str().as_bytes();
+                    let len = w.len().min(body.len() - 1);
+                    body[0] = supcmd::FAILED;
+                    body[1..1 + len].copy_from_slice(&w[..len]);
+                    body_len = 1 + len;
+                    supcmd::FAILED
+                }
+            },
+            _ => supcmd::UNKNOWN,
+        }
+    } else if payload.len() > 2 && payload[1] == supcmd::UNINSTALL {
+        let pkg = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        if inst.stop(ctx, pkg) { supcmd::OK } else { supcmd::UNKNOWN }
+    } else if payload.len() == 2 && payload[1] == supcmd::INSTALLED {
+        body_len = inst.answer(ctx, &mut body);
         supcmd::OK
     } else if payload.len() == 2 && payload[1] == supcmd::MANAGED {
         body_len = managed_answer(map, usb, &mut body);
@@ -546,9 +572,10 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // command (`godspeed ...`) and ended once its answer is in, as `ask` is
     // (`docs/developer-services-design.md` 10.2). Its peers are exactly what that command uses: the shell
     // for the answer, `fs` for its settings and roots (`/system/services/godspeed/`), `net-stack` for the
-    // registry's connection, `time` for the date a certificate is checked against. No privilege.
+    // registry's connection, `time` for the date a certificate is checked against, and this supervisor, which
+    // starts and stops an installed package for it (`supcmd::INSTALL`, `UNINSTALL`, `INSTALLED`). No privilege.
     ("godspeed-pm", GODSPEED_PM_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, u32::MAX,
-     &["shell", "fs", "net-stack", "time"], 0, 0, 0),
+     &["shell", "fs", "net-stack", "time", "supervisor"], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
@@ -933,6 +960,19 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
 
 #[path = "../../probe/src/table.rs"]
 mod probes;
+
+// The checks `godspeed verify` runs on a fetched package, by `#[path]`, so the supervisor judges an installed
+// package by the same code before it starts one (`installed.rs`). `meta` and `toml_lines` carry readers it does
+// not use (the registry's index), hence the allowances.
+#[allow(dead_code)]
+#[path = "../../godspeed-pm/src/toml_lines.rs"]
+mod toml_lines;
+#[allow(dead_code)]
+#[path = "../../godspeed-pm/src/meta.rs"]
+mod meta;
+#[path = "../../godspeed-pm/src/check.rs"]
+mod check;
+mod installed;
 
 /// The test-probe image - 193 test modes in one binary (docs/probe-params-design.md).
 ///
@@ -2389,6 +2429,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     ctx.log("supervisor: ready");
     usb.ready = true;
+    // The packages installed on this machine, started from the disk once everything they could name is up. A
+    // respawned supervisor adopts the ones still running rather than starting a second (`installed.rs`).
+    let mut inst = installed::Installed::new();
+    inst.boot(&ctx);
 
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
@@ -2405,7 +2449,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     }
     loop {
         let msg = gs::ipc::recv(&ctx);
-        handle_message(&ctx, &mut name_map, &mut usb, &mut events, &msg);
+        handle_message(&ctx, &mut name_map, &mut usb, &mut events, &mut inst, &msg);
         name_map.release_handoff(&ctx);
         // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
         // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
@@ -2420,7 +2464,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut drained = 0;
         while drained < DRAIN_MAX {
             let Some(next) = gs::ipc::try_recv(&ctx) else { break };
-            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &next);
+            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &mut inst, &next);
             name_map.release_handoff(&ctx);
             drained += 1;
         }
@@ -2457,7 +2501,8 @@ impl core::fmt::Display for How<'_> {
 
 /// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
 /// the main loop so the loop can drain its queue before the reconcile sweep (see there).
-fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, msg: &Message) {
+fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents,
+                  inst: &mut installed::Installed, msg: &Message) {
     // A USB host's device report, before the commands it shares `supcmd::MARKER` with: it carries no reply
     // capability and is never answered.
     if let Some(r) = usbdev::decode(msg.payload_bytes()) {
@@ -2465,13 +2510,15 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
         return;
     }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).
-    if handle_command(ctx, name_map, usb, events, msg.payload_bytes()) { return; }
+    if handle_command(ctx, name_map, usb, events, inst, msg.payload_bytes()) { return; }
     // The notice is the name, a NUL, and how the task ended (`death`): the kernel says how; this keeps the
     // newest per name for `supcmd::DEATH`, whatever happens to the restart below.
     let p = msg.payload_bytes();
     let (nb, how) = match p.iter().position(|&b| b == 0) { Some(z) => (&p[..z], &p[z + 1..]), None => (p, &p[p.len()..]) };
     let name = core::str::from_utf8(nb).unwrap_or("");
-    if !name.is_empty() && is_watched(name) { events.note_death(ctx, name, how); }
+    if !name.is_empty() && (is_watched(name) || inst.has(name)) { events.note_death(ctx, name, how); }
+    // An installed package's death is that module's: it restarts it from the disk, a bounded number of times.
+    if !name.is_empty() && inst.has(name) { inst.on_death(ctx, name, &How(how)); return; }
     // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
     // ALREADY respawned this service before its queued death notification reached us. If it is
     // already alive, a restart here hits the kernel singleton guard ("already running") and logs a
