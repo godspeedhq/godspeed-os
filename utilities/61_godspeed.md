@@ -28,10 +28,10 @@ RNG and RNG200, the JH7110's TRNG).
 ## 1. The command
 
 ```
-godspeed search <word>                             the packages the registry vouches for whose name holds the word
+godspeed search <word> [from <n>]                  the packages the registry vouches for whose name holds the word, 40 a page
 godspeed info <publisher/name>[@version]           its versions, then what it is: description, licence, release, what it ships and requests, who signed it
 godspeed fetch <publisher/name>[@version]          verify a package end to end and fetch it here - fetched, not installed
-godspeed list available                            every package the registry in use offers
+godspeed list available [from <n>]                 every package the registry in use offers, 40 a page
 godspeed list fetched                              the packages fetched here, with their sizes
 godspeed list installed                            the packages installed, and whether each is running
 godspeed list updates                              each fetched package against the registry it came from
@@ -161,7 +161,7 @@ the shared crate's):
 
 | command | rows |
 |---|---|
-| `search`, `list available` | a list, `package latest description`: each package's latest version and description, from its own index and manifest by the verified digests (the first 40 described; the note says how many more); the count and the chain in the status note |
+| `search`, `list available` | a list, `package latest description`, a page of 40 from `from <n>` (default 0): each package's latest version and description, from its own index and manifest by the verified digests; the count, which are here, the command for the next page and the chain in the status note |
 | `info` | a CARD (`key value note`): `title` (the release, the latest or not, when and by whom), `about` (its description), `licence`, `built for` (the release, beside this machine's), `ships` (its architectures, and whether this machine's is one), `requests`, `signed` (the key, shortened, and its standing), `versions`; the chain, through the contract, in the status note. Checked as `fetch` checks it |
 | `fetch` | progress while it works (the chain's steps, then a bar as the binary downloads), then a CARD: `title` (fetched, or already fetched, and from where), `about` (the folder), `binary` (this machine's architecture and size), `built for`, `requests`, `signed`, `installed no`; the chain, through the binary, in the status note |
 | `list fetched` | a list, `package version from size state`, `size` in bytes (a pipe can compare it; the console shows KiB); the count and total in the status note |
@@ -199,9 +199,20 @@ another registry - until the operator runs `godspeed trust reset <registry>` (wh
 `/system/services/godspeed/trust/<registry>/`), after which the registry is met again from root 1. The
 record also keeps the last namespaces document accepted, which is what `godspeed trust` lists the keys from.
 
-**Limits, refused by name, never cut**: the snapshot 16 KiB (about 150 packages), an index 8 KiB (about 40
-releases), a manifest or a contract 4 KiB, a binary `max-package-mib`. They are on the stack, which is
-256 KiB for every service and already carries the TLS session.
+**The snapshot is kept on the disk, not in memory**, so the registry's size does not decide whether a command
+runs. It names every package (a line each), so it grows with the registry: it is streamed to
+`/system/services/godspeed/trust/<registry>/snapshot.toml` as it arrives, sized by its `Content-Length`, hashed on
+the way and verified from the digest (a signature covers the digest, not the bytes), each line checked as the
+whole document would be, and only then put in place of the one kept. A command whose timestamp names the
+snapshot already kept does not download it again - the chain note says `(kept)`. Lookups and listings read it
+back a line at a time. A snapshot over 256 MiB (about two and a half million packages), or one that does not
+state its size, is refused by name. What is not solved here: a NEW snapshot is still downloaded whole, once per
+version, which at a large registry is a lot of bytes - the registry format's to fix (the CLI
+repository's backlog, item 2).
+
+**Limits, refused by name, never cut**: an index 8 KiB (about 40 releases), a manifest or a contract 4 KiB, a
+binary `max-package-mib`, a snapshot line 320 bytes. They are on the stack, which is 256 KiB for every service and
+already carries the TLS session.
 
 **One connection** carries a command's requests, kept alive; a server that closes it part way is asked
 again on a fresh one, up to three times, and a command writes its rows only after its last request, so

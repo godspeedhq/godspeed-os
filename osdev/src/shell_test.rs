@@ -8411,9 +8411,21 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let first = run!(b"godspeed list available\r", 180);
         check!(first.contains("godspeed/hello"), "`godspeed list available` lists the registry's package from the verified snapshot");
         check!(first.contains("first contact: root 1 matched the pin"), "first contact checks root 1 against the pinned digest, and says so under the list");
+        check!(!first.contains("(kept)"), "first contact downloads the snapshot: none is kept yet");
         let again = run!(b"godspeed search hel\r", 180);
         check!(again.contains("godspeed/hello") && again.contains("against the root this machine already trusts"),
                "a search filters by word and verifies against the root this machine kept");
+        check!(again.contains("(kept)"), "the snapshot the timestamp names is the one kept on disk: not downloaded again");
+        // A PAGE starts `from` a count of matches: the snapshot is read back from the disk a line at a time.
+        let page = run!(b"godspeed list available from 1\r", 180);
+        check!(page.contains("2 to ") && page.contains("here") && !page.contains("not a number"),
+               "`godspeed list available from 1` starts its page at the second package, and says which are here");
+        let past = run!(b"godspeed list available from 100000\r", 180);
+        check!(past.contains("none from 100000"), "a page past the end is empty, and says how many there are");
+        let bad_from = run!(b"godspeed list available from x\r", 60);
+        check!(bad_from.contains("[from <n>]"), "`from` needs a number");
+        let kept = run!(b"dir /system/services/godspeed/trust/default\r", 60);
+        check!(kept.contains("snapshot.toml") && !kept.contains("snapshot.partial"), "the verified snapshot is kept on disk, and no staging copy is left");
         let none = run!(b"godspeed search zzzz\r", 180);
         check!(none.contains("0 packages") && none.contains("verified: root"), "a word nothing matches is an empty list, not a failure, with the chain it was checked by");
         let info = run!(b"godspeed info godspeed/hello\r", 180);

@@ -96,11 +96,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         (Some("check"), None) => check(&ctx, &mut r),
-        (Some("search"), Some(word)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, Some(word))),
+        (Some("search"), Some(word)) => match page_from(&mut words) {
+            Ok(from) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, Some(word), from)),
+            Err(()) => r.fail("usage", "godspeed search <word> [from <n>]", "`from` and a number: where the page starts"),
+        },
         (Some("search"), _) => r.fail("usage", "godspeed search <word>", "a word is needed; `godspeed list available` lists everything"),
         (Some("info"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::info(&ctx, r, ready, roots, name)),
         (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name)),
-        (Some("list"), Some("available")) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, None)),
+        (Some("list"), Some("available")) => match page_from(&mut words) {
+            Ok(from) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, None, from)),
+            Err(()) => r.fail("usage", "godspeed list available [from <n>]", "`from` and a number: where the page starts"),
+        },
         (Some("list"), Some("fetched")) if words.clone().next().is_none() => packages::list_fetched(&ctx, &mut r),
         (Some("list"), Some("installed")) if words.clone().next().is_none() => install::list(&ctx, &mut r),
         (Some("list"), Some("updates")) if words.clone().next().is_none() => list_updates(&ctx, &mut r),
@@ -128,6 +134,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     r.send(&ctx);
     // DONE. The shell ends this program once it has the end-of-stream byte.
     gs::ipc::park(&ctx);
+}
+
+/// `[from <n>]` at the end of a listing: where its page starts. Nothing is 0; anything else is a usage error.
+fn page_from<'a>(words: &mut impl Iterator<Item = &'a str>) -> Result<usize, ()> {
+    match (words.next(), words.next(), words.next()) {
+        (None, _, _) => Ok(0),
+        (Some("from"), Some(n), None) => n.parse::<usize>().map_err(|_| ()),
+        _ => Err(()),
+    }
 }
 
 /// The answer being built: a record table whose last row is `status`, `ok` or `failed`.

@@ -5707,7 +5707,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
         "godspeed" => help_block(ctx, "godspeed", "the native package manager - packages verified against the registry's signed metadata, kept here", &[
-            ("godspeed search <word>", "the packages whose name holds the word, from the registry's verified snapshot", "godspeed search hello"),
+            ("godspeed search <word> [from <n>]", "the packages whose name holds the word, from the registry's verified snapshot, 40 a page", "godspeed search hello"),
             ("godspeed info <publisher/name>[@version]", "its versions, then what it is: description, licence, the release it was built for, what it ships and requests, who signed it", "godspeed info godspeed/hello"),
             ("godspeed fetch <publisher/name>[@version]", "verify a package end to end and fetch it to /system/packages/ - fetched, not installed", "godspeed fetch godspeed/hello"),
             ("godspeed list available | fetched | installed | updates", "what the registry offers, what has been fetched here (with sizes), what is installed and running, what is newer", "godspeed list updates"),
@@ -6075,7 +6075,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("what an install remembers", "the registry it came from: an update fetches from there, not from whichever is in use", ""),
         ], false),
         ("godspeed", "search") => help_block(ctx, "godspeed search", "the packages the registry vouches for", &[
-            ("godspeed search <word>", "those whose name holds the word, from the verified snapshot; the chain root -> timestamp -> snapshot is checked first, and said under the list", "godspeed search hello"),
+            ("godspeed search <word> [from <n>]", "those whose name holds the word, from the verified snapshot, 40 a page from the n-th; the chain root -> timestamp -> snapshot is checked first, and said under the list", "godspeed search hello"),
             ("everything", "`godspeed list available`", "godspeed list available"),
             ("first contact", "root 1 must match the pin on the registry's line; after that, every root and version seen is remembered, so nothing older is accepted", ""),
         ], false),
@@ -6104,7 +6104,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("what it does not do", "run it, or grant what its contract requests: `godspeed install` does that, and asks first", ""),
         ], false),
         ("godspeed", "list") => help_block(ctx, "godspeed list", "packages: say which list", &[
-            ("godspeed list available", "every package the registry in use offers, from its verified snapshot", "godspeed list available"),
+            ("godspeed list available [from <n>]", "every package the registry in use offers, from its verified snapshot kept on disk, 40 a page; the note gives the next page's command", "godspeed list available from 40"),
             ("godspeed list fetched", "the packages fetched here: publisher/name@version, the registry it came from and its size; the total under the list", "godspeed list fetched"),
             ("godspeed list installed", "what is installed, and whether the supervisor has each running", "godspeed list installed"),
             ("godspeed list updates", "each fetched package against the registry it came from: newer there, up to date, or no longer listed", "godspeed list updates"),

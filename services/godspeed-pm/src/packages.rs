@@ -115,7 +115,7 @@ fn why_text(why: &Why, ready: &Ready<'_>) -> (&'static str, Cell) {
 /// The chain's versions, for a row.
 fn chain_row(r: &mut Rows, v: &chain::Verified<'_>) {
     r.row("verified", cell(format_args!("root {}, timestamp {}, snapshot {}, namespaces {}",
-        v.root.header.version, v.timestamp.header.version, v.snapshot.header.version, v.namespaces.header.version)).as_str(),
+        v.root.header.version, v.timestamp.header.version, v.snapshot.version, v.namespaces.header.version)).as_str(),
         if v.first_contact { "first contact: root 1 matched the pin" } else { "against the root this machine already trusts" });
 }
 
@@ -126,8 +126,10 @@ fn chain_note(r: &mut Rows, v: &chain::Verified<'_>, prefix: &str) {
 }
 
 fn chain_note_through(r: &mut Rows, v: &chain::Verified<'_>, prefix: &str, tail: &str) {
-    r.note(format_args!("{}verified: root {} -> timestamp {} -> snapshot {} -> namespaces {}{} ({})", prefix,
-        v.root.header.version, v.timestamp.header.version, v.snapshot.header.version, v.namespaces.header.version, tail,
+    // `kept` when the snapshot the timestamp names is the one already on this machine's disk: not downloaded again.
+    r.note(format_args!("{}verified: root {} -> timestamp {} -> snapshot {}{} -> namespaces {}{} ({})", prefix,
+        v.root.header.version, v.timestamp.header.version, v.snapshot.version, if v.snapshot.fetched { "" } else { " (kept)" },
+        v.namespaces.header.version, tail,
         if v.first_contact { "first contact: root 1 matched the pin" } else { "against the root this machine already trusts" }));
 }
 
@@ -145,33 +147,48 @@ fn clip(s: &str, n: usize) -> Cell {
     cell(format_args!("{}...", &s[..end]))
 }
 
-/// The most packages a listing describes (latest version, description): two requests each, and an answer
-/// holds 64 rows. Past it, a package is listed by name, and the note says so.
-const DESCRIBED_MAX: usize = 40;
+/// One page of a listing: the packages it describes (latest version, description), two requests each, and an
+/// answer holds 64 rows. The next page is `from` the end of this one, and the note says the command.
+pub const PAGE: usize = 40;
 
 /// `godspeed search <word>`: the packages the verified snapshot lists whose name holds `word`; with no word
-/// (`godspeed list available`), every one. Columns `package latest description`. The latest version and
-/// the description are each package's own index and manifest, by the digests the verified snapshot and index
-/// name; `fetch` also checks the publisher's signature. The chain is the status note.
+/// (`godspeed list available`), every one. A page of [`PAGE`] at a time, starting `from` that many matches in.
+/// Columns `package latest description`. The names come from the snapshot kept on disk, read a line at a time,
+/// so the registry's size is the disk's business, not the stack's; the latest version and the description are
+/// each listed package's own index and manifest, by the digests the verified snapshot and index name; `fetch`
+/// also checks the publisher's signature. The count, the next page and the chain are the status note.
 #[inline(never)]
-pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, word: Option<&str>) {
+pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, word: Option<&str>, from: usize) {
     let mut docs = Docs::new();
     let base = ready.url.base;
     on_registry(ctx, r, ready, roots, |s, r| {
         let mut iso = [0u8; 20];
         let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
+        // This page's names and index digests, from the disk; every match counted, for the note.
+        let mut names = [[0u8; 128]; PAGE];
+        let mut lens = [0usize; PAGE];
+        let mut digests = [godspeed_package::Sha256Digest([0; 32]); PAGE];
+        let (mut np, mut total) = (0usize, 0usize);
+        chain::each_index(ctx, &v.snapshot, &mut |name, d| {
+            if word.is_some_and(|w| !name.contains(w)) { return true; }
+            if total >= from && np < PAGE && name.len() <= 128 {
+                names[np][..name.len()].copy_from_slice(name.as_bytes());
+                lens[np] = name.len();
+                digests[np] = *d;
+                np += 1;
+            }
+            total += 1;
+            true
+        })?;
         // Every request first, then the rows (a retried command must not say anything twice).
-        let mut found: [(&str, Option<Version>, Cell); DESCRIBED_MAX] = core::array::from_fn(|_| ("", None, Cell::new()));
-        let (mut nf, mut total) = (0usize, 0usize);
+        let mut found: [(Option<Version>, Cell); PAGE] = core::array::from_fn(|_| (None, Cell::new()));
         let mut ibuf = [0u8; INDEX_MAX];
         let mut mbuf = [0u8; MANIFEST_MAX];
-        for name in chain::packages(&v) {
-            if word.is_some_and(|w| !name.contains(w)) { continue; }
-            total += 1;
-            if nf == DESCRIBED_MAX { continue; }
+        for k in 0..np {
+            let name = core::str::from_utf8(&names[k][..lens[k]]).unwrap_or("");
             let (mut latest, mut desc) = (None, Cell::new());
             if let Ok(pn) = PackageName::parse(name) {
-                if let Some(text) = index_text(s, base, &v, &pn, &mut ibuf)? {
+                if let Some(text) = index_by_digest(s, base, &pn, &digests[k], &mut ibuf)? {
                     let mut rels = Releases::new();
                     if let Ok(idx) = meta::index(text, &mut rels) {
                         if let Some(rel) = idx.releases.iter().max_by_key(|rel| rel.version).copied() {
@@ -191,16 +208,26 @@ pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roo
                     }
                 }
             }
-            found[nf] = (name, latest, desc);
-            nf += 1;
+            found[k] = (latest, desc);
         }
         r.columns(&["package", "latest", "description"]);
-        for (name, latest, desc) in found.iter().take(nf) {
+        for k in 0..np {
+            let name = core::str::from_utf8(&names[k][..lens[k]]).unwrap_or("");
+            let (latest, desc) = &found[k];
             let lt = match latest { Some(l) => cell(format_args!("{}", l)), None => cell(format_args!("-")) };
             r.entry(&[C::S(name), C::S(lt.as_str()), C::S(desc.as_str())]);
         }
-        let count = if total > nf {
-            cell(format_args!("{} packages, the first {} described - `godspeed info <name>` for the rest  -  ", total, nf))
+        let next = from + np;
+        let count = if total == 0 {
+            cell(format_args!("0 packages  -  "))
+        } else if np == 0 {
+            cell(format_args!("{} package{}, none from {}  -  ", total, if total == 1 { "" } else { "s" }, from))
+        } else if next < total || from > 0 {
+            let more = if next < total {
+                let cmd = match word { Some(w) => cell(format_args!("godspeed search {} from {}", w, next)), None => cell(format_args!("godspeed list available from {}", next)) };
+                cell(format_args!("; next: `{}`", cmd.as_str()))
+            } else { cell(format_args!("")) };
+            cell(format_args!("{} packages, {} to {} here{}  -  ", total, from + 1, next, more.as_str()))
         } else {
             cell(format_args!("{} package{}  -  ", total, if total == 1 { "" } else { "s" }))
         };
@@ -209,18 +236,24 @@ pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roo
     });
 }
 
-/// The package's index, verified against the snapshot, or `None` if the registry has never published it.
-fn index_text<'b>(s: &mut Session<'_, '_, '_, '_>, base: &str, v: &chain::Verified<'_>, name: &PackageName<'_>,
-                  buf: &'b mut [u8; INDEX_MAX]) -> Result<Option<&'b str>, Why> {
+/// The package's index, verified against the snapshot kept on disk, or `None` if the registry has never published it.
+fn index_text<'b>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &str, v: &chain::Verified<'_>,
+                  name: &PackageName<'_>, buf: &'b mut [u8; INDEX_MAX]) -> Result<Option<&'b str>, Why> {
+    let full = cell(format_args!("{}", name));
+    match chain::index_of(ctx, v, full.as_str())? {
+        None => Ok(None),
+        Some(d) => index_by_digest(s, base, name, &d, buf),
+    }
+}
+
+/// The package's index, which must be exactly the bytes `listed` names.
+fn index_by_digest<'b>(s: &mut Session<'_, '_, '_, '_>, base: &str, name: &PackageName<'_>,
+                       listed: &godspeed_package::Sha256Digest, buf: &'b mut [u8; INDEX_MAX]) -> Result<Option<&'b str>, Why> {
     let mut rel = Path::new();
     rel.push("index/").push(name.publisher()).push("/").push(name.name()).push(".toml");
-    let full = cell(format_args!("{}", name));
-    if v.snapshot.index(full.as_str()).is_none() {
-        return Ok(None);
-    }
     let len = chain::required(s, base, rel.as_str(), buf, "the package index")?;
     let text = chain::text(&buf[..len], "the package index")?;
-    godspeed_package::trust::verify_index(&v.snapshot, full.as_str(), text)
+    godspeed_package::trust::verify_index_digest(listed, text)
         .map_err(|err| Why::Trust { what: "the package index", err })?;
     Ok(Some(text))
 }
@@ -370,7 +403,7 @@ pub fn info(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots
         let mut iso = [0u8; 20];
         let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
         let mut ibuf = [0u8; INDEX_MAX];
-        let Some(text) = index_text(s, base, &v, &name, &mut ibuf)? else {
+        let Some(text) = index_text(ctx, s, base, &v, &name, &mut ibuf)? else {
             r.fail("package", which, "never published on this registry");
             chain_note(r, &v, "");
             return Ok(());
@@ -470,7 +503,7 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
         let v = chain::verify(ctx, s, base, &ready.reg, now, &mut docs)?;
         crate::progress(ctx, format_args!("  checking {}: index - manifest - signature - contract", name));
         let mut ibuf = [0u8; INDEX_MAX];
-        let Some(text) = index_text(s, base, &v, &name, &mut ibuf)? else {
+        let Some(text) = index_text(ctx, s, base, &v, &name, &mut ibuf)? else {
             r.fail("package", which, "never published on this registry");
             return Ok(());
         };
@@ -827,7 +860,7 @@ pub fn updates(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Ro
             let full = cell(format_args!("{}/{}", all[i].publisher(), all[i].name()));
             let Ok(name) = PackageName::parse(full.as_str()) else { continue };
             let mut ibuf = [0u8; INDEX_MAX];
-            let (latest, state) = match index_text(s, base, &v, &name, &mut ibuf)? {
+            let (latest, state) = match index_text(ctx, s, base, &v, &name, &mut ibuf)? {
                 None => (None, 1u8),
                 Some(text) => {
                     let mut rels = Releases::new();

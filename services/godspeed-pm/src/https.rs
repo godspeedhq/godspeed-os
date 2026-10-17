@@ -188,10 +188,18 @@ impl Session<'_, '_, '_, '_> {
     /// and is read to its end otherwise, so the connection stays in step. `sink` returning `false` stops the
     /// request and the session ([`Fail::Refused`]).
     pub fn get(&mut self, path: &str, sink: &mut dyn FnMut(&[u8]) -> bool) -> Result<Head, Fail> {
+        self.get_sized(path, &mut |_| true, sink)
+    }
+
+    /// [`get`](Session::get), with `on_head` told the status and headers of a 200 before its body: what lets a
+    /// caller size a file for a body it will stream to disk. `on_head` returning `false` stops it as `sink`
+    /// would ([`Fail::Refused`]).
+    pub fn get_sized(&mut self, path: &str, on_head: &mut dyn FnMut(&Head) -> bool, sink: &mut dyn FnMut(&[u8]) -> bool)
+        -> Result<Head, Fail> {
         if self.broken {
             return Err(Fail::Closed);
         }
-        let r = self.get_inner(path, sink);
+        let r = self.get_inner(path, on_head, sink);
         match r {
             Ok(h) if !h.close => {}
             _ => self.broken = true,
@@ -199,7 +207,8 @@ impl Session<'_, '_, '_, '_> {
         r
     }
 
-    fn get_inner(&mut self, path: &str, sink: &mut dyn FnMut(&[u8]) -> bool) -> Result<Head, Fail> {
+    fn get_inner(&mut self, path: &str, on_head: &mut dyn FnMut(&Head) -> bool, sink: &mut dyn FnMut(&[u8]) -> bool)
+        -> Result<Head, Fail> {
         let start = gs::task::uptime_secs(self.ctx);
         let mut req = [0u8; 512];
         let len = request(&mut req, self.host, path);
@@ -238,6 +247,9 @@ impl Session<'_, '_, '_, '_> {
                     continue;
                 };
                 let h = parse_head(&head_buf[..end]).map_err(Fail::Http)?;
+                if h.status == 200 && !on_head(&h) {
+                    return Err(Fail::Refused);
+                }
                 head = Some(h);
                 body = Body::for_head(&h);
                 // What came after the headers in this record is the start of the body.

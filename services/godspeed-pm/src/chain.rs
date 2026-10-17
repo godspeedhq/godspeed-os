@@ -14,23 +14,33 @@
 //! folder: changing the pin is trusting another registry, which 10.8 says must never happen quietly.
 
 use godspeed::{self as gs, ServiceContext};
-use godspeed_package::trust::{self, Namespaces, Role, Root, Snapshot, Timestamp, TrustError};
-use godspeed_package::Sha256Digest;
+use godspeed_package::trust::{self, IndexLines, Namespaces, Role, Root, SnapshotHead, Timestamp, TrustError};
+use godspeed_package::{Sha256Digest, Sha256Stream};
 
 use crate::config::Registry;
 use crate::https::{Fail, Session};
 
-/// The largest of each document read. Measured on the registry, 2026-10-17: root 1 is 1.1 KiB and grows only
-/// with keys; a signature file is about 200 bytes a signature; the snapshot holds a line per package (about
-/// 100 bytes), so it has the most room, some 150 packages. They live on the stack, which is 256 KiB for every
+/// The largest of each document HELD. Measured on the registry, 2026-10-17: root 1 is 1.1 KiB and grows only
+/// with keys; a signature file is about 200 bytes a signature. They live on the stack, which is 256 KiB for every
 /// service and already carries a TLS session, so each is sized to what it holds rather than generously: a
 /// document past its size is refused by name ([`Why::TooLarge`]), never cut.
+///
+/// **The snapshot is not held.** It is a line per package (about 100 bytes), so it grows with the registry; it is
+/// streamed to `snapshot.toml` in this registry's trust folder as it arrives, hashed on the way, verified from its
+/// digest (its signatures cover the digest, not the bytes), and read back a line at a time. What this machine
+/// reads of it is bounded by [`SNAPSHOT_FILE_MAX`] on disk and [`HEAD_MAX`] and [`LINE_MAX`] in memory, so the
+/// registry's size no longer decides whether a command runs (the CLI repository's backlog, item 2, its first half).
 pub const ROOT_MAX: usize = 4 * 1024;
 pub const SIG_MAX: usize = 2 * 1024;
 const SMALL_SIG_MAX: usize = 1024;
 pub const TIMESTAMP_MAX: usize = 1024;
-pub const SNAPSHOT_MAX: usize = 16 * 1024;
 pub const NAMESPACES_MAX: usize = 8 * 1024;
+/// The largest snapshot kept: about two and a half million packages at 100 bytes a line. Past it, refused by name.
+pub const SNAPSHOT_FILE_MAX: u64 = 256 * 1024 * 1024;
+/// The most of the snapshot's start read to find its head - everything before its `index` lines.
+const HEAD_MAX: usize = 1024;
+/// The longest `index` line read back: a 128-byte name, its digest and the line's own words fit with room.
+const LINE_MAX: usize = 320;
 
 const TRUST_DIR: &str = "/system/services/godspeed/trust/";
 
@@ -134,7 +144,6 @@ pub struct Docs {
     ts_sig: [u8; SMALL_SIG_MAX],
     snap_sig: [u8; SMALL_SIG_MAX],
     pub timestamp: [u8; TIMESTAMP_MAX], pub timestamp_len: usize,
-    pub snapshot: [u8; SNAPSHOT_MAX], pub snapshot_len: usize,
     pub namespaces: [u8; NAMESPACES_MAX], pub namespaces_len: usize,
 }
 
@@ -143,19 +152,29 @@ impl Docs {
         Docs {
             root: [0; ROOT_MAX], root_len: 0, sig: [0; SIG_MAX], ts_sig: [0; SMALL_SIG_MAX], snap_sig: [0; SMALL_SIG_MAX],
             timestamp: [0; TIMESTAMP_MAX], timestamp_len: 0,
-            snapshot: [0; SNAPSHOT_MAX], snapshot_len: 0,
             namespaces: [0; NAMESPACES_MAX], namespaces_len: 0,
         }
     }
 }
 
-/// What a verified chain says, borrowed from [`Docs`].
+/// The verified snapshot, kept on disk: where, how long, which version, and its `index` lines' offset.
+#[derive(Clone, Copy)]
+pub struct SnapshotFile {
+    pub version: u64,
+    pub path: Path,
+    pub len: u64,
+    /// Where the `index` lines start.
+    pub body: u64,
+    /// True when this command downloaded it; false when the one already here is the one the timestamp names.
+    pub fetched: bool,
+}
+
+/// What a verified chain says, borrowed from [`Docs`]; the snapshot is on disk.
 pub struct Verified<'d> {
     pub root: Root<'d>,
     pub timestamp: Timestamp<'d>,
-    pub snapshot: Snapshot<'d>,
+    pub snapshot: SnapshotFile,
     pub namespaces: Namespaces<'d>,
-    pub snapshot_text: &'d str,
     /// True when this run reached the registry for the first time.
     pub first_contact: bool,
 }
@@ -166,18 +185,144 @@ fn store_dir(reg: &Registry<'_>) -> Path {
     p
 }
 
-/// The versions this machine has accepted: `timestamp N` and `namespaces N`, one per line.
-fn read_seen(text: &str) -> (Option<u64>, Option<u64>) {
-    let (mut t, mut n) = (None, None);
+/// The versions this machine has accepted: `timestamp N` and `namespaces N`, one per line - and `snapshot N
+/// <digest> <bytes>`, the snapshot kept beside them, so a command whose timestamp names it does not download it
+/// again.
+fn read_seen(text: &str) -> (Option<u64>, Option<u64>, Option<(u64, Sha256Digest, u64)>) {
+    let (mut t, mut n, mut s) = (None, None, None);
     for line in text.lines() {
         let mut w = line.split_whitespace();
         match (w.next(), w.next().and_then(|v| v.parse().ok())) {
             (Some("timestamp"), Some(v)) => t = Some(v),
             (Some("namespaces"), Some(v)) => n = Some(v),
+            (Some("snapshot"), Some(v)) => {
+                let d = w.next().and_then(|d| d.parse::<Sha256Digest>().ok());
+                let len = w.next().and_then(|l| l.parse::<u64>().ok());
+                if let (Some(d), Some(len)) = (d, len) { s = Some((v, d, len)); }
+            }
             _ => {}
         }
     }
-    (t, n)
+    (t, n, s)
+}
+
+/// GET the snapshot into `partial`, sized by its `Content-Length` before a byte of it arrives, hashed as it is
+/// written. Its digest and length. A snapshot that does not say its size, or says more than
+/// [`SNAPSHOT_FILE_MAX`], is refused by name; nothing is guessed at.
+fn fetch_snapshot(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &str, fs: &mut gs::fs::Fs<'_>,
+                  partial: &str) -> Result<(Sha256Digest, u64), Why> {
+    let mut path = Path::new();
+    path.push(base).push("trust/snapshot.toml");
+    // Both closures reach the file and the size, one before the body and one during it.
+    let fs = core::cell::RefCell::new(fs);
+    let size: core::cell::Cell<Option<u64>> = core::cell::Cell::new(None);
+    let store: core::cell::Cell<Option<gs::Error>> = core::cell::Cell::new(None);
+    let too_large = core::cell::Cell::new(false);
+    let mut hash = Sha256Stream::new();
+    let mut chunk = [0u8; gs::fs::IO_CHUNK];
+    let (mut held, mut written) = (0usize, 0u64);
+    let mut shown = u64::MAX;
+    let head = s.get_sized(path.as_str(), &mut |h| {
+        match h.length {
+            Some(n) if n <= SNAPSHOT_FILE_MAX && n > 0 => {
+                if let Err(e) = fs.borrow_mut().create_sized(partial, n) { store.set(Some(e)); return false; }
+                size.set(Some(n));
+                true
+            }
+            _ => { too_large.set(true); false }
+        }
+    }, &mut |bytes: &[u8]| {
+        hash.update(bytes);
+        let total = size.get().unwrap_or(1).max(1);
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let take = rest.len().min(chunk.len() - held);
+            chunk[held..held + take].copy_from_slice(&rest[..take]);
+            held += take;
+            rest = &rest[take..];
+            if held == chunk.len() {
+                if let Err(e) = fs.borrow_mut().write_at(partial, written, &chunk) { store.set(Some(e)); return false; }
+                written += held as u64;
+                held = 0;
+            }
+        }
+        // A large snapshot takes time: say how far it has got, by twentieths.
+        let step = (written + held as u64) * 20 / total;
+        if total > 64 * 1024 && step != shown {
+            shown = step;
+            crate::progress(ctx, format_args!("  downloading the snapshot  {} / {} KiB   [q] quit",
+                (written + held as u64) / 1024, total / 1024));
+        }
+        true
+    });
+    if too_large.get() { return Err(Why::TooLarge("the snapshot")); }
+    if let Some(e) = store.get() { return Err(Why::Store(e)); }
+    let head = head.map_err(Why::Net)?;
+    if head.status != 200 { return Err(Why::Missing { path, status: head.status }); }
+    if held > 0 { fs.borrow_mut().write_at(partial, written, &chunk[..held]).map_err(Why::Store)?; written += held as u64; }
+    if Some(written) != size.get() { return Err(Why::Net(Fail::Closed)); }
+    Ok((hash.finish(), written))
+}
+
+/// The snapshot's head, read from the start of the file at `path`.
+fn read_head<'b>(fs: &mut gs::fs::Fs<'_>, path: &str, buf: &'b mut [u8; HEAD_MAX]) -> Result<SnapshotHead<'b>, Why> {
+    let mut n = 0usize;
+    while n < buf.len() {
+        let got = fs.read_at(path, n as u64, &mut buf[n..]).map_err(Why::Store)?;
+        if got == 0 { break; }
+        n += got;
+    }
+    // Whole lines only: the head is parsed up to its last line, and must end inside what was read.
+    let end = buf[..n].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    let t = text(&buf[..end], "the snapshot")?;
+    SnapshotHead::parse(t).map_err(|err| Why::Trust { what: "the snapshot", err })
+}
+
+/// Every `index` line of the kept snapshot, in order, to `f`: its package name and index digest, each checked as
+/// the whole snapshot would be (`IndexLines`). `f` returning false stops the walk. Read from the disk a chunk at a
+/// time, a line never longer than [`LINE_MAX`].
+pub fn each_index(ctx: &ServiceContext, snap: &SnapshotFile, f: &mut dyn FnMut(&str, &Sha256Digest) -> bool) -> Result<(), Why> {
+    let mut fs = gs::fs::Fs::new(ctx);
+    let mut lines = IndexLines::new();
+    let mut chunk = [0u8; gs::fs::IO_CHUNK];
+    let mut line = [0u8; LINE_MAX];
+    let mut ll = 0usize;
+    // `read_at` takes offsets in whole 508-byte blocks, so the walk starts at the block holding the body and skips
+    // into it.
+    let block = 508u64;
+    let mut off = snap.body / block * block;
+    let mut skip = (snap.body - off) as usize;
+    while off < snap.len {
+        let got = fs.read_at(snap.path.as_str(), off, &mut chunk).map_err(Why::Store)?;
+        if got == 0 { break; }
+        for &b in &chunk[skip..got] {
+            if b == b'\n' {
+                let t = text(&line[..ll], "the snapshot")?;
+                let (name, d) = lines.next(t).map_err(|err| Why::Trust { what: "the snapshot", err })?;
+                if !f(name, &d) { return Ok(()); }
+                ll = 0;
+            } else {
+                if ll == line.len() { return Err(Why::TooLarge("a snapshot line")); }
+                line[ll] = b;
+                ll += 1;
+            }
+        }
+        skip = 0;
+        off += got as u64;
+    }
+    if ll != 0 { return Err(Why::Trust { what: "the snapshot", err: TrustError::Malformed("a line is missing, or the final newline") }); }
+    Ok(())
+}
+
+/// The digest of `name`'s index, if the kept snapshot lists it. Its lines are in order, so the walk stops at the
+/// first name past it.
+pub fn index_of(ctx: &ServiceContext, v: &Verified<'_>, name: &str) -> Result<Option<Sha256Digest>, Why> {
+    let mut found = None;
+    each_index(ctx, &v.snapshot, &mut |n, d| {
+        if n == name { found = Some(*d); return false; }
+        n < name
+    })?;
+    Ok(found)
 }
 
 /// Verify the chain through namespaces for the registry in use, at `now` (`YYYY-MM-DDTHH:MM:SSZ`).
@@ -253,17 +398,16 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
     }
 
     // What this machine has seen of this registry, so nothing older is accepted.
-    let mut seen_buf = [0u8; 128];
-    let (seen_ts, seen_ns) = match fs.read_into(at("seen").as_str(), &mut seen_buf) {
+    let mut seen_buf = [0u8; 256];
+    let (seen_ts, seen_ns, kept) = match fs.read_into(at("seen").as_str(), &mut seen_buf) {
         Ok(n) => read_seen(core::str::from_utf8(&seen_buf[..n]).unwrap_or("")),
-        Err(gs::Error::NotFound) => (None, None),
+        Err(gs::Error::NotFound) => (None, None, None),
         Err(e) => return Err(Why::Store(e)),
     };
 
-    // 2. TIMESTAMP -> SNAPSHOT -> NAMESPACES.
+    // 2. TIMESTAMP -> SNAPSHOT (on disk) -> NAMESPACES.
     d.timestamp_len = required(s, base, "trust/timestamp.toml", &mut d.timestamp, "the timestamp")?;
     let ts_sig = required(s, base, "trust/timestamp.sig", &mut d.ts_sig, "the timestamp's signatures")?;
-    d.snapshot_len = required(s, base, "trust/snapshot.toml", &mut d.snapshot, "the snapshot")?;
     let snap_sig = required(s, base, "trust/snapshot.sig", &mut d.snap_sig, "the snapshot's signatures")?;
     d.namespaces_len = required(s, base, "trust/namespaces.toml", &mut d.namespaces, "the namespaces")?;
     let ns_sig = required(s, base, "trust/namespaces.sig", &mut d.sig, "the namespaces' signatures")?;
@@ -274,15 +418,40 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
     let timestamp = trust::verify_timestamp(&root, text(&d.timestamp[..d.timestamp_len], "the timestamp")?,
                                             text(&d.ts_sig[..ts_sig], "the timestamp's signatures")?, now, seen_ts)
         .map_err(|err| Why::Trust { what: "the timestamp", err })?;
-    let snapshot_text = text(&d.snapshot[..d.snapshot_len], "the snapshot")?;
-    let snapshot = trust::verify_snapshot(&root, &timestamp, snapshot_text, text(&d.snap_sig[..snap_sig], "the snapshot's signatures")?, now)
+
+    // The snapshot the timestamp names: the one kept here already, or downloaded to a staging file beside it.
+    fs.create_dir_all(dir.as_str()).map_err(Why::Store)?;
+    let kept_path = at("snapshot.toml");
+    let staged = at("snapshot.partial");
+    let reuse = match kept {
+        Some((v, dg, len)) if v == timestamp.snapshot_version && dg == timestamp.snapshot_digest =>
+            fs.stat(kept_path.as_str()).ok().filter(|st| st.size == len).map(|_| (dg, len)),
+        _ => None,
+    };
+    let (digest, len, read_from, fetched) = match reuse {
+        Some((dg, len)) => (dg, len, kept_path, false),
+        None => {
+            let _ = fs.delete(staged.as_str());
+            let (dg, len) = fetch_snapshot(ctx, s, base, &mut fs, staged.as_str())?;
+            (dg, len, staged, true)
+        }
+    };
+    let mut head_buf = [0u8; HEAD_MAX];
+    let head = read_head(&mut fs, read_from.as_str(), &mut head_buf)?;
+    trust::verify_snapshot_stream(&root, &timestamp, &digest, &head, text(&d.snap_sig[..snap_sig], "the snapshot's signatures")?, now)
         .map_err(|err| Why::Trust { what: "the snapshot", err })?;
-    let namespaces = trust::verify_namespaces(&root, &snapshot, text(&d.namespaces[..d.namespaces_len], "the namespaces")?,
-                                              text(&d.sig[..ns_sig], "the namespaces' signatures")?, now, seen_ns)
+    let namespaces = trust::verify_namespaces_by_head(&root, &head, text(&d.namespaces[..d.namespaces_len], "the namespaces")?,
+                                                      text(&d.sig[..ns_sig], "the namespaces' signatures")?, now, seen_ns)
         .map_err(|err| Why::Trust { what: "the namespaces", err })?;
+    let snapshot = SnapshotFile { version: head.header.version, path: kept_path, len, body: head.len as u64, fetched };
+    if fetched {
+        // Every `index` line checked once, as it would be in memory, before the file replaces the one kept.
+        each_index(ctx, &SnapshotFile { path: staged, ..snapshot }, &mut |_, _| true)?;
+        let _ = fs.delete(kept_path.as_str());
+        fs.rename(staged.as_str(), "snapshot.toml").map_err(Why::Store)?;
+    }
 
     // The metadata held together: remember how far this machine has seen, so it never goes back.
-    fs.create_dir_all(dir.as_str()).map_err(Why::Store)?;
     if root_changed {
         fs.write(at("root.toml").as_str(), &d.root[..d.root_len]).map_err(Why::Store)?;
         fs.write(at("pin").as_str(), reg.pin.as_bytes()).map_err(Why::Store)?;
@@ -293,10 +462,13 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
         fs.write(at("namespaces.toml").as_str(), &d.namespaces[..d.namespaces_len]).map_err(Why::Store)?;
     }
     let mut seen = Path::new();
-    seen.push("timestamp ").num(timestamp.header.version).push("\nnamespaces ").num(namespaces.header.version).push("\n");
+    seen.push("timestamp ").num(timestamp.header.version).push("\nnamespaces ").num(namespaces.header.version)
+        .push("\nsnapshot ").num(snapshot.version).push(" ");
+    let _ = core::fmt::write(&mut PathWriter(&mut seen), format_args!("{}", digest));
+    seen.push(" ").num(len).push("\n");
     fs.write(at("seen").as_str(), &seen.b[..seen.n]).map_err(Why::Store)?;
 
-    Ok(Verified { root, timestamp, snapshot, namespaces, snapshot_text, first_contact })
+    Ok(Verified { root, timestamp, snapshot, namespaces, first_contact })
 }
 
 /// `godspeed trust`: what this machine has accepted from each registry the configuration knows - the root, the
@@ -324,7 +496,7 @@ pub fn show(ctx: &ServiceContext, r: &mut crate::Rows, regs: &[Registry<'_>], us
         let root_len = fs.read_into(at("root.toml").as_str(), &mut root_buf).unwrap_or(0);
         let mut seen_buf = [0u8; 128];
         let seen_len = fs.read_into(at("seen").as_str(), &mut seen_buf).unwrap_or(0);
-        let (ts, ns) = read_seen(core::str::from_utf8(&seen_buf[..seen_len]).unwrap_or(""));
+        let (ts, ns, _) = read_seen(core::str::from_utf8(&seen_buf[..seen_len]).unwrap_or(""));
         let root = core::str::from_utf8(&root_buf[..root_len]).ok().and_then(|t| Root::parse(t).ok());
         r.row("title", reg.name, in_use);
         let Some(root) = root else {
@@ -366,15 +538,6 @@ pub fn reset(ctx: &ServiceContext, r: &mut crate::Rows, reg: &Registry<'_>) {
         Ok(()) => r.row(reg.name, "forgotten", "the next command meets it again from root 1, checked against its pin"),
         Err(e) => r.fail(reg.name, dir.as_str(), crate::cell(format_args!("could not be removed: {:?} - {}", e, fs.reason())).as_str()),
     }
-}
-
-/// Every package the verified snapshot lists, by name, each confirmed against the snapshot's own lookup.
-pub fn packages<'v, 'd: 'v>(v: &'v Verified<'d>) -> impl Iterator<Item = &'d str> + 'v {
-    v.snapshot_text.lines().filter_map(move |l| {
-        let inner = l.strip_prefix("index = \"")?.strip_suffix('"')?;
-        let name = inner.split_whitespace().next()?;
-        v.snapshot.index(name).map(|_| name)
-    })
 }
 
 struct PathWriter<'p>(&'p mut Path);
