@@ -621,11 +621,34 @@ presenting a development convenience as installation; the same holds here.
 config set` and `godspeed check`** (`services/godspeed-pm`, `utilities/61_godspeed.md`), QEMU-verified and,
 for `check`, hardware-verified the same day on the T630 and the Wyse 5070, and on 2026-10-17 on the Pi 2,
 the Pi 4 and the VisionFive 2 Lite. The settings of 10.8 and the transport of 10.3, end to end: the file written on first start, a checked `set` that keeps the rest of the file, and the registry
-reached over TLS verified to the roots folder. Search, fetch and keep are not built; they need the
-registry's metadata format (10.6). Three things were missing on the way and were added: an outbound TCP
+reached over TLS verified to the roots folder. Three things were missing on the way and were added: an outbound TCP
 connection held as a capability (`net-stack` op 23, `docs/tcp-design.md`); `gs::task::wall_clock` and
 `gs::task::hw_random`; and RDRAND behind x86's random seam, which had answered `None` - so on a PC whose
 CPU has no RDRAND, TLS refuses to run, and says so.
+
+**Built, 2026-10-17 (branch `feat/packages`): `godspeed search`, `info`, `fetch`, `list` and `uninstall`** -
+10.1's first version, fetch, verify, keep, list and remove. Every answer is verified on the machine by the
+shared crate's own checks (10.6), in the CLI's order: root 1 by the pin, each rotation by the root before
+it, then timestamp, snapshot, namespaces, the package's index, its manifest by digest, the manifest's
+signature by a key the namespaces vouch for at the release's time, and the contract and this machine's
+binary by digest and size. A fetched package is KEPT under `/system/packages/` (10.5) and says it is not
+installed; `godspeed install` refuses with 9.2's reason. QEMU-verified against the real registry and its
+package `godspeed/hello` (`osdev test godspeed`, 76/0); no hardware card yet. `utilities/61_godspeed.md` 4a
+is the as-built reference. What the work needed, recorded so it is not rediscovered:
+
+- **One kept-alive TLS session per command.** A fetch is a dozen requests; a handshake per request would be
+  a dozen handshakes, which is seconds each on a Pi 2. Each answer is read to its exact end
+  (`Content-Length` or chunked, `services/godspeed-pm/src/http.rs`, host-tested), and the body is streamed to
+  a sink, so a binary goes to disk as it arrives, checked as it goes, and never sits in memory.
+- **The stack, not the heap.** Every service has a 256 KiB stack and no heap, and the first QEMU run of
+  `info` overflowed it: the trust documents, the TLS session and the command's own buffers measured about
+  258 KiB on the deepest path. Each buffer is now sized to what it holds (the snapshot 16 KiB, the root 4 KiB,
+  the TLS output 4 KiB), about 216 KiB on `fetch`'s path, and a document past its size is refused by name.
+- **The machine's architecture** comes from the target triple the program is built for, whose first word is
+  the package architecture's name, so no `cfg` was added.
+- **What this machine has seen** is kept per registry under `/system/services/godspeed/trust/<registry>/`,
+  so a registry cannot show it an older view than one it accepted; a pin changed since first contact is
+  refused until that folder is removed (10.8's rule, made concrete).
 
 ### 10.2 Where it lives
 
@@ -774,9 +797,10 @@ bound on the date.
 ### 10.5 Where a kept package goes
 
 `docs/filesystem-layout.md` 10 reserves package storage for phase 4, "only when package management needs
-it". This is that moment. A proposal for the layout doc, not made here: `/system/packages/<publisher>/<name>/
-<version>/` holding the verified files as published, with the package manager the owner (L2) and nothing
-else writing there. Uninstall then deletes that folder and keeps the package's own data under
+it". This is that moment. **Built 2026-10-17, as proposed here:** `/system/packages/<publisher>/<name>/
+<version>/` holding the verified files as published (this machine's binary only, its manifest, signature
+and contract, and an `origin` file), with the package manager the owner (L2) and nothing else writing
+there; the layout doc's 10 records it. Uninstall then deletes that folder and keeps the package's own data under
 `/system/services/<name>/` and `/users/`, as the CLI's contract requires; a `delete data` is separate and
 says what it destroys first. Until folder capabilities (phase 2) exist, the package manager's send cap to
 `fs` reaches the whole disk like every other `fs` client; that is acceptable for a reviewed in-tree service
@@ -801,6 +825,20 @@ Option 3 matches 4.3's rule that the format a Godspeed machine verifies is defin
 option 1 is the smallest change. Whichever is chosen, `godspeed-package`'s own open question is answered
 here: "how the native side reads the text without a heap" (the CLI repository's docs/package-format.md, open question 1)
 is decided when the native package manager is, and that is now.
+
+**As built, 2026-10-17: option 1**, the smallest, taken to build the first version and easy to change: a
+git dependency on the CLI repository at tag `cli-v0.2.0` (`services/godspeed-pm/Cargo.toml`). The choice
+between the three is still the operator's; moving to option 2 or 3 changes one line of that file. Two
+things found doing it:
+
+- **Cargo reads every `Cargo.toml` in a git dependency's repository**, and the CLI's two templates hold
+  `name = "{{name}}"`, so every build of this repository printed two `error:` lines (harmless: the build
+  finishes). The CLI side renames them to `Cargo.toml.template` on its branch `feat/platform-file`; the
+  lines stop once this dependency points at a CLI release with that change.
+- **The open question's answer:** the native side reads the index and the manifest with its own heapless
+  line reader (`services/godspeed-pm/src/toml_lines.rs`, host-tested) into the crate's own borrowed types,
+  and runs the crate's own `validate()` on them, so the rules stay the crate's. The trust documents need
+  nothing: the crate's `trust` module already reads them without a heap.
 
 ### 10.7 What it needs from the kernel
 

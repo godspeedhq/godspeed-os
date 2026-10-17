@@ -304,6 +304,12 @@ Package storage, versioned images and application data may need namespaces of th
 needs them arrives (service images from `fs` are step 2 of `docs/service-ownership.md`). Nothing is added to
 the tree in advance of that.
 
+**Package storage arrived, 2026-10-17:** `/system/packages/<publisher>/<name>/<version>/`, owned by the
+package manager (`godspeed fetch`, `utilities/61_godspeed.md` 4a), created at first use like every owner's
+folder (L2). It holds verified copies, not running programs: nothing starts a program from disk yet. Its
+trust record is the package manager's own, under `/system/services/godspeed/trust/`. Versioned images and
+application data have not arrived.
+
 ---
 
 ## 11. Layout rules

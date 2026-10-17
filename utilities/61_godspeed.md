@@ -9,14 +9,16 @@ does not do yet, is `docs/developer-services-design.md` section 10.
 The command typed is `godspeed`. `godspeed-pm` is only the program's name, because the standard library's
 crate is already called `godspeed`; it appears in `status` while a command runs and nowhere else.
 
-## Status, as built and honest (2026-10-16)
+## Status, as built and honest (2026-10-17)
 
-Built on `feat/tls`: the registries, the settings and the registry check. Searching for, fetching and
-keeping packages are **not built**: they need the registry's signed metadata format (the CLI repository's
-`godspeed-package` crate), and a machine that could fetch a package still could not run it (10.1).
-`osdev test godspeed` runs every command against a real disk and reaches the real registry over verified
-TLS through QEMU's user network (its registry checks are skipped, not passed, when the machine running the
-test is offline). On hardware: `godspeed check` verified the registry and got `HTTP/1.1 200 OK` on all five
+Built: the registries, the settings, the registry check, and (2026-10-17, branch `feat/packages`) **search,
+info, fetch, list and uninstall**, every answer verified on this machine against the registry's signed
+metadata by the shared package crate's own checks (the CLI repository's `godspeed-package`). **Install is
+not built**: a fetched package is KEPT, verified, under `/system/packages/`, and cannot run, because the
+supervisor starts only the programs built into the image (design 9.2). `osdev test godspeed` runs every
+command against a real disk and the real registry over verified TLS through QEMU's user network, fetching
+`godspeed/hello` (its registry checks are skipped, not passed, when the machine running the test is
+offline). Packages are QEMU-verified only, x86; no hardware card yet. On hardware: `godspeed check` verified the registry and got `HTTP/1.1 200 OK` on all five
 boards - the HP T630 and the Dell Wyse 5070 on 2026-10-16, and the Raspberry Pi 2, the Raspberry Pi 4 and
 the VisionFive 2 Lite on 2026-10-17, each with its own hardware random source (RDRAND on the PCs, the Pis'
 RNG and RNG200, the JH7110's TRNG).
@@ -24,6 +26,12 @@ RNG and RNG200, the JH7110's TRNG).
 ## 1. The command
 
 ```
+godspeed search [<word>]                           the packages the registry vouches for, or those whose name holds the word
+godspeed info <publisher/name>                     one package's published versions
+godspeed fetch <publisher/name>[@version]          verify a package end to end and keep it here - kept, not installed
+godspeed list                                      the packages kept here
+godspeed uninstall <publisher/name>[@version]      remove a kept copy, one version or every one
+godspeed install                                   not built: says why
 godspeed registry                                  the registries this machine knows; one is in use
 godspeed registry add <name> <url> <root> [yes]    know another; asks [y/N] before trusting its root
 godspeed registry use <name>                       search and install from that one from now on
@@ -122,24 +130,71 @@ A failure names the step and the reason in words a person can act on: an expired
 that is ahead), one not valid yet (or a clock behind), a chain that reaches no trusted root, a certificate
 for another name, no hardware random source, no network. TLS is never skipped: there is no `insecure` mode.
 
+## 4a. Packages
+
+**What is checked, in order** (`services/godspeed-pm/src/chain.rs` and `packages.rs`, the checks themselves
+the shared crate's):
+
+1. **The root.** On first contact, root 1 (the registry's trust/root/1.toml) must have the SHA-256 pinned on the registry's line
+   in the settings, and be signed by its own root keys. Every root since must be signed by the one before it
+   and by itself. What this machine reached is kept in `/system/services/godspeed/trust/<registry>/`: the
+   root, the pin it was reached under, and the newest timestamp and namespaces versions seen.
+2. **Timestamp, snapshot, namespaces**, each signed by its role's keys, unexpired, and not older than what
+   this machine already accepted (a rollback is refused).
+3. **The package's index**, exactly the bytes the snapshot names for it.
+4. **The manifest**, by the digest the index names; **its signature**, by a key the signed namespaces vouch
+   for the publisher at the release's publication time (a revoked key never; a retired one only for what was
+   published before it retired).
+5. **The contract and this machine's binary**, each by the digest and size the manifest names. The binary
+   is streamed to disk and checked as it arrives; a file that does not match is deleted, never kept.
+
+| command | rows |
+|---|---|
+| `search` | `verified` (the chain's versions, and whether this was first contact), then a `package` row per name |
+| `info` | `verified`, then a `version` row per release: when, by whom, and which is the latest |
+| `fetch` | `verified`, `package`, `signed` (the key, active or retired), `binary` (this machine's architecture and its size), `requests` (what the contract asks for; nothing is granted), `kept` (the folder), `installed no` |
+| `list` | a row per kept `publisher/name@version`, with the registry it came from |
+| `uninstall` | `removed` and the folder |
+
+**Where a package is kept**: `/system/packages/<publisher>/<name>/<version>/`, holding `<arch>.elf` (this
+machine's only), `manifest.toml`, `manifest.sig`, `contract.toml` and `origin` (the registry, when, the
+architecture and the signing key). A fetch is written beside it as `<version>.partial` and renamed into place
+only once every file is verified, so a half-fetched package is never listed. Fetching a version already kept
+leaves it as it is.
+
+**A pin that changed** since this machine first reached a registry is refused - changing it is trusting
+another registry - until the operator removes `/system/services/godspeed/trust/<registry>/`, after which the
+registry is met again from root 1.
+
+**Limits, refused by name, never cut**: the snapshot 16 KiB (about 150 packages), an index 8 KiB (about 40
+releases), a manifest or a contract 4 KiB, a binary `max-package-mib`. They are on the stack, which is
+256 KiB for every service and already carries the TLS session.
+
+**One connection** carries a command's requests, kept alive; a server that closes it part way is asked
+again on a fresh one, up to three times, and a command writes its rows only after its last request, so
+nothing is said twice.
+
 ## 5. Pipes
 
-`godspeed registry`, `godspeed config` and `godspeed check` are reports, so they pipe as records (`item`,
-`value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
+`godspeed search`, `info`, `list`, `registry`, `config` and `check` are reports, so they pipe as records
+(`item`, `value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```
+godspeed search | where item=package
+godspeed list | where item~hello | count
 godspeed registry | where note~in use
 godspeed config | where note=file
 godspeed check | where item=tls
 ```
 
-`godspeed config set` and `godspeed registry add`, `use` and `remove` are actions and refuse to start a
-pipe, with the sentence naming the reports.
+`godspeed fetch`, `uninstall` and `install`, `godspeed config set` and `godspeed registry add`, `use` and
+`remove` are actions and refuse to start a pipe, with the sentence naming the reports.
 
 ## 6. What it holds
 
-Its supervisor row grants exactly four peers - the shell for its answer, `fs` for its settings and roots,
-`net-stack` for the registry's connection, `time` for the date - and no privilege of any kind. Pinned in
+Its supervisor row grants exactly four peers - the shell for its answer, `fs` for its settings, roots,
+trust record and kept packages, `net-stack` for the registry's connection, `time` for the date - and no
+privilege of any kind. Packages added no peer and no privilege. Pinned in
 `COMMANDMENTS.baseline.toml`. The TLS client is `sdk/tls`; the connection is `net-stack`'s op 23, a TCP
 connection held as a capability (`gs::net::Net::connect`). The `[y/N]` before a root is trusted is asked by
 the shell, which holds the console; the package manager is told only what to add.
