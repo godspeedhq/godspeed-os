@@ -8549,6 +8549,38 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(ug.contains("unknown: hello-utility"), "and its name is no longer a command");
         let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
 
+        // A SERVICE, by its own name: installed, started now and kept running.
+        let _ = run!(b"godspeed fetch godspeed/hello-service\r", 240);
+        let si = run!(b"godspeed install godspeed/hello-service yes\r", 180);
+        check!(si.contains("godspeed/hello-service 0.1.0 asks for nothing (no peers, no privilege) and starts at every boot"),
+               "installing a service says it starts at every boot");
+        check!(si.contains("hello-service: started") && si.contains("running, as the task godspeed/hello-service"),
+               "`godspeed/hello-service` is started by the supervisor and runs");
+        let su = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);
+        check!(su.contains("uninstalled") && su.contains("stopped"), "and is stopped by `godspeed uninstall`");
+
+        // AN APP: the screen and the keyboard are its while it runs, and the shell's again when it ends.
+        let af = run!(b"godspeed fetch godspeed/hello-app\r", 240);
+        check!(af.contains("an app: `godspeed install` makes it a command that has the screen while it runs"),
+               "`godspeed fetch` says what installing an app does");
+        let ai = run!(b"godspeed install godspeed/hello-app yes\r", 180);
+        check!(ai.contains("asks for: console") && ai.contains("has the screen and keyboard while it runs"),
+               "installing an app asks for the console, by name, and says what it means");
+        check!(ai.contains("an app: type `hello-app"), "and says how to run it");
+        send(&mut write_half, b"hello-app Ada\r");
+        let shown = collect_until(&buf, &mut cursor, b"give it back to the shell", Duration::from_secs(60)).unwrap_or_default();
+        check!(shown.contains("hello, Ada"), "the app has the screen: it says hello to its argument");
+        send(&mut write_half, b"x");
+        let back = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+        check!(back.contains("installed godspeed/hello-app ended - exited with status 0"), "a key ends it, with status 0");
+        let after = run!(b"godspeed list installed\r", 60);
+        check!(after.contains("app: type `hello-app`"), "and the shell has the console back: its next command runs");
+        let ap = run!(b"hello-app | count\r", 60);
+        check!(ap.contains("is an app - it has the screen while it runs, so it cannot start a pipe"), "an app cannot start a pipe");
+        let _ = run!(b"godspeed uninstall godspeed/hello-app yes\r", 60);
+        let _ = run!(b"godspeed remove godspeed/hello-app\r", 60);
+        let _ = run!(b"godspeed remove godspeed/hello-service\r", 60);
+
         // A CHANGED PIN is trusting another registry: refused until the operator clears what this machine kept.
         let _ = run!(b"write /system/services/godspeed/trust/default/pin sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);
         let changed = run!(b"godspeed search hello\r", 180);

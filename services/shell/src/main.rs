@@ -2479,9 +2479,10 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             // run/selfcheck it is one interpreter layer, so it is refused inside another script
             // (depth > 0) to keep the bounded user stack safe.
             // An INSTALLED UTILITY, by its name (`hello-utility`) or its package name (`godspeed/hello-utility`).
-            if let Some(task) = installed_utility(ctx, other) {
+            if let Some((task, app)) = installed_utility(ctx, other) {
                 let rest = s[other.len()..].trim();
-                return run_utility(ctx, core::str::from_utf8(task.as_bytes()).unwrap_or(""), rest, out);
+                let task = core::str::from_utf8(task.as_bytes()).unwrap_or("");
+                return if app { run_app(ctx, task, rest) } else { run_utility(ctx, task, rest, out) };
             }
             if let Some(src) = library_script(other) {
                 if depth > 0 {
@@ -14870,9 +14871,13 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
         let mut cap = Cap::new();
         if !drain_service(ctx, c0, None, &mut cap) { return Err(ShellError::Unknown); }
         Stream::Bytes(cap)
-    } else if let Some(task) = installed_utility(ctx, c0) {
+    } else if let Some((task, app)) = installed_utility(ctx, c0) {
         // An INSTALLED UTILITY starts a pipe as any producer does: what it writes is the stream. A failure goes to
-        // the console and stops the pipe, as a built-in producer's does.
+        // the console and stops the pipe, as a built-in producer's does. An APP owns the screen, so it has no stream.
+        if app {
+            gs::io::println_fmt(ctx, format_args!("pipe: '{}' is an app - it has the screen while it runs, so it cannot start a pipe", c0));
+            return Err(ShellError::Unknown);
+        }
         let mut cap = Cap::new();
         let ran = run_utility(ctx, core::str::from_utf8(task.as_bytes()).unwrap_or(""), split_first(stages[0]).1,
                               &mut Out::Capture(&mut cap));
@@ -15622,7 +15627,8 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
     }
     let peers = core::str::from_utf8(&peers[..pn]).unwrap_or("");
     // What installing it does, from the note's kind: a service starts at every boot, a utility becomes a command.
-    let when = if note.contains("; a utility;") { "becomes a command, run when typed" } else { "starts at every boot" };
+    let when = if note.contains("; an app;") { "becomes a command that has the screen and keyboard while it runs" }
+        else if note.contains("; a utility;") { "becomes a command, run when typed" } else { "starts at every boot" };
     let mut head = [0u8; 512];
     let head = match from {
         Some(h) => fmt_into(&mut head, format_args!("{} (upgrade from {})", release, h)),
@@ -18701,16 +18707,17 @@ fn task_running(ctx: &ShellCtx, name: &str) -> bool {
     })
 }
 
-/// The installed UTILITY a typed command names - `hello-utility` for `godspeed/hello-utility` - as its task name,
-/// asked of the supervisor (`supcmd::INSTALLED`). `None` when no installed utility has that name, or when two
-/// publishers' do, which is said, since guessing between them would run code the operator did not choose.
-fn installed_utility(ctx: &ShellCtx, cmd: &str) -> Option<String8L> {
+/// The installed UTILITY or APP a typed command names - `hello-utility` for `godspeed/hello-utility` - as its task
+/// name and whether it is an app, asked of the supervisor (`supcmd::INSTALLED`). `None` when nothing installed has
+/// that name, or when two publishers' do, which is said, since guessing between them would run code the operator
+/// did not choose.
+fn installed_utility(ctx: &ShellCtx, cmd: &str) -> Option<(String8L, bool)> {
     use godspeed_sdk::service_context::supcmd;
     if cmd.is_empty() || cmd.contains('/') && cmd.split('/').count() != 2 { return None; }
     let reply = hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::INSTALLED])?;
     let b = reply.payload_bytes();
     if b.first() != Some(&supcmd::OK) || b.len() < 2 { return None; }
-    let mut found: Option<String8L> = None;
+    let mut found: Option<(String8L, bool)> = None;
     let mut many = false;
     let mut i = 2usize;
     for _ in 0..b[1] {
@@ -18718,14 +18725,14 @@ fn installed_utility(ctx: &ShellCtx, cmd: &str) -> Option<String8L> {
         let name = b.get(i + 1..i + 1 + l)?;
         let state = *b.get(i + 1 + l)?;
         i += 2 + l;
-        if state != installed_state::UTILITY { continue; }
+        if state != installed_state::UTILITY && state != installed_state::APP { continue; }
         let n = core::str::from_utf8(name).unwrap_or("");
         let short = n.rsplit('/').next().unwrap_or(n);
         if n == cmd || short == cmd {
             if found.is_some() { many = true; }
             let mut s = String8L::new();
             s.set(name);
-            found = Some(s);
+            found = Some((s, state == installed_state::APP));
         }
     }
     if many {
@@ -18738,6 +18745,43 @@ fn installed_utility(ctx: &ShellCtx, cmd: &str) -> Option<String8L> {
 /// The `INSTALLED` answer's state byte (`services/supervisor/src/installed.rs`).
 mod installed_state {
     pub const UTILITY: u8 = 2;
+    pub const APP: u8 = 3;
+}
+
+/// Run the installed APP `task` with `args`: started by the supervisor, handed its arguments, and then left to
+/// own the console. The shell goes quiet while it does (the muted loop, as for `chaos`), and draws a fresh prompt
+/// when the app gives the console back - by ending, or by dying, since the kernel releases a dead holder's.
+fn run_app(ctx: &ShellCtx, task: &str, args: &str) -> Result<(), ShellError> {
+    if !spawn_watched(ctx, task, &["shell"], UTILITY_START_SECS) {
+        gs::io::println_fmt(ctx, format_args!("{}: could not be started", task));
+        return Err(ShellError::Unknown);
+    }
+    let noticed = core::cell::Cell::new(false);
+    match lookup_sink(ctx, task, &noticed, &|_| {}) {
+        Sink::Found(h) => {
+            let fed = gs::ipc::send_to(ctx, h, &Message::from_bytes(args.as_bytes())).is_ok()
+                && gs::ipc::send_to(ctx, h, &Message::from_bytes(&[PIPE_EOT])).is_ok();
+            gs::cap::remove(ctx, h);
+            if !fed {
+                gs::io::println_fmt(ctx, format_args!("{}: its arguments could not be sent - ended", task));
+                let _ = ctx.kill(task);
+                return Err(ShellError::Unknown);
+            }
+        }
+        _ => {
+            gs::io::println_fmt(ctx, format_args!("{}: never became ready - ended", task));
+            let _ = ctx.kill(task);
+            return Err(ShellError::Unknown);
+        }
+    }
+    // Until it has the console, so the prompt is not drawn under it. A second at most: an app takes the console as
+    // its first act, and one that has not by then is shown the prompt it would otherwise hide.
+    let mut waited = 0u64;
+    while waited < 1000 && ctx.is_console_foreground() && task_running(ctx, task) {
+        gs::task::sleep_ms(ctx, 20);
+        waited += 20;
+    }
+    Ok(())
 }
 
 /// Run the installed utility `task` with `args`, as `ask` runs: started by the supervisor wired to send to this

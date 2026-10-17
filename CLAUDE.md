@@ -1944,6 +1944,15 @@ Every syscall checks the calling task's capability table, populated at spawn tim
 > narrowing to the contract is what keeps a forged grant from reaching further. `IMAGE_SPAWN` stays the supervisor's
 > alone and undelegated; `godspeed-pm` asks over IPC (`supcmd::INSTALL`). No kernel change, no new syscall, and no
 > responsibility added: the supervisor already starts images and already decides with what.
+>
+> **Amendment 2026-10-17, later (apps): one thing beyond peers, the console, for an `app` and only with the
+> operator's answer.** An installed package of kind `app` is a utility that owns the screen and the keyboard while it
+> runs (`gs::app`, `docs/developer-services-design.md` 13.2, approved by the operator the same day). The supervisor
+> starts it with `SPAWN_FLAG_REQ_CONSOLE` - the console read capability `chaos` and the shell already hold - when its
+> grant names `console`, which `godspeed install` asks about by name, and refuses to start an app whose grant does
+> not. Still no privilege bit: the console is a spawn flag, and a service or a utility is never given it. The
+> residual is SEC-2's (6.4): a holder of the keyboard can read what is typed while it runs, which is exactly what the
+> operator was asked to approve. The kernel gives the console back when the app dies, so a crash cannot keep it.
 
 ### 14.2 Restart and Cap Rebinding (Possibly Cross-Core)
 

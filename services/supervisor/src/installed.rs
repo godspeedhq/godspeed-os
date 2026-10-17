@@ -25,7 +25,10 @@
 use godspeed::{self as gs, ServiceContext};
 use godspeed_package::{Arch, Kind};
 use godspeed::memory::Region;
-use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_REQ_RECV, SPAWN_FLAG_WATCHED};
+use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_REQ_CONSOLE, SPAWN_FLAG_REQ_RECV, SPAWN_FLAG_WATCHED};
+
+/// The word an app's grant uses for the console - the screen and the keyboard while it runs - beside its peers.
+pub const CONSOLE_GRANT: &str = "console";
 
 use crate::check::{self, Text, MAX_PEERS, PEER_MAX};
 
@@ -59,6 +62,8 @@ struct Entry {
     restarts: u32,
     /// A utility: checked at install and at boot, started only when the shell asks, never restarted.
     utility: bool,
+    /// ...and an app: a utility that owns the console while it runs.
+    app: bool,
 }
 
 impl Entry {
@@ -112,7 +117,7 @@ impl Installed {
     }
 
     /// `[OK, count, (len, name, state)*]` of what is installed - state 0 not running, 1 running, 2 a utility, run
-    /// when typed: for `godspeed list installed` and the shell's lookup of a typed command.
+    /// when typed, 3 an app, the same with the console: for `godspeed list installed` and the shell's lookup.
     pub fn answer(&self, ctx: &ServiceContext, out: &mut [u8]) -> usize {
         out[0] = gs_ok();
         let mut n = 2usize;
@@ -122,7 +127,7 @@ impl Installed {
             if n + 2 + name.len() > out.len() { break; }
             out[n] = name.len() as u8;
             out[n + 1..n + 1 + name.len()].copy_from_slice(name);
-            out[n + 1 + name.len()] = if x.utility { 2 } else { alive(ctx, x.name()) as u8 };
+            out[n + 1 + name.len()] = if x.app { 3 } else if x.utility { 2 } else { alive(ctx, x.name()) as u8 };
             n += 2 + name.len();
             count += 1;
         }
@@ -142,12 +147,12 @@ impl Installed {
         let restarts = self.e[slot].map_or(0, |x| x.restarts);
         if alive(ctx, pkg) {
             // A respawned supervisor finds what the last one started still running: adopt it, do not start a second.
-            let utility = self.e[slot].is_some_and(|x| x.utility);
-            self.remember(slot, pkg, version, restarts, utility);
+            let kind = self.e[slot].map_or((false, false), |x| (x.utility, x.app));
+            self.remember(slot, pkg, version, restarts, kind);
             return Ok(());
         }
-        let utility = self.run(ctx, publisher, name, pkg, version, None)?;
-        self.remember(slot, pkg, version, restarts, utility);
+        let kind = self.run(ctx, publisher, name, pkg, version, None)?;
+        self.remember(slot, pkg, version, restarts, kind);
         Ok(())
     }
 
@@ -164,17 +169,18 @@ impl Installed {
         self.run(ctx, publisher, name, e.name(), e.version(), Some(peers)).map(|_| ())
     }
 
-    fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32, utility: bool) {
-        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility };
+    fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32, (utility, app): (bool, bool)) {
+        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility, app };
         e.name[..pkg.len()].copy_from_slice(pkg.as_bytes());
         e.version[..version.len()].copy_from_slice(version.as_bytes());
         self.e[slot] = Some(e);
     }
 
-    /// Check the fetched copy, read its grant, and spawn it. True when it is a utility. A utility is spawned only
-    /// when `first` is given - the shell asking to run it, with its own peers first - and otherwise only checked.
+    /// Check the fetched copy, read its grant, and spawn it. Whether it is a utility, and an app. A utility (and an
+    /// app) is spawned only when `first` is given - the shell asking to run it, with its own peers first - and
+    /// otherwise only checked.
     fn run(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str,
-           first: Option<&[&str]>) -> Result<bool, Text> {
+           first: Option<&[&str]>) -> Result<(bool, bool), Text> {
         let arch = this_arch().ok_or_else(|| text(format_args!("this machine's architecture has no package spelling")))?;
         if self.image.is_none() {
             self.image = Some(Region::alloc(ctx, IMAGE_MAX)
@@ -200,16 +206,25 @@ impl Installed {
                 Err(e) => return Err(text(format_args!("its grant could not be read: {:?}", e))),
             }
         };
-        let utility = checked.kind == Kind::Utility;
+        let app = checked.kind == Kind::App;
+        let utility = checked.kind == Kind::Utility || app;
         if utility && first.is_none() {
-            ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - a utility, run when typed", pkg, version));
-            return Ok(true);
+            ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - {}, run when typed", pkg, version,
+                if app { "an app" } else { "a utility" }));
+            return Ok((utility, app));
         }
+        // The console: for an app, and only when the operator's answer gave it.
+        let mut console = false;
         let mut peers: [&str; MAX_PEERS + 1] = [""; MAX_PEERS + 1];
         let mut np = 0usize;
         // The shell first: a utility's output goes to its first peer (`gs::program::Output`).
         for p in first.unwrap_or(&[]) { if np < peers.len() { peers[np] = p; np += 1; } }
         for p in core::str::from_utf8(&grant[..gl]).unwrap_or("").lines().map(str::trim).filter(|p| !p.is_empty()) {
+            if p == CONSOLE_GRANT {
+                if !app { return Err(text(format_args!("its grant names the console, which only an app is given"))); }
+                console = true;
+                continue;
+            }
             if p == "supervisor" { return Err(text(format_args!("its grant names `supervisor`, which no package is given"))); }
             if !checked.contract.peers().any(|q| q == p) {
                 return Err(text(format_args!("its grant names `{}`, which its contract does not request", p)));
@@ -222,6 +237,11 @@ impl Installed {
         req.core = u32::MAX;
         // A utility always has an endpoint: its arguments arrive on it.
         req.flags = SPAWN_FLAG_WATCHED | if checked.contract.receives || utility { SPAWN_FLAG_REQ_RECV } else { 0 };
+        if app {
+            // An app without the console it was approved for cannot be what it is: refused, not run blind.
+            if !console { return Err(text(format_args!("it is an app, and its grant does not give it the console"))); }
+            req.flags |= SPAWN_FLAG_REQ_CONSOLE;
+        }
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
         req.privileges = 0;
         let mut out = [0u8; 128];
@@ -231,7 +251,7 @@ impl Installed {
                 if let Some(c) = cap { gs::cap::remove(ctx, c.into()); }
                 ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s), checked from disk)",
                     pkg, version, checked.size, np));
-                Ok(utility)
+                Ok((utility, app))
             }
             Err(e) => Err(text(format_args!("the kernel refused to start it: {:?}", e))),
         }

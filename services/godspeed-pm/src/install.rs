@@ -99,12 +99,19 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
         Err(why) => return r.fail("check", cell(format_args!("{}/{} {}", f.publisher(), f.name(), f.version())).as_str(), why.as_str()),
     };
     r.columns(&["peer", "gives", "note"]);
+    if checked.kind == godspeed_package::Kind::App {
+        r.entry(&[C::S("console"), C::S("the screen and the keyboard while it runs"), C::S("an app is given it by its kind")]);
+    }
     for p in checked.contract.peers() {
         r.entry(&[C::S(p), C::S("a send capability to it"), C::S(if p == "supervisor" { "never granted to a package" } else { "" })]);
     }
     // The kind rides in the note, so the shell's question says what installing it does: a service starts at
     // every boot, a utility becomes a command.
-    let kind = if checked.kind == godspeed_package::Kind::Utility { "a utility" } else { "a service" };
+    let kind = match checked.kind {
+        godspeed_package::Kind::Utility => "a utility",
+        godspeed_package::Kind::App => "an app",
+        _ => "a service",
+    };
     r.note(format_args!("{}/{} {} requests these; {}; the operator answers each", f.publisher(), f.name(), f.version(), kind));
 }
 
@@ -124,7 +131,8 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
     if grant != "none" {
         for p in grant.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             if p == "supervisor" { return r.fail("grant", p, "`supervisor` is never granted to a package"); }
-            if !checked.contract.peers().any(|q| q == p) { return r.fail("grant", p, "its contract does not request it"); }
+            let console = p == "console" && checked.kind == godspeed_package::Kind::App;
+            if !console && !checked.contract.peers().any(|q| q == p) { return r.fail("grant", p, "its contract does not request it"); }
             if granted[..ng].contains(&p) { continue; }
             if ng == MAX_PEERS { return r.fail("grant", grant, "more peers than a package is given"); }
             granted[ng] = p;
@@ -149,9 +157,11 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
     // Start it: a running older version first stops, so the one listed is the one that runs.
     let _ = supervisor(ctx, supcmd::UNINSTALL, pkg.as_str().as_bytes(), 10);
     let started = supervisor(ctx, supcmd::INSTALL, line.as_str().as_bytes(), START_SECS);
-    let utility = checked.kind == godspeed_package::Kind::Utility;
+    let app = checked.kind == godspeed_package::Kind::App;
+    let utility = checked.kind == godspeed_package::Kind::Utility || app;
     let short = f.name();
     let state = match started {
+        Ok(()) if app => cell(format_args!("an app: type `{} <arguments>` to run it; it has the screen until it ends", short)),
         Ok(()) if utility => cell(format_args!("a utility: type `{} <arguments>` to run it", short)),
         Ok(()) => cell(format_args!("running, as the task {}", pkg.as_str())),
         Err(why) => {
@@ -226,9 +236,11 @@ pub fn list(ctx: &ServiceContext, r: &mut Rows) {
         let mut it = l.split_whitespace();
         let (Some(pkg), Some(version)) = (it.next(), it.next()) else { continue };
         let short = cell(format_args!("utility: type `{}`", pkg.rsplit('/').next().unwrap_or(pkg)));
+        let app_short = cell(format_args!("app: type `{}`", pkg.rsplit('/').next().unwrap_or(pkg)));
         let state = match running(pkg) {
             Some(1) => "running",
             Some(2) => short.as_str(),
+            Some(3) => app_short.as_str(),
             Some(_) => "NOT running",
             None => "unknown: the supervisor did not answer",
         };

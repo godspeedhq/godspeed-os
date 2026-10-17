@@ -628,9 +628,11 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
         r.row("built for", built.as_str(), os_note.as_str());
         r.row("requests", req.as_str(), "what its contract asks for; fetching grants nothing");
         r.row("signed", short_key(&c.key).as_str(), key_status.as_str());
-        r.row("installed", "no", if m.kind == godspeed_package::Kind::Utility {
-            "a utility: `godspeed install` makes it a command, run when typed"
-        } else { "`godspeed install` starts it, and at every boot" });
+        r.row("installed", "no", match m.kind {
+            godspeed_package::Kind::Utility => "a utility: `godspeed install` makes it a command, run when typed",
+            godspeed_package::Kind::App => "an app: `godspeed install` makes it a command that has the screen while it runs",
+            _ => "`godspeed install` starts it, and at every boot",
+        });
         let _ = key;
         chain_note_through(r, &v, "", " -> index -> manifest -> signature -> contract -> binary");
         Ok(())
