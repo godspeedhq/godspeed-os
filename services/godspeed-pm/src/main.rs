@@ -129,16 +129,39 @@ pub(crate) struct Rows {
     /// The `status` row's note: what a list's rows do not say about themselves (that the registry's chain
     /// verified, or why a list is empty). The shell prints it under the table.
     note: Cell,
+    /// The columns are `item value note`, the shape every answer had and every failure still has.
+    triple: bool,
 }
+
+/// One cell of a [`Rows::entry`]: text, or a number a pipe can compare (`where size>1000000`).
+#[derive(Clone, Copy)]
+pub(crate) enum C<'a> { S(&'a str), N(u64) }
 
 impl Rows {
     fn new(cols: &[&str]) -> Rows {
-        Rows { t: Table::new(cols), failed: false, note: Cell::new() }
+        Rows { t: Table::new(cols), failed: false, note: Cell::new(), triple: true }
+    }
+
+    /// The answer's columns, for a command whose rows are not `item value note`: a LIST names what it lists
+    /// (`package version from size state`), and a CARD about one thing is `key value note`. Called before
+    /// any row. A failure afterwards still answers in `item value note` (see [`fail`](Rows::fail)).
+    pub(crate) fn columns(&mut self, cols: &[&str]) {
+        self.t = Table::new(cols);
+        self.triple = cols == ["item", "value", "note"];
     }
 
     pub(crate) fn row(&mut self, item: &str, value: &str, note: &str) {
-        let cells: [Value; 3] = [self.t.intern(item.as_bytes()), self.t.intern(value.as_bytes()), self.t.intern(note.as_bytes())];
-        self.t.add_row(&cells);
+        self.entry(&[C::S(item), C::S(value), C::S(note)]);
+    }
+
+    /// A row of up to eight cells, in the columns' order; the rest are empty.
+    pub(crate) fn entry(&mut self, cells: &[C<'_>]) {
+        let mut vals = [Value::Empty; 8];
+        for (i, c) in cells.iter().enumerate().take(8) {
+            vals[i] = match *c { C::S(s) => self.t.intern(s.as_bytes()), C::N(n) => Value::Int(n) };
+        }
+        let n = self.t.ncols();
+        self.t.add_row(&vals[..n]);
     }
 
     /// Set the status row's note.
@@ -146,7 +169,18 @@ impl Rows {
         self.note = cell(args);
     }
 
+    /// The command failed, and its rows, in the shape they already have, say why (a damaged copy in `verify`).
+    pub(crate) fn failed_in_place(&mut self) {
+        self.failed = true;
+    }
+
+    /// A failure, always as `item value note`: a list or a card that fails part way is not shown half made,
+    /// and the failure reads the same whatever the command was.
     pub(crate) fn fail(&mut self, item: &str, value: &str, note: &str) {
+        if !self.triple {
+            self.t = Table::new(&["item", "value", "note"]);
+            self.triple = true;
+        }
         self.row(item, value, note);
         self.failed = true;
     }
@@ -169,6 +203,23 @@ impl Rows {
         }
         let _ = gs::ipc::send_to(ctx, dst, &Message::from_bytes(&[EOT]));
     }
+}
+
+/// A progress frame for the shell, sent BEFORE the answer: `PROGRESS` and one line of text, which the shell
+/// draws in place on one line until the answer arrives. The shell reads frames only until the first byte of
+/// the answer, so nothing in an answer can be taken for one.
+pub(crate) const PROGRESS: &[u8; 8] = b"\x01GSPROG1";
+
+/// Send one progress line to the shell. A frame that cannot be sent changes nothing: progress is a courtesy,
+/// the answer is what counts.
+pub(crate) fn progress(ctx: &ServiceContext, args: core::fmt::Arguments<'_>) {
+    let Some(dst) = gs::ipc::peer_at(ctx, 0) else { return };
+    let mut b = [0u8; 8 + 160];
+    b[..8].copy_from_slice(PROGRESS);
+    let line = cell(args);
+    let n = line.n.min(160);
+    b[8..8 + n].copy_from_slice(&line.as_str().as_bytes()[..n]);
+    let _ = gs::ipc::send_to(ctx, dst, &Message::from_bytes(&b[..8 + n]));
 }
 
 struct BufSink { buf: [u8; 8 * 1024], len: usize }

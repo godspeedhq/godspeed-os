@@ -305,15 +305,18 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
 #[inline(never)]
 pub fn show(ctx: &ServiceContext, r: &mut crate::Rows, regs: &[Registry<'_>], using: &str) {
     let mut fs = gs::fs::Fs::new(ctx);
+    // A CARD per registry: `title` starts each, the shell indents the rest under it.
+    r.columns(&["key", "value", "note"]);
     for reg in regs {
         let dir = store_dir(reg);
         let at = |name: &str| { let mut p = dir; p.push(name); p };
-        let in_use = if reg.name == using { "in use; " } else { "" };
+        let in_use = if reg.name == using { "in use" } else { "" };
         let mut pin_buf = [0u8; 128];
         let pin = match fs.read_into(at("pin").as_str(), &mut pin_buf) {
             Ok(n) => core::str::from_utf8(&pin_buf[..n]).unwrap_or("").trim(),
             Err(_) => {
-                r.row(reg.name, "never reached", crate::cell(format_args!("{}its root is met at the next command that reaches it", in_use)).as_str());
+                r.row("title", reg.name, in_use);
+                r.row("state", "never reached", "its root is met at the next command that reaches it");
                 continue;
             }
         };
@@ -323,13 +326,17 @@ pub fn show(ctx: &ServiceContext, r: &mut crate::Rows, regs: &[Registry<'_>], us
         let seen_len = fs.read_into(at("seen").as_str(), &mut seen_buf).unwrap_or(0);
         let (ts, ns) = read_seen(core::str::from_utf8(&seen_buf[..seen_len]).unwrap_or(""));
         let root = core::str::from_utf8(&root_buf[..root_len]).ok().and_then(|t| Root::parse(t).ok());
-        let pin_note = if pin == reg.pin { "the pin in the configuration" } else { "NOT the pin now in the configuration - commands refuse it until `godspeed trust reset`" };
-        match root {
-            Some(root) => r.row(reg.name, crate::cell(format_args!("root {}, timestamp {}, namespaces {}", root.header.version,
-                ts.unwrap_or(0), ns.unwrap_or(0))).as_str(),
-                crate::cell(format_args!("{}root expires {}; reached under {}", in_use, root.header.expires, pin_note)).as_str()),
-            None => r.fail(reg.name, "unreadable", "this machine's record of it does not read: `godspeed trust reset` starts again"),
-        }
+        r.row("title", reg.name, in_use);
+        let Some(root) = root else {
+            r.fail(reg.name, "unreadable", "this machine's record of it does not read: `godspeed trust reset` starts again");
+            continue;
+        };
+        r.row("root", crate::cell(format_args!("{}", root.header.version)).as_str(),
+              crate::cell(format_args!("expires {}", root.header.expires)).as_str());
+        r.row("timestamp", crate::cell(format_args!("{}", ts.unwrap_or(0))).as_str(), "the newest accepted; an older one is refused");
+        r.row("namespaces", crate::cell(format_args!("{}", ns.unwrap_or(0))).as_str(), "the newest accepted; an older one is refused");
+        r.row("pin", pin, if pin == reg.pin { "the configuration's" }
+              else { "NOT the pin now in the configuration - commands refuse it until `godspeed trust reset`" });
         let mut ns_buf = [0u8; NAMESPACES_MAX];
         let ns_len = fs.read_into(at("namespaces.toml").as_str(), &mut ns_buf).unwrap_or(0);
         if let Some(n) = core::str::from_utf8(&ns_buf[..ns_len]).ok().and_then(|t| Namespaces::parse(t).ok()) {
@@ -339,8 +346,7 @@ pub fn show(ctx: &ServiceContext, r: &mut crate::Rows, regs: &[Registry<'_>], us
                     godspeed_package::trust::KeyStatus::Retired(at) => crate::cell(format_args!("retired {}", at)),
                     godspeed_package::trust::KeyStatus::Revoked(at) => crate::cell(format_args!("REVOKED {}", at)),
                 };
-                r.row(crate::cell(format_args!("{} {}/", reg.name, publisher)).as_str(),
-                      crate::cell(format_args!("{}", key)).as_str(), st.as_str());
+                r.row(crate::cell(format_args!("key {}/", publisher)).as_str(), crate::cell(format_args!("{}", key)).as_str(), st.as_str());
             }
         }
     }

@@ -14784,7 +14784,7 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
             }
             // `godspeed config | where note=file`: the reports as records. `config set` is refused before
             // here (`producer_refusal`): its value is its effect.
-            "godspeed" => match build_godspeed_table(ctx, arg) { Some(t) => t, None => return Err(ShellError::Unknown) },
+            "godspeed" => match build_godspeed_table(ctx, arg, None) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
             "audio" if arg.trim() == "hardware" => build_audio_hardware_table(ctx),
             "audio" => match build_audio_outputs_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -15250,7 +15250,7 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
         ask_know::Reading::One(ask_know::Kind::Network, _) => "ask-net",
         _ => "ask",
     };
-    let how = drain_service_with(ctx, row, ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep));
+    let how = drain_service_with(ctx, row, ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep), None);
     match how {
         // Already said on the console: "pipe: aborted" for a `q`, the spawn or feed failure otherwise.
         Drained::Failed | Drained::Aborted => return None,
@@ -15349,11 +15349,17 @@ const GODSPEED_WAIT_SECS: i64 = 120;
 /// `godspeed <command>` as a record table (`item`, `value`, `note`) whose last row is `status`. Like `ask`, a
 /// FOREGROUND PROGRAM: started for one command, its answer read, then ended. Its peers are its supervisor
 /// row's (`fs`, `net-stack`, `time`, and this shell), never passed from here.
-fn build_godspeed_table(ctx: &ShellCtx, arg: &str) -> Option<Table> {
+/// The marker that begins a progress frame from `godspeed-pm` (`services/godspeed-pm/src/main.rs`, `PROGRESS`).
+const PROGRESS_FRAME: &[u8] = b"\x01GSPROG1";
+
+fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>) -> Option<Table> {
     let line = arg.trim();
     let mut cap = Cap::new();
     let keep = |b: u8| ctx.keep_key(b);
-    match drain_service_with(ctx, "godspeed-pm", &[], Some(line.as_bytes()), &mut cap, GODSPEED_WAIT_SECS, Some(&keep)) {
+    // Piped, progress is not drawn, but its frames are still taken out of the answer.
+    let quiet = |_: &[u8]| {};
+    let progress: &dyn Fn(&[u8]) = show.unwrap_or(&quiet);
+    match drain_service_with(ctx, "godspeed-pm", &[], Some(line.as_bytes()), &mut cap, GODSPEED_WAIT_SECS, Some(&keep), Some(progress)) {
         Drained::Failed | Drained::Aborted => return None,
         Drained::Eot | Drained::Overflow | Drained::NoEot => {}
     }
@@ -15442,24 +15448,31 @@ fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
     }
-    let mut t = match build_godspeed_table(ctx, line) { Some(t) => t, None => return Err(ShellError::Unknown) };
+    // PROGRESS, drawn in place on one line until the answer comes, then cleared.
+    let drawn = core::cell::Cell::new(false);
+    let show = |line: &[u8]| {
+        gs::io::print(ctx, "\r\x1b[2K");
+        gs::io::print(ctx, core::str::from_utf8(line).unwrap_or(""));
+        drawn.set(true);
+        // The line offers `q` itself, so the watch does not print a second notice under it.
+        if line.windows(8).any(|w| w == b"[q] quit") { ctx.quit_shown(); }
+    };
+    let built = build_godspeed_table(ctx, line, Some(&show));
+    if drawn.get() { gs::io::print(ctx, "\r\x1b[2K"); }
+    let mut t = match built { Some(t) => t, None => return Err(ShellError::Unknown) };
     let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
     let answered = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status");
     // The status row's note is what a list's rows do not say about themselves (the chain it was verified
-    // by, or why it is empty), so it is printed under the table rather than dropped with the row.
+    // by, a count, why it is empty), so it is printed under the answer rather than dropped with the row.
     let mut note = String8L::new();
     if let Some(r) = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status") {
         note.set(t.cell_bytes(r, 2));
     }
-    t.filter("item", "!=", "status");
-    let mut o = Out::Console;
-    if t.nrows() == 0 && !failed {
-        gs::io::println(ctx, "0 packages");
-    } else {
-        t.to_grid(&mut OutSink { ctx, out: &mut o });
-    }
+    let first = String8L::from(t.col_name(0));
+    t.filter(core::str::from_utf8(first.as_bytes()).unwrap_or("item"), "!=", "status");
+    godspeed_render(ctx, &t, failed);
     if note.n > 0 && note.as_bytes() != b"-" {
-        gs::io::println(ctx, core::str::from_utf8(note.as_bytes()).unwrap_or(""));
+        gs::io::println_fmt(ctx, format_args!("  {}", core::str::from_utf8(note.as_bytes()).unwrap_or("")));
     }
     if !answered {
         gs::io::println(ctx, "godspeed: the answer had no status - treat it as incomplete");
@@ -15468,10 +15481,118 @@ fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if failed { Err(ShellError::Unknown) } else { Ok(()) }
 }
 
+/// How `godspeed` answers look on the console, in the style `dir` set: two spaces in, upper-case headers, a
+/// footer line. A `key value note` answer is a CARD about one thing (`info`, `fetch`, `trust`): a `title` row
+/// heads each, `about` is a line of its own, and the rest are aligned under it. Anything else is a LIST: a
+/// header and one line a row, a `size` column in readable units. An empty list says `0 packages`. Piped, the
+/// same answer is records, unchanged.
+fn godspeed_render(ctx: &ShellCtx, t: &Table, failed: bool) {
+    let nc = t.ncols();
+    let is_card = nc == 3 && t.col_name(0) == b"key" && t.col_name(1) == b"value" && t.col_name(2) == b"note";
+    let text = |r: usize, c: usize| core::str::from_utf8(t.cell_bytes(r, c)).unwrap_or("?");
+    if t.nrows() == 0 && !failed {
+        gs::io::println(ctx, "  0 packages");
+        return;
+    }
+    if is_card {
+        let (mut kw, mut vw) = (0usize, 0usize);
+        for r in 0..t.nrows() {
+            let k = text(r, 0);
+            if k != "title" && k != "about" { kw = kw.max(k.len()); vw = vw.max(text(r, 1).chars().count().min(44)); }
+        }
+        for r in 0..t.nrows() {
+            let (k, v, n) = (text(r, 0), text(r, 1), text(r, 2));
+            match k {
+                "title" => {
+                    if r > 0 { gs::io::println(ctx, ""); }
+                    if n.is_empty() { gs::io::println_fmt(ctx, format_args!("  {}", v)); }
+                    else { gs::io::println_fmt(ctx, format_args!("  {}   ({})", v, n)); }
+                }
+                "about" => {
+                    if n.is_empty() { gs::io::println_fmt(ctx, format_args!("  {}", v)); }
+                    else { gs::io::println_fmt(ctx, format_args!("  {}   {}", v, n)); }
+                    gs::io::println(ctx, "");
+                }
+                _ => {
+                    let pad_v = vw.saturating_sub(v.chars().count());
+                    gs::io::print_fmt(ctx, format_args!("    {:<kw$}  {}", k, v, kw = kw));
+                    if n.is_empty() { gs::io::println(ctx, ""); }
+                    else { gs::io::println_fmt(ctx, format_args!("{:pad$}  {}", "", n, pad = pad_v)); }
+                }
+            }
+        }
+        return;
+    }
+    // A LIST.
+    let size_col = (0..nc).find(|&c| t.col_name(c) == b"size");
+    let cellv = |r: usize, c: usize| -> String8L {
+        if Some(c) == size_col {
+            if let Some(n) = t.cell_int(r, c) {
+                let mut s = String8L::new();
+                let k = if n < 1024 { format_args_to(&mut s, format_args!("{} B", n)) }
+                    else if n < 1024 * 1024 { format_args_to(&mut s, format_args!("{}.{} KiB", n / 1024, n % 1024 * 10 / 1024)) }
+                    else { format_args_to(&mut s, format_args!("{}.{} MiB", n >> 20, (n & 0xfffff) * 10 >> 20)) };
+                let _ = k;
+                return s;
+            }
+        }
+        if let Some(n) = t.cell_int(r, c) {
+            let mut s = String8L::new();
+            format_args_to(&mut s, format_args!("{}", n));
+            return s;
+        }
+        String8L::from(t.cell_bytes(r, c))
+    };
+    let mut w = [0usize; 8];
+    for c in 0..nc { w[c] = t.col_name(c).len(); }
+    for r in 0..t.nrows() {
+        for c in 0..nc { w[c] = w[c].max(core::str::from_utf8(cellv(r, c).as_bytes()).unwrap_or("").chars().count()); }
+    }
+    gs::io::print(ctx, " ");
+    for c in 0..nc {
+        let mut up = [0u8; 24];
+        let name = t.col_name(c);
+        for (i, b) in name.iter().enumerate().take(24) { up[i] = b.to_ascii_uppercase(); }
+        let h = core::str::from_utf8(&up[..name.len().min(24)]).unwrap_or("");
+        if c + 1 == nc { gs::io::print_fmt(ctx, format_args!(" {}", h)); }
+        else { gs::io::print_fmt(ctx, format_args!(" {:<w$} ", h, w = w[c])); }
+    }
+    gs::io::println(ctx, "");
+    for r in 0..t.nrows() {
+        gs::io::print(ctx, " ");
+        for c in 0..nc {
+            let v = cellv(r, c);
+            let s = core::str::from_utf8(v.as_bytes()).unwrap_or("");
+            if c + 1 == nc { gs::io::print_fmt(ctx, format_args!(" {}", s)); }
+            else { gs::io::print_fmt(ctx, format_args!(" {:<w$} ", s, w = w[c])); }
+        }
+        gs::io::println(ctx, "");
+    }
+    if t.overflow() {
+        gs::io::println(ctx, "  (the answer was cut: more than one answer holds)");
+    }
+}
+
+/// Format into a [`String8L`], cut at its size.
+fn format_args_to(s: &mut String8L, args: core::fmt::Arguments<'_>) {
+    struct W<'a>(&'a mut String8L);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, x: &str) -> core::fmt::Result {
+            let room = self.0.b.len() - self.0.n;
+            let take = x.len().min(room);
+            self.0.b[self.0.n..self.0.n + take].copy_from_slice(&x.as_bytes()[..take]);
+            self.0.n += take;
+            Ok(())
+        }
+    }
+    let _ = core::fmt::write(&mut W(s), args);
+}
+
 /// A fixed-size copy of a cell up to a line long, for the status note `cmd_godspeed` prints under its table.
 struct String8L { b: [u8; 240], n: usize }
 impl String8L {
     fn new() -> String8L { String8L { b: [0; 240], n: 0 } }
+    fn from(s: &[u8]) -> String8L { let mut x = String8L::new(); x.set(s); x }
     fn set(&mut self, s: &[u8]) { let n = s.len().min(self.b.len()); self.b[..n].copy_from_slice(&s[..n]); self.n = n; }
     fn as_bytes(&self) -> &[u8] { &self.b[..self.n] }
 }
@@ -18166,7 +18287,7 @@ const MAX_STAGES: usize = 8;
 /// shell's endpoint until the service sends an EOT (0x04), then the service is reaped. Whole-
 /// buffer messaging (≤ one message each way) keeps the bounded queues deadlock-free (§8.9).
 fn drain_service(ctx: &ShellCtx, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
-    !matches!(drain_service_with(ctx, svc, &["shell"], input, out, FILTER_WAIT_SECS, None), Drained::Failed)
+    !matches!(drain_service_with(ctx, svc, &["shell"], input, out, FILTER_WAIT_SECS, None, None), Drained::Failed)
 }
 
 /// How a [`drain_service_with`] ended. Each way but `Eot` has already been said on the console; the
@@ -18193,7 +18314,7 @@ enum Drained {
 /// while the stage runs reaches the prompt instead of vanishing. `None` keeps a plain pipe stage's
 /// behaviour, which still drops type-ahead (recorded, `backlog/fixed/80` H16's receive side).
 fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
-                      wait_secs: i64, keep: Option<&dyn Fn(u8)>) -> Drained {
+                      wait_secs: i64, keep: Option<&dyn Fn(u8)>, progress: Option<&dyn Fn(&[u8])>) -> Drained {
     // A stage crossing a service boundary is one IPC message until streaming chunks across
     // many. Refuse a larger buffer LOUDLY rather than silently clipping it to 4 KiB (§3.12).
     if let Some(inp) = input {
@@ -18264,12 +18385,23 @@ fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&
     // Aborted => the user pressed q. Both stop the drain loudly (§26.7) rather than blocking.
     // A stage that sends 512 messages and no EOT ends as `NoEot` too: the shell stopped it.
     let mut how = Drained::NoEot;
+    // PROGRESS FRAMES come first, if the stage sends any (`godspeed fetch`): each is `PROGRESS_FRAME` and a
+    // line, handed to `progress`. They are read only until the answer's first byte, so nothing in an answer
+    // can be taken for one.
+    let mut answering = progress.is_none();
     for _ in 0..512 {
         let got = recv_quittable(ctx, wait_secs, &noticed, keep.unwrap_or(&|_| {}));
         match got {
             ReqOutcome::Reply(msg) => {
                 let p = msg.payload_bytes();
                 if p == [PIPE_EOT] { how = Drained::Eot; break; }
+                if !answering {
+                    if let (Some(show), Some(line)) = (progress, p.strip_prefix(PROGRESS_FRAME)) {
+                        show(line);
+                        continue;
+                    }
+                    answering = true;
+                }
                 out.push(p);
                 if out.overflow { how = Drained::Overflow; break; }
             }

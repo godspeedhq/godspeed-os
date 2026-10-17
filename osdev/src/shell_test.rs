@@ -8417,10 +8417,10 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let none = run!(b"godspeed search zzzz\r", 180);
         check!(none.contains("0 packages") && none.contains("verified: root"), "a word nothing matches is an empty list, not a failure, with the chain it was checked by");
         let info = run!(b"godspeed info godspeed/hello\r", 180);
-        check!(info.contains("0.1.0") && info.contains("the latest") && info.contains("bankole"),
-               "`godspeed info` lists the versions from the verified index, by whom, and the latest");
-        check!(info.contains("description") && info.contains("The service template") && info.contains("GPL-2.0-only"),
-               "`godspeed info` gives the manifest's description and licence");
+        check!(info.contains("godspeed/hello 0.1.0") && info.contains("latest; published") && info.contains("bankole"),
+               "`godspeed info` is a card headed by the release: the latest, when and by whom");
+        check!(info.contains("The service template") && info.contains("licence") && info.contains("GPL-2.0-only") && !info.contains("ITEM"),
+               "the card gives the manifest's description and licence, and is not a three-column table");
         check!(info.contains("built for") && info.contains("0.28.0") && info.contains("ships") && info.contains("this machine's, x86_64, is one"),
                "and the release it was built for, the architectures it ships and whether this machine's is one");
         check!(info.contains("requests") && info.contains("log_write") && info.contains("an active key of the publisher's"),
@@ -8435,7 +8435,11 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
                "it keeps this machine's binary, checked against the manifest");
         check!(fetched.contains("an active key of the publisher's"), "the manifest's signature is by a key the signed namespaces vouch for");
         check!(fetched.contains("log_write"), "it says what the contract requests");
-        check!(fetched.contains("installed") && fetched.contains("fetched, not running"), "and that it is fetched, not installed");
+        check!(fetched.contains("installed") && fetched.contains("not installed") && fetched.contains("cannot start a program from disk yet"),
+               "and that it is fetched, not installed");
+        check!(fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
+               "`godspeed fetch` draws a progress bar while the binary downloads");
+        check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
         let kept = run!(b"dir /system/packages/godspeed/hello/0.1.0\r", 60);
         check!(kept.contains("x86_64.elf") && kept.contains("manifest.toml") && kept.contains("manifest.sig")
                && kept.contains("contract.toml") && kept.contains("origin") && !kept.contains("aarch64.elf"),
@@ -8443,22 +8447,26 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let twice = run!(b"godspeed fetch godspeed/hello@0.1.0\r", 240);
         check!(twice.contains("already fetched"), "fetching a fetched version again leaves it as it is");
         let listed = run!(b"godspeed list fetched\r", 60);
-        check!(listed.contains("godspeed/hello@0.1.0") && listed.contains("from default"), "`godspeed list fetched` shows it and its registry");
-        check!(listed.contains("KiB") && listed.contains("1 fetched"), "with its size, and the total under the list");
+        check!(listed.contains("PACKAGE") && listed.contains("VERSION") && listed.contains("FROM") && listed.contains("SIZE"),
+               "`godspeed list fetched` is a list with real columns");
+        check!(listed.contains("godspeed/hello") && listed.contains("0.1.0") && listed.contains("default"), "it shows the package, its version and registry");
+        check!(listed.contains("KiB") && listed.contains("1 package,"), "with its size, and the count and total under the list");
         let verified = run!(b"godspeed verify\r", 120);
         check!(verified.contains("intact") && verified.contains("1 checked, 0 damaged"), "`godspeed verify` checks the fetched copy from the disk: intact");
         let updates = run!(b"godspeed list updates\r", 180);
         check!(updates.contains("godspeed/hello") && updates.contains("up to date on default"), "`godspeed list updates` asks the registry it came from");
         let trust = run!(b"godspeed trust\r", 60);
-        check!(trust.contains("root 1") && trust.contains("the pin in the configuration") && trust.contains("default godspeed/")
-               && trust.contains("active"), "`godspeed trust` shows the root, the pin, and the publishers' keys, from this machine's record");
+        check!(trust.contains("root") && trust.contains("expires 2028") && trust.contains("the configuration's") && trust.contains("key godspeed/")
+               && trust.contains("active"), "`godspeed trust` is a card: the root, the pin, and the publishers' keys, from this machine's record");
         let installed = run!(b"godspeed list installed\r", 60);
         check!(installed.contains("0 packages") && installed.contains("nothing can be installed on this machine yet"),
                "`godspeed list installed` is an empty list with the reason, not a refusal");
         let piped = run!(b"godspeed search | where item=package | count\r", 60);
         check!(piped.contains("a word is needed") || piped.lines().any(|l| l.trim() == "0"), "a bare search refuses in a pipe too");
-        let piped = run!(b"godspeed list available | where item=package | count\r", 180);
-        check!(piped.lines().any(|l| l.trim() == "1") && !piped.contains("where:"), "`godspeed list available` pipes as records: one package row");
+        let piped = run!(b"godspeed list available | where package=godspeed/hello | count\r", 180);
+        check!(piped.lines().any(|l| l.trim() == "1") && !piped.contains("where:"), "`godspeed list available` pipes as records with a package column");
+        let sized = run!(b"godspeed list fetched | where size>1000 | count\r", 60);
+        check!(sized.lines().any(|l| l.trim() == "1") && !sized.contains("where:"), "`size` is a number a pipe can compare");
         let refused = run!(b"godspeed fetch godspeed/hello | count\r", 30);
         check!(refused.contains("are actions, not reports"), "`godspeed fetch` refuses to start a pipe");
         let missing = run!(b"godspeed fetch godspeed/hello@9.9.9\r", 240);
