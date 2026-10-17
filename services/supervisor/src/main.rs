@@ -164,7 +164,17 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                 // restarting a service that already died is exactly the case the harness drives.
                 // SPAWN does not kill - starting something already running must fail, not replace it.
                 if restart { let _ = ctx.kill(name); }
-                let ok = if let Some(r) = probes::row(name) {
+                let ok = if inst.is_utility(name) {
+                    // An INSTALLED UTILITY, which the shell runs for one command line: checked from the disk and
+                    // started now, wired to the shell (`installed.rs`).
+                    match inst.run_utility(ctx, name, &peers[..np]) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            ctx.log_fmt(format_args!("supervisor: installed {} NOT run: {}", name, why.as_str()));
+                            false
+                        }
+                    }
+                } else if let Some(r) = probes::row(name) {
                     // A TEST PROBE, asked for by a probe respawning its own victim. Its parameters
                     // come from the shared table here rather than off the wire - the caller sends a
                     // name, not a configuration, so a probe cannot ask to be something it is not.

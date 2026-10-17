@@ -8490,9 +8490,11 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let rm = run!(b"godspeed remove godspeed/hello\r", 60);
         check!(rm.contains("`godspeed uninstall` it first"), "an installed copy is not removed");
         let k = run!(b"kill godspeed/hello\r", 60);
-        check!(k.contains("installed godspeed/hello died") && k.contains("restarting (1 of 5)"),
-               "an installed package that dies is restarted from the disk, counted");
         let li2 = run!(b"godspeed list installed\r", 60);
+        // The supervisor's line lands once the prompt is back, so it is in either answer's window.
+        let both = format!("{}{}", k, li2);
+        check!(both.contains("installed godspeed/hello died") && both.contains("restarting (1 of 5)"),
+               "an installed package that dies is restarted from the disk, counted");
         check!(li2.contains("running") && !li2.contains("NOT running"), "and is running again");
         let un = run!(b"godspeed uninstall godspeed/hello yes\r", 60);
         check!(un.contains("[y/N]: yes (given on the command line)") && un.contains("uninstalled") && un.contains("stopped"),
@@ -8502,6 +8504,35 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(li3.contains("0 packages"), "and it is no longer listed");
         let un2 = run!(b"godspeed uninstall godspeed/hello yes\r", 60);
         check!(un2.contains("not installed here"), "uninstalling what is not installed says so");
+
+        // A UTILITY: installed, run by its name for one command line, its output shown and piped, its status said.
+        let uf = run!(b"godspeed fetch godspeed/hello-utility\r", 240);
+        check!(uf.contains("godspeed/hello-utility 0.1.0") && uf.contains("fetched"), "`godspeed fetch` fetches a utility package");
+        let ui = run!(b"godspeed install godspeed/hello-utility yes\r", 180);
+        check!(ui.contains("godspeed/hello-utility 0.1.0 asks for nothing") && ui.contains("a utility: type `hello-utility"),
+               "installing a utility asks once and says how to run it");
+        check!(ui.contains("checked from disk - a utility, run when typed") && !ui.contains("hello-utility' spawned OK"),
+               "the supervisor checks a utility at install and does not start it");
+        let ul = run!(b"godspeed list installed\r", 60);
+        check!(ul.contains("godspeed/hello-utility") && ul.contains("utility: type `hello-utility`"), "`godspeed list installed` says it is a utility");
+        let ur = run!(b"hello-utility Ada\r", 60);
+        check!(ur.contains("hello, Ada"), "typing an installed utility's name runs it with its arguments");
+        check!(!ur.contains("did not end by itself"), "it ends by itself, not because the shell ended it");
+        let ub = run!(b"hello-utility\r", 60);
+        check!(ub.contains("hello, world"), "with no arguments it is handed an empty line");
+        // The supervisor's line can land after the prompt, so it is looked for in either window.
+        let both = format!("{}{}", ur, ub);
+        check!(both.contains("installed godspeed/hello-utility ended - exited with status 0 - not restarted"),
+               "it ends itself with status 0, and a utility is not restarted");
+        let up = run!(b"hello-utility Ada | match Ada | count\r", 60);
+        check!(up.lines().any(|l| l.trim() == "1") && !up.contains("not a pipe source"), "an installed utility starts a pipe");
+        let uq = run!(b"godspeed/hello-utility Grace\r", 60);
+        check!(uq.contains("hello, Grace"), "it runs by its package name too");
+        let uu = run!(b"godspeed uninstall godspeed/hello-utility yes\r", 60);
+        check!(uu.contains("uninstalled"), "`godspeed uninstall` removes a utility");
+        let ug = run!(b"hello-utility Ada\r", 60);
+        check!(ug.contains("unknown: hello-utility"), "and its name is no longer a command");
+        let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
 
         // A CHANGED PIN is trusting another registry: refused until the operator clears what this machine kept.
         let _ = run!(b"write /system/services/godspeed/trust/default/pin sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);

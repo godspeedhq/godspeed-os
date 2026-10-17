@@ -1098,3 +1098,21 @@ signed, and the grant is narrowed to what the signed contract requests - but a w
 record or widen a grant up to that. The supervisor cannot tell an operator's answer from a forged one; it can only
 refuse anything beyond what the publisher signed. Also unchecked offline: whether the registry has since revoked the
 key - `godspeed list updates` and every fetch refresh the record, and a revoked key is refused once it is there.
+
+### 12.4 Utilities (built 2026-10-17)
+
+Option B of 9.3, as the operator chose: `Exit(status)` (syscall 57, CLAUDE.md 14.5 amendment) ends the caller
+by the self-kill path, and the death notice says `E` and the status. `gs::program` is what a utility is written
+on: `args` (the command line, the first message on its endpoint), `Output` (a `fmt::Write` sent to the shell a
+message at a time) and `finish(status)` (the end byte, then `Exit`). The package format gained the kind
+`utility` (the CLI crate, format 1), and the CLI a `utility` template.
+
+- **Install** checks a utility and records it, and starts nothing; boot does the same.
+- **Running it**: an unknown command, or a pipe's first stage, that names an installed utility is started
+  through the supervisor's SPAWN, which checks the copy from the disk and spawns it with the shell first and
+  its grant after. The shell feeds it its arguments, drains it as any stage, gives it a second to end itself,
+  and reads how it ended from the supervisor's death record (`supcmd::DEATH`, which keeps 32 bytes of a name
+  now, not 16, so `publisher/name`s do not collide).
+- **Never restarted**, whether it exited or was killed; one at a time.
+- `godspeed/hello-utility` is the first, published 2026-10-17. The registry was redeployed with the crate that
+  knows the kind, with the operator's approval.

@@ -685,6 +685,7 @@ fn list_updates(ctx: &ServiceContext, r: &mut Rows) {
 }
 
 /// `godspeed trust`: what this machine has accepted from every registry it knows.
+#[inline(never)]
 fn trust_show(ctx: &ServiceContext, r: &mut Rows) {
     let mut buf = [0u8; config::FILE_MAX];
     let n = match load(ctx, r, &mut buf) {
@@ -699,6 +700,7 @@ fn trust_show(ctx: &ServiceContext, r: &mut Rows) {
 }
 
 /// `godspeed trust reset <registry>`. The shell asked `[y/N]` first.
+#[inline(never)]
 fn trust_reset(ctx: &ServiceContext, r: &mut Rows, name: &str) {
     let mut buf = [0u8; config::FILE_MAX];
     let n = match load(ctx, r, &mut buf) {

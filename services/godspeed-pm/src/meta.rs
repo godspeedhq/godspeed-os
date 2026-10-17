@@ -197,6 +197,7 @@ pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, 
                 (In::Package, "version") => ver = Some(version(n, v)?),
                 (In::Package, "kind") => kind = Some(match plain(n, v)? {
                     "service" => Kind::Service,
+                    "utility" => Kind::Utility,
                     _ => return Err(bad(n, "a package kind this machine does not know")),
                 }),
                 (In::Package, "description") => desc = Some(match v { Val::Str(s) | Val::Escaped(s) => s, Val::Int(_) | Val::Bool(_) | Val::Strings(_) => return Err(bad(n, "a number or array where a string belongs")) }),

@@ -23,7 +23,7 @@
 //! what the publisher signed; it cannot tell an operator's answer from a forged one.
 
 use godspeed::{self as gs, ServiceContext};
-use godspeed_package::Arch;
+use godspeed_package::{Arch, Kind};
 use godspeed::memory::Region;
 use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_REQ_RECV, SPAWN_FLAG_WATCHED};
 
@@ -57,6 +57,8 @@ struct Entry {
     version: [u8; 24],
     vl: usize,
     restarts: u32,
+    /// A utility: checked at install and at boot, started only when the shell asks, never restarted.
+    utility: bool,
 }
 
 impl Entry {
@@ -104,7 +106,13 @@ impl Installed {
     /// Is `task` an installed package's? Its death is this module's to answer.
     pub fn has(&self, task: &str) -> bool { self.find(task).is_some() }
 
-    /// `[OK, count, (len, name)*]` of what is installed and whether each is running: for `godspeed list installed`.
+    /// Is `task` an installed UTILITY - one the shell may ask to run (`supcmd::SPAWN`)?
+    pub fn is_utility(&self, task: &str) -> bool {
+        self.find(task).and_then(|i| self.e[i]).is_some_and(|e| e.utility)
+    }
+
+    /// `[OK, count, (len, name, state)*]` of what is installed - state 0 not running, 1 running, 2 a utility, run
+    /// when typed: for `godspeed list installed` and the shell's lookup of a typed command.
     pub fn answer(&self, ctx: &ServiceContext, out: &mut [u8]) -> usize {
         out[0] = gs_ok();
         let mut n = 2usize;
@@ -114,7 +122,7 @@ impl Installed {
             if n + 2 + name.len() > out.len() { break; }
             out[n] = name.len() as u8;
             out[n + 1..n + 1 + name.len()].copy_from_slice(name);
-            out[n + 1 + name.len()] = alive(ctx, x.name()) as u8;
+            out[n + 1 + name.len()] = if x.utility { 2 } else { alive(ctx, x.name()) as u8 };
             n += 2 + name.len();
             count += 1;
         }
@@ -131,25 +139,42 @@ impl Installed {
             None => self.e.iter().position(|x| x.is_none())
                 .ok_or_else(|| text(format_args!("{} packages are installed already, the most this machine runs", MAX_INSTALLED)))?,
         };
+        let restarts = self.e[slot].map_or(0, |x| x.restarts);
         if alive(ctx, pkg) {
             // A respawned supervisor finds what the last one started still running: adopt it, do not start a second.
-            self.remember(slot, pkg, version, self.e[slot].map_or(0, |x| x.restarts));
+            let utility = self.e[slot].is_some_and(|x| x.utility);
+            self.remember(slot, pkg, version, restarts, utility);
             return Ok(());
         }
-        self.run(ctx, publisher, name, pkg, version)?;
-        self.remember(slot, pkg, version, self.e[slot].map_or(0, |x| x.restarts));
+        let utility = self.run(ctx, publisher, name, pkg, version, None)?;
+        self.remember(slot, pkg, version, restarts, utility);
         Ok(())
     }
 
-    fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32) {
-        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts };
+    /// Run the installed utility `task`, for the shell: `peers` are the shell's own (it reads the output), and
+    /// its grant adds the rest. One at a time: a utility still running is refused rather than started twice.
+    pub fn run_utility(&mut self, ctx: &ServiceContext, task: &str, peers: &[&str]) -> Result<(), Text> {
+        let Some(e) = self.find(task).and_then(|i| self.e[i]) else { return Err(text(format_args!("`{}` is not installed", task))) };
+        if !e.utility { return Err(text(format_args!("`{}` is a service, started at boot - not run on demand", task))); }
+        if peers.iter().any(|p| *p != "shell") {
+            return Err(text(format_args!("a utility is started for the shell, with the shell as its peer and nothing else asked")));
+        }
+        if alive(ctx, task) { return Err(text(format_args!("`{}` is already running", task))); }
+        let Some((publisher, name)) = split(e.name()) else { return Err(text(format_args!("`{}` is not a package name", task))) };
+        self.run(ctx, publisher, name, e.name(), e.version(), Some(peers)).map(|_| ())
+    }
+
+    fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32, utility: bool) {
+        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility };
         e.name[..pkg.len()].copy_from_slice(pkg.as_bytes());
         e.version[..version.len()].copy_from_slice(version.as_bytes());
         self.e[slot] = Some(e);
     }
 
-    /// Check the fetched copy, read its grant, and spawn it.
-    fn run(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str) -> Result<(), Text> {
+    /// Check the fetched copy, read its grant, and spawn it. True when it is a utility. A utility is spawned only
+    /// when `first` is given - the shell asking to run it, with its own peers first - and otherwise only checked.
+    fn run(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str,
+           first: Option<&[&str]>) -> Result<bool, Text> {
         let arch = this_arch().ok_or_else(|| text(format_args!("this machine's architecture has no package spelling")))?;
         if self.image.is_none() {
             self.image = Some(Region::alloc(ctx, IMAGE_MAX)
@@ -175,20 +200,28 @@ impl Installed {
                 Err(e) => return Err(text(format_args!("its grant could not be read: {:?}", e))),
             }
         };
-        let mut peers: [&str; MAX_PEERS] = [""; MAX_PEERS];
+        let utility = checked.kind == Kind::Utility;
+        if utility && first.is_none() {
+            ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - a utility, run when typed", pkg, version));
+            return Ok(true);
+        }
+        let mut peers: [&str; MAX_PEERS + 1] = [""; MAX_PEERS + 1];
         let mut np = 0usize;
+        // The shell first: a utility's output goes to its first peer (`gs::program::Output`).
+        for p in first.unwrap_or(&[]) { if np < peers.len() { peers[np] = p; np += 1; } }
         for p in core::str::from_utf8(&grant[..gl]).unwrap_or("").lines().map(str::trim).filter(|p| !p.is_empty()) {
             if p == "supervisor" { return Err(text(format_args!("its grant names `supervisor`, which no package is given"))); }
             if !checked.contract.peers().any(|q| q == p) {
                 return Err(text(format_args!("its grant names `{}`, which its contract does not request", p)));
             }
-            if np < MAX_PEERS && p.len() <= PEER_MAX { peers[np] = p; np += 1; }
+            if np < peers.len() && p.len() <= PEER_MAX && !peers[..np].contains(&p) { peers[np] = p; np += 1; }
         }
 
         let region = self.image.as_ref().ok_or_else(|| text(format_args!("no memory to hold an image")))?;
         let mut req = SpawnRequest::new(&region.bytes()[..checked.size as usize], pkg);
         req.core = u32::MAX;
-        req.flags = SPAWN_FLAG_WATCHED | if checked.contract.receives { SPAWN_FLAG_REQ_RECV } else { 0 };
+        // A utility always has an endpoint: its arguments arrive on it.
+        req.flags = SPAWN_FLAG_WATCHED | if checked.contract.receives || utility { SPAWN_FLAG_REQ_RECV } else { 0 };
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
         req.privileges = 0;
         let mut out = [0u8; 128];
@@ -198,7 +231,7 @@ impl Installed {
                 if let Some(c) = cap { gs::cap::remove(ctx, c.into()); }
                 ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s), checked from disk)",
                     pkg, version, checked.size, np));
-                Ok(())
+                Ok(utility)
             }
             Err(e) => Err(text(format_args!("the kernel refused to start it: {:?}", e))),
         }
@@ -220,7 +253,8 @@ impl Installed {
         let Some(i) = self.find(task) else { return };
         let Some(mut e) = self.e[i] else { return };
         if alive(ctx, task) { return; }
-        if exited {
+        if exited || e.utility {
+            // Finished (it said so), or a utility, which runs for one command and is never kept running.
             ctx.log_fmt(format_args!("supervisor: installed {} ended{} - not restarted", task, how));
             return;
         }
@@ -233,7 +267,7 @@ impl Installed {
         self.e[i] = Some(e);
         ctx.log_fmt(format_args!("supervisor: installed {} died{}, restarting ({} of {})", task, how, e.restarts, RESTARTS_MAX));
         let Some((publisher, name)) = split(e.name()) else { return };
-        if let Err(why) = self.run(ctx, publisher, name, e.name(), e.version()) {
+        if let Err(why) = self.run(ctx, publisher, name, e.name(), e.version(), None) {
             ctx.log_fmt(format_args!("supervisor: installed {} restart FAILED: {}", task, why.as_str()));
         }
     }

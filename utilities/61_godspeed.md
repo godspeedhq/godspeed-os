@@ -16,7 +16,8 @@ info, fetch, list and remove**, every answer verified on this machine against th
 metadata by the shared package crate's own checks (the CLI repository's `godspeed-package`). And (the same day)
 **install, upgrade and uninstall** for a SERVICE: the supervisor checks the fetched copy from the disk again and
 starts it, now and at every boot, with the send peers the operator approved and no privilege (section 4b; design 12).
-A `utility` package, which ends, is not built yet. `osdev test godspeed` runs every
+And a `utility` package - a program that does one job and ends - installed the same way and run by its name
+(section 4c). `osdev test godspeed` runs every
 command against a real disk and the real registry over verified TLS through QEMU's user network, fetching
 `godspeed/hello` (its registry checks are skipped, not passed, when the machine running the test is
 offline). Packages are QEMU-verified only, x86; no hardware card yet. On hardware: `godspeed check` verified the registry and got `HTTP/1.1 200 OK` on all five
@@ -235,7 +236,29 @@ from, fetches and verifies it, and installs it in the old one's place with the s
 version change: a new release may ask for more. One already newest is said to be up to date. `godspeed uninstall`
 asks, stops it and takes it off the list; its fetched copy stays, and `godspeed remove` refuses an installed copy.
 
-`list installed` is `package version state`, `state` being what the supervisor says: `running` or `NOT running`.
+`list installed` is `package version state`, `state` being what the supervisor says: `running`, `NOT running`,
+or for a utility, how to run it.
+
+## 4c. Utilities
+
+A package of kind `utility` (`godspeed new utility` in the CLI) is installed exactly as a service is - fetched,
+checked, asked about once - but it is NOT started at install or at boot. It runs when its name is typed:
+
+```
+gsh> hello-utility Ada
+hello, Ada
+gsh> hello-utility Ada | match Ada | count
+1
+```
+
+The shell asks the supervisor to start it, wired to send to the shell and to the peers its grant names; the
+supervisor checks the copy from the disk again first, as it does for every start. The rest of the command line
+is handed to it as its arguments, and what it writes is shown, or is the stream of a pipe, as any producer's is.
+It ends itself with a status (`gs::program`, the `Exit` syscall); the shell says the status when it is not 0,
+and the command fails then. A utility is never restarted and runs one at a time. Its name is the package's own
+name (`hello-utility`), or the full `publisher/name` when two publishers' utilities share one, which is refused
+rather than guessed between. A built-in command of the same name always wins: an installed utility can never
+replace `dir`.
 
 ## 5. Pipes
 

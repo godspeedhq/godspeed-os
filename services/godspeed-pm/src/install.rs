@@ -26,6 +26,7 @@ pub const LIST: &str = "/system/packages/installed";
 const START_SECS: i64 = 60;
 
 /// The newest fetched version `which` names (`publisher/name` or `publisher/name@version`).
+#[inline(never)]
 fn pick(ctx: &ServiceContext, which: &str) -> Result<Fetched, Cell> {
     let mut all = [Fetched::EMPTY_PUB; MAX_FETCHED];
     let mut more = false;
@@ -53,6 +54,7 @@ fn read_list<'b>(ctx: &ServiceContext, buf: &'b mut [u8; 1024]) -> Result<&'b st
 }
 
 /// [`LIST`] with `pkg`'s line replaced by `line`, or removed when `line` is empty.
+#[inline(never)]
 fn write_list(ctx: &ServiceContext, pkg: &str, line: &str) -> Result<(), Cell> {
     let mut buf = [0u8; 1024];
     let old = read_list(ctx, &mut buf)?;
@@ -76,6 +78,7 @@ fn write_list(ctx: &ServiceContext, pkg: &str, line: &str) -> Result<(), Cell> {
 }
 
 /// Is `pkg` in [`LIST`]? Its version, if so.
+#[inline(never)]
 pub fn installed_version(ctx: &ServiceContext, pkg: &str, out: &mut [u8; 24]) -> Option<usize> {
     let mut buf = [0u8; 1024];
     let list = read_list(ctx, &mut buf).ok()?;
@@ -88,6 +91,7 @@ pub fn installed_version(ctx: &ServiceContext, pkg: &str, out: &mut [u8; 24]) ->
 /// `godspeed install <pkg>[@ver]` with no answer yet: what the contract requests, for the shell to ask about. Columns
 /// `peer gives note`, one row per send peer, and the release in the status note; none is no rows. Three columns, so
 /// the status row has a note to carry the release in.
+#[inline(never)]
 pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     let f = match pick(ctx, which) { Ok(f) => f, Err(why) => return r.fail("fetched", which, why.as_str()) };
     let checked = match check::package(ctx, f.publisher(), f.name(), f.version(), packages::this_arch().map(|a| a.as_str()), &mut |_, _| true) {
@@ -142,7 +146,10 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
     // Start it: a running older version first stops, so the one listed is the one that runs.
     let _ = supervisor(ctx, supcmd::UNINSTALL, pkg.as_str().as_bytes(), 10);
     let started = supervisor(ctx, supcmd::INSTALL, line.as_str().as_bytes(), START_SECS);
+    let utility = checked.kind == godspeed_package::Kind::Utility;
+    let short = f.name();
     let state = match started {
+        Ok(()) if utility => cell(format_args!("a utility: type `{} <arguments>` to run it", short)),
         Ok(()) => cell(format_args!("running, as the task {}", pkg.as_str())),
         Err(why) => {
             // Not started is not installed: the list says only what runs, or will at the next boot.
@@ -159,15 +166,21 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
     };
     r.columns(&["key", "value", "note"]);
     r.row("title", line.as_str(), "installed");
-    r.row("about", state.as_str(), "started by the supervisor from the copy it checked");
+    r.row("about", state.as_str(), if utility { "checked by the supervisor; it is checked again every time it runs" }
+          else { "started by the supervisor from the copy it checked" });
     r.row("binary", cell(format_args!("{}, {} bytes", checked.arch, checked.size)).as_str(), "its size and digest the manifest's");
     r.row("peers", peers.as_str(), "what the operator approved of what its contract requests");
     r.row("privilege", "none", "a package is given none");
-    r.row("boot", "starts at every boot", cell(format_args!("listed in {}", LIST)).as_str());
+    if utility {
+        r.row("runs", "when typed", "for one command line; its output is shown or piped, and its status said");
+    } else {
+        r.row("boot", "starts at every boot", cell(format_args!("listed in {}", LIST)).as_str());
+    }
     r.note(format_args!("checked from the disk: signature -> key -> contract -> binary"));
 }
 
 /// `godspeed uninstall <pkg>`: stop it and take it off the list. Its fetched copy stays (`godspeed remove` deletes it).
+#[inline(never)]
 pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, pkg: &str) {
     let mut v = [0u8; 24];
     let Some(vl) = installed_version(ctx, pkg, &mut v) else {
@@ -183,12 +196,14 @@ pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, pkg: &str) {
 }
 
 /// `godspeed list installed`: the list, with whether the supervisor has each running. Columns `package version state`.
+#[inline(never)]
 pub fn list(ctx: &ServiceContext, r: &mut Rows) {
     let mut buf = [0u8; 1024];
     let list = match read_list(ctx, &mut buf) { Ok(l) => l, Err(why) => return r.fail("installed", LIST, why.as_str()) };
     // What the supervisor says is running, by name.
     let reply = gs::call::request_within(ctx, "supervisor", &Message::from_bytes(&[supcmd::MARKER, supcmd::INSTALLED]), 10).ok();
-    let running = |pkg: &str| -> Option<bool> {
+    // 0 not running, 1 running, 2 a utility (run when typed).
+    let running = |pkg: &str| -> Option<u8> {
         let r = reply.as_ref()?;
         let b = r.payload_bytes();
         if b.first() != Some(&supcmd::OK) || b.len() < 2 { return None; }
@@ -196,26 +211,33 @@ pub fn list(ctx: &ServiceContext, r: &mut Rows) {
         for _ in 0..b[1] {
             let l = *b.get(i)? as usize;
             let name = b.get(i + 1..i + 1 + l)?;
-            let up = *b.get(i + 1 + l)? == 1;
-            if name == pkg.as_bytes() { return Some(up); }
+            let state = *b.get(i + 1 + l)?;
+            if name == pkg.as_bytes() { return Some(state); }
             i += 2 + l;
         }
-        Some(false)
+        Some(0)
     };
     r.columns(&["package", "version", "state"]);
     let mut n = 0u32;
     for l in list.lines() {
         let mut it = l.split_whitespace();
         let (Some(pkg), Some(version)) = (it.next(), it.next()) else { continue };
-        let state = match running(pkg) { Some(true) => "running", Some(false) => "NOT running", None => "unknown: the supervisor did not answer" };
+        let short = cell(format_args!("utility: type `{}`", pkg.rsplit('/').next().unwrap_or(pkg)));
+        let state = match running(pkg) {
+            Some(1) => "running",
+            Some(2) => short.as_str(),
+            Some(_) => "NOT running",
+            None => "unknown: the supervisor did not answer",
+        };
         r.entry(&[C::S(pkg), C::S(version), C::S(state)]);
         n += 1;
     }
     if n == 0 { r.note(format_args!("`godspeed install <publisher/name>` installs a fetched package")); }
-    else { r.note(format_args!("{} package{}; each starts at boot", n, if n == 1 { "" } else { "s" })); }
+    else { r.note(format_args!("{} package{}; a service starts at boot, a utility when typed", n, if n == 1 { "" } else { "s" })); }
 }
 
 /// One command to the supervisor, answered `[OK]` or `[FAILED, reason...]`.
+#[inline(never)]
 fn supervisor(ctx: &ServiceContext, op: u8, arg: &[u8], secs: i64) -> Result<(), Cell> {
     let mut m = [0u8; 120];
     if arg.len() + 2 > m.len() { return Err(cell(format_args!("the request is too long"))); }

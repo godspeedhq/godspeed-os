@@ -120,8 +120,17 @@ def main():
                 body = re.sub(r'\.\s*[A-Za-z_][A-Za-z0-9_]*\s*\(', '.(', body)
                 crate = path.split('/')[1]
                 for name in sdk:
-                    if re.search(r'\b%s\b' % re.escape(name), body):
-                        consumers.setdefault(name, set()).add(crate)
+                    # A NAME QUALIFIED BY ANOTHER MODULE IS NOT THIS ITEM. Only column-0 items are counted, so
+                    # `supcmd::encode` - a function inside `pub mod supcmd` in service_context.rs - is not one, and
+                    # the column-0 item of that name is `trace::encode`. Matched by the bare word, the shell's
+                    # `supcmd::encode(..)` counted as a new user of `trace::encode`, which it never touches. So an
+                    # occurrence counts when it stands alone or is qualified by the item's own module (or the
+                    # crate); `other::name` is somebody else's.
+                    stem = sdk[name][1].rsplit('/', 1)[-1][:-3]
+                    for m in re.finditer(r'(?:\b([A-Za-z_][A-Za-z0-9_]*)\s*::\s*)?\b%s\b' % re.escape(name), body):
+                        if m.group(1) in (None, stem, 'godspeed_sdk'):
+                            consumers.setdefault(name, set()).add(crate)
+                            break
 
     ordinary = []
     for name, (kind, path) in sorted(sdk.items()):

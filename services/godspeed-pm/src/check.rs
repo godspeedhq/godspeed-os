@@ -13,7 +13,7 @@
 
 use godspeed as gs;
 use godspeed_package::trust::{KeyStatus, Namespaces};
-use godspeed_package::{ArtifactVerifier, ManifestSignature, Sha256Digest};
+use godspeed_package::{ArtifactVerifier, Kind, ManifestSignature, Sha256Digest};
 use gs::ServiceContext;
 
 use crate::meta::{self, Artifacts};
@@ -80,6 +80,8 @@ pub struct Checked {
     pub size: u64,
     /// What its contract requests.
     pub contract: Contract,
+    /// What kind of program it is: a service, kept running, or a utility, run for one command line.
+    pub kind: Kind,
 }
 
 /// `32MiB`, `512KiB`, `1GiB` or a plain number of bytes.
@@ -249,5 +251,5 @@ pub fn package(ctx: &ServiceContext, publisher: &str, name: &str, version: &str,
         off += got as u64;
     }
     verifier.finish().map_err(|_| text(format_args!("{} is not the size or digest the manifest names", file)))?;
-    Ok(Checked { arch: artifact.arch.as_str(), size: artifact.size, contract: requested })
+    Ok(Checked { arch: artifact.arch.as_str(), size: artifact.size, contract: requested, kind: man.kind })
 }

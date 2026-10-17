@@ -2478,6 +2478,11 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             // script runs that script (a fresh, self-contained run; any args become $arg1..). Like
             // run/selfcheck it is one interpreter layer, so it is refused inside another script
             // (depth > 0) to keep the bounded user stack safe.
+            // An INSTALLED UTILITY, by its name (`hello-utility`) or its package name (`godspeed/hello-utility`).
+            if let Some(task) = installed_utility(ctx, other) {
+                let rest = s[other.len()..].trim();
+                return run_utility(ctx, core::str::from_utf8(task.as_bytes()).unwrap_or(""), rest, out);
+            }
             if let Some(src) = library_script(other) {
                 if depth > 0 {
                     gs::io::println_fmt(ctx, format_args!(
@@ -14865,6 +14870,17 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
         let mut cap = Cap::new();
         if !drain_service(ctx, c0, None, &mut cap) { return Err(ShellError::Unknown); }
         Stream::Bytes(cap)
+    } else if let Some(task) = installed_utility(ctx, c0) {
+        // An INSTALLED UTILITY starts a pipe as any producer does: what it writes is the stream. A failure goes to
+        // the console and stops the pipe, as a built-in producer's does.
+        let mut cap = Cap::new();
+        let ran = run_utility(ctx, core::str::from_utf8(task.as_bytes()).unwrap_or(""), split_first(stages[0]).1,
+                              &mut Out::Capture(&mut cap));
+        if ran.is_err() {
+            Out::Console.put_bytes(ctx, cap.bytes());
+            return Err(ShellError::Unknown);
+        }
+        Stream::Bytes(cap)
     } else if c0 == "result" || c0 == "assert" {
         // The classic mix-up: piping into the *outcome* channel. `result`/`assert` read a
         // command's Ok/Err, not its piped output. Point at the right idiom instead of the
@@ -18533,6 +18549,15 @@ enum Drained {
 /// behaviour, which still drops type-ahead (recorded, `backlog/fixed/80` H16's receive side).
 fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
                       wait_secs: i64, keep: Option<&dyn Fn(u8)>, progress: Option<&dyn Fn(&[u8])>) -> Drained {
+    drain_stage(ctx, svc, peers, input, out, wait_secs, keep, progress, 0)
+}
+
+/// [`drain_service_with`], and for a program that ENDS ITSELF after its output (an installed utility,
+/// `gs::program`), up to `grace_ms` for it to do so before it is ended: then its death says the status it
+/// chose, not that the shell killed it. Zero is the plain stage, ended as soon as its output is in.
+#[allow(clippy::too_many_arguments)]
+fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
+               wait_secs: i64, keep: Option<&dyn Fn(u8)>, progress: Option<&dyn Fn(&[u8])>, grace_ms: u64) -> Drained {
     // A stage crossing a service boundary is one IPC message until streaming chunks across
     // many. Refuse a larger buffer LOUDLY rather than silently clipping it to 4 KiB (§3.12).
     if let Some(inp) = input {
@@ -18551,12 +18576,19 @@ fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&
     // leaked one table slot per stage: about sixty `ask`s and pipe stages into a boot, the shell's table
     // was full and every later lookup failed (found by `selfcheck ask` run twice in one boot; the same
     // leak `spawn_on` closed for `backlog/fixed/80`).
-    match ctx.spawn_via_supervisor(svc, 0xFFFF, peers) {
-        Ok(cap) => { if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } }
-        Err(_) => {
-            gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
-            return Drained::Failed;
+    // A program that ends itself is an INSTALLED UTILITY, which the supervisor checks from the disk before it
+    // starts it: that takes longer than the 2 s a built-in stage's spawn is given, so it is asked with a longer
+    // wait that watches for `q` (`spawn_watched`). Asked with 2 s, the shell gave up on a utility that then
+    // started, and every later run of it was refused as already running.
+    let spawned = if grace_ms > 0 { spawn_watched(ctx, svc, peers, UTILITY_START_SECS) } else {
+        match ctx.spawn_via_supervisor(svc, 0xFFFF, peers) {
+            Ok(cap) => { if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } true }
+            Err(_) => false,
         }
+    };
+    if !spawned {
+        gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
+        return Drained::Failed;
     }
     // One `[q] quit` for the whole stage: the registration wait below and the drain after it share it.
     let noticed = core::cell::Cell::new(false);
@@ -18632,9 +18664,106 @@ fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&
             }
         }
     }
+    if grace_ms > 0 && matches!(how, Drained::Eot) {
+        // Bounded by grace_ms, a second at most, and only after the program has sent its end byte.
+        let mut waited = 0u64;
+        while waited < grace_ms && task_running(ctx, svc) {
+            gs::task::sleep_ms(ctx, 20);
+            waited += 20;
+        }
+    }
     let _ = ctx.kill(svc);
     if out.overflow { gs::io::println(ctx, "pipe: pipe output exceeded the buffer (truncated)"); }
     how
+}
+
+/// How long the supervisor is given to check an installed utility from the disk and start it.
+const UTILITY_START_SECS: i64 = 30;
+
+/// Ask the supervisor to start `svc` wired to `peers`, waiting up to `secs` with `[q]` watched. True when it said
+/// it started; the capability it hands back is released, since the stage is reached by name.
+fn spawn_watched(ctx: &ShellCtx, svc: &str, peers: &[&str], secs: i64) -> bool {
+    use godspeed_sdk::service_context::supcmd;
+    let mut buf = [0u8; supcmd::MAX];
+    let Some(n) = supcmd::encode(&mut buf, supcmd::SPAWN, 0xFFFF, svc, peers) else { return false };
+    let reply = gs::call::request_watched(ctx, "supervisor", &Message::from_bytes(&buf[..n]), secs, ctx);
+    if let Some(c) = gs::ipc::take_sent_cap(ctx) { gs::cap::remove(ctx, c); }
+    matches!(reply, Ok(r) if r.payload_bytes().first() == Some(&supcmd::OK))
+}
+
+/// Is a task called `name` running?
+fn task_running(ctx: &ShellCtx, name: &str) -> bool {
+    (0..256u32).any(|slot| {
+        let st = ctx.task_stat(slot);
+        st.valid && st.state != 4 && st.name_str() == name
+    })
+}
+
+/// The installed UTILITY a typed command names - `hello-utility` for `godspeed/hello-utility` - as its task name,
+/// asked of the supervisor (`supcmd::INSTALLED`). `None` when no installed utility has that name, or when two
+/// publishers' do, which is said, since guessing between them would run code the operator did not choose.
+fn installed_utility(ctx: &ShellCtx, cmd: &str) -> Option<String8L> {
+    use godspeed_sdk::service_context::supcmd;
+    if cmd.is_empty() || cmd.contains('/') && cmd.split('/').count() != 2 { return None; }
+    let reply = hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::INSTALLED])?;
+    let b = reply.payload_bytes();
+    if b.first() != Some(&supcmd::OK) || b.len() < 2 { return None; }
+    let mut found: Option<String8L> = None;
+    let mut many = false;
+    let mut i = 2usize;
+    for _ in 0..b[1] {
+        let l = *b.get(i)? as usize;
+        let name = b.get(i + 1..i + 1 + l)?;
+        let state = *b.get(i + 1 + l)?;
+        i += 2 + l;
+        if state != installed_state::UTILITY { continue; }
+        let n = core::str::from_utf8(name).unwrap_or("");
+        let short = n.rsplit('/').next().unwrap_or(n);
+        if n == cmd || short == cmd {
+            if found.is_some() { many = true; }
+            let mut s = String8L::new();
+            s.set(name);
+            found = Some(s);
+        }
+    }
+    if many {
+        gs::io::println_fmt(ctx, format_args!("{}: two installed utilities have that name - type it as publisher/name", cmd));
+        return None;
+    }
+    found
+}
+
+/// The `INSTALLED` answer's state byte (`services/supervisor/src/installed.rs`).
+mod installed_state {
+    pub const UTILITY: u8 = 2;
+}
+
+/// Run the installed utility `task` with `args`, as `ask` runs: started by the supervisor wired to send to this
+/// shell, handed its arguments, its output read until its end byte and written to `out` - the console, or the
+/// next stage of a pipe - and its status said when it is not 0.
+fn run_utility(ctx: &ShellCtx, task: &str, args: &str, out: &mut Out) -> Result<(), ShellError> {
+    use godspeed_sdk::service_context::{death, supcmd};
+    let mut cap = Cap::new();
+    let how = drain_stage(ctx, task, &["shell"], Some(args.as_bytes()), &mut cap, FILTER_WAIT_SECS, None, None, 1000);
+    out.put_bytes(ctx, &cap.buf[..cap.len]);
+    if !matches!(how, Drained::Eot) { return Err(ShellError::Unknown); }
+    // How it ended: the supervisor keeps the newest death per name (`supcmd::DEATH`).
+    let mut q = [0u8; 2 + 80];
+    let n = task.len().min(80);
+    q[0] = supcmd::MARKER;
+    q[1] = supcmd::DEATH;
+    q[2..2 + n].copy_from_slice(&task.as_bytes()[..n]);
+    let Some(r) = hw_ask(ctx, "supervisor", &q[..2 + n]) else { return Ok(()) };
+    let b = r.payload_bytes();
+    if b.len() >= 23 && b[13] == death::EXITED {
+        let status = u64::from_le_bytes([b[15], b[16], b[17], b[18], b[19], b[20], b[21], b[22]]);
+        if status == 0 { return Ok(()); }
+        gs::io::println_fmt(ctx, format_args!("{}: ended with status {}", task, status));
+        return Err(ShellError::Unknown);
+    }
+    // It did not end itself within the grace the drain gave it, so the shell ended it.
+    gs::io::println_fmt(ctx, format_args!("{}: did not end by itself after its output - ended", task));
+    Err(ShellError::Unknown)
 }
 
 /// Split `s` into (first word, rest-trimmed).
