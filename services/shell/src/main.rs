@@ -588,6 +588,16 @@ impl ShellCtx {
     fn end_command(&self) {
         self.cmd_active.set(false);
     }
+    /// The command's `[q] quit`, once 2 s have passed since Enter, for a loop that reads its own keys and
+    /// makes no watched wait: the notice still comes, and from the one place every other wait's comes from.
+    fn offer_quit(&self) {
+        if self.cmd_active.get() && gs::call::Watch::notice_due_in(self) == 0 { gs::call::Watch::notice(self); }
+    }
+    /// A key legend the command prints itself because it offers keys the watch does not (`[b]` handled in
+    /// its own loop, a countdown's line): it counts as the command's notice, so no second one follows.
+    fn quit_shown(&self) {
+        if self.cmd_active.get() { self.cmd_noticed.set(true); }
+    }
     /// The next key if one is waiting: a kept type-ahead key first, then the console.
     fn try_console_read(&self) -> Option<u8> {
         if let Some(b) = self.typeahead.borrow_mut().pop() { return Some(b); }
@@ -626,6 +636,14 @@ impl gs::call::Watch for ShellCtx {
     }
     fn keep(&self, key: u8) { self.keep_key(key); }
     fn quit(&self) { self.quit.set(true); }
+}
+
+/// The `[q] quit` a hand-made wait prints when it lingers. Inside a command it is the command's ONE notice
+/// (`gs::call::Watch`), so two waits, or a wait and the watch, cannot each print it - the duplicate the
+/// operator found on `date sync` and `ping` (2026-10-17). Between commands there is no command clock, and
+/// it is printed here as before.
+fn say_quit(ctx: &ShellCtx) {
+    if ctx.cmd_active.get() { gs::call::Watch::notice(ctx); } else { say_quit(ctx); }
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -4924,7 +4942,7 @@ fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, 
             out.line_fmt(ctx, format_args!(
                 "##### [{}] part {}/{}  {:<8}{} #####",
                 str_of(&bar), k + 1, parts.len(), name,
-                if abortable { "   [q] quit" } else { "" }));
+                if abortable && k == 0 { "   [q] quit" } else { "" }));
             if abortable { ctx.cmd_noticed.set(true); }
         }
         // The per-part result is discarded ON PURPOSE: `t.failed` is the answer for the suite, and a
@@ -7772,6 +7790,7 @@ fn cmd_power(ctx: &ShellCtx, act: PowerAct, arg: &str) -> Result<(), ShellError>
             shown = left;
             gs::io::print_fmt(ctx, format_args!("\r\x1b[2K{} in {}   [q] quit   [b] background",
                                                  cmd, Delay(left)));
+            ctx.quit_shown();
             if first { shutdown_cue_power(ctx); }
         }
         let key = if ctx.quit.get() { Some(b'q') } else { ctx.try_console_read() };
@@ -7859,8 +7878,9 @@ fn cmd_cores(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         }
     }
     let t0 = gs::task::epoch_secs_monotonic(ctx);
-    out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...  [q] quit", SAMPLE_SECS));
+    out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...", SAMPLE_SECS));
     while gs::task::epoch_secs_monotonic(ctx) - t0 < SAMPLE_SECS {
+        ctx.offer_quit();
         // q quits the 5 s wait (conventions rule 10; `backlog/fixed/80` H21 - it had no way out).
         if let Some(b) = ctx.try_console_read() {
             if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
@@ -9686,7 +9706,7 @@ fn pause_quittable(ctx: &ShellCtx, secs: i64) -> bool {
         // The command's `[q] quit`, once it has run 2 s (`gs::call::Watch`), and a `q` is the COMMAND's: a
         // `wait` inside a script loop used to end only that `wait`, and the loop went on.
         if ctx.quit.get() { return false; }
-        if ctx.cmd_active.get() && gs::call::Watch::notice_due_in(ctx) == 0 { gs::call::Watch::notice(ctx); }
+        ctx.offer_quit();
         if quit_key_or_keep(ctx) { ctx.quit.set(true); return false; }
         if gs::task::epoch_secs_monotonic(ctx) - start >= secs { return true; }
         // SLEEP, not yield: a yield loop kept this core busy for the whole wait (`backlog/fixed/80` H21).
@@ -9752,8 +9772,8 @@ fn cmd_repeat(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8, out: &mut Ou
     loop {
         ran += 1;
         match count {
-            Some(n) => out.line_fmt(ctx, format_args!("repeat {} of {}: {}   [q] quit", ran, n, cmd)),
-            None => out.line_fmt(ctx, format_args!("repeat {}: {}   [q] quit", ran, cmd)),
+            Some(n) => out.line_fmt(ctx, format_args!("repeat {} of {}: {}", ran, n, cmd)),
+            None => out.line_fmt(ctx, format_args!("repeat {}: {}", ran, cmd)),
         }
         // Into the caller's output, so a function capture, `$(f)`, holds the runs and the verdict as it
         // would any other command's (`backlog/84` S2). Refusals above still go to the console.
@@ -9766,6 +9786,7 @@ fn cmd_repeat(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8, out: &mut Ou
         let quit = if wait > 0 {
             !pause_quittable(ctx, wait as i64)
         } else {
+            ctx.offer_quit();
             quit_key_or_keep(ctx)
         };
         if quit { stopped = true; break; }
@@ -10770,13 +10791,14 @@ fn audio_tone(ctx: &ShellCtx, out: &mut Out, rest: &str) -> Result<(), ShellErro
     put_u16(&mut req, 1, hz);
     put_u32(&mut req, 3, ms);
     audio_reply(ctx, out, audio_ask(ctx, &req, AUDIO_REPLY_MS), 1)?;
-    gs::io::println_fmt(ctx, format_args!("playing {} Hz for {}.{} s  [q] quit", hz, ms / 1000, ms % 1000 / 100));
+    gs::io::println_fmt(ctx, format_args!("playing {} Hz for {}.{} s", hz, ms / 1000, ms % 1000 / 100));
     // Watch: a status every 200 ms, the key every 50. Bounded by the tone's length plus five seconds, so a
     // driver that stops answering costs this shell a bounded wait, never the prompt.
     let t0 = gs::driver::wait::Since::now(ctx);
     let limit = gs::driver::wait::Budget::ms(ms as u64 + 5000);
     let mut since_status = 0u32;
     loop {
+        ctx.offer_quit();
         if let Some(k) = ctx.try_console_read() {
             if k == b'q' || k == b'Q' || k == 0x1b {
                 let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS), 6)?;
@@ -10950,7 +10972,7 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
     let r = audio_reply(ctx, out, r, 5)?;
     let mut free = get_u32(r.payload_bytes(), 1) as u64;
     let (mm, ss) = audio_clock(length_ms);
-    gs::io::println_fmt(ctx, format_args!("playing {} ({} Hz, 16-bit, {}, {}:{:02})  [q] quit",
+    gs::io::println_fmt(ctx, format_args!("playing {} ({} Hz, 16-bit, {}, {}:{:02})",
         str_of(path), w.rate, if w.channels == 2 { "stereo" } else { "mono" }, mm, ss));
 
     // Send. A chunk is whole frames, at most one file read and one message.
@@ -10963,6 +10985,7 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
     let t0 = gs::driver::wait::Since::now(ctx);
     let limit = gs::driver::wait::Budget::ms(length_ms * 2 + 10_000);
     while sent < w.data_len {
+        ctx.offer_quit();
         if let Some(k) = ctx.try_console_read() {
             if k == b'q' || k == b'Q' || k == 0x1b {
                 return audio_stop_said(ctx, out);
@@ -11376,7 +11399,7 @@ fn ask_sifted_quittable(ctx: &ShellCtx, peer: &str, msg: &Message, max_ms: u64,
     let s0 = gs::driver::wait::Since::now(ctx);
     let out = ctx.inner.request_with_reply_keyhint_sifted_keeping(peer, msg, hint, secs,
         ServiceContext::QUIT_KEYS,
-        || { if !noticed.get() { noticed.set(true); gs::io::println(ctx, "  [q] quit"); } },
+        || { if !noticed.get() { noticed.set(true); say_quit(ctx); } },
         mine, &|b| ctx.keep_key(b));
     match out {
         ReqOutcome::Reply(r) => (Some(r), true),
@@ -11459,7 +11482,7 @@ fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64, noticed: &core::cell::Cell<bool>
         }
         if !noticed.get() && t0.passed(ctx, notice_at) {
             noticed.set(true);
-            gs::io::println(ctx, "  [q] quit");
+            say_quit(ctx);
         }
         if noticed.get() {
             while let Some(b) = ctx.inner.try_console_read() {
@@ -11477,7 +11500,7 @@ fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64, noticed: &core::cell::Cell<bool>
 /// `wifi status` has the outcome. A "timeout" that comes back at once is a failed send (a respawned driver);
 /// it is reacquired and asked once more, as `wifi_ask` does. A real timeout is never re-sent.
 fn wifi_ask_q(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64) -> ReqOutcome {
-    wifi_ask_keys(ctx, req, hint_secs, max_secs, || gs::io::println(ctx, "  [q] quit"))
+    wifi_ask_keys(ctx, req, hint_secs, max_secs, || say_quit(ctx))
 }
 
 /// The tagged, key-abortable radio request behind `wifi_ask_q` and the join. The answer is the one carrying
@@ -11724,6 +11747,7 @@ fn wifi_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     }
 
     out.line_fmt(ctx, format_args!("scanning  [q] quit  [b] background"));
+    ctx.quit_shown();
     wifi_header(ctx, out);
 
     let t0 = gs::task::epoch_secs_monotonic(ctx);
@@ -11914,14 +11938,14 @@ fn wifi_join(ctx: &ShellCtx, out: &mut Out, ssid: &[u8], pass: &[u8]) -> Result<
         req[2 + SSID_MAX] = pass.len() as u8;
         req[3 + SSID_MAX..3 + SSID_MAX + pass.len()].copy_from_slice(pass);
 
-        out.line_fmt(ctx, format_args!("joining {}  [q] quit", name));
+        out.line_fmt(ctx, format_args!("joining {}", name));
         // Reacquire and ask once more ONLY for a send that failed - which the abortable form reports as a
         // `Timeout` that returns at once, since it cannot tell the two apart. A timeout that took its full
         // thirty seconds is the driver not answering, and re-sending a join to it would be a second join
         // whose answer arrives when nobody is listening (see `wifi_ask`).
-        // Tagged like every radio request (`wifi_ask_keys`); the "joining ... [q] quit" line above is the
-        // hint, so none is printed on a linger.
-        let outcome = wifi_ask_keys(ctx, &req, MAX_SECS + 1, MAX_SECS, || {});
+        // Tagged like every radio request (`wifi_ask_keys`), and the command's `[q] quit` when it lingers past
+        // 2 s, as for every wait (the "joining" line used to carry it, and the watch printed a second).
+        let outcome = wifi_ask_keys(ctx, &req, gs::call::NOTICE_AFTER_SECS, MAX_SECS, || say_quit(ctx));
         for b in req.iter_mut() { *b = 0; }
 
         let status = match &outcome {
@@ -13101,6 +13125,7 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
         ctx.log_fmt(format_args!("shell: {} stale message(s) cleared before watching the power cycle", stale + other));
     }
     out.line_fmt(ctx, format_args!("the radio is coming back from power-on  [q] quit  [b] background"));
+    ctx.quit_shown();
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     let mut last = "";
     // Whether the radio, once up and not joined, has been asked if it will rejoin at all (`OP_USE`).
@@ -13249,7 +13274,7 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
 /// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
 fn net_renew(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway)  [q] quit"));
+    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway)"));
     let outcome = ns_abortable(ctx, &[8u8], 30);
     match outcome {
         ReqOutcome::Reply(r) => {
@@ -13277,7 +13302,7 @@ fn net_arp(ctx: &ShellCtx, ip_str: &str, out: &mut Out) -> Result<(), ShellError
         Some(ip) => ip,
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{}  [q] quit", ip[0], ip[1], ip[2], ip[3]));
+    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
     // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
     let outcome = ns_abortable(ctx, &[6, ip[0], ip[1], ip[2], ip[3]], 8);
     match outcome {
@@ -13310,7 +13335,7 @@ fn net_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
         ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts:  [q] quit", our[0], our[1], our[2]));
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts:", our[0], our[1], our[2]));
     // Walk the /24 host-by-host (net-stack op 6 = one ARP resolve), driven FROM THE SHELL so an abort
     // actually STOPS the work: q ends the loop and net-stack is only ever mid-ONE resolve (fast), never
     // wedged finishing a 254-host sweep (which is why a batch op 7 left the NEXT command stuck). Each
@@ -13431,7 +13456,8 @@ fn net_query(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64, tag: Opti
         }
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
-        if i == 0 { gs::io::println(ctx, "net: waiting for a reply  [q] quit"); }
+        // Inside a command, the command's one notice at 2 s; between commands, this line after the first second.
+        if ctx.cmd_active.get() { ctx.offer_quit(); } else if i == 0 { gs::io::println(ctx, "net: waiting for a reply  [q] quit"); }
         let _ = gs::cap::reacquire(ctx, peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
@@ -13791,7 +13817,7 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
 
     // `[q] quit` while it lingers. The library fires this and knows nothing else about it: the
     // callback takes nothing and returns nothing, so the console stays entirely on this side.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let mut buf = [0u8; 512];
     let mut net = gs::net::Net::with_notice(&*ctx, &notice);
     match net.tcp(gs::net::Ipv4(ip), port, &req[..n], &mut buf) {
@@ -13914,7 +13940,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     // Through `gs::net`: the opcodes, the capability lifetimes and the correlation tag are the
     // library's now. What stays here is what `serve` MEANS.
     // A notice, so `q` reaches the `Cancelled` arm below, and a keep, so type-ahead survives (H16).
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut gnet = gs::net::Net::with_notice(&**ctx, &notice).keeping(&keep);
     let mut lis = match gnet.listen(port) {
@@ -13940,14 +13966,14 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
         if st.len() >= 4 && st[..4] != [0, 0, 0, 0] {
             out.line_fmt(ctx, format_args!(
-                "listening on {}.{}.{}.{}:{} - answering connections  [q] quit",
+                "listening on {}.{}.{}.{}:{} - answering connections",
                 st[0], st[1], st[2], st[3], port));
             shown = true;
         }
     }
     if !shown {
         out.line_fmt(ctx, format_args!(
-            "listening on port {} - answering connections  [q] quit", port));
+            "listening on port {} - answering connections", port));
     }
 
     let mut last_note: i64 = -1;
@@ -13994,9 +14020,9 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
                 last_note = waited;
                 match limit {
                     Some(n) => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s of {}s, {} served  [q] quit", waited, n, served)),
+                        "still listening - {}s of {}s, {} served", waited, n, served)),
                     None => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s, {} served  [q] quit", waited, served)),
+                        "still listening - {}s, {} served", waited, served)),
                 }
             }
             // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four
@@ -14052,7 +14078,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // Give the close a moment to go out before the capability is dropped - the connection is
         // driven by net-stack's poll step, which needs a pass to put the FIN on the wire.
         gs::task::sleep_ms(ctx, 200);
-        out.line(ctx, "closed - waiting for the next connection  [q] quit");
+        out.line(ctx, "closed - waiting for the next connection");
         // THE LISTENER IS KEPT. Releasing it here is what made this one-shot; it stays open across
         // connections and is released once, below, by every exit path.
     }
@@ -14104,7 +14130,7 @@ fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     };
 
     // A notice, so `q` quits a wait that can run about 40 s; type-ahead kept (H16).
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut gnet = gs::net::Net::with_notice(&**ctx, &notice).keeping(&keep);
     let r = match gnet.socket() {
@@ -14370,7 +14396,7 @@ fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     // q quits the wait, as bare `dir`'s does; type-ahead is kept (H16). A `q` typed AHEAD for a stage
     // later in the pipe (`dir /many | paginate`) is not taken as a quit: the SDK's wait reads no key
     // before it has shown `[q] quit`, so a quick listing never sees it.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut g = ctx.fs_waiting(&notice, &keep);
     let walked = g.list_dir(path, |e| {
@@ -14542,7 +14568,7 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     let mut cancelled = false;
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits the walk; type-ahead kept (H16, see `build_dir_table`)
     while let Some(dlen) = stack.pop(&mut dir) {
         let mut g = ctx.fs_waiting(&notice, &keep);
@@ -17684,7 +17710,7 @@ fn cmd_observe_now(ctx: &ShellCtx) -> Result<(), ShellError> {
             waited += PARK_POLL_MS;
             if !noticed && waited >= notice_ms {
                 noticed = true;
-                gs::io::println(ctx, "  [q] quit");
+                say_quit(ctx);
             }
             if noticed {
                 if let Some(b) = ctx.inner.try_console_read() {
@@ -19009,7 +19035,7 @@ fn chaos_link_flap(ctx: &ShellCtx, tok: &[&str], ntok: usize) -> Result<(), Shel
     let clr  = Message::from_bytes(&[8]);
     for cycle in 1..=cycles {
         gs::io::println_fmt(ctx, format_args!(
-            "chaos link-flap: cycle {}/{} - forcing link DOWN  [q] quit", cycle, cycles));
+            "chaos link-flap: cycle {}/{} - forcing link DOWN", cycle, cycles));
         match net_query(ctx, "nic-driver", &down, 3, None) {
             NetQ::Aborted => {
                 let _ = net_query(ctx, "nic-driver", &clr, 2, None);
@@ -20542,7 +20568,7 @@ fn ask_watched(ctx: &ShellCtx, peer: &str, msg: &Message, secs: i64) -> Option<M
 /// its own frame that would be another 4 KiB of the shell's stack.
 #[inline(always)]
 fn ask_with_quit_notice(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // type-ahead read during the wait is kept (H16)
     // Inside a command the command's watch is the observer; between commands, the request's own notice.
     let r = if ctx.cmd_active.get() {
@@ -20593,7 +20619,7 @@ fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
 fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
     // `q` quits the wait, as `dir`'s does, and a key typed meanwhile is KEPT for the prompt
     // (`backlog/fixed/80` H16): without a notice the callers' `Cancelled` arms could never fire.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.stat(path);
@@ -20604,7 +20630,7 @@ fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise (absent and unanswered alike).
 /// Used by the streaming read/copy paths to learn a file's size before chunking through it.
 fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits; type-ahead kept (H16)
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.stat(path);
@@ -20617,7 +20643,7 @@ fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
 fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
     // q quits the wait and type-ahead is kept (H16). `None` is then "no answer", as a failure is - so
     // every caller must treat `None` as a failure, never as the end of the file (EOF is Some(0)).
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.read_at(path, offset, out);
@@ -20864,7 +20890,7 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     let mut truncated = false;
     // The PAGING, the entry layout, the page cap and the did-it-finish answer are the library's.
     // What stays here is what `dir` means by a row.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     // A key typed while the listing waits is the NEXT command, and is kept for it (H16): the notice
     // reads the console to see `q`, and used to discard everything else it read.
     let keep = |b: u8| ctx.keep_key(b);
@@ -21018,7 +21044,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     let mut gfs = ctx.fs();
     let _ = gfs.create_dir_all(DIR);
     out.line_fmt(ctx, format_args!(
-        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
+        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT", secs));
 
     let mut buf = [0u8; 3000];
     let mut path = [0u8; 32];
@@ -21457,7 +21483,7 @@ fn recv_quittable(ctx: &ShellCtx, secs: i64, noticed: &core::cell::Cell<bool>, k
     let after = if noticed.get() { i64::MAX } else { gs::call::NOTICE_AFTER_SECS };
     ctx.recv_abortable_deadline_noticing(secs, after, &|| {
         noticed.set(true);
-        gs::io::println(ctx, "  [q] quit");
+        say_quit(ctx);
     }, keep)
 }
 
@@ -24177,6 +24203,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     }
 
     gs::io::println(ctx, "[q] quit   [b] background");
+    ctx.quit_shown();
     let mut shown = 101u32; // impossible, so the first sample always prints
     loop {
         // A `q` the status wait below read is the command's quit, set on `ctx.quit` rather than left for this
@@ -24460,7 +24487,7 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
     let mut first = true;
     let mut dir = [0u8; PATH_MAX];
     let mut cancelled = false;
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits the walk; type-ahead kept (H16)
     while let Some(dlen) = stack.pop(&mut dir) {
         let is_start = first;
@@ -24581,7 +24608,7 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         // second buffer: the entries are already on the stack.
         let base = stack.top;
         let mut nc = 0usize;
-        let notice = || gs::io::println(ctx, "  [q] quit");   // q quits the walk; type-ahead kept (H16)
+        let notice = || say_quit(ctx);   // q quits the walk; type-ahead kept (H16)
         let keep = |b: u8| ctx.keep_key(b);
         let mut g = ctx.fs_waiting(&notice, &keep);
         let walked = g.list_dir(&buf[..plen], |e| {
@@ -24796,7 +24823,7 @@ const FILTER_READ_MAX: usize = 8192;
 /// matters is the one the old path could not make: a file that is ABSENT versus one that is merely
 /// bigger than the buffer. Both used to print "not found".
 fn filter_read(ctx: &ShellCtx, verb: &str, path: &[u8], buf: &mut [u8]) -> Result<usize, ()> {
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits the read (match, count, sort, first, last); type-ahead kept (H16)
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.read_into(path, buf);
@@ -25435,7 +25462,7 @@ fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
     // running state to hand to a service. Typed at the prompt, `drives check` runs as a job instead and its
     // notice offers `[b]` (`run_typed_as_job`); this is the form a script or a pipe runs, or when a job is
     // already running.
-    gs::io::println(ctx, "drives check - walking the tree   [q] quit");
+    gs::io::println(ctx, "drives check - walking the tree");
     // q-abortable: a tree walk on a slow stick takes seconds (bounded by FS_FSCK_SECS), and a shell
     // parked in a request it cannot leave cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_CHECK) {

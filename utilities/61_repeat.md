@@ -35,8 +35,9 @@ count goes in one: `repeat count 4 <command>`.
 
 ## 3. Behaviour
 
-- **Each run is announced**: `repeat 2 of 4: kill xhci   [q] quit`, or `repeat 2: status   [q] quit` with
-  no count. The command's own output follows it, as typed at the prompt.
+- **Each run is announced**: `repeat 2 of 4: kill xhci`, or `repeat 2: status` with no count. The
+  command's own output follows it, as typed at the prompt. `[q] quit` is the shell's, once, 2 s in, not
+  repeated on every run's line.
 - **`q` stops it between runs**: during the pause, or - with no pause - when it looks at the keys after a
   run. A command that waits has its own `q` (rule 10).
 - **The end is a verdict**: `repeat: 4 run(s), 1 failed`, with `- stopped by q` when it was. It is `Err`

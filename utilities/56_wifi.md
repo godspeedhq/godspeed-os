@@ -326,7 +326,7 @@ echoes the row, and the join reports what was actually joined:
 join: 1
  1  Maple-House                       5GHz    excellent  -41  WPA2      joined
 passphrase (not shown):
-joining Maple-House  [q] quit
+joining Maple-House
 joined Maple-House on 5GHz, bssid 02:1a:7e:c4:09:51 - the link is up and the handshake completed
   (for the address, type net)
 ```

@@ -135,8 +135,8 @@ asked, `FAILED` when it disagrees.
 | `audio off` | `audio off - the codec is powered down; audio on brings it back - verified` |
 | `audio off hard` | `audio off (hard - the controller is held in reset; audio on brings it back) - verified` |
 | `audio on` | `audio on - volume 60, unmuted, output speaker - verified`; if on: `already on` |
-| `audio tone 440 2` | `playing 440 Hz for 2 s  [q] quit`, then `played 440 Hz for 2 s` or `stopped after 1.3 s` |
-| `audio play /x.wav` | `playing /x.wav (48000 Hz, 16-bit, stereo, 3:12)  [q] quit`, then `played 3:12` or `played 3:12, 2 underruns (180 ms of silence)` |
+| `audio tone 440 2` | `playing 440 Hz for 2 s`, then `played 440 Hz for 2 s` or `stopped after 1.3 s` |
+| `audio play /x.wav` | `playing /x.wav (48000 Hz, 16-bit, stereo, 3:12)`, then `played 3:12` or `played 3:12, 2 underruns (180 ms of silence)` |
 | `audio play` or `tone` while off | ``audio is off - `audio on` first`` |
 | `audio play` or `tone` at volume 0, or muted | plays, and says first: `volume is 0 - nothing will be heard` / `muted - nothing will be heard` |
 
