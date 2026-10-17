@@ -9540,6 +9540,11 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         // `time` itself, and the next sync on its own cadence still sets the clock.
         const SYNC_WAIT_SECS: i64 = 10;
         const SYNC_POLL_MS: u64 = 250;
+        // The last sync's age BEFORE asking, so a sync `time` made on its own in the same second is not taken
+        // for this one: only a sync newer than that one counts. Comparing the age with the wait alone did take
+        // it, and reported a sync while the setting was being refused (`osdev test godspeed`, 2026-10-17).
+        let (age_before, _) = time_sync_state(ctx);
+        let asked_at = gs::task::epoch_secs_monotonic(ctx);
         match time_rpc(ctx, &[5]) {                  // OP_SYNC -> [1] query on its way, [0] could not send
             Some(r) if r.payload_bytes().first() == Some(&1) => {}
             // Every way the sync did not happen is an Err - all of them returned Ok (`backlog/fixed/80` H10).
@@ -9556,9 +9561,18 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         let mut synced = false;
         loop {
             let waited = gs::task::epoch_secs_monotonic(ctx) - t0;
+            // Read BEFORE the age, so a second ticking over between the two can only make an old sync look
+            // older, never newer.
+            let since_asked = gs::task::epoch_secs_monotonic(ctx) - asked_at;
             let (age, refused) = time_sync_state(ctx);
-            // Synced SINCE WE ASKED: an age no older than the wait so far. An older sync is not this one.
-            if matches!(age, Some(a) if a <= waited) {
+            // Synced SINCE WE ASKED: newer than the sync before the question, which by now would be its age
+            // then plus the time since. No sync before means any sync is this one.
+            let newer = match (age, age_before) {
+                (Some(a), Some(b)) => a < b + since_asked,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if newer {
                 synced = true;
                 break;
             }

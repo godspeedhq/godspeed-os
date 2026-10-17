@@ -31,7 +31,7 @@ fn plain<'a>(line: usize, v: Val<'a>) -> Result<&'a str, Bad> {
     match v {
         Val::Str(s) => Ok(s),
         Val::Escaped(_) => Err(bad(line, "a field that must match exactly holds an escape")),
-        Val::Int(_) => Err(bad(line, "a number where a string belongs")),
+        Val::Int(_) | Val::Bool(_) => Err(bad(line, "a number or boolean where a string belongs")),
     }
 }
 
@@ -199,8 +199,8 @@ pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, 
                     "service" => Kind::Service,
                     _ => return Err(bad(n, "a package kind this machine does not know")),
                 }),
-                (In::Package, "description") => desc = Some(match v { Val::Str(s) | Val::Escaped(s) => s, Val::Int(_) => return Err(bad(n, "a number where a string belongs")) }),
-                (In::Package, "license") => lic = Some(match v { Val::Str(s) | Val::Escaped(s) => s, Val::Int(_) => return Err(bad(n, "a number where a string belongs")) }),
+                (In::Package, "description") => desc = Some(match v { Val::Str(s) | Val::Escaped(s) => s, Val::Int(_) | Val::Bool(_) => return Err(bad(n, "a number where a string belongs")) }),
+                (In::Package, "license") => lic = Some(match v { Val::Str(s) | Val::Escaped(s) => s, Val::Int(_) | Val::Bool(_) => return Err(bad(n, "a number where a string belongs")) }),
                 (In::Os, "release") => os = Some(version(n, v)?),
                 (In::Contract, "digest") => contract = Some(digest(n, v)?),
                 (In::Artifact, "arch") => {

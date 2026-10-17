@@ -4,8 +4,8 @@
 //! The package index and the manifest are TOML that the developer CLI writes, and the shared crate reads
 //! them only with a heap (its `toml` feature). This is the native side's answer to that crate's open
 //! question 1, "how the native side reads the text without a heap" (`docs/developer-services-design.md` 10.6):
-//! the subset those two files use, and nothing more. Comments, blank lines, `[table]`, `[[array]]`, and
-//! `key = "string"` or `key = integer`, each on one line. Anything else - an array, an inline table, a float,
+//! the subset those files use, and nothing more. Comments, blank lines, `[table]`, `[[array]]`, and
+//! `key = "string"`, `key = integer` or `key = true|false`, each on one line. Anything else - an array, an inline table, a float,
 //! a multi-line string - is refused with its line number rather than guessed at.
 //!
 //! **A string is returned as written, between its quotes, and must not need unescaping.** A backslash is
@@ -35,6 +35,8 @@ pub enum Val<'a> {
     Escaped(&'a str),
     /// A non-negative integer.
     Int(u64),
+    /// `true` or `false` (a contract's capabilities are booleans).
+    Bool(bool),
 }
 
 /// The lines of `text`, numbered from 1, each one `Ok(line)` or `Err(why)`.
@@ -108,6 +110,9 @@ fn line(l: &str) -> Result<Line<'_>, &'static str> {
     }
     let end = value.find(|c: char| c.is_whitespace() || c == '#').unwrap_or(value.len());
     let (num, rest) = value.split_at(end);
+    if (num == "true" || num == "false") && tail_ok(rest) {
+        return Ok(Line::Pair(key, Val::Bool(num == "true")));
+    }
     if !tail_ok(rest) || num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) || (num.len() > 1 && num.starts_with('0')) {
         return Err("a value is not a string or a non-negative integer");
     }
@@ -153,6 +158,9 @@ mod tests {
 
     #[test]
     fn crlf_and_comments() {
+        let mut b = lines("log_write = true   # a note\nx = false\n");
+        assert_eq!(b.next().map(|x| x.1), Some(Ok(Line::Pair("log_write", Val::Bool(true)))));
+        assert_eq!(b.next().map(|x| x.1), Some(Ok(Line::Pair("x", Val::Bool(false)))));
         let mut it = lines("# head\r\nk = \"v\" # tail\r\n\r\n");
         assert_eq!(it.next(), Some((2, Ok(Line::Pair("k", Val::Str("v"))))));
         assert_eq!(it.next(), None);

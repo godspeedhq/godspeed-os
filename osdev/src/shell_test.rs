@@ -8265,7 +8265,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
 
     // ---- the command explains itself.
     let bare = run!(b"godspeed\r", 20);
-    check!(bare.contains("usage: godspeed registry"), "a bare `godspeed` prints its usage");
+    check!(bare.contains("usage: godspeed search") && bare.contains("registry"), "a bare `godspeed` prints its usage");
     let help = run!(b"godspeed help\r", 20);
     check!(help.contains("godspeed check") && help.contains("godspeed registry add") && help.contains("godspeed config set"),
            "`godspeed help` lists every command");
