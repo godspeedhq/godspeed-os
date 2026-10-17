@@ -110,7 +110,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         (Some("list"), Some("fetched")) if words.clone().next().is_none() => packages::list_fetched(&ctx, &mut r),
         (Some("list"), Some("installed")) if words.clone().next().is_none() => install::list(&ctx, &mut r),
         (Some("list"), Some("updates")) if words.clone().next().is_none() => list_updates(&ctx, &mut r),
-        (Some("list"), _) => r.fail("usage", "godspeed list available | fetched | installed | updates", "say which"),
+        (Some("list"), Some("versions")) => match (words.next(), words.next()) {
+            (Some(name), None) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::versions(&ctx, r, ready, roots, name)),
+            _ => r.fail("usage", "godspeed list versions <publisher/name>", "one package"),
+        },
+        (Some("list"), _) => r.fail("usage", "godspeed list available | fetched | installed | updates | versions <publisher/name>", "say which"),
         (Some("verify"), which) if words.clone().next().is_none() => packages::verify(&ctx, &mut r, which),
         (Some("trust"), None) => trust_show(&ctx, &mut r),
         (Some("trust"), Some("reset")) => match (words.next(), words.next()) {

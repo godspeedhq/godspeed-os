@@ -8555,10 +8555,24 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         // A SERVICE, by its own name: installed, started now and kept running.
         let _ = run!(b"godspeed fetch godspeed/hello-service\r", 240);
         let si = run!(b"godspeed install godspeed/hello-service yes\r", 180);
-        check!(si.contains("godspeed/hello-service 0.1.0 asks for nothing (no peers, no privilege) and starts at every boot"),
+        check!(si.contains("godspeed/hello-service 0.2.0 asks for nothing (no peers, no privilege) and starts at every boot"),
                "installing a service says it starts at every boot");
         check!(si.contains("hello-service: started") && si.contains("running, as the task godspeed/hello-service"),
                "`godspeed/hello-service` is started by the supervisor and runs");
+        // VERSIONS: every release, newest first, and what each is here. Then an older one installed by its version.
+        let lv = run!(b"godspeed list versions godspeed/hello-service\r", 180);
+        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.2.0") && lv.contains("0.1.0")
+               && lv.contains("installed") && lv.contains("2 versions, the latest 0.2.0"),
+               "`godspeed list versions` lists every release, newest first, the installed one marked");
+        check!(lv.find("0.2.0").unwrap_or(usize::MAX) < lv.find("0.1.0").unwrap_or(0), "newest first");
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.1.0\r", 240);
+        let dg = run!(b"godspeed install godspeed/hello-service@0.1.0 yes\r", 180);
+        check!(dg.contains("a DOWNGRADE from the installed 0.2.0, whose data stays as that version left it"),
+               "installing an older version says it is a downgrade, and what that means for its data");
+        check!(dg.contains("installed godspeed/hello-service 0.1.0 started"), "and installs it in place of the newer one");
+        let lv2 = run!(b"godspeed list installed\r", 60);
+        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.1.0") && !lv2.contains("0.2.0"), "the older version is the installed one now");
+        let _ = run!(b"godspeed remove godspeed/hello-service@0.2.0\r", 60);
         let su = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);
         check!(su.contains("uninstalled") && su.contains("stopped"), "and is stopped by `godspeed uninstall`");
 

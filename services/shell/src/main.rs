@@ -15630,9 +15630,16 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
     let when = if note.contains("; a driver;") { "starts at every boot, driving that device" }
         else if note.contains("; an app;") { "becomes a command that has the screen and keyboard while it runs" }
         else if note.contains("; a utility;") { "becomes a command, run when typed" } else { "starts at every boot" };
+    // What it replaces, from the note (`; installed <version>`): an upgrade, a downgrade, or nothing.
+    let now_installed = note.split("; installed ").nth(1).and_then(|r| r.split(';').next()).unwrap_or("");
+    let this = release.rsplit(' ').next().unwrap_or("");
     let mut head = [0u8; 512];
     let head = match from {
         Some(h) => fmt_into(&mut head, format_args!("{} (upgrade from {})", release, h)),
+        None if !now_installed.is_empty() && now_installed != this && semver(this) < semver(now_installed) =>
+            fmt_into(&mut head, format_args!("{} (a DOWNGRADE from the installed {}, whose data stays as that version left it)", release, now_installed)),
+        None if !now_installed.is_empty() && now_installed != this =>
+            fmt_into(&mut head, format_args!("{} (in place of the installed {})", release, now_installed)),
         None => fmt_into(&mut head, format_args!("{}", release)),
     };
     let act = if from.is_some() { "Upgrade it" } else { "Install it" };

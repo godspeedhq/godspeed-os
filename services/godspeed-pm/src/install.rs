@@ -118,7 +118,11 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
         godspeed_package::Kind::Driver => "a driver",
         _ => "a service",
     };
-    r.note(format_args!("{}/{} {} requests these; {}; the operator answers each", f.publisher(), f.name(), f.version(), kind));
+    let pkg = cell(format_args!("{}/{}", f.publisher(), f.name()));
+    let mut iv = [0u8; 24];
+    let now = installed_version(ctx, pkg.as_str(), &mut iv).map(|l| cell(format_args!("; installed {}", core::str::from_utf8(&iv[..l]).unwrap_or("?"))))
+        .unwrap_or_else(Cell::new);
+    r.note(format_args!("{}/{} {} requests these; {}{}; the operator answers each", f.publisher(), f.name(), f.version(), kind, now.as_str()));
 }
 
 /// `godspeed install <pkg>[@ver] grant <peer>,...|none`: record the answer, list it, and have the supervisor start it.
@@ -159,11 +163,26 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
         return r.fail("grant", gpath.as_str(), cell(format_args!("could not be written: {:?}", e)).as_str());
     }
     let line = cell(format_args!("{} {}", pkg.as_str(), f.version()));
+    // What was installed before, read before the list changes: a start that fails puts it back, rather than leaving
+    // nothing installed.
+    let mut before = [0u8; 24];
+    let prev = installed_version(ctx, pkg.as_str(), &mut before)
+        .map(|l| cell(format_args!("{} {}", pkg.as_str(), core::str::from_utf8(&before[..l]).unwrap_or(""))));
     if let Err(why) = write_list(ctx, pkg.as_str(), line.as_str()) { return r.fail("installed", LIST, why.as_str()); }
 
-    // Start it: a running older version first stops, so the one listed is the one that runs.
+    // Start it: a running other version first stops, so the one listed is the one that runs.
     let _ = supervisor(ctx, supcmd::UNINSTALL, pkg.as_str().as_bytes(), 10);
     let started = supervisor(ctx, supcmd::INSTALL, line.as_str().as_bytes(), START_SECS);
+    if let (Err(why), Some(p)) = (&started, &prev) {
+        if p.as_str() != line.as_str() {
+            // The new one did not start: the previous one back, on the list and running, and both said.
+            let restored = write_list(ctx, pkg.as_str(), p.as_str()).is_ok()
+                && supervisor(ctx, supcmd::INSTALL, p.as_str().as_bytes(), START_SECS).is_ok();
+            return r.fail("start", line.as_str(), cell(format_args!("{} - {}", why.as_str(),
+                if restored { "the version installed before is back, and running" }
+                else { "and the version installed before could not be started again either" })).as_str());
+        }
+    }
     let app = checked.kind == godspeed_package::Kind::App;
     let utility = checked.kind == godspeed_package::Kind::Utility || app;
     let short = f.name();

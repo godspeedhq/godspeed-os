@@ -389,6 +389,62 @@ fn os_cells(m: &godspeed_package::Manifest<'_>) -> (Cell, Cell) {
 }
 
 /// `godspeed info <publisher/name>[@version]`: a CARD about one release - what it is, its licence, the release
+/// `godspeed list versions <publisher/name>`: every release the registry's verified index lists, newest first, with
+/// when it was published, by whom, and what it is here - installed, fetched, or neither. Columns `version published by
+/// state`; the latest is said in the note. Installing one is `godspeed install <name>@<version>`, older or newer.
+#[inline(never)]
+pub fn versions(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str) {
+    let name = match spec(which) {
+        Ok((n, None)) => n,
+        Ok((_, Some(_))) => return r.fail("usage", which, "a package, not one version: `godspeed list versions publisher/name`"),
+        Err(why) => return r.fail("usage", which, why),
+    };
+    // What is here, read before the registry is reached: the installed version, and the fetched ones.
+    let pkg = cell(format_args!("{}", name));
+    let mut iv = [0u8; 24];
+    let installed = crate::install::installed_version(ctx, pkg.as_str(), &mut iv);
+    let mut all = [Fetched::EMPTY; MAX_FETCHED];
+    let mut more = false;
+    let n = fetched(ctx, &mut all, &mut more).unwrap_or(0);
+    let mut docs = Docs::new();
+    let base = ready.url.base;
+    on_registry(ctx, r, ready, roots, |s, r| {
+        let mut iso = [0u8; 20];
+        let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
+        let mut ibuf = [0u8; INDEX_MAX];
+        let Some(text) = index_text(ctx, s, base, &v, &name, &mut ibuf)? else {
+            r.fail("package", which, "never published on this registry");
+            chain_note(r, &v, "");
+            return Ok(());
+        };
+        let mut rel = Releases::new();
+        let idx = match meta::index(text, &mut rel) {
+            Ok(i) => i,
+            Err(b) => { r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(()); }
+        };
+        r.columns(&["version", "published", "by", "state"]);
+        let latest = idx.releases.iter().map(|rel| rel.version).max();
+        // Newest first: the index is in the order they were published.
+        let mut order: [usize; meta::MAX_RELEASES] = [0; meta::MAX_RELEASES];
+        let count = idx.releases.len().min(order.len());
+        for (i, o) in order.iter_mut().enumerate().take(count) { *o = i; }
+        order[..count].sort_unstable_by(|a, b| idx.releases[*b].version.cmp(&idx.releases[*a].version));
+        for &i in &order[..count] {
+            let rel = idx.releases[i];
+            let vt = cell(format_args!("{}", rel.version));
+            let is_installed = installed.is_some_and(|l| &iv[..l] == vt.as_str().as_bytes());
+            let is_fetched = all.iter().take(n).any(|f| f.publisher() == name.publisher() && f.name() == name.name() && f.version() == vt.as_str());
+            let state = if is_installed { "installed" } else if is_fetched { "fetched" } else { "-" };
+            r.entry(&[C::S(vt.as_str()), C::S(&rel.published[..rel.published.len().min(10)]), C::S(rel.published_by), C::S(state)]);
+        }
+        let lt = latest.map(|l| cell(format_args!("{}", l))).unwrap_or_else(Cell::new);
+        let how = cell(format_args!("{} version{}, the latest {}; `godspeed install {}@<version>` installs any of them  -  ",
+            count, if count == 1 { "" } else { "s" }, lt.as_str(), pkg.as_str()));
+        chain_note(r, &v, how.as_str());
+        Ok(())
+    });
+}
+
 /// it was built for, what it ships, what its contract requests, who signed it, and every version published -
 /// each checked as `fetch` checks it. Columns `key value note`; the shell shows it as a card.
 #[inline(never)]
