@@ -8415,7 +8415,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
            "the file shows the server in effect");
     let _ = run!(b"write /system/services/time/ntp time.cloudflare.com\r", 30);
     let named = run!(b"date sync\r", 60);
-    check!(saw!(named, "/system/services/time/ntp line 1 is not an IPv4 address - no network time until it is"),
+    check!(saw!(named.clone(), "/system/services/time/ntp line 1 is not an IPv4 address - no network time until it is"),
            "a name in place of an address is refused by line, not replaced by the default");
     check!(named.contains("date sync: /system/services/time/ntp does not name one IPv4 address")
                && !named.contains("is the cable in"),
