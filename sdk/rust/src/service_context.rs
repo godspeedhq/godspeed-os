@@ -718,6 +718,12 @@ const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
 /// MUST match `kernel::task::MAX_SEND_PEERS` - this indexes the kernel-written context page.
 const MAX_SEND_PEERS:      usize = 6;
 const PEER_NAME_BYTES:     usize = 24;
+/// The longest name the kernel's name directory holds (`kernel/src/ipc/names.rs`), and so the longest a
+/// service can be reached by. It is NOT `PEER_NAME_BYTES`: that one sizes a send-peer's LABEL in the context
+/// page the kernel writes, whose layout every built program reads, so it cannot grow without breaking every
+/// program already built. Acquiring by name never touches that page, and was refused past 24 bytes for no
+/// reason - which made an installed package called `godspeed/selfcheck-service` unreachable by its name.
+pub const NAME_MAX:        usize = 32;
 
 #[repr(C)]
 struct SendPeerEntry {
@@ -830,12 +836,12 @@ static mut CACHE_NEXT_EVICT: usize = 0;
 struct CacheEntry {
     slot:     u32,
     name_len: u8,
-    name:     [u8; PEER_NAME_BYTES],
+    name:     [u8; NAME_MAX],
 }
 
 impl CacheEntry {
     const fn empty() -> Self {
-        CacheEntry { slot: u32::MAX, name_len: 0, name: [0u8; PEER_NAME_BYTES] }
+        CacheEntry { slot: u32::MAX, name_len: 0, name: [0u8; NAME_MAX] }
     }
 }
 
@@ -1264,7 +1270,7 @@ impl ServiceContext {
     pub fn reacquire_cap_detail(&self, peer: &str) -> Result<CapHandle, AcquireFailure> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return Err(AcquireFailure::Refused); }
+        if len == 0 || len > NAME_MAX { return Err(AcquireFailure::Refused); }
 
         // SAFETY: syscall(10) = AcquireSendCap; peer bytes are in user space.
         let ret = unsafe {
@@ -1287,7 +1293,7 @@ impl ServiceContext {
         // used to fall through doing nothing and still return Ok: the caller believed the peer was
         // reacquired, `find_send_slot` could not find it, and the cap just acquired leaked (CACHE_SIZE).
         let mut stale: Option<u32> = None;
-        let mut evicted: Option<([u8; PEER_NAME_BYTES], usize)> = None;
+        let mut evicted: Option<([u8; NAME_MAX], usize)> = None;
         let mut placed = false;
         unsafe {
             let cache = &mut *core::ptr::addr_of_mut!(SEND_CAP_CACHE);
@@ -1315,13 +1321,13 @@ impl ServiceContext {
                 let entry = &mut cache[i];
                 entry.slot     = new_slot;
                 entry.name_len = len as u8;
-                entry.name     = [0u8; PEER_NAME_BYTES];
+                entry.name     = [0u8; NAME_MAX];
                 entry.name[..len].copy_from_slice(bytes);
             }
         }
         if let Some(old) = stale { self.remove_cap(CapHandle(old)); }
         if let Some((name, nlen)) = evicted {
-            let gone = core::str::from_utf8(&name[..nlen.min(PEER_NAME_BYTES)]).unwrap_or("?");
+            let gone = core::str::from_utf8(&name[..nlen.min(NAME_MAX)]).unwrap_or("?");
             self.log_fmt(format_args!(
                 "sdk: the send-cap cache is full ({} peers) - dropped the cap to '{}' to hold '{}'; '{}' is reacquired when next used",
                 CACHE_SIZE, gone, peer, gone));
@@ -2947,7 +2953,7 @@ impl ServiceContext {
     pub fn acquire_send_grant_cap(&self, peer: &str) -> Option<CapHandle> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return None; }
+        if len == 0 || len > NAME_MAX { return None; }
         // SAFETY: syscall(10) = AcquireSendCap; arg2=1 requests SEND|GRANT.
         let ret = unsafe { raw_syscall(10, bytes.as_ptr() as u64, len as u64, 1) };
         if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
@@ -2959,7 +2965,7 @@ impl ServiceContext {
     pub fn acquire_send_cap(&self, peer: &str) -> Option<CapHandle> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return None; }
+        if len == 0 || len > NAME_MAX { return None; }
         // SAFETY: syscall(10) = AcquireSendCap; arg2=0 = SEND only.
         let ret = unsafe { raw_syscall(10, bytes.as_ptr() as u64, len as u64, 0) };
         if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
@@ -2973,7 +2979,7 @@ impl ServiceContext {
     pub fn inspect_endpoint_generation(&self, name: &str) -> u64 {
         let bytes = name.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return 0; }
+        if len == 0 || len > NAME_MAX { return 0; }
         // SAFETY: syscall(13) = InspectKernel; query_id=2 = endpoint generation by name.
         let ret = unsafe {
             raw_syscall(13, 2, bytes.as_ptr() as u64, len as u64)

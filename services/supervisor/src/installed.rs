@@ -131,11 +131,18 @@ impl Installed {
     /// version cannot hand over - and the caller restarts instead. An error is a successor that would not start.
     pub fn hand_over(&mut self, ctx: &ServiceContext, pkg: &str, version: &str) -> Result<bool, Text> {
         let Some((publisher, name)) = split(pkg) else { return Err(text(format_args!("`{}` is not a package name", pkg))) };
-        let Some(i) = self.find(pkg) else { return Ok(false) };
-        let Some(e) = self.e[i] else { return Ok(false) };
-        if e.utility || !e.handover || !alive(ctx, pkg) { return Ok(false); }
+        // Every way out to a restart says why: a fallback that is not said is the silent kind (26.7).
+        let cold = |why: &str| {
+            ctx.log_fmt(format_args!("supervisor: installed {} -> {}: not live - {}; stopped and started instead", pkg, version, why));
+            Ok(false)
+        };
+        let Some(e) = self.find(pkg).and_then(|i| self.e[i]) else { return cold("it is not installed here") };
+        let i = self.find(pkg).unwrap_or(0);
+        if e.utility { return cold("it is a utility or an app, which is not replaced live"); }
+        if !e.handover { return cold("the running version cannot hand over (no `handover` in its contract, or no key)"); }
+        if !alive(ctx, pkg) { return cold("it is not running"); }
         // The running one's endpoint, by its name, BEFORE the successor takes the name.
-        let Ok(old) = gs::cap::acquire(ctx, pkg) else { return Ok(false) };
+        let Ok(old) = gs::cap::acquire(ctx, pkg) else { return cold("its endpoint could not be found by its name") };
         let started = self.run_as(ctx, publisher, name, pkg, version, None, true);
         let (_, successor, can) = match started {
             Ok(x) => x,
@@ -281,6 +288,12 @@ impl Installed {
     fn run_as(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str,
               first: Option<&[&str]>, successor: bool)
         -> Result<((bool, bool), Option<godspeed_sdk::capability::CapHandle>, (bool, u32)), Text> {
+        // A package runs under its name and is reached by it, so a name longer than the kernel's directory
+        // holds would start and then be unreachable by its own clients. Refused, never truncated.
+        if pkg.len() > godspeed_sdk::service_context::NAME_MAX {
+            return Err(text(format_args!("its name is {} bytes, and a package name is at most {} - the longest this machine reaches a program by",
+                pkg.len(), godspeed_sdk::service_context::NAME_MAX)));
+        }
         let arch = this_arch().ok_or_else(|| text(format_args!("this machine's architecture has no package spelling")))?;
         if self.image.is_none() {
             self.image = Some(Region::alloc(ctx, IMAGE_MAX)
