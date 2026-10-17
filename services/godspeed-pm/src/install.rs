@@ -102,7 +102,10 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     for p in checked.contract.peers() {
         r.entry(&[C::S(p), C::S("a send capability to it"), C::S(if p == "supervisor" { "never granted to a package" } else { "" })]);
     }
-    r.note(format_args!("{}/{} {} requests these; the operator answers each", f.publisher(), f.name(), f.version()));
+    // The kind rides in the note, so the shell's question says what installing it does: a service starts at
+    // every boot, a utility becomes a command.
+    let kind = if checked.kind == godspeed_package::Kind::Utility { "a utility" } else { "a service" };
+    r.note(format_args!("{}/{} {} requests these; {}; the operator answers each", f.publisher(), f.name(), f.version(), kind));
 }
 
 /// `godspeed install <pkg>[@ver] grant <peer>,...|none`: record the answer, list it, and have the supervisor start it.
@@ -191,7 +194,7 @@ pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, pkg: &str) {
     let stopped = supervisor(ctx, supcmd::UNINSTALL, pkg.as_bytes(), 10);
     r.columns(&["key", "value", "note"]);
     r.row("title", cell(format_args!("{} {}", pkg, version)).as_str(), "uninstalled");
-    r.row("about", match stopped { Ok(()) => "stopped", Err(_) => "was not running" }, "and will not start at boot");
+    r.row("about", match stopped { Ok(()) => "stopped", Err(_) => "was not running" }, "and will not start at boot, or run when typed");
     r.row("kept", cell(format_args!("{}{}/{}", check::DIR, pkg, version)).as_str(), "the fetched copy; `godspeed remove` deletes it");
 }
 

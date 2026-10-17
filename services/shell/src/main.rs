@@ -15621,6 +15621,8 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
         pn += p.len();
     }
     let peers = core::str::from_utf8(&peers[..pn]).unwrap_or("");
+    // What installing it does, from the note's kind: a service starts at every boot, a utility becomes a command.
+    let when = if note.contains("; a utility;") { "becomes a command, run when typed" } else { "starts at every boot" };
     let mut head = [0u8; 512];
     let head = match from {
         Some(h) => fmt_into(&mut head, format_args!("{} (upgrade from {})", release, h)),
@@ -15628,10 +15630,10 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
     };
     let act = if from.is_some() { "Upgrade it" } else { "Install it" };
     if peers.is_empty() {
-        gs::io::print_fmt(ctx, format_args!("{} asks for nothing (no peers, no privilege) and starts at every boot. {}? [y/N]: ", head, act));
+        gs::io::print_fmt(ctx, format_args!("{} asks for nothing (no peers, no privilege) and {}. {}? [y/N]: ", head, when, act));
     } else {
-        gs::io::print_fmt(ctx, format_args!("{} asks for: {} (no privilege) and starts at every boot. {} and grant them? [y/N]: ",
-            head, Commas(peers), act));
+        gs::io::print_fmt(ctx, format_args!("{} asks for: {} (no privilege) and {}. {} and grant them? [y/N]: ",
+            head, Commas(peers), when, act));
     }
     if yes { gs::io::println(ctx, "yes (given on the command line)"); }
     else if !read_confirm(ctx) {

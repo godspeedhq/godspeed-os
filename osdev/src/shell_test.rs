@@ -8507,9 +8507,11 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
 
         // A UTILITY: installed, run by its name for one command line, its output shown and piped, its status said.
         let uf = run!(b"godspeed fetch godspeed/hello-utility\r", 240);
-        check!(uf.contains("godspeed/hello-utility 0.1.0") && uf.contains("fetched"), "`godspeed fetch` fetches a utility package");
+        check!(uf.contains("godspeed/hello-utility 0.1.0") && uf.contains("fetched") && uf.contains("a utility: `godspeed install` makes it a command"),
+               "`godspeed fetch` fetches a utility package and says what installing it does");
         let ui = run!(b"godspeed install godspeed/hello-utility yes\r", 180);
-        check!(ui.contains("godspeed/hello-utility 0.1.0 asks for nothing") && ui.contains("a utility: type `hello-utility"),
+        check!(ui.contains("godspeed/hello-utility 0.1.0 asks for nothing (no peers, no privilege) and becomes a command, run when typed")
+               && ui.contains("a utility: type `hello-utility"),
                "installing a utility asks once and says how to run it");
         check!(ui.contains("checked from disk - a utility, run when typed") && !ui.contains("hello-utility' spawned OK"),
                "the supervisor checks a utility at install and does not start it");
@@ -8525,7 +8527,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(both.contains("installed godspeed/hello-utility ended - exited with status 0 - not restarted"),
                "it ends itself with status 0, and a utility is not restarted");
         let up = run!(b"hello-utility Ada | match Ada | count\r", 60);
-        check!(up.lines().any(|l| l.trim() == "1") && !up.contains("not a pipe source"), "an installed utility starts a pipe");
+        // `count` on text says lines, words and bytes: one line, "hello, Ada".
+        check!(up.contains("1 line, 2 words, 11 bytes") && !up.contains("not a pipe source"), "an installed utility starts a pipe");
         let uq = run!(b"godspeed/hello-utility Grace\r", 60);
         check!(uq.contains("hello, Grace"), "it runs by its package name too");
         let uu = run!(b"godspeed uninstall godspeed/hello-utility yes\r", 60);

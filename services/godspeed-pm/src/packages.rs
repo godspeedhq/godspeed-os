@@ -595,7 +595,9 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
         r.row("built for", built.as_str(), os_note.as_str());
         r.row("requests", req.as_str(), "what its contract asks for; fetching grants nothing");
         r.row("signed", short_key(&c.key).as_str(), key_status.as_str());
-        r.row("installed", "no", "`godspeed install` starts it, and at every boot");
+        r.row("installed", "no", if m.kind == godspeed_package::Kind::Utility {
+            "a utility: `godspeed install` makes it a command, run when typed"
+        } else { "`godspeed install` starts it, and at every boot" });
         let _ = key;
         chain_note_through(r, &v, "", " -> index -> manifest -> signature -> contract -> binary");
         Ok(())
@@ -905,5 +907,5 @@ pub fn remove(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     let mut pubdir = Path::new();
     pubdir.push(DIR).push(name.publisher());
     empty(pubdir.as_str(), &mut fs);
-    r.row("removed", target.as_str(), "the fetched copy; it had not run, so it has no data to keep");
+    r.row("removed", target.as_str(), "the fetched copy, and nothing else: a package's own data is not kept here");
 }
