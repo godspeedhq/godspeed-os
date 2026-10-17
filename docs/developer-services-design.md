@@ -1191,3 +1191,23 @@ change. Not in scope: windows, more than one app on screen, a graphics surface b
 2. Driver: refuse a DMA-class package on a machine with no IOMMU unless asked twice (proposed), or refuse it?
 3. App: is "a utility that owns the console while it runs" the right definition of an app for now?
 
+
+### 13.4 Four kinds, decided (2026-10-17)
+
+Service, utility, app and driver stay four kinds. Merging app into utility was considered - today an app is a
+utility whose grant names the console - and rejected by the operator, because the line between the kinds is not how
+long a program runs but who governs its life:
+
+| Kind | Started by | Ended by | Holds |
+|------|------------|----------|-------|
+| service | the system, at boot | nobody: restarted if it dies | its peers |
+| utility | the operator, by typing it | itself, when the job is done | a stream: what it writes can be piped |
+| app | the operator, by typing it | the operator, by closing it | the screen and the keyboard |
+| driver | the system, at boot | nobody: restarted if it dies | its peers and one device |
+
+An office application runs for as long as it is open and is still an app, not a utility. What it will need and a
+utility never does - being backgrounded with its work open and brought back, focus among several, closing with "you
+have unsaved changes" - is the app lifecycle 9.5 names, not built yet. That is where the two kinds part, so merging them
+now would mean splitting them again, with every app published in between carrying the wrong kind. Underneath, they
+share one mechanism (an app is started as a utility is, with the console flag); that is an implementation detail the
+package format does not have to say.
