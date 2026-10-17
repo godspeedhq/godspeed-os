@@ -94,20 +94,27 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         (Some("check"), None) => check(&ctx, &mut r),
-        (Some("search"), Some(word)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::search(&ctx, r, ready, roots, Some(word))),
+        (Some("search"), Some(word)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, Some(word))),
         (Some("search"), _) => r.fail("usage", "godspeed search <word>", "a word is needed; `godspeed list available` lists everything"),
-        (Some("info"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::info(&ctx, r, ready, roots, name)),
-        (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name)),
-        (Some("list"), Some("available")) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::search(&ctx, r, ready, roots, None)),
+        (Some("info"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::info(&ctx, r, ready, roots, name)),
+        (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name)),
+        (Some("list"), Some("available")) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, None)),
         (Some("list"), Some("fetched")) if words.clone().next().is_none() => packages::list_fetched(&ctx, &mut r),
         (Some("list"), Some("installed")) if words.clone().next().is_none() => packages::list_installed(&mut r),
-        (Some("list"), _) => r.fail("usage", "godspeed list available | fetched | installed", "say which"),
+        (Some("list"), Some("updates")) if words.clone().next().is_none() => list_updates(&ctx, &mut r),
+        (Some("list"), _) => r.fail("usage", "godspeed list available | fetched | installed | updates", "say which"),
+        (Some("verify"), which) if words.clone().next().is_none() => packages::verify(&ctx, &mut r, which),
+        (Some("trust"), None) => trust_show(&ctx, &mut r),
+        (Some("trust"), Some("reset")) => match (words.next(), words.next()) {
+            (Some(name), None) => trust_reset(&ctx, &mut r, name),
+            _ => r.fail("usage", "godspeed trust reset <registry>", "one registry, by the name `godspeed registry` lists"),
+        },
         (Some("remove"), Some(name)) if words.clone().next().is_none() => packages::remove(&ctx, &mut r, name),
         (Some("install"), _) => r.fail("install", "not built",
             "this machine cannot start a program from disk yet (design 9.2); `godspeed fetch` keeps a verified copy"),
         (Some("uninstall"), _) => r.fail("uninstall", "not built",
             "nothing is installed, because nothing can be yet (design 9.2); `godspeed remove` deletes a fetched copy"),
-        _ => r.fail("usage", "godspeed search | info | fetch | list | remove | registry | config | check",
+        _ => r.fail("usage", "godspeed search | info | fetch | list | verify | remove | trust | registry | config | check",
                     "`godspeed help` says what each does"),
     }
     r.send(&ctx);
@@ -560,10 +567,11 @@ fn read_roots(ctx: &ServiceContext, r: &mut Rows, folder: &str, out: &mut Roots)
     true
 }
 
-/// The configuration, the registry in use, the clock and the roots, then `f`: what every registry command
-/// needs before it connects. Each that is missing is a row saying so, and `f` does not run.
+/// The configuration, a registry (the one in use, or `which` by name), the clock and the roots, then `f`: what
+/// every registry command needs before it connects. Each that is missing is a row saying so, and `f` does not
+/// run.
 #[inline(never)]
-fn with_ready(ctx: &ServiceContext, r: &mut Rows, f: impl FnOnce(&packages::Ready<'_>, &Roots, &mut Rows)) {
+fn with_ready(ctx: &ServiceContext, r: &mut Rows, which: Option<&str>, f: impl FnOnce(&packages::Ready<'_>, &Roots, &mut Rows)) {
     let mut buf = [0u8; config::FILE_MAX];
     let n = match load(ctx, r, &mut buf) {
         Ok(n) => n,
@@ -573,7 +581,13 @@ fn with_ready(ctx: &ServiceContext, r: &mut Rows, f: impl FnOnce(&packages::Read
     if let Some(p) = c.problem {
         return r.fail("config", config::PATH, problem_text(&p).as_str());
     }
-    let reg = c.in_use();
+    let reg = match which {
+        None => c.in_use(),
+        Some(name) => match c.find(name) {
+            Some(reg) => reg,
+            None => return r.fail(name, "not known", "the registry it came from is no longer in `godspeed registry`"),
+        },
+    };
     let url = match config::url(reg.url) {
         Ok(u) => u,
         Err(why) => return r.fail("registry", reg.url, why),
@@ -587,6 +601,56 @@ fn with_ready(ctx: &ServiceContext, r: &mut Rows, f: impl FnOnce(&packages::Read
         max_bytes: config::number_of(c.get("max-package-mib")) as u64 * 1024 * 1024,
     };
     f(&ready, &roots, r);
+}
+
+/// `godspeed list updates`: each fetched package against the registry IT came from (an installed package
+/// will update from its origin, `utilities/61_godspeed.md` 2), one registry at a time.
+#[inline(never)]
+fn list_updates(ctx: &ServiceContext, r: &mut Rows) {
+    let mut all = [packages::Fetched::EMPTY_PUB; 32];
+    let mut more = false;
+    let n = match packages::fetched(ctx, &mut all, &mut more) {
+        Ok(n) => n,
+        Err(e) => return r.fail("fetched", packages::DIR, cell(format_args!("could not be listed: {:?}", e)).as_str()),
+    };
+    if n == 0 {
+        return r.note(format_args!("nothing is fetched here, so nothing can be newer"));
+    }
+    let mut done = [false; 32];
+    for i in 0..n {
+        if done[i] { continue; }
+        let reg_name = cell(format_args!("{}", all[i].registry()));
+        for j in i..n { if all[j].registry() == reg_name.as_str() { done[j] = true; } }
+        with_ready(ctx, r, Some(reg_name.as_str()), |ready, roots, r| packages::updates(ctx, r, ready, roots, &all[..n]));
+    }
+}
+
+/// `godspeed trust`: what this machine has accepted from every registry it knows.
+fn trust_show(ctx: &ServiceContext, r: &mut Rows) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let n = match load(ctx, r, &mut buf) {
+        Ok(n) => n,
+        Err(why) => return r.fail("config", "unreadable", why.as_str()),
+    };
+    let c = config::parse(Some(&buf[..n]));
+    if let Some(p) = c.problem {
+        return r.fail("problem", config::PATH, problem_text(&p).as_str());
+    }
+    chain::show(ctx, r, c.registries(), c.in_use().name);
+}
+
+/// `godspeed trust reset <registry>`. The shell asked `[y/N]` first.
+fn trust_reset(ctx: &ServiceContext, r: &mut Rows, name: &str) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let n = match load(ctx, r, &mut buf) {
+        Ok(n) => n,
+        Err(why) => return r.fail("config", "unreadable", why.as_str()),
+    };
+    let c = config::parse(Some(&buf[..n]));
+    match c.find(name) {
+        Some(reg) => chain::reset(ctx, r, &reg),
+        None => r.fail(name, "not known", "`godspeed registry` lists the registries this machine knows"),
+    }
 }
 
 fn first_line(b: &[u8]) -> &str {

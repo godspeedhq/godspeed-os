@@ -287,11 +287,79 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
         fs.write(at("root.toml").as_str(), &d.root[..d.root_len]).map_err(Why::Store)?;
         fs.write(at("pin").as_str(), reg.pin.as_bytes()).map_err(Why::Store)?;
     }
+    // The namespaces document too, when it is new to this machine, so `godspeed trust` can show the
+    // publishers' keys without the network. Verified above; kept only as a record of what was accepted.
+    if root_changed || seen_ns != Some(namespaces.header.version) {
+        fs.write(at("namespaces.toml").as_str(), &d.namespaces[..d.namespaces_len]).map_err(Why::Store)?;
+    }
     let mut seen = Path::new();
     seen.push("timestamp ").num(timestamp.header.version).push("\nnamespaces ").num(namespaces.header.version).push("\n");
     fs.write(at("seen").as_str(), &seen.b[..seen.n]).map_err(Why::Store)?;
 
     Ok(Verified { root, timestamp, snapshot, namespaces, snapshot_text, first_contact })
+}
+
+/// `godspeed trust`: what this machine has accepted from each registry the configuration knows - the root, the
+/// pin it was reached under, the newest timestamp and namespaces versions, and the publishers' keys - read from
+/// its own record, with no network.
+#[inline(never)]
+pub fn show(ctx: &ServiceContext, r: &mut crate::Rows, regs: &[Registry<'_>], using: &str) {
+    let mut fs = gs::fs::Fs::new(ctx);
+    for reg in regs {
+        let dir = store_dir(reg);
+        let at = |name: &str| { let mut p = dir; p.push(name); p };
+        let in_use = if reg.name == using { " (in use)" } else { "" };
+        let mut pin_buf = [0u8; 128];
+        let pin = match fs.read_into(at("pin").as_str(), &mut pin_buf) {
+            Ok(n) => core::str::from_utf8(&pin_buf[..n]).unwrap_or("").trim(),
+            Err(_) => {
+                r.row(reg.name, "never reached", crate::cell(format_args!("{}its root is met at the next command that reaches it", in_use)).as_str());
+                continue;
+            }
+        };
+        let mut root_buf = [0u8; ROOT_MAX];
+        let root_len = fs.read_into(at("root.toml").as_str(), &mut root_buf).unwrap_or(0);
+        let mut seen_buf = [0u8; 128];
+        let seen_len = fs.read_into(at("seen").as_str(), &mut seen_buf).unwrap_or(0);
+        let (ts, ns) = read_seen(core::str::from_utf8(&seen_buf[..seen_len]).unwrap_or(""));
+        let root = core::str::from_utf8(&root_buf[..root_len]).ok().and_then(|t| Root::parse(t).ok());
+        let pin_note = if pin == reg.pin { "the pin in the configuration" } else { "NOT the pin now in the configuration - commands refuse it until `godspeed trust reset`" };
+        match root {
+            Some(root) => r.row(reg.name, crate::cell(format_args!("root {}, timestamp {}, namespaces {}", root.header.version,
+                ts.unwrap_or(0), ns.unwrap_or(0))).as_str(),
+                crate::cell(format_args!("{}root expires {}; reached under {}", in_use, root.header.expires, pin_note)).as_str()),
+            None => r.fail(reg.name, "unreadable", "this machine's record of it does not read: `godspeed trust reset` starts again"),
+        }
+        let mut ns_buf = [0u8; NAMESPACES_MAX];
+        let ns_len = fs.read_into(at("namespaces.toml").as_str(), &mut ns_buf).unwrap_or(0);
+        if let Some(n) = core::str::from_utf8(&ns_buf[..ns_len]).ok().and_then(|t| Namespaces::parse(t).ok()) {
+            for (publisher, status, key) in n.entries() {
+                let st = match status {
+                    godspeed_package::trust::KeyStatus::Active => crate::cell(format_args!("active")),
+                    godspeed_package::trust::KeyStatus::Retired(at) => crate::cell(format_args!("retired {}", at)),
+                    godspeed_package::trust::KeyStatus::Revoked(at) => crate::cell(format_args!("REVOKED {}", at)),
+                };
+                r.row(crate::cell(format_args!("{} {}/", reg.name, publisher)).as_str(),
+                      crate::cell(format_args!("{}", key)).as_str(), st.as_str());
+            }
+        }
+    }
+}
+
+/// `godspeed trust reset <registry>`: forget what this machine accepted from it, so the next command meets it
+/// again from root 1, checked against the pin in the configuration. The shell has asked first.
+pub fn reset(ctx: &ServiceContext, r: &mut crate::Rows, reg: &Registry<'_>) {
+    let dir = store_dir(reg);
+    let mut fs = gs::fs::Fs::new(ctx);
+    match fs.exists(dir.as_str()) {
+        Ok(false) => return r.row(reg.name, "nothing to forget", "this machine has not reached it yet"),
+        Ok(true) => {}
+        Err(e) => return r.fail(reg.name, dir.as_str(), crate::cell(format_args!("could not be checked: {:?}", e)).as_str()),
+    }
+    match fs.delete_all(dir.as_str()) {
+        Ok(()) => r.row(reg.name, "forgotten", "the next command meets it again from root 1, checked against its pin"),
+        Err(e) => r.fail(reg.name, dir.as_str(), crate::cell(format_args!("could not be removed: {:?} - {}", e, fs.reason())).as_str()),
+    }
 }
 
 /// Every package the verified snapshot lists, by name, each confirmed against the snapshot's own lookup.

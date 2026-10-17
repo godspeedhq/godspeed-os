@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Packages: search, inspect, fetch, list and remove (`docs/developer-services-design.md` 10.1).
+//! Packages: search, inspect, fetch, list, verify and remove (`docs/developer-services-design.md` 10.1).
 //!
 //! **Fetched is not installed.** A fetched package is verified and kept under `/system/packages/` (10.5): its
 //! signed manifest, its signature, its service contract and this machine's binary, each checked against what
@@ -7,9 +7,9 @@
 //! built into it; 9.2), so nothing here runs one, and every answer says so rather than calling it installed.
 //!
 //! **Every answer is verified first.** Search reads the verified snapshot; info reads an index the snapshot
-//! names by digest; fetch reads a manifest the index names by digest, signed by a key the signed namespaces
-//! vouch for at the release's publication time, and files the manifest names by digest and size
-//! (`chain.rs`, `godspeed_package`). A file that does not match is never kept.
+//! names by digest, and the chosen release's manifest, signature and contract; fetch reads all of that and
+//! the binary (`chain.rs`, `godspeed_package`). A file that does not match is never kept. `verify` checks a
+//! fetched copy again from what is on disk, without the network.
 //!
 //! **A command's rows are written after its last request**, so when the server closes a kept-alive
 //! connection part way (`Fail::Closed`) the command runs again on a fresh one without saying anything twice.
@@ -17,7 +17,7 @@
 use core::fmt::Write as _;
 
 use godspeed::{self as gs, ServiceContext};
-use godspeed_package::{trust::KeyStatus, Arch, ArtifactVerifier, ManifestSignature, PackageName, Version};
+use godspeed_package::{trust::KeyStatus, Arch, ArtifactVerifier, ManifestSignature, PackageName, PublicKey, Release, Version};
 
 use crate::chain::{self, Docs, Path, Why};
 use crate::config;
@@ -26,7 +26,7 @@ use crate::meta::{self, Artifacts, Releases};
 use crate::toml_lines::{lines, Line, Val};
 use crate::{cell, Cell, Roots, Rows};
 
-/// Where kept packages live: one folder per publisher, package and version (10.5).
+/// Where fetched packages live: one folder per publisher, package and version (10.5).
 pub const DIR: &str = "/system/packages/";
 // Sized to what each holds, as `chain.rs`'s are: `godspeed/hello`'s manifest is 821 bytes and its contract
 // 439, and an index grows by about 200 bytes a release.
@@ -34,8 +34,14 @@ const INDEX_MAX: usize = 8 * 1024;
 const MANIFEST_MAX: usize = 4 * 1024;
 const MSIG_MAX: usize = 1024;
 const CONTRACT_MAX: usize = 4 * 1024;
+const ORIGIN_MAX: usize = 512;
 /// How many times a command is tried on a fresh connection when the server closed the last one part way.
 const ATTEMPTS: u32 = 3;
+/// The most fetched versions one listing reads. More are said, not dropped in silence.
+const MAX_FETCHED: usize = 32;
+
+/// The GodspeedOS release this machine runs, as the workspace says (`build.rs`).
+pub const OS_RELEASE: &str = env!("GODSPEED_OS_RELEASE");
 
 /// This machine's architecture, as package manifests name it: the one whose name begins the target triple
 /// this program was built for (`build.rs`).
@@ -66,8 +72,8 @@ fn spec(s: &str) -> Result<(PackageName<'_>, Option<Version>), &'static str> {
     Ok((name, version))
 }
 
-/// Run `f` on a session to the registry in use, again on a fresh one when the server closed the last part
-/// way, and turn what went wrong into a row.
+/// Run `f` on a session to the registry `ready` names, again on a fresh one when the server closed the last
+/// part way, and turn what went wrong into a row.
 fn on_registry(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots,
                mut f: impl FnMut(&mut Session<'_, '_, '_, '_>, &mut Rows) -> Result<(), Why>) {
     let mut list: [&[u8]; crate::MAX_ROOTS] = [&[]; crate::MAX_ROOTS];
@@ -92,10 +98,7 @@ fn on_registry(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Ro
 
 fn why_text(why: &Why, ready: &Ready<'_>) -> (&'static str, Cell) {
     match why {
-        Why::Net(f) => {
-            let (step, c) = crate::failure(f, config::DEFAULT_ROOTS, "the clock");
-            (step, c)
-        }
+        Why::Net(f) => crate::failure(f, config::DEFAULT_ROOTS, "the clock"),
         Why::Missing { path, status } => ("registry", cell(format_args!("{} answered HTTP {}", path.as_str(), status))),
         Why::TooLarge(what) => ("registry", cell(format_args!("{} is larger than this machine reads", what))),
         Why::NotText(what) => ("registry", cell(format_args!("{} is not text", what))),
@@ -103,8 +106,8 @@ fn why_text(why: &Why, ready: &Ready<'_>) -> (&'static str, Cell) {
         Why::PinMismatch => ("trust", cell(format_args!(
             "the registry's root 1 is not the root {} pins ({}) - nothing from it is trusted", ready.reg.name, ready.reg.pin))),
         Why::PinChanged => ("trust", cell(format_args!(
-            "the pin for {} changed since this machine first reached it; remove {}{}/ to trust the new one",
-            ready.reg.name, "/system/services/godspeed/trust/", ready.reg.name))),
+            "the pin for {} changed since this machine first reached it: `godspeed trust reset {}` to trust the new one",
+            ready.reg.name, ready.reg.name))),
         Why::Store(e) => ("trust", cell(format_args!("this machine's record of the registry: {:?}", e))),
     }
 }
@@ -134,47 +137,9 @@ pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roo
         let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
         for name in chain::packages(&v) {
             if word.is_some_and(|w| !name.contains(w)) { continue; }
-            r.row("package", name, "`godspeed info <name>` lists its versions");
+            r.row("package", name, "`godspeed info <name>` describes it");
         }
         chain_note(r, &v, "");
-        Ok(())
-    });
-}
-
-/// `godspeed info <publisher/name>`: every release the verified index lists.
-#[inline(never)]
-pub fn info(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str) {
-    let (name, _) = match spec(which) {
-        Ok(x) => x,
-        Err(why) => return r.fail("usage", which, why),
-    };
-    let mut docs = Docs::new();
-    let base = ready.url.base;
-    on_registry(ctx, r, ready, roots, |s, r| {
-        let mut iso = [0u8; 20];
-        let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
-        let mut buf = [0u8; INDEX_MAX];
-        let Some(text) = index_text(s, base, &v, &name, &mut buf)? else {
-            r.fail("package", which, "never published on this registry");
-            chain_note(r, &v, "");
-            return Ok(());
-        };
-        let mut rel = Releases::new();
-        let idx = match meta::index(text, &mut rel) {
-            Ok(i) => i,
-            Err(b) => {
-                r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str());
-                return Ok(());
-            }
-        };
-        chain_note(r, &v, "");
-        let latest = idx.latest().map(|l| l.version);
-        for rel in idx.releases {
-            let c = cell(format_args!("{}", rel.version));
-            let note = cell(format_args!("published {} by {}{}", rel.published, rel.published_by,
-                if Some(rel.version) == latest { "; the latest" } else { "" }));
-            r.row("version", c.as_str(), note.as_str());
-        }
         Ok(())
     });
 }
@@ -193,6 +158,191 @@ fn index_text<'b>(s: &mut Session<'_, '_, '_, '_>, base: &str, v: &chain::Verifi
     godspeed_package::trust::verify_index(&v.snapshot, full.as_str(), text)
         .map_err(|err| Why::Trust { what: "the package index", err })?;
     Ok(Some(text))
+}
+
+/// The release `wanted`, or the latest. `None` after a row naming the versions that are published.
+fn release_of<'i>(idx: &godspeed_package::PackageIndex<'i>, wanted: Option<Version>, r: &mut Rows) -> Option<Release<'i>> {
+    match wanted {
+        Some(want) => match idx.releases.iter().find(|rel| rel.version == want) {
+            Some(rel) => Some(*rel),
+            None => {
+                let mut all = Cell::new();
+                for (i, rel) in idx.releases.iter().enumerate() {
+                    let _ = write!(all, "{}{}", if i > 0 { ", " } else { "" }, rel.version);
+                }
+                r.fail("version", cell(format_args!("{}", want)).as_str(), cell(format_args!("not published; these are: {}", all.as_str())).as_str());
+                None
+            }
+        },
+        None => idx.releases.iter().max_by_key(|rel| rel.version).copied(),
+    }
+}
+
+/// One release's documents, as fetched: the manifest, its signature, the contract.
+struct Bufs {
+    m: [u8; MANIFEST_MAX],
+    s: [u8; MSIG_MAX],
+    c: [u8; CONTRACT_MAX],
+}
+
+impl Bufs {
+    fn new() -> Bufs { Bufs { m: [0; MANIFEST_MAX], s: [0; MSIG_MAX], c: [0; CONTRACT_MAX] } }
+}
+
+/// What [`documents`] checked: the lengths in [`Bufs`], and who signed.
+#[derive(Clone, Copy)]
+struct Checked {
+    ml: usize,
+    sl: usize,
+    cl: usize,
+    key: PublicKey,
+}
+
+/// `packages/<publisher>/<name>/<version>/` on the registry.
+fn registry_dir(name: &PackageName<'_>, version: Version) -> Path {
+    let mut pkg = Path::new();
+    pkg.push("packages/").push(name.publisher()).push("/").push(name.name()).push("/");
+    let vtext = cell(format_args!("{}", version));
+    pkg.push(vtext.as_str()).push("/");
+    pkg
+}
+
+/// A release's manifest by the digest the index names, its signature by a key the namespaces vouch for at
+/// the release's publication time, and its contract by the manifest's digest, agreeing with the manifest.
+/// `Ok(None)` after a row saying which check failed.
+fn documents(s: &mut Session<'_, '_, '_, '_>, base: &str, v: &chain::Verified<'_>, name: &PackageName<'_>, which: &str,
+             release: &Release<'_>, b: &mut Bufs, r: &mut Rows) -> Result<Option<Checked>, Why> {
+    let pkg = registry_dir(name, release.version);
+    let mut p = pkg;
+    p.push("manifest.toml");
+    let ml = chain::required(s, base, p.as_str(), &mut b.m, "the manifest")?;
+    if godspeed_package::Sha256Digest::of(&b.m[..ml]) != release.manifest {
+        return Err(Why::Trust { what: "the manifest", err: godspeed_package::trust::TrustError::DigestMismatch("the manifest") });
+    }
+    let mut p = pkg;
+    p.push("manifest.sig");
+    let sl = chain::required(s, base, p.as_str(), &mut b.s, "the manifest's signature")?;
+    let sig_text = chain::text(&b.s[..sl], "the manifest's signature")?;
+    let signature = match ManifestSignature::parse(sig_text).and_then(|sig| sig.verify(&b.m[..ml]).map(|()| sig)) {
+        Ok(sig) => sig,
+        Err(e) => {
+            r.fail("signature", which, cell(format_args!("{:?} - the manifest is not the publisher's; nothing was kept", e)).as_str());
+            return Ok(None);
+        }
+    };
+    v.namespaces.trusts_release(name.publisher(), &signature.key, release.published)
+        .map_err(|err| Why::Trust { what: "the publisher's key", err })?;
+    let mtext = chain::text(&b.m[..ml], "the manifest")?;
+    let mut arts = Artifacts::new();
+    let m = match meta::manifest(mtext, &mut arts) {
+        Ok(m) => m.manifest,
+        Err(e) => { r.fail("manifest", which, cell(format_args!("line {}: {}", e.line, e.why)).as_str()); return Ok(None); }
+    };
+    if m.name != *name || m.version != release.version {
+        r.fail("manifest", which, "the signed manifest names another package or version than the index; nothing was kept");
+        return Ok(None);
+    }
+    let mut p = pkg;
+    p.push(godspeed_package::CONTRACT_FILE);
+    let cl = chain::required(s, base, p.as_str(), &mut b.c, "the contract")?;
+    if godspeed_package::Sha256Digest::of(&b.c[..cl]) != m.contract {
+        return Err(Why::Trust { what: "the contract", err: godspeed_package::trust::TrustError::DigestMismatch("the contract") });
+    }
+    let ctext = chain::text(&b.c[..cl], "the contract")?;
+    if !contract_identity(ctext).is_some_and(|(cn, cv)| m.validate_against_contract(cn, cv, |_| {})) {
+        r.fail("contract", which, "the contract's name or version is not the package's; nothing was kept");
+        return Ok(None);
+    }
+    Ok(Some(Checked { ml, sl, cl, key: signature.key }))
+}
+
+/// The key's standing with the publisher, for a row.
+fn key_note(v: &chain::Verified<'_>, publisher: &str, key: &PublicKey) -> Cell {
+    match v.namespaces.status(publisher, key) {
+        Some(KeyStatus::Retired(at)) => cell(format_args!("a retired key of the publisher's, retired {}, published before then", at)),
+        Some(KeyStatus::Revoked(at)) => cell(format_args!("REVOKED {}", at)),
+        _ => cell(format_args!("an active key of the publisher's")),
+    }
+}
+
+/// The architectures a manifest ships, and whether this machine's is one of them.
+fn arch_cells(m: &godspeed_package::Manifest<'_>) -> (Cell, Cell) {
+    let mut list = Cell::new();
+    for (i, a) in m.artifacts.iter().enumerate() {
+        let _ = write!(list, "{}{}", if i > 0 { ", " } else { "" }, a.arch.as_str());
+    }
+    let note = match this_arch() {
+        Some(here) if m.artifacts.iter().any(|a| a.arch == here) => cell(format_args!("this machine's, {}, is one", here.as_str())),
+        Some(here) => cell(format_args!("NOT this machine's, {}: it cannot be fetched here", here.as_str())),
+        None => cell(format_args!("this machine's architecture is not one packages name")),
+    };
+    (list, note)
+}
+
+/// The OS release a package was built against, beside this machine's.
+fn os_cells(m: &godspeed_package::Manifest<'_>) -> (Cell, Cell) {
+    let built = cell(format_args!("{}", m.os_release));
+    let note = if built.as_str() == OS_RELEASE {
+        cell(format_args!("the release this machine runs"))
+    } else {
+        cell(format_args!("this machine runs {}: there is no stable interface yet, so another release may not run it", OS_RELEASE))
+    };
+    (built, note)
+}
+
+/// `godspeed info <publisher/name>[@version]`: every release the verified index lists, then the chosen one's
+/// manifest - what it is, who signed it, what it was built for, what it ships and what its contract requests.
+#[inline(never)]
+pub fn info(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str) {
+    let (name, wanted) = match spec(which) {
+        Ok(x) => x,
+        Err(why) => return r.fail("usage", which, why),
+    };
+    let mut docs = Docs::new();
+    let base = ready.url.base;
+    on_registry(ctx, r, ready, roots, |s, r| {
+        let mut iso = [0u8; 20];
+        let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
+        let mut ibuf = [0u8; INDEX_MAX];
+        let Some(text) = index_text(s, base, &v, &name, &mut ibuf)? else {
+            r.fail("package", which, "never published on this registry");
+            chain_note(r, &v, "");
+            return Ok(());
+        };
+        let mut rel = Releases::new();
+        let idx = match meta::index(text, &mut rel) {
+            Ok(i) => i,
+            Err(b) => { r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(()); }
+        };
+        let Some(release) = release_of(&idx, wanted, r) else { return Ok(()) };
+        let mut b = Bufs::new();
+        let Some(c) = documents(s, base, &v, &name, which, &release, &mut b, r)? else { return Ok(()) };
+
+        // Every request is made: now the rows.
+        let latest = idx.latest().map(|l| l.version);
+        for rel in idx.releases {
+            let note = cell(format_args!("published {} by {}{}{}", rel.published, rel.published_by,
+                if Some(rel.version) == latest { "; the latest" } else { "" },
+                if rel.version == release.version { "; described below" } else { "" }));
+            r.row("version", cell(format_args!("{}", rel.version)).as_str(), note.as_str());
+        }
+        let mut arts = Artifacts::new();
+        let Ok(read) = meta::manifest(chain::text(&b.m[..c.ml], "the manifest")?, &mut arts) else { return Ok(()) };
+        let m = read.manifest;
+        r.row("description", m.description.unwrap_or("-"), "the publisher's words");
+        r.row("license", m.license.unwrap_or("-"), "not interpreted");
+        let (built, os_note) = os_cells(&m);
+        r.row("built for", built.as_str(), os_note.as_str());
+        let (archs, arch_note) = arch_cells(&m);
+        r.row("ships", archs.as_str(), arch_note.as_str());
+        let mut req = Cell::new();
+        requests(chain::text(&b.c[..c.cl], "the contract")?, &mut req);
+        r.row("requests", req.as_str(), "what its contract asks for; fetching grants nothing");
+        r.row("signed", cell(format_args!("{}", c.key)).as_str(), key_note(&v, name.publisher(), &c.key).as_str());
+        let _ = c.sl;
+        chain_note(r, &v, "");
+        Ok(())
+    });
 }
 
 /// The capabilities a contract REQUESTS, by name, for the answer: the `[capabilities]` keys.
@@ -225,15 +375,11 @@ fn contract_identity(contract: &str) -> Option<(&str, &str)> {
     Some((name?, version?))
 }
 
-/// What one fetch decided, gathered before any row is written.
-struct Fetched {
-    dest: Path,
-    already: bool,
-    key: Cell,
-    retired: Option<Cell>,
-    requests: Cell,
-    arch: &'static str,
-    size: u64,
+/// `/system/packages/<publisher>/<name>/<version>`.
+fn local_dir(name: &PackageName<'_>, version: &str) -> Path {
+    let mut dest = Path::new();
+    dest.push(DIR).push(name.publisher()).push("/").push(name.name()).push("/").push(version);
+    dest
 }
 
 /// `godspeed fetch <publisher/name>[@version]`: verify everything, and keep it.
@@ -252,8 +398,6 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
         let mut iso = [0u8; 20];
         let now = chain::iso(ready.now, &mut iso);
         let v = chain::verify(ctx, s, base, &ready.reg, now, &mut docs)?;
-
-        // The release, from the verified index.
         let mut ibuf = [0u8; INDEX_MAX];
         let Some(text) = index_text(s, base, &v, &name, &mut ibuf)? else {
             r.fail("package", which, "never published on this registry");
@@ -264,55 +408,12 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
             Ok(i) => i,
             Err(b) => { r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(()); }
         };
-        let release = match wanted {
-            Some(want) => match idx.release(want) {
-                Some(rel) => *rel,
-                None => {
-                    let mut all = Cell::new();
-                    for (i, rel) in idx.releases.iter().enumerate() {
-                        let _ = write!(all, "{}{}", if i > 0 { ", " } else { "" }, rel.version);
-                    }
-                    r.fail("version", cell(format_args!("{}", want)).as_str(), cell(format_args!("not published; these are: {}", all.as_str())).as_str());
-                    return Ok(());
-                }
-            },
-            None => match idx.latest() { Some(rel) => *rel, None => return Ok(()) },
-        };
-
-        // The manifest, by the digest the index names; its signature, by a key the namespaces vouch for.
-        let mut pkg = Path::new();
-        pkg.push("packages/").push(name.publisher()).push("/").push(name.name()).push("/");
-        let vtext = cell(format_args!("{}", release.version));
-        pkg.push(vtext.as_str()).push("/");
-        let mut mbuf = [0u8; MANIFEST_MAX];
-        let mut rel_path = pkg;
-        rel_path.push("manifest.toml");
-        let mlen = chain::required(s, base, rel_path.as_str(), &mut mbuf, "the manifest")?;
-        if godspeed_package::Sha256Digest::of(&mbuf[..mlen]) != release.manifest {
-            return Err(Why::Trust { what: "the manifest", err: godspeed_package::trust::TrustError::DigestMismatch("the manifest") });
-        }
-        let mut sbuf = [0u8; MSIG_MAX];
-        let mut sig_path = pkg;
-        sig_path.push("manifest.sig");
-        let slen = chain::required(s, base, sig_path.as_str(), &mut sbuf, "the manifest's signature")?;
-        let sig_text = chain::text(&sbuf[..slen], "the manifest's signature")?;
-        let signature = match ManifestSignature::parse(sig_text).and_then(|sig| sig.verify(&mbuf[..mlen]).map(|()| sig)) {
-            Ok(sig) => sig,
-            Err(e) => { r.fail("signature", which, cell(format_args!("{:?} - the manifest is not the publisher's; nothing was kept", e)).as_str()); return Ok(()); }
-        };
-        v.namespaces.trusts_release(name.publisher(), &signature.key, release.published)
-            .map_err(|err| Why::Trust { what: "the publisher's key", err })?;
-        let mtext = chain::text(&mbuf[..mlen], "the manifest")?;
+        let Some(release) = release_of(&idx, wanted, r) else { return Ok(()) };
+        let mut b = Bufs::new();
+        let Some(c) = documents(s, base, &v, &name, which, &release, &mut b, r)? else { return Ok(()) };
         let mut arts = Artifacts::new();
-        let read = match meta::manifest(mtext, &mut arts) {
-            Ok(m) => m,
-            Err(b) => { r.fail("manifest", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(()); }
-        };
+        let Ok(read) = meta::manifest(chain::text(&b.m[..c.ml], "the manifest")?, &mut arts) else { return Ok(()) };
         let m = read.manifest;
-        if m.name != name || m.version != release.version {
-            r.fail("manifest", which, "the signed manifest names another package or version than the index; nothing was kept");
-            return Ok(());
-        }
         let Some(artifact) = m.artifacts.iter().find(|a| a.arch == arch).copied() else {
             r.fail("arch", arch.as_str(), "the package has no binary for this machine");
             return Ok(());
@@ -321,177 +422,395 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
             r.fail("size", cell(format_args!("{} bytes", artifact.size)).as_str(), "larger than max-package-mib allows");
             return Ok(());
         }
-
-        // The contract, by its digest, and against the manifest's name and version.
-        let mut cbuf = [0u8; CONTRACT_MAX];
-        let mut c_path = pkg;
-        c_path.push(godspeed_package::CONTRACT_FILE);
-        let clen = chain::required(s, base, c_path.as_str(), &mut cbuf, "the contract")?;
-        if godspeed_package::Sha256Digest::of(&cbuf[..clen]) != m.contract {
-            return Err(Why::Trust { what: "the contract", err: godspeed_package::trust::TrustError::DigestMismatch("the contract") });
-        }
-        let ctext = chain::text(&cbuf[..clen], "the contract")?;
-        let agrees = contract_identity(ctext).is_some_and(|(cn, cv)| m.validate_against_contract(cn, cv, |_| {}));
-        if !agrees {
-            r.fail("contract", which, "the contract's name or version is not the package's; nothing was kept");
-            return Ok(());
-        }
-
-        // Where it goes. A version already kept is left as it is.
-        let mut dest = Path::new();
-        dest.push(DIR).push(name.publisher()).push("/").push(name.name()).push("/").push(vtext.as_str());
+        let vtext = cell(format_args!("{}", release.version));
+        let dest = local_dir(&name, vtext.as_str());
         let mut fs = gs::fs::Fs::new(ctx);
-        let key = cell(format_args!("{}", signature.key));
-        let retired = match v.namespaces.status(name.publisher(), &signature.key) {
-            Some(KeyStatus::Retired(at)) => Some(cell(format_args!("{}", at))),
-            _ => None,
-        };
+        let key = cell(format_args!("{}", c.key));
+        let key_status = key_note(&v, name.publisher(), &c.key);
         let mut req = Cell::new();
-        requests(ctext, &mut req);
-        if fs.exists(dest.as_str()).unwrap_or(false) {
-            return finish(r, which, &v, Fetched { dest, already: true, key, retired, requests: req, arch: arch.as_str(), size: artifact.size }, ready);
-        }
-        let mut staging = dest;
-        staging.push(".partial");
-        let _ = fs.delete_all(staging.as_str());
-        fs.create_dir_all(staging.as_str()).map_err(Why::Store)?;
+        requests(chain::text(&b.c[..c.cl], "the contract")?, &mut req);
+        let already = fs.exists(dest.as_str()).unwrap_or(false);
+        if !already {
+            let mut staging = dest;
+            staging.push(".partial");
+            let _ = fs.delete_all(staging.as_str());
+            fs.create_dir_all(staging.as_str()).map_err(Why::Store)?;
 
-        // The binary, streamed to disk and checked as it arrives: never held, never kept unverified.
-        let mut bin_rel = pkg;
-        bin_rel.push(arch.artifact_file());
-        let mut bin = staging;
-        bin.push("/").push(arch.artifact_file());
-        fs.create_sized(bin.as_str(), artifact.size).map_err(Why::Store)?;
-        let mut verifier = ArtifactVerifier::new(artifact);
-        let mut chunk = [0u8; gs::fs::IO_CHUNK];
-        let (mut held, mut written) = (0usize, 0u64);
-        let mut store_err: Option<gs::Error> = None;
-        let mut bad_bytes = false;
-        let mut path = Path::new();
-        path.push(base).push(bin_rel.as_str());
-        let head = s.get(path.as_str(), &mut |b: &[u8]| {
-            if verifier.update(b).is_err() { bad_bytes = true; return false; }
-            let mut rest = b;
-            while !rest.is_empty() {
-                let take = rest.len().min(chunk.len() - held);
-                chunk[held..held + take].copy_from_slice(&rest[..take]);
-                held += take;
-                rest = &rest[take..];
-                if held == chunk.len() {
-                    if let Err(e) = fs.write_at(bin.as_str(), written, &chunk) { store_err = Some(e); return false; }
-                    written += held as u64;
-                    held = 0;
+            // The binary, streamed to disk and checked as it arrives: never held, never kept unverified.
+            let mut bin_rel = registry_dir(&name, release.version);
+            bin_rel.push(arch.artifact_file());
+            let mut bin = staging;
+            bin.push("/").push(arch.artifact_file());
+            fs.create_sized(bin.as_str(), artifact.size).map_err(Why::Store)?;
+            let mut verifier = ArtifactVerifier::new(artifact);
+            let mut chunk = [0u8; gs::fs::IO_CHUNK];
+            let (mut held, mut written) = (0usize, 0u64);
+            let mut store_err: Option<gs::Error> = None;
+            let mut bad_bytes = false;
+            let mut path = Path::new();
+            path.push(base).push(bin_rel.as_str());
+            let head = s.get(path.as_str(), &mut |bytes: &[u8]| {
+                if verifier.update(bytes).is_err() { bad_bytes = true; return false; }
+                let mut rest = bytes;
+                while !rest.is_empty() {
+                    let take = rest.len().min(chunk.len() - held);
+                    chunk[held..held + take].copy_from_slice(&rest[..take]);
+                    held += take;
+                    rest = &rest[take..];
+                    if held == chunk.len() {
+                        if let Err(e) = fs.write_at(bin.as_str(), written, &chunk) { store_err = Some(e); return false; }
+                        written += held as u64;
+                        held = 0;
+                    }
                 }
+                true
+            });
+            if bad_bytes {
+                let _ = fs.delete_all(staging.as_str());
+                r.fail("binary", arch.artifact_file(), "its bytes are not the ones the manifest names; nothing was kept");
+                return Ok(());
             }
-            true
-        });
-        if bad_bytes {
-            let _ = fs.delete_all(staging.as_str());
-            r.fail("binary", arch.artifact_file(), "its bytes are not the ones the manifest names; nothing was kept");
-            return Ok(());
-        }
-        if let Some(e) = store_err {
-            let _ = fs.delete_all(staging.as_str());
-            return Err(Why::Store(e));
-        }
-        let head = head.map_err(|e| { let _ = fs.delete_all(staging.as_str()); Why::Net(e) })?;
-        if head.status != 200 {
-            let _ = fs.delete_all(staging.as_str());
-            return Err(Why::Missing { path: bin_rel, status: head.status });
-        }
-        if held > 0 {
-            fs.write_at(bin.as_str(), written, &chunk[..held]).map_err(Why::Store)?;
-        }
-        if verifier.finish().is_err() {
-            let _ = fs.delete_all(staging.as_str());
-            r.fail("binary", arch.artifact_file(), "it is not the size or digest the manifest names; nothing was kept");
-            return Ok(());
-        }
+            if let Some(e) = store_err {
+                let _ = fs.delete_all(staging.as_str());
+                return Err(Why::Store(e));
+            }
+            let head = head.map_err(|e| { let _ = fs.delete_all(staging.as_str()); Why::Net(e) })?;
+            if head.status != 200 {
+                let _ = fs.delete_all(staging.as_str());
+                return Err(Why::Missing { path: bin_rel, status: head.status });
+            }
+            if held > 0 {
+                fs.write_at(bin.as_str(), written, &chunk[..held]).map_err(Why::Store)?;
+            }
+            if verifier.finish().is_err() {
+                let _ = fs.delete_all(staging.as_str());
+                r.fail("binary", arch.artifact_file(), "it is not the size or digest the manifest names; nothing was kept");
+                return Ok(());
+            }
 
-        // The documents that prove it, beside it, and where it came from.
-        for (file, bytes) in [("manifest.toml", &mbuf[..mlen]), ("manifest.sig", &sbuf[..slen]), (godspeed_package::CONTRACT_FILE, &cbuf[..clen])] {
-            let mut p = staging;
-            p.push("/").push(file);
-            fs.write(p.as_str(), bytes).map_err(Why::Store)?;
+            // The documents that prove it, beside it, and where it came from.
+            for (file, bytes) in [("manifest.toml", &b.m[..c.ml]), ("manifest.sig", &b.s[..c.sl]), (godspeed_package::CONTRACT_FILE, &b.c[..c.cl])] {
+                let mut p = staging;
+                p.push("/").push(file);
+                fs.write(p.as_str(), bytes).map_err(Why::Store)?;
+            }
+            let mut origin = Path::new();
+            origin.push("registry ").push(ready.reg.name).push(" ").push(ready.reg.url).push("\nfetched ").push(now)
+                  .push("\narch ").push(arch.as_str()).push("\nsigned-by ").push(key.as_str()).push("\n");
+            let mut op = staging;
+            op.push("/origin");
+            fs.write(op.as_str(), &origin.b[..origin.n]).map_err(Why::Store)?;
+            fs.rename(staging.as_str(), vtext.as_str()).map_err(Why::Store)?;
         }
-        let mut origin = Path::new();
-        origin.push("registry ").push(ready.reg.name).push(" ").push(ready.reg.url).push("\nfetched ").push(now)
-              .push("\narch ").push(arch.as_str()).push("\nsigned-by ").push(key.as_str()).push("\n");
-        let mut op = staging;
-        op.push("/origin");
-        fs.write(op.as_str(), &origin.b[..origin.n]).map_err(Why::Store)?;
-        fs.rename(staging.as_str(), vtext.as_str()).map_err(Why::Store)?;
-        finish(r, which, &v, Fetched { dest, already: false, key, retired, requests: req, arch: arch.as_str(), size: artifact.size }, ready)
+        chain_row(r, &v);
+        r.row("package", which, cell(format_args!("from {}", ready.reg.name)).as_str());
+        r.row("signed", key.as_str(), key_status.as_str());
+        r.row("binary", arch.as_str(), cell(format_args!("{} bytes, its size and digest the manifest's", artifact.size)).as_str());
+        let (built, os_note) = os_cells(&m);
+        r.row("built for", built.as_str(), os_note.as_str());
+        r.row("requests", req.as_str(), "what its contract asks for; nothing is granted by fetching it");
+        r.row(if already { "already fetched" } else { "fetched" }, dest.as_str(), "verified");
+        r.row("installed", "no", "this machine cannot start a program from disk yet (design 9.2): fetched, not running");
+        Ok(())
     });
 }
 
-fn finish(r: &mut Rows, which: &str, v: &chain::Verified<'_>, f: Fetched, ready: &Ready<'_>) -> Result<(), Why> {
-    chain_row(r, v);
-    r.row("package", which, cell(format_args!("from {}", ready.reg.name)).as_str());
-    r.row("signed", f.key.as_str(), match &f.retired {
-        Some(at) => cell(format_args!("a retired key of the publisher's, retired {}, published before then", at.as_str())),
-        None => cell(format_args!("an active key of the publisher's")),
-    }.as_str());
-    r.row("binary", f.arch, cell(format_args!("{} bytes, its size and digest the manifest's", f.size)).as_str());
-    r.row("requests", f.requests.as_str(), "what its contract asks for; nothing is granted by fetching it");
-    r.row(if f.already { "already fetched" } else { "fetched" }, f.dest.as_str(), "verified");
-    r.row("installed", "no", "this machine cannot start a program from disk yet (design 9.2): fetched, not running");
-    Ok(())
+// ---- what is fetched here --------------------------------------------------------------------------------
+
+/// One fetched version, read from its folder.
+#[derive(Clone, Copy)]
+pub struct Fetched {
+    publisher: [u8; 64], pl: usize,
+    name: [u8; 64], nl: usize,
+    version: [u8; 32], vl: usize,
+    registry: [u8; 32], rl: usize,
+    pub bytes: u64,
 }
 
-/// The kept packages under `/system/packages/`: `(publisher, name, version)` for each, in folder order.
-fn each_kept(ctx: &ServiceContext, mut f: impl FnMut(&str, &str, &str)) -> Result<(), gs::Error> {
+impl Fetched {
+    /// An empty slot, for a caller's array.
+    pub const EMPTY_PUB: Fetched = Fetched::EMPTY;
+    const EMPTY: Fetched = Fetched { publisher: [0; 64], pl: 0, name: [0; 64], nl: 0, version: [0; 32], vl: 0, registry: [0; 32], rl: 0, bytes: 0 };
+    fn s(b: &[u8]) -> &str { core::str::from_utf8(b).unwrap_or("?") }
+    pub fn publisher(&self) -> &str { Self::s(&self.publisher[..self.pl]) }
+    pub fn name(&self) -> &str { Self::s(&self.name[..self.nl]) }
+    pub fn version(&self) -> &str { Self::s(&self.version[..self.vl]) }
+    pub fn registry(&self) -> &str { Self::s(&self.registry[..self.rl]) }
+    fn dir(&self) -> Path {
+        let mut p = Path::new();
+        p.push(DIR).push(self.publisher()).push("/").push(self.name()).push("/").push(self.version());
+        p
+    }
+}
+
+fn copy_into(dst: &mut [u8], src: &[u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+/// The versions fetched here, in folder order: each with the registry it came from and its size on disk.
+/// `Ok(n)` with the first `n` of `out` filled; `more` is set when there were more than `out` holds.
+pub fn fetched(ctx: &ServiceContext, out: &mut [Fetched; MAX_FETCHED], more: &mut bool) -> Result<usize, gs::Error> {
     let mut fs = gs::fs::Fs::new(ctx);
     let mut pubs = [[0u8; 64]; 16];
+    let mut pl = [0usize; 16];
     let mut npubs = 0usize;
-    fs.list_dir(DIR, |e| { if e.is_dir && npubs < 16 { let n = e.name.len().min(64); pubs[npubs][..n].copy_from_slice(&e.name[..n]); npubs += 1; } true })?;
-    for p in pubs.iter().take(npubs) {
-        let publisher = core::str::from_utf8(p).unwrap_or("").trim_end_matches('\0');
+    match fs.list_dir(DIR, |e| { if e.is_dir && npubs < 16 { pl[npubs] = copy_into(&mut pubs[npubs], e.name); npubs += 1; } true }) {
+        Ok(_) => {}
+        Err(gs::Error::NotFound) => return Ok(0),
+        Err(e) => return Err(e),
+    }
+    let mut n = 0usize;
+    for i in 0..npubs {
+        let publisher = Fetched::s(&pubs[i][..pl[i]]);
         let mut dir = Path::new();
         dir.push(DIR).push(publisher);
         let mut names = [[0u8; 64]; 32];
+        let mut nlen = [0usize; 32];
         let mut nn = 0usize;
-        let _ = fs.list_dir(dir.as_str(), |e| { if e.is_dir && nn < 32 { let n = e.name.len().min(64); names[nn][..n].copy_from_slice(&e.name[..n]); nn += 1; } true });
-        for nm in names.iter().take(nn) {
-            let name = core::str::from_utf8(nm).unwrap_or("").trim_end_matches('\0');
+        let _ = fs.list_dir(dir.as_str(), |e| { if e.is_dir && nn < 32 { nlen[nn] = copy_into(&mut names[nn], e.name); nn += 1; } true });
+        for j in 0..nn {
+            let name = Fetched::s(&names[j][..nlen[j]]);
             let mut d2 = dir;
             d2.push("/").push(name);
             let mut vers = [[0u8; 32]; 16];
+            let mut vlen = [0usize; 16];
             let mut nv = 0usize;
-            let _ = fs.list_dir(d2.as_str(), |e| { if e.is_dir && nv < 16 { let n = e.name.len().min(32); vers[nv][..n].copy_from_slice(&e.name[..n]); nv += 1; } true });
-            for v in vers.iter().take(nv) {
-                let version = core::str::from_utf8(v).unwrap_or("").trim_end_matches('\0');
+            let _ = fs.list_dir(d2.as_str(), |e| { if e.is_dir && nv < 16 { vlen[nv] = copy_into(&mut vers[nv], e.name); nv += 1; } true });
+            for k in 0..nv {
+                let version = Fetched::s(&vers[k][..vlen[k]]);
                 if version.ends_with(".partial") { continue; }
-                f(publisher, name, version);
+                if n == MAX_FETCHED { *more = true; return Ok(n); }
+                let mut f = Fetched::EMPTY;
+                f.pl = copy_into(&mut f.publisher, publisher.as_bytes());
+                f.nl = copy_into(&mut f.name, name.as_bytes());
+                f.vl = copy_into(&mut f.version, version.as_bytes());
+                let mut vdir = d2;
+                vdir.push("/").push(version);
+                let mut bytes = 0u64;
+                let _ = fs.list_dir(vdir.as_str(), |e| { bytes += e.size; true });
+                f.bytes = bytes;
+                let mut op = vdir;
+                op.push("/origin");
+                let mut ob = [0u8; ORIGIN_MAX];
+                let got = fs.read_into(op.as_str(), &mut ob).unwrap_or(0);
+                let text = core::str::from_utf8(&ob[..got]).unwrap_or("");
+                let reg = text.lines().find_map(|l| l.strip_prefix("registry ")).and_then(|l| l.split_whitespace().next()).unwrap_or("?");
+                f.rl = copy_into(&mut f.registry, reg.as_bytes());
+                out[n] = f;
+                n += 1;
             }
         }
     }
-    Ok(())
+    Ok(n)
 }
 
-/// `godspeed list fetched`: what has been fetched here, and where it came from. None is no rows.
+fn size_text(bytes: u64) -> Cell {
+    if bytes < 1024 { cell(format_args!("{} B", bytes)) }
+    else if bytes < 1024 * 1024 { cell(format_args!("{}.{} KiB", bytes / 1024, bytes % 1024 * 10 / 1024)) }
+    else { cell(format_args!("{}.{} MiB", bytes >> 20, (bytes & 0xfffff) * 10 >> 20)) }
+}
+
+/// `godspeed list fetched`: what has been fetched here, where it came from and its size. None is no rows.
 pub fn list_fetched(ctx: &ServiceContext, r: &mut Rows) {
-    let mut count = 0u32;
-    let mut origins = [[0u8; 256]; 1];
-    let walked = each_kept(ctx, |p, n, v| {
-        let mut path = Path::new();
-        path.push(DIR).push(p).push("/").push(n).push("/").push(v).push("/origin");
-        let got = gs::fs::Fs::new(ctx).read_into(path.as_str(), &mut origins[0]).unwrap_or(0);
-        let text = core::str::from_utf8(&origins[0][..got]).unwrap_or("");
-        let reg = text.lines().find_map(|l| l.strip_prefix("registry ")).and_then(|l| l.split_whitespace().next()).unwrap_or("?");
-        r.row(cell(format_args!("{}/{}@{}", p, n, v)).as_str(), cell(format_args!("from {}", reg)).as_str(), "fetched, not installed");
-        count += 1;
-    });
-    match walked {
-        Ok(()) | Err(gs::Error::NotFound) if count == 0 => r.note(format_args!("`godspeed fetch <publisher/name>` fetches and verifies one")),
-        Ok(()) | Err(gs::Error::NotFound) => {}
-        Err(e) => r.fail("fetched", DIR, cell(format_args!("could not be listed: {:?}", e)).as_str()),
+    let mut all = [Fetched::EMPTY; MAX_FETCHED];
+    let mut more = false;
+    let n = match fetched(ctx, &mut all, &mut more) {
+        Ok(n) => n,
+        Err(e) => return r.fail("fetched", DIR, cell(format_args!("could not be listed: {:?}", e)).as_str()),
+    };
+    let mut total = 0u64;
+    for f in all.iter().take(n) {
+        r.row(cell(format_args!("{}/{}@{}", f.publisher(), f.name(), f.version())).as_str(),
+              cell(format_args!("from {}", f.registry())).as_str(),
+              cell(format_args!("fetched, not installed; {}", size_text(f.bytes).as_str())).as_str());
+        total += f.bytes;
+    }
+    if n == 0 {
+        r.note(format_args!("`godspeed fetch <publisher/name>` fetches and verifies one"));
+    } else {
+        r.note(format_args!("{} fetched, {} on disk{}", n, size_text(total).as_str(),
+            if more { "; more are fetched than one listing shows" } else { "" }));
     }
 }
 
 /// `godspeed list installed`: none, and why - nothing can be installed yet (9.2). An empty list, not a refusal.
 pub fn list_installed(r: &mut Rows) {
     r.note(format_args!("nothing can be installed on this machine yet (design 9.2); `godspeed list fetched` shows what has been fetched"));
+}
+
+/// The fetched versions `which` names: every one, one package's, or one version.
+fn select(all: &[Fetched], which: Option<&str>) -> Result<[bool; MAX_FETCHED], &'static str> {
+    let mut pick = [false; MAX_FETCHED];
+    let (name, version) = match which {
+        None => (None, None),
+        Some(w) => { let (n, v) = spec(w)?; (Some(n), v) }
+    };
+    for (i, f) in all.iter().enumerate() {
+        let name_ok = name.is_none_or(|n| n.publisher() == f.publisher() && n.name() == f.name());
+        let ver_ok = version.is_none_or(|v| cell(format_args!("{}", v)).as_str() == f.version());
+        pick[i] = name_ok && ver_ok;
+    }
+    Ok(pick)
+}
+
+/// `godspeed verify [<publisher/name>[@version]]`: check fetched copies again from what is on disk, with no
+/// network - the signature over the manifest, the manifest against its folder, the contract and the binary
+/// against the manifest's digests and sizes. Whether the registry still vouches for the key needs the network
+/// (`godspeed list updates` asks it); this is about the bytes on this disk.
+#[inline(never)]
+pub fn verify(ctx: &ServiceContext, r: &mut Rows, which: Option<&str>) {
+    let mut all = [Fetched::EMPTY; MAX_FETCHED];
+    let mut more = false;
+    let n = match fetched(ctx, &mut all, &mut more) {
+        Ok(n) => n,
+        Err(e) => return r.fail("fetched", DIR, cell(format_args!("could not be listed: {:?}", e)).as_str()),
+    };
+    let pick = match select(&all[..n], which) {
+        Ok(p) => p,
+        Err(why) => return r.fail("usage", which.unwrap_or(""), why),
+    };
+    let mut checked = 0u32;
+    let mut damaged = 0u32;
+    for (i, f) in all.iter().take(n).enumerate() {
+        if !pick[i] { continue; }
+        checked += 1;
+        let label = cell(format_args!("{}/{}@{}", f.publisher(), f.name(), f.version()));
+        match verify_one(ctx, f) {
+            Ok(arch) => r.row(label.as_str(), "intact", cell(format_args!(
+                "the signature, the contract and the {} binary match the manifest", arch)).as_str()),
+            Err(why) => { damaged += 1; r.fail(label.as_str(), "DAMAGED", why.as_str()); }
+        }
+    }
+    if checked == 0 {
+        if which.is_some() {
+            return r.fail("fetched", which.unwrap_or(""), "not fetched here: `godspeed list fetched` says what is");
+        }
+        r.note(format_args!("nothing is fetched here"));
+        return;
+    }
+    r.note(format_args!("{} checked, {} damaged; from the disk alone - `godspeed fetch` again replaces a damaged copy once it is removed",
+        checked, damaged));
+}
+
+/// One fetched version, checked from disk. The architecture of its binary, or what is wrong.
+fn verify_one(ctx: &ServiceContext, f: &Fetched) -> Result<&'static str, Cell> {
+    let mut fs = gs::fs::Fs::new(ctx);
+    let dir = f.dir();
+    let read = |fs: &mut gs::fs::Fs<'_>, file: &str, buf: &mut [u8]| -> Result<usize, Cell> {
+        let mut p = dir;
+        p.push("/").push(file);
+        fs.read_into(p.as_str(), buf).map_err(|e| cell(format_args!("{} could not be read: {:?}", file, e)))
+    };
+    let mut m = [0u8; MANIFEST_MAX];
+    let ml = read(&mut fs, "manifest.toml", &mut m)?;
+    let mut s = [0u8; MSIG_MAX];
+    let sl = read(&mut fs, "manifest.sig", &mut s)?;
+    let mut c = [0u8; CONTRACT_MAX];
+    let cl = read(&mut fs, godspeed_package::CONTRACT_FILE, &mut c)?;
+    let mut o = [0u8; ORIGIN_MAX];
+    let ol = read(&mut fs, "origin", &mut o)?;
+    let sig_text = core::str::from_utf8(&s[..sl]).map_err(|_| cell(format_args!("manifest.sig is not text")))?;
+    let sig = ManifestSignature::parse(sig_text).and_then(|g| g.verify(&m[..ml]).map(|()| g))
+        .map_err(|e| cell(format_args!("the signature does not verify over manifest.toml ({:?})", e)))?;
+    let origin = core::str::from_utf8(&o[..ol]).unwrap_or("");
+    let recorded = origin.lines().find_map(|l| l.strip_prefix("signed-by ")).unwrap_or("");
+    if recorded != cell(format_args!("{}", sig.key)).as_str() {
+        return Err(cell(format_args!("signed by another key than the one recorded when it was fetched")));
+    }
+    let mtext = core::str::from_utf8(&m[..ml]).map_err(|_| cell(format_args!("manifest.toml is not text")))?;
+    let mut arts = Artifacts::new();
+    let man = meta::manifest(mtext, &mut arts).map_err(|b| cell(format_args!("manifest.toml line {}: {}", b.line, b.why)))?.manifest;
+    if man.name.publisher() != f.publisher() || man.name.name() != f.name()
+        || cell(format_args!("{}", man.version)).as_str() != f.version() {
+        return Err(cell(format_args!("the manifest names another package or version than its folder")));
+    }
+    if godspeed_package::Sha256Digest::of(&c[..cl]) != man.contract {
+        return Err(cell(format_args!("contract.toml is not the contract the manifest names")));
+    }
+    let arch_name = origin.lines().find_map(|l| l.strip_prefix("arch ")).unwrap_or("");
+    let Some(artifact) = man.artifacts.iter().find(|a| a.arch.as_str() == arch_name).copied() else {
+        return Err(cell(format_args!("the manifest has no binary for the architecture recorded ({})", arch_name)));
+    };
+    let mut bin = dir;
+    bin.push("/").push(artifact.arch.artifact_file());
+    let mut verifier = ArtifactVerifier::new(artifact);
+    let mut chunk = [0u8; gs::fs::IO_CHUNK];
+    let mut off = 0u64;
+    loop {
+        let got = fs.read_at(bin.as_str(), off, &mut chunk)
+            .map_err(|e| cell(format_args!("{} could not be read: {:?}", artifact.arch.artifact_file(), e)))?;
+        if got == 0 { break; }
+        verifier.update(&chunk[..got])
+            .map_err(|_| cell(format_args!("{} is longer than the manifest says", artifact.arch.artifact_file())))?;
+        off += got as u64;
+    }
+    verifier.finish().map_err(|_| cell(format_args!("{} is not the size or digest the manifest names", artifact.arch.artifact_file())))?;
+    Ok(artifact.arch.as_str())
+}
+
+/// `godspeed list updates`, for the fetched packages from one registry: the newest version each has there,
+/// against the newest fetched here. Rows only for packages from `ready`'s registry; the caller runs this
+/// once per registry the fetched packages came from.
+#[inline(never)]
+pub fn updates(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, all: &[Fetched]) {
+    let mut docs = Docs::new();
+    let base = ready.url.base;
+    on_registry(ctx, r, ready, roots, |s, r| {
+        let mut iso = [0u8; 20];
+        let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
+        // One answer per package: the newest version fetched here.
+        let mut seen = [false; MAX_FETCHED];
+        let mut answers: [(usize, Option<Version>, u8); MAX_FETCHED] = [(0, None, 0); MAX_FETCHED];
+        let mut na = 0usize;
+        for i in 0..all.len() {
+            if seen[i] || all[i].registry() != ready.reg.name { continue; }
+            let mut best = i;
+            for j in i + 1..all.len() {
+                if all[j].publisher() == all[i].publisher() && all[j].name() == all[i].name() {
+                    seen[j] = true;
+                    let (a, b) = (all[best].version().parse::<Version>().ok(), all[j].version().parse::<Version>().ok());
+                    if b > a { best = j; }
+                }
+            }
+            let full = cell(format_args!("{}/{}", all[i].publisher(), all[i].name()));
+            let Ok(name) = PackageName::parse(full.as_str()) else { continue };
+            let mut ibuf = [0u8; INDEX_MAX];
+            let (latest, state) = match index_text(s, base, &v, &name, &mut ibuf)? {
+                None => (None, 1u8),
+                Some(text) => {
+                    let mut rels = Releases::new();
+                    match meta::index(text, &mut rels) {
+                        Ok(idx) => (idx.latest().map(|l| l.version), 0u8),
+                        Err(_) => (None, 2u8),
+                    }
+                }
+            };
+            answers[na] = (best, latest, state);
+            na += 1;
+        }
+        for &(i, latest, state) in answers.iter().take(na) {
+            let f = &all[i];
+            let label = cell(format_args!("{}/{}", f.publisher(), f.name()));
+            match (state, latest) {
+                (1, _) => r.row(label.as_str(), f.version(), cell(format_args!("{} no longer lists it", ready.reg.name)).as_str()),
+                (2, _) | (_, None) => r.fail(label.as_str(), f.version(), "its index on the registry does not read"),
+                (_, Some(l)) => {
+                    let lt = cell(format_args!("{}", l));
+                    let newer = f.version().parse::<Version>().map(|h| l > h).unwrap_or(false);
+                    if newer {
+                        r.row(label.as_str(), cell(format_args!("{} -> {}", f.version(), lt.as_str())).as_str(),
+                              cell(format_args!("newer on {}: `godspeed fetch {}`", ready.reg.name, label.as_str())).as_str());
+                    } else {
+                        r.row(label.as_str(), f.version(), cell(format_args!("up to date on {}", ready.reg.name)).as_str());
+                    }
+                }
+            }
+        }
+        chain_note(r, &v, "");
+        Ok(())
+    });
 }
 
 /// `godspeed remove <publisher/name>[@version]`: delete a fetched copy, one version or every one. Nothing of
@@ -517,7 +836,7 @@ pub fn remove(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     if let Err(e) = fs.delete_all(target.as_str()) {
         return r.fail("removed", target.as_str(), cell(format_args!("{:?} - {}", e, fs.reason())).as_str());
     }
-    // Empty folders above it go too, so `list` shows only what is there.
+    // Empty folders above it go too, so a listing shows only what is there.
     let empty = |p: &str, fs: &mut gs::fs::Fs<'_>| {
         let mut any = false;
         let _ = fs.list_dir(p, |_| { any = true; false });

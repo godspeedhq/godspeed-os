@@ -8419,6 +8419,12 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let info = run!(b"godspeed info godspeed/hello\r", 180);
         check!(info.contains("0.1.0") && info.contains("the latest") && info.contains("bankole"),
                "`godspeed info` lists the versions from the verified index, by whom, and the latest");
+        check!(info.contains("description") && info.contains("The service template") && info.contains("GPL-2.0-only"),
+               "`godspeed info` gives the manifest's description and licence");
+        check!(info.contains("built for") && info.contains("0.28.0") && info.contains("ships") && info.contains("this machine's, x86_64, is one"),
+               "and the release it was built for, the architectures it ships and whether this machine's is one");
+        check!(info.contains("requests") && info.contains("log_write") && info.contains("an active key of the publisher's"),
+               "and what its contract requests and who signed it");
         let nope = run!(b"godspeed info godspeed/nothing-here\r", 180);
         check!(nope.contains("never published on this registry"), "a package the snapshot does not list is said to be unpublished");
 
@@ -8438,6 +8444,14 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(twice.contains("already fetched"), "fetching a fetched version again leaves it as it is");
         let listed = run!(b"godspeed list fetched\r", 60);
         check!(listed.contains("godspeed/hello@0.1.0") && listed.contains("from default"), "`godspeed list fetched` shows it and its registry");
+        check!(listed.contains("KiB") && listed.contains("1 fetched"), "with its size, and the total under the list");
+        let verified = run!(b"godspeed verify\r", 120);
+        check!(verified.contains("intact") && verified.contains("1 checked, 0 damaged"), "`godspeed verify` checks the fetched copy from the disk: intact");
+        let updates = run!(b"godspeed list updates\r", 180);
+        check!(updates.contains("godspeed/hello") && updates.contains("up to date on default"), "`godspeed list updates` asks the registry it came from");
+        let trust = run!(b"godspeed trust\r", 60);
+        check!(trust.contains("root 1") && trust.contains("the pin in the configuration") && trust.contains("default godspeed/")
+               && trust.contains("active"), "`godspeed trust` shows the root, the pin, and the publishers' keys, from this machine's record");
         let installed = run!(b"godspeed list installed\r", 60);
         check!(installed.contains("0 packages") && installed.contains("nothing can be installed on this machine yet"),
                "`godspeed list installed` is an empty list with the reason, not a refusal");
@@ -8457,10 +8471,22 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         // A CHANGED PIN is trusting another registry: refused until the operator clears what this machine kept.
         let _ = run!(b"write /system/services/godspeed/trust/default/pin sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);
         let changed = run!(b"godspeed search hello\r", 180);
-        check!(changed.contains("changed since this machine first reached it"), "a pin that changed since first contact is refused, with the folder to remove");
-        let _ = run!(b"delete /system/services/godspeed/trust/default recursive\r", 60);
+        check!(changed.contains("changed since this machine first reached it") && changed.contains("godspeed trust reset default"),
+               "a pin that changed since first contact is refused, naming the command that forgets it");
+        let trust_changed = run!(b"godspeed trust\r", 60);
+        check!(trust_changed.contains("NOT the pin now in the configuration"), "`godspeed trust` says the record's pin is not the configuration's");
+        let refused_reset = run!(b"godspeed trust reset default | count\r", 30);
+        check!(refused_reset.contains("are actions, not reports"), "`godspeed trust reset` refuses to start a pipe");
+        let forgot = run!(b"godspeed trust reset default yes\r", 60);
+        check!(forgot.contains("forgotten"), "`godspeed trust reset` forgets what was accepted");
         let fresh = run!(b"godspeed search hello\r", 180);
-        check!(fresh.contains("first contact: root 1 matched the pin"), "with that folder removed, the registry is met again from root 1");
+        check!(fresh.contains("first contact: root 1 matched the pin"), "and the registry is met again from root 1");
+
+        // DAMAGE on disk is found without the network.
+        let _ = run!(b"write /system/packages/godspeed/hello/0.1.0/contract.toml name = \"other\"\r", 60);
+        let damaged = run!(b"godspeed verify godspeed/hello\r", 120);
+        check!(damaged.contains("DAMAGED") && damaged.contains("contract.toml is not the contract the manifest names"),
+               "`godspeed verify` finds a fetched file changed on disk, and names it");
 
         let removed = run!(b"godspeed remove godspeed/hello\r", 60);
         check!(removed.contains("removed") && removed.contains("/system/packages/godspeed/hello"), "`godspeed remove` deletes the fetched copy");

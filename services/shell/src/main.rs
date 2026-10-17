@@ -1198,7 +1198,7 @@ const _: () = assert!(
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
-    ("godspeed", &["search", "info", "fetch", "list", "remove", "install", "uninstall", "registry", "config", "check"]),
+    ("godspeed", &["search", "info", "fetch", "list", "verify", "remove", "install", "uninstall", "trust", "registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -5703,10 +5703,12 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
         ], true),
         "godspeed" => help_block(ctx, "godspeed", "the native package manager - packages verified against the registry's signed metadata, kept here", &[
             ("godspeed search <word>", "the packages whose name holds the word, from the registry's verified snapshot", "godspeed search hello"),
-            ("godspeed info <publisher/name>", "every published version of one package, from its verified index", "godspeed info godspeed/hello"),
+            ("godspeed info <publisher/name>[@version]", "its versions, then what it is: description, licence, the release it was built for, what it ships and requests, who signed it", "godspeed info godspeed/hello"),
             ("godspeed fetch <publisher/name>[@version]", "verify a package end to end and fetch it to /system/packages/ - fetched, not installed", "godspeed fetch godspeed/hello"),
-            ("godspeed list available | fetched | installed", "what the registry offers, what has been fetched here, what is installed (none yet)", "godspeed list fetched"),
+            ("godspeed list available | fetched | installed | updates", "what the registry offers, what has been fetched here (with sizes), what is installed (none yet), what is newer", "godspeed list updates"),
+            ("godspeed verify [<publisher/name>[@version]]", "check fetched copies again from the disk alone: the signature, the contract, the binary", "godspeed verify"),
             ("godspeed remove <publisher/name>[@version]", "delete a fetched copy, one version or every one", "godspeed remove godspeed/hello"),
+            ("godspeed trust [reset <registry>]", "what this machine has accepted from each registry, and the publishers' keys; reset forgets one (asks [y/N])", "godspeed trust"),
             ("godspeed install | uninstall", "not built: this machine cannot start a program from disk yet, so a package is fetched, not run", ""),
             ("godspeed registry", "the registries this machine knows; exactly one is in use", "godspeed registry"),
             ("godspeed registry add <name> <url> <root>", "know another registry; asks [y/N] before trusting its signing root", "godspeed registry add mirror https://mirror.example/ sha256:..."),
@@ -6070,8 +6072,23 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("everything", "`godspeed list available`", "godspeed list available"),
             ("first contact", "root 1 must match the pin on the registry's line; after that, every root and version seen is remembered, so nothing older is accepted", ""),
         ], false),
-        ("godspeed", "info") => help_block(ctx, "godspeed info", "one package's published versions", &[
-            ("godspeed info <publisher/name>", "each version, when and by whom it was published, and which is the latest - from the index the signed snapshot names by digest", "godspeed info godspeed/hello"),
+        ("godspeed", "info") => help_block(ctx, "godspeed info", "one package: its versions, and what it is", &[
+            ("godspeed info <publisher/name>", "each version (when, by whom, the latest), then the latest's manifest", "godspeed info godspeed/hello"),
+            ("godspeed info <publisher/name>@<version>", "the same, describing that version", "godspeed info godspeed/hello@0.1.0"),
+            ("description, license", "the publisher's words, not interpreted", ""),
+            ("built for", "the GodspeedOS release it was built against, beside the one this machine runs", ""),
+            ("ships, requests, signed", "its architectures and whether this machine's is one; what its contract asks for; the key and its standing", ""),
+            ("checked", "all of it as fetch checks it: the index by the snapshot, the manifest, its signature and the contract by digest", ""),
+        ], false),
+        ("godspeed", "verify") => help_block(ctx, "godspeed verify", "check fetched copies again, with no network", &[
+            ("godspeed verify", "every fetched copy", "godspeed verify"),
+            ("godspeed verify <publisher/name>[@version]", "one package, or one version", "godspeed verify godspeed/hello"),
+            ("what is checked", "the signature over the manifest, the key against the one recorded at fetch, the contract and the binary against the manifest's digests and sizes", ""),
+            ("what is not", "whether the registry still vouches for the key: that needs the network (`godspeed list updates`)", ""),
+        ], false),
+        ("godspeed", "trust") => help_block(ctx, "godspeed trust", "what this machine has accepted from each registry", &[
+            ("godspeed trust", "per registry: its root, timestamp and namespaces versions, the root's expiry, the pin it was reached under; then each publisher's keys and their standing", "godspeed trust"),
+            ("godspeed trust reset <registry> [yes]", "forget what was accepted from it, so the next command meets it again from root 1 against its pin; asks [y/N] unless `yes`", "godspeed trust reset default"),
         ], false),
         ("godspeed", "fetch") => help_block(ctx, "godspeed fetch", "verify a package and fetch it here - fetched, not installed", &[
             ("godspeed fetch <publisher/name>[@version]", "the latest, or the version named", "godspeed fetch godspeed/hello@0.1.0"),
@@ -6081,8 +6098,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("godspeed", "list") => help_block(ctx, "godspeed list", "packages: say which list", &[
             ("godspeed list available", "every package the registry in use offers, from its verified snapshot", "godspeed list available"),
-            ("godspeed list fetched", "the packages fetched here: publisher/name@version, and the registry it came from", "godspeed list fetched"),
+            ("godspeed list fetched", "the packages fetched here: publisher/name@version, the registry it came from and its size; the total under the list", "godspeed list fetched"),
             ("godspeed list installed", "what is installed: none yet, because nothing can be installed yet (design 9.2)", "godspeed list installed"),
+            ("godspeed list updates", "each fetched package against the registry it came from: newer there, up to date, or no longer listed", "godspeed list updates"),
             ("an empty list", "no rows, and not a failure: the console says `0 packages`; piped, only the status row is left", ""),
         ], false),
         ("godspeed", "remove") => help_block(ctx, "godspeed remove", "delete a fetched copy", &[
@@ -15358,7 +15376,7 @@ fn build_godspeed_table(ctx: &ShellCtx, arg: &str) -> Option<Table> {
 #[inline(never)]
 fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     if arg.trim().is_empty() {
-        gs::io::println(ctx, "usage: godspeed search | info | fetch | list | remove | registry | config | check - `godspeed help` says what each does");
+        gs::io::println(ctx, "usage: godspeed search | info | fetch | list | verify | remove | trust | registry | config | check - `godspeed help` says what each does");
         return Err(ShellError::Unknown);
     }
     // TRUSTING A NEW ROOT IS ASKED FIRST, here where the console is: the package manager answers in a
@@ -15390,6 +15408,32 @@ fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         // The request without the `yes`: the package manager is never told a person agreed, only what to add.
         let mut n = 0usize;
         for (i, w) in words[..5].iter().enumerate() {
+            let b = w.as_bytes();
+            if n + b.len() + 1 > line_buf.len() { break; }
+            if i > 0 { line_buf[n] = b' '; n += 1; }
+            line_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
+    }
+    // FORGETTING A REGISTRY'S TRUST is asked first too: the next command trusts whatever root 1 matches the pin.
+    if nw >= 3 && words[0] == "trust" && words[1] == "reset" {
+        let yes = nw == 4 && words[3] == "yes";
+        if nw > 4 || (nw == 4 && !yes) {
+            gs::io::println(ctx, "usage: godspeed trust reset <registry> [yes]");
+            return Err(ShellError::Unknown);
+        }
+        gs::io::println_fmt(ctx, format_args!(
+            "forget what this machine accepted from {} - its next command trusts the root 1 that matches its pin again.", words[2]));
+        if !yes {
+            gs::io::print(ctx, " Forget it? [y/N]: ");
+            if !read_confirm(ctx) {
+                gs::io::println(ctx, "godspeed: cancelled - nothing was forgotten");
+                return Ok(());
+            }
+        }
+        let mut n = 0usize;
+        for (i, w) in words[..3].iter().enumerate() {
             let b = w.as_bytes();
             if n + b.len() + 1 > line_buf.len() { break; }
             if i > 0 { line_buf[n] = b' '; n += 1; }
@@ -18299,8 +18343,9 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
         "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
             (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
             (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("fetch" | "remove" | "install" | "uninstall"), _) => Some("pipe: 'godspeed fetch', 'remove', 'install' and 'uninstall' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) | (Some("search"), _) | (Some("info"), _) | (Some("list"), _) => None,
+            (Some("fetch" | "remove" | "install" | "uninstall"), _) | (Some("trust"), Some("reset")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall' and 'trust reset' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, list, verify, trust, registry, config and check"),
+            (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) | (Some("search"), _) | (Some("info"), _) | (Some("list"), _)
+                | (Some("verify"), _) | (Some("trust"), None) => None,
             _ => Some("pipe: pipe a report: godspeed search, info, list, registry, config or check"),
         },
         "churn" if arg.split_whitespace().next() == Some("verify") => None,
