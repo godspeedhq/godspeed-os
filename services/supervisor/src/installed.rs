@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! INSTALLED PACKAGES: services this machine starts from `/system/packages`, not from an image it was built with.
 //!
 //! `godspeed install` fetches nothing and starts nothing itself. It records the operator's answer - which of the

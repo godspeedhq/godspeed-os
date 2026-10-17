@@ -197,14 +197,14 @@ mod tests {
 
     #[test]
     fn arrays_of_strings() {
-        let mut it = lines("ipc_send = [\"fs\", \"events\",]  # peers
-none = []
-");
-        let Some((_, Ok(Line::Pair("ipc_send", Val::Strings(inner))))) = it.next() else { panic!("not an array") };
+        let mut it = lines("ipc_send = [\"fs\", \"events\",]  # peers\nnone = []\n");
+        let first = it.next().map(|x| x.1);
+        assert_eq!(first, Some(Ok(Line::Pair("ipc_send", Val::Strings("\"fs\", \"events\",")))));
+        let inner = match first { Some(Ok(Line::Pair(_, Val::Strings(s)))) => s, _ => "" };
         let got: [Option<&str>; 3] = { let mut s = strings(inner); [s.next(), s.next(), s.next()] };
         assert_eq!(got, [Some("fs"), Some("events"), None]);
-        let Some((_, Ok(Line::Pair("none", Val::Strings(empty))))) = it.next() else { panic!("not an empty array") };
-        assert_eq!(strings(empty).next(), None);
+        assert_eq!(it.next().map(|x| x.1), Some(Ok(Line::Pair("none", Val::Strings("")))));
+        assert_eq!(strings("").next(), None);
     }
 
     #[test]

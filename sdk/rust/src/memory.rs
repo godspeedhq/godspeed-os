@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A bounded block of this task's own memory, as a byte slice.
 //!
 //! `AllocMem` (syscall 6) maps fresh pages into the calling task and returns their address, and an

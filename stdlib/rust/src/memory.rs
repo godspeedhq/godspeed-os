@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! A bounded block of this program's own memory, for a working set too large for its stack.
 //!
 //! [`Region`] is the SDK's, re-exported so an ordinary program never names `godspeed_sdk`: the same type,

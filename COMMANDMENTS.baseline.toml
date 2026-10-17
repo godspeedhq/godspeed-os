@@ -748,7 +748,10 @@ SpawnImage               = 52
 # program for one `godspeed` command. The shell for its answer; `fs` for its own settings and roots under
 # /system/services/godspeed/; `net-stack` for the registry's TCP connection (op 23); `time` for the date a
 # certificate is checked against. No privilege of any kind.
-"godspeed-pm" = ["peer:fs", "peer:net-stack", "peer:shell", "peer:time"]
+# godspeed-pm reaches the supervisor (2026-10-17) to have it start, stop and list an INSTALLED package
+# (`supcmd::INSTALL`, `UNINSTALL`, `INSTALLED`): IMAGE_SPAWN is the supervisor's alone and undelegated, so the
+# package manager asks rather than spawns. It gains no privilege; CLAUDE.md 14.1 amendment of the same date.
+"godspeed-pm" = ["peer:fs", "peer:net-stack", "peer:shell", "peer:supervisor", "peer:time"]
 # ask-net: the same program, started for a network question, with that question's peers instead
 # (`board::ASK_NET_PEERS`): the shell, the supervisor, `net-stack` (its status) and the board's radio.
 "ask-net" = ["peer:net-stack", "peer:shell", "peer:supervisor", "peer:wifi-driver", "peer:wifi-usb", "priv:INTROSPECT"]

@@ -32,9 +32,9 @@ pub const DIR: &str = "/system/packages/";
 // 439, and an index grows by about 200 bytes a release.
 const INDEX_MAX: usize = 8 * 1024;
 const MANIFEST_MAX: usize = 4 * 1024;
-const MSIG_MAX: usize = 1024;
 const CONTRACT_MAX: usize = 4 * 1024;
-const ORIGIN_MAX: usize = 512;
+// The sizes of the documents a fetched copy keeps are `check.rs`'s, which reads them back.
+use crate::check::{MSIG_MAX, ORIGIN_MAX};
 /// How many times a command is tried on a fresh connection when the server closed the last one part way.
 const ATTEMPTS: u32 = 3;
 /// The most fetched versions one listing reads. More are said, not dropped in silence.
