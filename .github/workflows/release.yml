@@ -243,6 +243,11 @@ jobs:
           cp ../boot/visionfive/extlinux-on-stock-esp.conf extlinux.conf
           7z a -tzip -bso0 -bsp0 "godspeed-os-$V-riscv64-visionfive.zip" "godspeed-os-$V-riscv64-visionfive.img" extlinux.conf
           rm -f extlinux.conf
+          # THE PLATFORM FILE (docs/developer-services-design.md 11): the seven facts the `godspeed` CLI builds
+          # against, generated from the files this commit built from, so its digest is in SHA256SUMS like
+          # every other asset. `osdev build` runs the same script's check, so a missing fact fails long before
+          # this step does.
+          python3 ../scripts/platform_file.py --out godspeed-platform.toml --commit "$(git rev-parse HEAD)"
           sha256sum * > "SHA256SUMS-$V"
           ls -l
 

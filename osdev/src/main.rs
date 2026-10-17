@@ -548,6 +548,12 @@ const EXTRA_CHECKS: &[&str] = &[
     // command's watch, or carries `// quit-ok:` saying why it cannot trap anyone, and those exceptions may
     // fall and may not rise. On the build path from its first day, for the reason above.
     "scripts/quit_wait_check.py",
+    // THE PLATFORM FILE (docs/developer-services-design.md 11): every fact `godspeed-platform.toml` publishes
+    // to developer tooling is still found where the OS builds from it, and every `build.rs` agrees on the
+    // entry symbol and the linker script. The release workflow writes the file with the same script; this is
+    // its `--check`, so moving `services/user.ld` or renaming a key fails the next local build rather than
+    // every installed `godspeed` CLI.
+    "scripts/platform_file.py",
 
     // ---- AND THE COMMENTS, which the audit above could not finish ------------------------------
     //

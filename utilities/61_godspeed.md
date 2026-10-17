@@ -16,8 +16,10 @@ keeping packages are **not built**: they need the registry's signed metadata for
 `godspeed-package` crate), and a machine that could fetch a package still could not run it (10.1).
 `osdev test godspeed` runs every command against a real disk and reaches the real registry over verified
 TLS through QEMU's user network (its registry checks are skipped, not passed, when the machine running the
-test is offline). On hardware, 2026-10-16: `godspeed check` verified the registry and got `HTTP/1.1 200 OK`
-on the HP T630 and the Dell Wyse 5070, the two x86 boards; the ARM and RISC-V boards are not tried yet.
+test is offline). On hardware: `godspeed check` verified the registry and got `HTTP/1.1 200 OK` on all five
+boards - the HP T630 and the Dell Wyse 5070 on 2026-10-16, and the Raspberry Pi 2, the Raspberry Pi 4 and
+the VisionFive 2 Lite on 2026-10-17, each with its own hardware random source (RDRAND on the PCs, the Pis'
+RNG and RNG200, the JH7110's TRNG).
 
 ## 1. The command
 

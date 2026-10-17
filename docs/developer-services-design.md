@@ -608,7 +608,7 @@ is what the OS has to settle before the native side can be built, and what it ca
 
 | command | needs | today |
 |---|---|---|
-| `search`, `info` | to read the registry's index and trust metadata, and verify them | blocked on transport (10.3) and the clock (10.4); no kernel change |
+| `search`, `info` | to read the registry's index and trust metadata, and verify them | transport (10.3) and the clock (10.4) are built; what remains is reading and verifying the metadata (10.6); no kernel change |
 | download and verify a package | the above, plus a place to keep it (10.5) | the same; no kernel change |
 | `list`, `uninstall` | a record of what is kept, and deleting it | possible once something is kept |
 | `install`, `update` (running the package) | a loader and a local grant policy (9.2) | blocked: nothing reads an image from disk |
@@ -619,8 +619,8 @@ presenting a development convenience as installation; the same holds here.
 
 **Built, 2026-10-16: `godspeed registry` (with `add`, `use` and `remove`), `godspeed config`, `godspeed
 config set` and `godspeed check`** (`services/godspeed-pm`, `utilities/61_godspeed.md`), QEMU-verified and,
-for `check`, hardware-verified the same day on the T630 and the Wyse 5070 (the ARM and RISC-V boards not
-tried yet). The settings of 10.8 and the transport of 10.3, end to end: the file written on first start, a checked `set` that keeps the rest of the file, and the registry
+for `check`, hardware-verified the same day on the T630 and the Wyse 5070, and on 2026-10-17 on the Pi 2,
+the Pi 4 and the VisionFive 2 Lite. The settings of 10.8 and the transport of 10.3, end to end: the file written on first start, a checked `set` that keeps the rest of the file, and the registry
 reached over TLS verified to the roots folder. Search, fetch and keep are not built; they need the
 registry's metadata format (10.6). Three things were missing on the way and were added: an outbound TCP
 connection held as a capability (`net-stack` op 23, `docs/tcp-design.md`); `gs::task::wall_clock` and
@@ -871,7 +871,10 @@ current time are arguments, never constants, so the library has no address in it
 
 ## 11. The platform file: what a release says to developer tooling
 
-**Added 2026-10-17. A proposal: nothing here is approved, and nothing in this repository is built.** The
+**Added 2026-10-17 as a proposal; approved the same day (11.5), and the OS side is built:**
+`scripts/platform_file.py` writes the file in the release workflow and checks it on every `osdev build`
+(11.4). The first release to carry it is the next one; the CLI's side is its own repository's to release
+after that (its `backlog/01`). The
 `godspeed` CLI no longer needs a clone of this repository (`godspeed-cli` 0.2.0, the CLI repository's
 docs/no-checkout.md). The first time it needs a release, it fetches six files from the release's tag,
 resolved first to one commit, and caches them with their digests. That works today with nothing changed
@@ -954,7 +957,7 @@ the CLI's own change, behind its src/kit.rs, and needs nothing further here.
 - **The CLI** reads one published file per release instead of six private ones. This repository can
   move or reshape its build files freely, as long as the generator keeps producing the same facts.
 - **Other tools**, such as an editor plugin or a second CLI, get the same facts the same way.
-- **The cost:** one new script in `scripts/`, with two modes. The release workflow runs it to
+- **The cost:** one script, `scripts/platform_file.py`, with two modes. The release workflow runs it to
   write the TOML. With `--check` it writes nothing and fails if any fact cannot be found, or if the
   services disagree about the entry symbol or the linker script; that mode goes in `osdev`'s
   `EXTRA_CHECKS`, so a rename fails the next local build rather than a developer's machine. Not in
@@ -968,3 +971,44 @@ the CLI's own change, behind its src/kit.rs, and needs nothing further here.
 
    *Recommended: yes, with the entry symbol (11.1) and the `--check` mode in `EXTRA_CHECKS` (11.4). It
    needs no kernel change, grants nothing, and is the one item here the CLI is already waiting on.*
+
+   **Decided 2026-10-17 by the operator: yes, as recommended.** Built the same day.
+
+### 11.6 As built
+
+The file, as `scripts/platform_file.py` writes it for 0.28.0 (the two `[files]` strings shortened here):
+
+    format = 1
+    os = "0.28.0"
+    commit = "<the full commit the release was built from>"
+
+    [stdlib]
+    crate = "godspeed"
+    tag = "v0.28.0"
+
+    [toolchain]
+    channel = "nightly-2026-05-16"
+    targets = ["x86_64-unknown-none", "armv7a-none-eabi", "aarch64-unknown-none", "riscv64imac-unknown-none-elf"]
+
+    [link]
+    entry = "service_main"
+    script = "user.ld"          # a key of [files]
+
+    [rustflags]
+    "x86_64-unknown-none" = ["-C", "relocation-model=static", "--cfg", "aes_force_soft", ...]
+    ...                         # one line per target above, and no others
+
+    [files]
+    "user.ld" = "..."
+    "service.schema.json" = "..."
+
+- **Refusals**, each proven by `--selftest`: a `build.rs` naming another entry symbol or linker script
+  (42 build.rs files, under `services/` and `examples/`, are read); a listed target with no rustflags; a
+  missing file; a linker script not called `user.ld`, since the CLI carries it under that name and a
+  rename is a new format, not a quiet change.
+- **Read back before it is written:** the rendered text is parsed again (`tomllib`, or the repository's
+  subset parser on an older Python) and compared with the facts it was made from.
+- **Strings are TOML basic strings**, escaped, so the linker script and the schema survive any character
+  they contain.
+- **Where it runs:** `osdev build` (`EXTRA_CHECKS`), and the release workflow's Package step, into `dist/`
+  before `SHA256SUMS-<tag>` is written.
