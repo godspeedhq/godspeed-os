@@ -69,6 +69,8 @@ pub struct Contract {
     pub pci_bar: u32,
     /// `hw_pci_irq`: it asks for an interrupt.
     pub pci_irq: bool,
+    /// `handover`: it can hand its state to a newer version of itself and end (`gs::handover`).
+    pub handover: bool,
 }
 
 impl Contract {
@@ -102,7 +104,7 @@ fn size_of(s: &str) -> Option<u64> {
 /// The contract's name, version, send peers, receive endpoint and memory limit.
 fn contract(c: &str) -> Result<(&str, &str, Contract), Text> {
     let mut out = Contract { peers: [[0; PEER_MAX]; MAX_PEERS], lens: [0; MAX_PEERS], np: 0, receives: false, memory_limit: 0,
-                             pci_class: None, pci_bar: 7, pci_irq: false };
+                             pci_class: None, pci_bar: 7, pci_irq: false, handover: false };
     let (mut name, mut version) = (None, None);
     let mut table = "";
     for (n, l) in lines(c) {
@@ -129,6 +131,7 @@ fn contract(c: &str) -> Result<(&str, &str, Contract), Text> {
             Line::Pair("hw_pci_bar", Val::Int(b)) if table == "capabilities" && b <= 5 => out.pci_bar = b as u32,
             Line::Pair("hw_pci_bar", Val::Str("auto")) if table == "capabilities" => out.pci_bar = 7,
             Line::Pair("hw_pci_irq", Val::Bool(b)) if table == "capabilities" => out.pci_irq = b,
+            Line::Pair("handover", Val::Bool(b)) if table == "capabilities" => out.handover = b,
             Line::Pair("limit", Val::Str(s)) if table == "resources.memory" => {
                 out.memory_limit = size_of(s).ok_or_else(|| text(format_args!("contract.toml line {}: `{}` is not a size", n, s)))?;
             }

@@ -917,6 +917,12 @@ const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 const SPAWN_FLAG_WATCHED: u32 = 1 << 4;
 /// Mint the child's peer caps with GRANT (§22 Test 5A). See the SDK constant.
 const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
+/// A LIVE HANDOVER: start this beside the one task already running under its name, rather than refusing it
+/// (CLAUDE.md 2.5 amendment, 2026-10-17). Honoured only here, in `SpawnImage`, which only an `IMAGE_SPAWN` holder
+/// reaches - the supervisor alone - and only when exactly one task holds the name. The new task's endpoint takes
+/// the name in the directory; the old one keeps running until it ends itself, and its death leaves the name alone
+/// (the endpoint-id guard in `ipc::names`). The kernel learns nothing about what is handed over.
+const SPAWN_FLAG_HANDOVER: u32 = 1 << 5;
 /// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
 /// largest real request (xHCI's scratchpad, 1168 KiB) and far below anything that could starve the
 /// frame allocator.
@@ -1169,6 +1175,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.bdf,
         req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
         req.flags & SPAWN_FLAG_WATCHED     != 0,
+        req.flags & SPAWN_FLAG_HANDOVER    != 0,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it

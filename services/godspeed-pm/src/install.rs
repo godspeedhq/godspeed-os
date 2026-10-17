@@ -171,8 +171,15 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
     if let Err(why) = write_list(ctx, pkg.as_str(), line.as_str()) { return r.fail("installed", LIST, why.as_str()); }
 
     // Start it: a running other version first stops, so the one listed is the one that runs.
-    let _ = supervisor(ctx, supcmd::UNINSTALL, pkg.as_str().as_bytes(), 10);
-    let started = supervisor(ctx, supcmd::INSTALL, line.as_str().as_bytes(), START_SECS);
+    // Another version running: replaced LIVE where both versions can hand over, stopped and started where they cannot
+    // (the supervisor decides, and says which). Nothing running: started.
+    let mut how = 0u8;
+    let started = if prev.as_ref().is_some_and(|p| p.as_str() != line.as_str()) {
+        supervisor_how(ctx, supcmd::HANDOVER, line.as_str().as_bytes(), START_SECS).map(|h| { how = h; })
+    } else {
+        let _ = supervisor(ctx, supcmd::UNINSTALL, pkg.as_str().as_bytes(), 10);
+        supervisor(ctx, supcmd::INSTALL, line.as_str().as_bytes(), START_SECS)
+    };
     if let (Err(why), Some(p)) = (&started, &prev) {
         if p.as_str() != line.as_str() {
             // The new one did not start: the previous one back, on the list and running, and both said.
@@ -214,6 +221,11 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
         r.row("runs", "when typed", "for one command line; its output is shown or piped, and its status said");
     } else {
         r.row("boot", "starts at every boot", cell(format_args!("listed in {}", LIST)).as_str());
+        match how {
+            b'H' => r.row("replaced", "live, with no restart", "the running version handed its state to this one and ended"),
+            b'R' => r.row("replaced", "stopped and started", "the running version, or this one, cannot hand over (`handover` in its contract)"),
+            _ => {}
+        }
     }
     r.note(format_args!("checked from the disk: signature -> key -> contract -> binary"));
 }
@@ -279,6 +291,23 @@ pub fn list(ctx: &ServiceContext, r: &mut Rows) {
 
 /// One command to the supervisor, answered `[OK]` or `[FAILED, reason...]`.
 #[inline(never)]
+/// [`supervisor`], for a command that answers `[OK, how]`: the `how` byte.
+fn supervisor_how(ctx: &ServiceContext, op: u8, arg: &[u8], secs: i64) -> Result<u8, Cell> {
+    let mut m = [0u8; 120];
+    if arg.len() + 2 > m.len() { return Err(cell(format_args!("the request is too long"))); }
+    m[0] = supcmd::MARKER;
+    m[1] = op;
+    m[2..2 + arg.len()].copy_from_slice(arg);
+    let reply = gs::call::request_within(ctx, "supervisor", &Message::from_bytes(&m[..2 + arg.len()]), secs)
+        .map_err(|e| cell(format_args!("the supervisor did not answer: {:?}", e)))?;
+    let b = reply.payload_bytes();
+    match b.first() {
+        Some(&supcmd::OK) => Ok(b.get(1).copied().unwrap_or(0)),
+        Some(&supcmd::FAILED) if b.len() > 1 => Err(cell(format_args!("{}", core::str::from_utf8(&b[1..]).unwrap_or("refused")))),
+        _ => Err(cell(format_args!("refused"))),
+    }
+}
+
 fn supervisor(ctx: &ServiceContext, op: u8, arg: &[u8], secs: i64) -> Result<(), Cell> {
     let mut m = [0u8; 120];
     if arg.len() + 2 > m.len() { return Err(cell(format_args!("the request is too long"))); }

@@ -377,6 +377,9 @@ pub const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 /// supervisor sets it for every service it manages; the kernel keeps no list of which services those are
 /// (`docs/audio.md`, "No service names in the kernel").
 pub const SPAWN_FLAG_WATCHED:     u32 = 1 << 4;
+/// A live handover: start this beside the one task already running under its name, which keeps running until it
+/// ends itself; the new one takes the name. The supervisor's alone, since only `SpawnImage` honours it (CLAUDE.md 2.5).
+pub const SPAWN_FLAG_HANDOVER:    u32 = 1 << 5;
 
 /// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
 /// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
@@ -600,6 +603,12 @@ pub mod supcmd {
     /// Which packages has this supervisor started from the disk? Read only: `[MARKER, INSTALLED]`, answered with
     /// `[OK, count, (len, name, running 0/1)*]`. `godspeed list installed`.
     pub const INSTALLED: u8 = b'L';
+    /// Replace a running installed package with another version WITHOUT STOPPING IT: `[MARKER, HANDOVER, "publisher/name
+    /// version"]`. The supervisor checks the new version, starts it beside the running one, and tells the running one to
+    /// hand over (`gs::handover`). Where either version cannot - it is not running, or a contract does not declare
+    /// `handover` - it stops the old and starts the new, as INSTALL after UNINSTALL would. Answered `[OK, how]`, `how`
+    /// `b'H'` handed over live or `b'R'` restarted, or `[FAILED, reason...]`.
+    pub const HANDOVER: u8 = b'H';
     /// A device's driver died and was restarted.
     pub const EV_RESTARTED: u8 = 1;
     /// A device's driver died and its restart failed.

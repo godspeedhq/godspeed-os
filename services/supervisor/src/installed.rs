@@ -25,7 +25,7 @@
 use godspeed::{self as gs, ServiceContext};
 use godspeed_package::{Arch, Kind};
 use godspeed::memory::Region;
-use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_REQ_CONSOLE, SPAWN_FLAG_REQ_RECV, SPAWN_FLAG_WATCHED};
+use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_HANDOVER, SPAWN_FLAG_REQ_CONSOLE, SPAWN_FLAG_REQ_RECV, SPAWN_FLAG_WATCHED};
 
 /// The word an app's grant uses for the console - the screen and the keyboard while it runs - beside its peers.
 pub const CONSOLE_GRANT: &str = "console";
@@ -68,6 +68,8 @@ struct Entry {
     app: bool,
     /// A driver's device class, once it has been started with it: one installed driver per class.
     pci_class: Option<u32>,
+    /// The running version's contract declares `handover`: it can hand its state to a successor and end.
+    handover: bool,
 }
 
 impl Entry {
@@ -114,6 +116,45 @@ impl Installed {
 
     /// Is `task` an installed package's? Its death is this module's to answer.
     pub fn has(&self, task: &str) -> bool { self.find(task).is_some() }
+
+    /// Record whether the version of `pkg` now running can hand over.
+    fn note_handover(&mut self, pkg: &str, can: bool) {
+        if let Some(i) = self.find(pkg) {
+            if let Some(mut e) = self.e[i] { e.handover = can; self.e[i] = Some(e); }
+        }
+    }
+
+    /// Replace the running `pkg` with `version` LIVE: start it beside the running one as its successor and tell the
+    /// running one to hand over. True when that happened; false when it could not - nothing running, or the running
+    /// version cannot hand over - and the caller restarts instead. An error is a successor that would not start.
+    pub fn hand_over(&mut self, ctx: &ServiceContext, pkg: &str, version: &str) -> Result<bool, Text> {
+        let Some((publisher, name)) = split(pkg) else { return Err(text(format_args!("`{}` is not a package name", pkg))) };
+        let Some(i) = self.find(pkg) else { return Ok(false) };
+        let Some(e) = self.e[i] else { return Ok(false) };
+        if e.utility || !e.handover || !alive(ctx, pkg) { return Ok(false); }
+        // The running one's endpoint, by its name, BEFORE the successor takes the name.
+        let Some(old) = ctx.acquire_send_cap(pkg) else { return Ok(false) };
+        let started = self.run_as(ctx, publisher, name, pkg, version, None, true);
+        let (_, successor, can) = match started {
+            Ok(x) => x,
+            Err(why) => { gs::cap::remove(ctx, old.into()); return Err(why); }
+        };
+        let Some(succ) = successor else {
+            gs::cap::remove(ctx, old.into());
+            return Err(text(format_args!("the successor started with no endpoint to hand to")));
+        };
+        // The offer, with the successor's endpoint attached: the running one sends its state there and ends.
+        let sent = gs::ipc::send_granting(ctx, old.into(), succ.into(), &gs::ipc::Message::from_bytes(godspeed::handover::OFFER)).is_ok();
+        if !sent { gs::cap::remove(ctx, succ.into()); }
+        gs::cap::remove(ctx, old.into());
+        let restarts = e.restarts;
+        let slot = i;
+        self.remember(slot, pkg, version, restarts, (false, false));
+        self.note_handover(pkg, can);
+        ctx.log_fmt(format_args!("supervisor: installed {} {} -> {}: handover {}", pkg, e.version(), version,
+            if sent { "offered - the running version hands its state over and ends" } else { "could NOT be offered - the old version keeps running beside it" }));
+        Ok(true)
+    }
 
     /// Record the device class `pkg` was started with.
     fn class_of(&mut self, pkg: &str, class: Option<u32>) {
@@ -162,8 +203,9 @@ impl Installed {
             self.remember(slot, pkg, version, restarts, kind);
             return Ok(());
         }
-        let kind = self.run(ctx, publisher, name, pkg, version, None)?;
+        let ((kind, _), handover) = self.run_as(ctx, publisher, name, pkg, version, None, false).map(|(k, c, h)| ((k, c), h))?;
         self.remember(slot, pkg, version, restarts, kind);
+        self.note_handover(pkg, handover);
         Ok(())
     }
 
@@ -182,7 +224,9 @@ impl Installed {
 
     fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32, (utility, app): (bool, bool)) {
         let pci_class = self.e[slot].and_then(|x| x.pci_class);
-        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility, app, pci_class };
+        let handover = self.e[slot].is_some_and(|x| x.handover);
+        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility, app, pci_class,
+                            handover };
         e.name[..pkg.len()].copy_from_slice(pkg.as_bytes());
         e.version[..version.len()].copy_from_slice(version.as_bytes());
         self.e[slot] = Some(e);
@@ -193,6 +237,15 @@ impl Installed {
     /// otherwise only checked.
     fn run(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str,
            first: Option<&[&str]>) -> Result<(bool, bool), Text> {
+        self.run_as(ctx, publisher, name, pkg, version, first, false).map(|(k, _, _)| k)
+    }
+
+    /// [`run`](Installed::run), and when `successor` is set, started BESIDE the running version as its successor
+    /// (`SPAWN_FLAG_HANDOVER`, the handover spawn mode). The new endpoint's capability comes back for the offer.
+    #[allow(clippy::too_many_arguments)]
+    fn run_as(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str,
+              first: Option<&[&str]>, successor: bool)
+        -> Result<((bool, bool), Option<godspeed_sdk::capability::CapHandle>, bool), Text> {
         let arch = this_arch().ok_or_else(|| text(format_args!("this machine's architecture has no package spelling")))?;
         if self.image.is_none() {
             self.image = Some(Region::alloc(ctx, IMAGE_MAX)
@@ -224,7 +277,7 @@ impl Installed {
         if utility && first.is_none() {
             ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - {}, run when typed", pkg, version,
                 if app { "an app" } else { "a utility" }));
-            return Ok((utility, app));
+            return Ok(((utility, app), None, false));
         }
         // The console: for an app, and only when the operator's answer gave it. The device, likewise, for a driver.
         let mut console = false;
@@ -285,16 +338,22 @@ impl Installed {
             req.dma_pages = 0;
         }
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
+        if successor {
+            if !checked.contract.handover { return Err(text(format_args!("its contract does not declare `handover`"))); }
+            req.flags |= SPAWN_FLAG_HANDOVER;
+            req.probe_mode = godspeed::handover::MODE;
+        }
         req.privileges = 0;
         let mut out = [0u8; 128];
         match ctx.spawn_image(&mut req, &mut out, &peers[..np]) {
             Ok(cap) => {
-                // Nobody asked for a capability to it here; clients reach it by name, as every service.
-                if let Some(c) = cap { gs::cap::remove(ctx, c.into()); }
+                // Nobody asked for a capability to it here; clients reach it by name, as every service. A successor's
+                // goes back to the caller, which hands it to the running version with the offer.
+                let kept = if successor { cap } else { if let Some(c) = cap { gs::cap::remove(ctx, c.into()); } None };
                 ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s){}, checked from disk)",
                     pkg, version, checked.size, np, if driver { ", its device" } else { "" }));
                 if driver { self.class_of(pkg, checked.contract.pci_class); }
-                Ok((utility, app))
+                Ok(((utility, app), kept, checked.contract.handover))
             }
             Err(e) => Err(text(format_args!("the kernel refused to start it: {:?}", e))),
         }

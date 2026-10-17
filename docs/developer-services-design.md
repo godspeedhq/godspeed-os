@@ -1211,3 +1211,40 @@ have unsaved changes" - is the app lifecycle 9.5 names, not built yet. That is w
 now would mean splitting them again, with every app published in between carrying the wrong kind. Underneath, they
 share one mechanism (an app is started as a utility is, with the console flag); that is an implementation detail the
 package format does not have to say.
+
+## 14. Live handover: a running service replaced without stopping (built 2026-10-17)
+
+The operator asked for Erlang's upgrade-in-place. CLAUDE.md 2.5 forbids changing code inside a running program, and
+still does; the 2.5 amendment of this date allows the part a user sees - the service is a new version and never
+stopped - built from two isolated programs and an explicit handover.
+
+### 14.1 The sequence
+
+1. `godspeed upgrade` (or `install <name>@<version>` with another version running) asks the supervisor for a handover
+   (`supcmd::HANDOVER`).
+2. The supervisor checks the new version from the disk, as for every start, and takes a send capability to the RUNNING
+   version's endpoint by its name.
+3. It starts the new version with `SPAWN_FLAG_HANDOVER` and the handover spawn mode (`gs::handover::MODE`). The kernel
+   lets it start beside the one running instance; the name now answers to the new one.
+4. It sends the running version the OFFER, with the new version's endpoint capability attached.
+5. The running version answers what is already in its queue (`hand_over`'s drain), sends its state (one message), and
+   ends with status 0. The supervisor sees the name still alive and does not restart anything.
+6. The new version, started in the handover mode, waits up to 10 s for the state (`take_over`), keeping up to two
+   ordinary requests that arrive first, and carries on from it.
+
+### 14.2 When it falls back
+
+A restart, said in the answer (`replaced: stopped and started`), when the running version's contract or the new one's
+does not declare `handover`, or nothing is running. A successor that will not start leaves the running version running.
+A state that never arrives (the old version does not answer the offer) is said by the successor, which starts fresh.
+
+### 14.3 What it does not do
+
+Capabilities do not travel. A request sent to the old version after its drain is lost with it, reported to its caller as
+`OutcomeUnknown`. The state is one message (4088 bytes); more stays on disk. Apps are not covered: an app's handover
+would move the screen with the state, and is not built. The kernel's part is one flag (2.5 amendment).
+
+### 14.4 Shown
+
+`godspeed/hello-service` 0.3.0 and 0.4.0 count the seconds they run; upgraded from one to the other in QEMU, the new
+version logs `took over, live, at N seconds` with the old version's count, and nothing died or restarted.

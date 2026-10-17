@@ -104,6 +104,28 @@ A deliberately small, fully-understood capability microkernel, built to internal
 | Zero-copy IPC      | **Rejected, permanent** | Violates "no shared mutable memory"             |
 | Live code updates  | **Rejected, permanent** | Restart-with-reacquisition is sufficient        |
 
+> **Amendment 2026-10-17 (live handover): a running service may be REPLACED without stopping, by a second program -
+> code is still never changed inside a running one.** The operator asked for Erlang's upgrade-in-place. What this row
+> rejects stays rejected: no new code is ever loaded into a running address space, so W^X holds and the bytes that run
+> are always the bytes the supervisor checked from the disk (14.1). What is now allowed is the observable half of
+> Erlang's feature, made out of mechanisms the system already has: the new version is a separate, isolated program,
+> started BESIDE the running one under the same name; the running one hands it its state over IPC and ends itself
+> (`gs::handover`, `docs/developer-services-design.md` 14). Erlang's `code_change` is the successor reading the old
+> version's state - written by the package, explicitly.
+>
+> **What the kernel learns: one spawn flag, `SPAWN_FLAG_HANDOVER`.** `SpawnImage` (which only the supervisor can call,
+> 14.1) may start a task beside the ONE task already running under its name; the name directory re-points to the new
+> endpoint, and the old task's death leaves the name alone (the endpoint-id guard that already handles a respawn racing a
+> death). No new syscall, no shared memory, no capability passed between the two except the successor's endpoint, which
+> the supervisor sends with the offer. A name never has more than two instances. Not a seventh responsibility: it is
+> spawning (4.3), with one refusal relaxed for one caller.
+>
+> **What is opt-in, and what is not promised.** A package declares `handover = true`; without it, an upgrade stops the
+> old version and starts the new as before. Capabilities do not travel (the successor holds its own spawn request's), a
+> request sent to the old version after it drained its queue is lost with it - its caller's `gs::call` reports
+> `OutcomeUnknown`, exactly as for a death - and the state is one message. Services only; an app's handover (its screen
+> moving with its state) is not built.
+
 ### 2.6 Reference Systems
 
 | System  | What we borrow                                          |

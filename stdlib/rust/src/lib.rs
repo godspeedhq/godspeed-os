@@ -89,6 +89,7 @@ pub mod driver;
 #[cfg(not(test))] pub mod memory;
 #[cfg(not(test))] pub mod program;
 #[cfg(not(test))] pub mod app;
+#[cfg(not(test))] pub mod handover;
 
 pub use error::Error;
 

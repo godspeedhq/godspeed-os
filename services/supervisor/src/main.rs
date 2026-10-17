@@ -119,6 +119,33 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
             },
             _ => supcmd::UNKNOWN,
         }
+    } else if payload.len() > 2 && payload[1] == supcmd::HANDOVER {
+        // `publisher/name version`: live where both versions can, a restart where they cannot (`installed.rs`).
+        let spec = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        let mut it = spec.split(' ');
+        match (it.next(), it.next(), it.next()) {
+            (Some(pkg), Some(version), None) => {
+                let live = inst.hand_over(ctx, pkg, version);
+                let outcome = match live {
+                    Ok(true) => Ok(b'H'),
+                    Ok(false) => { inst.stop(ctx, pkg); inst.start(ctx, pkg, version).map(|()| b'R') }
+                    Err(why) => Err(why),
+                };
+                match outcome {
+                    Ok(how) => { body[0] = supcmd::OK; body[1] = how; body_len = 2; supcmd::OK }
+                    Err(why) => {
+                        ctx.log_fmt(format_args!("supervisor: installed {} {} NOT started: {}", pkg, version, why.as_str()));
+                        let w = why.as_str().as_bytes();
+                        let len = w.len().min(body.len() - 1);
+                        body[0] = supcmd::FAILED;
+                        body[1..1 + len].copy_from_slice(&w[..len]);
+                        body_len = 1 + len;
+                        supcmd::FAILED
+                    }
+                }
+            }
+            _ => supcmd::UNKNOWN,
+        }
     } else if payload.len() > 2 && payload[1] == supcmd::UNINSTALL {
         let pkg = core::str::from_utf8(&payload[2..]).unwrap_or("");
         if inst.stop(ctx, pkg) { supcmd::OK } else { supcmd::UNKNOWN }

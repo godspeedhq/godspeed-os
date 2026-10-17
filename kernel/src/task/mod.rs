@@ -1375,14 +1375,24 @@ pub fn spawn_from_image(
     // The spawner asks to hear of this task's death and to have it counted as a restart
     // (`SPAWN_FLAG_WATCHED`). The supervisor sets it for what it manages; the kernel holds no list.
     watched:           bool,
+    // A live handover (`SPAWN_FLAG_HANDOVER`): start beside the ONE task already running under this name.
+    handover:          bool,
 ) -> Result<Option<EndpointId>, SpawnError> {
     if service_config(name).is_some() {
         crate::kprintln!("task: SpawnImage '{}' rejected: that name belongs to the kernel catalogue", name);
         return Err(SpawnError::NotFound);
     }
-    if scheduler::find_task_by_name(name).is_some() {
-        crate::kprintln!("task: spawn '{}' rejected: already running", name);
-        return Err(SpawnError::AlreadyRunning);
+    match scheduler::find_task_by_name(name) {
+        None => {}
+        // One running and a handover asked for: the new one starts beside it. Two already running is a handover
+        // still in progress, and a third is refused, so a name never has more than two instances.
+        Some(first) if handover && scheduler::find_task_by_name_excluding(name, first).is_none() => {
+            crate::kprintln!("task: spawn '{}' beside the running one: a live handover", name);
+        }
+        Some(_) => {
+            crate::kprintln!("task: spawn '{}' rejected: already running", name);
+            return Err(SpawnError::AlreadyRunning);
+        }
     }
 
     let core_id = resolve_spawn_core(core_override, core_preferred)?;
