@@ -18749,9 +18749,11 @@ mod installed_state {
 }
 
 /// Run the installed APP `task` with `args`: started by the supervisor, handed its arguments, and then left to
-/// own the console. The shell goes quiet while it does (the muted loop, as for `chaos`), and draws a fresh prompt
-/// when the app gives the console back - by ending, or by dying, since the kernel releases a dead holder's.
+/// own the console until it gives it back - by ending, or by dying, since the kernel releases a dead holder's. The
+/// command lasts as long as the app does: returned any sooner, the shell drew its prompt under the app's screen and
+/// the app's keys and the next command fought over one ring.
 fn run_app(ctx: &ShellCtx, task: &str, args: &str) -> Result<(), ShellError> {
+    use godspeed_sdk::service_context::{death, supcmd};
     if !spawn_watched(ctx, task, &["shell"], UTILITY_START_SECS) {
         gs::io::println_fmt(ctx, format_args!("{}: could not be started", task));
         return Err(ShellError::Unknown);
@@ -18774,12 +18776,47 @@ fn run_app(ctx: &ShellCtx, task: &str, args: &str) -> Result<(), ShellError> {
             return Err(ShellError::Unknown);
         }
     }
-    // Until it has the console, so the prompt is not drawn under it. A second at most: an app takes the console as
-    // its first act, and one that has not by then is shown the prompt it would otherwise hide.
+    // Until it has the console: a second at most, since an app takes it as its first act.
     let mut waited = 0u64;
     while waited < 1000 && ctx.is_console_foreground() && task_running(ctx, task) {
         gs::task::sleep_ms(ctx, 20);
         waited += 20;
+    }
+    // Then for as long as it holds it. This reads no key - they are the app's, and the kernel gives this shell none
+    // while it holds the console - so it is the app's own quit that ends it, as `chaos`'s `q` ends a storm; the
+    // operator channel's `kill` is the way out of an app that will not. One poll every 50 ms.
+    while !ctx.is_console_foreground() && task_running(ctx, task) {
+        gs::task::sleep_ms(ctx, 50);
+    }
+    // The console is back. The kernel pushed a newline to wake a reader; take it, and anything typed at the app after
+    // it stopped reading, so neither runs as a command.
+    for _ in 0..512 {
+        if ctx.try_console_read().is_none() { break; }
+    }
+    // A moment for it to end, if it gave the console back and is still finishing.
+    let mut waited = 0u64;
+    while waited < 1000 && task_running(ctx, task) {
+        gs::task::sleep_ms(ctx, 20);
+        waited += 20;
+    }
+    // How it ended, as for a utility: the supervisor's death record.
+    let mut q = [0u8; 2 + 80];
+    let n = task.len().min(80);
+    q[0] = supcmd::MARKER;
+    q[1] = supcmd::DEATH;
+    q[2..2 + n].copy_from_slice(&task.as_bytes()[..n]);
+    if let Some(r) = hw_ask(ctx, "supervisor", &q[..2 + n]) {
+        let b = r.payload_bytes();
+        if b.len() >= 23 && b[13] == death::EXITED {
+            let status = u64::from_le_bytes([b[15], b[16], b[17], b[18], b[19], b[20], b[21], b[22]]);
+            if status != 0 {
+                gs::io::println_fmt(ctx, format_args!("{}: ended with status {}", task, status));
+                return Err(ShellError::Unknown);
+            }
+        } else if b.len() >= 14 && b[13] == death::FAULT {
+            gs::io::println_fmt(ctx, format_args!("{}: ended by a fault - the console is the shell's again", task));
+            return Err(ShellError::Unknown);
+        }
     }
     Ok(())
 }

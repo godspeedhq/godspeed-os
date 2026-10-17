@@ -8572,7 +8572,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(shown.contains("hello, Ada"), "the app has the screen: it says hello to its argument");
         send(&mut write_half, b"x");
         let back = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
-        check!(back.contains("installed godspeed/hello-app ended - exited with status 0"), "a key ends it, with status 0");
+        check!(back.contains("installed godspeed/hello-app ended - exited with status 0") && !shown.contains("gsh>"),
+               "a key ends it, with status 0 - and no prompt was drawn under its screen");
         let after = run!(b"godspeed list installed\r", 60);
         check!(after.contains("app: type `hello-app`"), "and the shell has the console back: its next command runs");
         let ap = run!(b"hello-app | count\r", 60);
