@@ -8401,6 +8401,17 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     let piped_check = if offline { String::new() } else { run!(b"godspeed check | where item=tls\r", 150) };
     if !offline {
         check!(piped_check.contains("verified") && !piped_check.contains("HTTP/1.1"), "`godspeed check` pipes as records");
+        // BACK TO BACK: each connection is still closing when the next command asks for one, and net-stack
+        // holds two. A connect that finds the table full of closing connections waits for a slot rather than
+        // refusing (`OP_CONNECT`, CONNECT_SLOT_WAIT_MS), so all three answer.
+        let mut quick = 0;
+        for _ in 0..3 {
+            if run!(b"godspeed check | where item=tls\r", 150).contains("verified") { quick += 1; }
+        }
+        check!(quick == 3, "three `godspeed check` back to back all reach the registry: a closing connection's slot is waited for");
+        let so_far = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        check!(!so_far.contains("the connection table is full"), "no connect so far was refused for a full table");
+        println!("godspeed: the closing-slot wait fired {} time(s) so far", so_far.matches("for a closing connection's slot - freed").count());
     }
 
     // ---- PACKAGES, against the real registry and its real package, `godspeed/hello` (design 10.1). Every answer
