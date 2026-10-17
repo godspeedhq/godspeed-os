@@ -1116,3 +1116,78 @@ message at a time) and `finish(status)` (the end byte, then `Exit`). The package
 - **Never restarted**, whether it exited or was killed; one at a time.
 - `godspeed/hello-utility` is the first, published 2026-10-17. The registry was redeployed with the crate that
   knows the kind, with the operator's approval.
+
+## 13. Drivers and apps from packages: a design for approval (2026-10-17, not built)
+
+The operator's fourth decision was **design only** for these two kinds: no template, no package, no OS change
+until this is approved. What follows is a proposal. 9.4 and 9.5 named what each needs; this answers them using
+what install (12) already built.
+
+### 13.1 `driver`: a package granted one device, by the operator, by class
+
+**What a driver is given.** Everything a service is, plus ONE device the operator chose. Never an address, an
+IRQ or a BDF: the package's contract names a device CLASS, exactly as an in-tree driver's spawn row does
+(`hwclass`: a PCI class code, or a USB vendor and product for a USB device). The kernel resolves the window,
+the arena and the vector against its own bus scan, as it does today (14.1's step C amendment), so a driver
+package can never name a register the kernel did not find.
+
+**Who approves, and how it is shown.** `godspeed install` for a driver adds one question after the peers:
+
+```
+vendor/rtl8139 0.1.0 asks for the device: PCI class 02:00 (network), found here at 00:03.0
+  now driven by: nic-driver. Installing it stops nic-driver for that device. Grant it? [y/N]
+```
+
+`yes` answers it like the rest: what is approved is what was named. A driver whose class matches nothing on this
+machine installs and stays down, said so.
+
+**Exclusivity.** One driver per device. The supervisor keeps, per device, which driver holds it; a package
+driver granted a device REPLACES the in-tree driver for that device only - the supervisor stops it and does not
+restart it while the package holds the device - and `uninstall` gives the device back, restarting the in-tree
+driver. Nothing about the in-tree roster changes for any other device.
+
+**Trust posture, stated as 6.4 does.** A driver granted a DMA arena is trust-critical on a machine that cannot
+confine it, and only `xhci` and `audio-driver` are confined today, x86 only. So the install question says it,
+from the same fact the boot line reports: "no IOMMU confines this device: a driver for it can reach all of
+memory" - and on such a machine a DMA-class package is refused unless the operator answers a second question.
+A register-only class (no arena) carries no such warning.
+
+**What it needs, and costs:**
+- A contract key the supervisor reads (`[device] class = "02:00"`, or `usb = "0bda:8179"`), validated by the
+  schema and narrowed like peers: the grant is never wider than the contract.
+- The supervisor: a per-device holder, and a spawn path that fills `hw_flags`/`bdf` from the approved class
+  (the fields `spawn_by_image` already sets for in-tree drivers). No kernel change: the kernel already grants by
+  class from the request, and refuses raw addresses.
+- The CLI: `godspeed new driver` on `gs::driver`, refused until this ships, as `utility` was.
+- Open: what a USB-class driver's host does (it must hand the device to the package, as `dwc2`/`xhci` hand the
+  dongle to `wifi-usb` today - that protocol, `usbfn`, is the precedent).
+
+### 13.2 `app`: a program with a screen of its own, while it has focus
+
+**What an app is.** A utility that, while it runs, owns the console - the screen and the keyboard - and gives
+them back when it ends. That is exactly what `edit` and `observe` do today as built-ins, and what the
+`ConsoleForeground` syscall (40) already provides: a task may claim the input ring and the display, and the
+shell gets them back when it releases or dies. So an app is the utility mechanism (12.4) plus one capability.
+
+**The one new grant.** `console` (contract key `[capabilities] console = true`): a send cap to the `console`
+service for output, and the right to claim the foreground. Asked at install like a peer, with the reason:
+"it will read the keyboard while it runs". A keyboard is a command channel (6.4, SEC-2), so this is the grant
+that matters, and it is never given silently.
+
+**Lifecycle.** Started by typing its name, as a utility, and in the foreground until it ends. The shell's
+`[q]` cannot reach a program that owns the keyboard, so the way out is the app's own (its quit key) or from
+outside it: the shell regains the console when the app's task dies, and `kill` from a second console (the
+control channel) ends it.
+Recorded rather than solved: an app that hangs holding the keyboard is ended only from outside it, which is
+true of `edit` today.
+
+**What it needs:** `gs::app` (claim, draw a grid through `console`, read keys, release - the shapes `edit`
+uses, lifted out of the shell), the contract key, the install question, and `godspeed new app`. No kernel
+change. Not in scope: windows, more than one app on screen, a graphics surface beyond the console's grid.
+
+### 13.3 Questions for the operator
+
+1. Driver: replace the in-tree driver per device (proposed), or refuse a device an in-tree driver holds?
+2. Driver: refuse a DMA-class package on a machine with no IOMMU unless asked twice (proposed), or refuse it?
+3. App: is "a utility that owns the console while it runs" the right definition of an app for now?
+
