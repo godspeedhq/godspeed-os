@@ -8404,14 +8404,18 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     //      is verified on this machine by the shared crate's checks: root 1 by the pin, then timestamp ->
     //      snapshot -> namespaces -> index -> manifest -> signature -> contract -> binary.
     if !offline {
-        let first = run!(b"godspeed search\r", 180);
-        check!(first.contains("godspeed/hello"), "`godspeed search` lists the registry's package from the verified snapshot");
-        check!(first.contains("first contact: root 1 matched the pin"), "first contact checks root 1 against the pinned digest, and says so");
+        let bare = run!(b"godspeed search\r", 60);
+        check!(bare.contains("a word is needed") && bare.contains("godspeed list available"), "a bare `godspeed search` asks for a word and names the list of everything");
+        let bare_list = run!(b"godspeed list\r", 60);
+        check!(bare_list.contains("godspeed list available | fetched | installed") && bare_list.contains("say which"), "a bare `godspeed list` asks which list");
+        let first = run!(b"godspeed list available\r", 180);
+        check!(first.contains("godspeed/hello"), "`godspeed list available` lists the registry's package from the verified snapshot");
+        check!(first.contains("first contact: root 1 matched the pin"), "first contact checks root 1 against the pinned digest, and says so under the list");
         let again = run!(b"godspeed search hel\r", 180);
         check!(again.contains("godspeed/hello") && again.contains("against the root this machine already trusts"),
-               "a second search filters by word and verifies against the root this machine kept");
+               "a search filters by word and verifies against the root this machine kept");
         let none = run!(b"godspeed search zzzz\r", 180);
-        check!(none.contains("no package's name holds that word"), "a word nothing matches says so");
+        check!(none.contains("0 packages") && !none.contains("FAIL"), "a word nothing matches is an empty list, not a failure");
         let info = run!(b"godspeed info godspeed/hello\r", 180);
         check!(info.contains("0.1.0") && info.contains("the latest") && info.contains("bankole"),
                "`godspeed info` lists the versions from the verified index, by whom, and the latest");
@@ -8419,44 +8423,51 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(nope.contains("never published on this registry"), "a package the snapshot does not list is said to be unpublished");
 
         let fetched = run!(b"godspeed fetch godspeed/hello\r", 240);
-        check!(fetched.contains("/system/packages/godspeed/hello/0.1.0") && fetched.contains("kept"),
-               "`godspeed fetch` verifies the package and keeps it under /system/packages/");
+        check!(fetched.contains("/system/packages/godspeed/hello/0.1.0") && fetched.contains("fetched"),
+               "`godspeed fetch` verifies the package and fetches it to /system/packages/");
         check!(fetched.contains("x86_64") && fetched.contains("its size and digest the manifest's"),
                "it keeps this machine's binary, checked against the manifest");
         check!(fetched.contains("an active key of the publisher's"), "the manifest's signature is by a key the signed namespaces vouch for");
         check!(fetched.contains("log_write"), "it says what the contract requests");
-        check!(fetched.contains("installed") && fetched.contains("kept, not running"), "and that it is kept, not installed");
+        check!(fetched.contains("installed") && fetched.contains("fetched, not running"), "and that it is fetched, not installed");
         let kept = run!(b"dir /system/packages/godspeed/hello/0.1.0\r", 60);
         check!(kept.contains("x86_64.elf") && kept.contains("manifest.toml") && kept.contains("manifest.sig")
                && kept.contains("contract.toml") && kept.contains("origin") && !kept.contains("aarch64.elf"),
                "the folder holds the binary, the documents that prove it, and where it came from - and no other architecture's");
         let twice = run!(b"godspeed fetch godspeed/hello@0.1.0\r", 240);
-        check!(twice.contains("already kept"), "fetching a kept version again leaves it as it is");
-        let listed = run!(b"godspeed list\r", 60);
-        check!(listed.contains("godspeed/hello@0.1.0") && listed.contains("from default"), "`godspeed list` shows it and its registry");
-        let piped = run!(b"godspeed search | where item=package | count\r", 180);
-        check!(piped.lines().any(|l| l.trim() == "1") && !piped.contains("where:"), "`godspeed search` pipes as records: one package row");
+        check!(twice.contains("already fetched"), "fetching a fetched version again leaves it as it is");
+        let listed = run!(b"godspeed list fetched\r", 60);
+        check!(listed.contains("godspeed/hello@0.1.0") && listed.contains("from default"), "`godspeed list fetched` shows it and its registry");
+        let installed = run!(b"godspeed list installed\r", 60);
+        check!(installed.contains("0 packages") && installed.contains("nothing can be installed on this machine yet"),
+               "`godspeed list installed` is an empty list with the reason, not a refusal");
+        let piped = run!(b"godspeed search | where item=package | count\r", 60);
+        check!(piped.contains("a word is needed") || piped.lines().any(|l| l.trim() == "0"), "a bare search refuses in a pipe too");
+        let piped = run!(b"godspeed list available | where item=package | count\r", 180);
+        check!(piped.lines().any(|l| l.trim() == "1") && !piped.contains("where:"), "`godspeed list available` pipes as records: one package row");
         let refused = run!(b"godspeed fetch godspeed/hello | count\r", 30);
         check!(refused.contains("are actions, not reports"), "`godspeed fetch` refuses to start a pipe");
         let missing = run!(b"godspeed fetch godspeed/hello@9.9.9\r", 240);
         check!(missing.contains("not published") && missing.contains("0.1.0"), "a version not published is refused, naming the ones that are");
         let install = run!(b"godspeed install godspeed/hello\r", 60);
         check!(install.contains("cannot start a program from disk yet"), "`godspeed install` says why it is not built");
+        let uninstall = run!(b"godspeed uninstall godspeed/hello\r", 60);
+        check!(uninstall.contains("nothing is installed") && uninstall.contains("godspeed remove"), "`godspeed uninstall` says why, and names `remove`");
 
         // A CHANGED PIN is trusting another registry: refused until the operator clears what this machine kept.
         let _ = run!(b"write /system/services/godspeed/trust/default/pin sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);
-        let changed = run!(b"godspeed search\r", 180);
+        let changed = run!(b"godspeed search hello\r", 180);
         check!(changed.contains("changed since this machine first reached it"), "a pin that changed since first contact is refused, with the folder to remove");
         let _ = run!(b"delete /system/services/godspeed/trust/default recursive\r", 60);
-        let fresh = run!(b"godspeed search\r", 180);
+        let fresh = run!(b"godspeed search hello\r", 180);
         check!(fresh.contains("first contact: root 1 matched the pin"), "with that folder removed, the registry is met again from root 1");
 
-        let removed = run!(b"godspeed uninstall godspeed/hello\r", 60);
-        check!(removed.contains("removed") && removed.contains("/system/packages/godspeed/hello"), "`godspeed uninstall` removes the kept copy");
-        let after = run!(b"godspeed list\r", 60);
-        check!(after.contains("none"), "and `godspeed list` then shows none");
-        let gone = run!(b"godspeed uninstall godspeed/hello\r", 60);
-        check!(gone.contains("not kept here"), "uninstalling what is not kept says so");
+        let removed = run!(b"godspeed remove godspeed/hello\r", 60);
+        check!(removed.contains("removed") && removed.contains("/system/packages/godspeed/hello"), "`godspeed remove` deletes the fetched copy");
+        let after = run!(b"godspeed list fetched\r", 60);
+        check!(after.contains("0 packages") && after.contains("godspeed fetch <publisher/name>"), "and `godspeed list fetched` is then empty, with the way to fetch one");
+        let gone = run!(b"godspeed remove godspeed/hello\r", 60);
+        check!(gone.contains("not fetched here"), "removing what is not fetched says so");
     }
 
     // ---- THE NTP SERVER IS A SETTING, `/system/services/time/ntp`, re-read by `date sync` (the same rule as

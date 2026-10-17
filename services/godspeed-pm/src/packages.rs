@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! Packages: search, inspect, fetch-and-keep, list and remove (`docs/developer-services-design.md` 10.1).
+//! Packages: search, inspect, fetch, list and remove (`docs/developer-services-design.md` 10.1).
 //!
-//! **Kept is not installed.** A fetched package is verified and kept under `/system/packages/` (10.5): its
+//! **Fetched is not installed.** A fetched package is verified and kept under `/system/packages/` (10.5): its
 //! signed manifest, its signature, its service contract and this machine's binary, each checked against what
 //! the manifest names. This machine cannot start a program from disk yet (the supervisor runs only the images
 //! built into it; 9.2), so nothing here runs one, and every answer says so rather than calling it installed.
@@ -116,7 +116,15 @@ fn chain_row(r: &mut Rows, v: &chain::Verified<'_>) {
         if v.first_contact { "first contact: root 1 matched the pin" } else { "against the root this machine already trusts" });
 }
 
-/// `godspeed search [<word>]`: every package the verified snapshot lists, or those whose name holds `word`.
+/// The same, as the status note, for a LIST: its rows are its entries and nothing else, so `count` counts them.
+fn chain_note(r: &mut Rows, v: &chain::Verified<'_>, prefix: &str) {
+    r.note(format_args!("{}verified: root {}, timestamp {}, snapshot {}, namespaces {} ({})", prefix,
+        v.root.header.version, v.timestamp.header.version, v.snapshot.header.version, v.namespaces.header.version,
+        if v.first_contact { "first contact: root 1 matched the pin" } else { "against the root this machine already trusts" }));
+}
+
+/// `godspeed search <word>`: the packages the verified snapshot lists whose name holds `word`; with no word
+/// (`godspeed list available`), every one. One row a package, the chain's versions in the status note.
 #[inline(never)]
 pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, word: Option<&str>) {
     let mut docs = Docs::new();
@@ -124,16 +132,11 @@ pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roo
     on_registry(ctx, r, ready, roots, |s, r| {
         let mut iso = [0u8; 20];
         let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
-        chain_row(r, &v);
-        let mut shown = 0u32;
         for name in chain::packages(&v) {
             if word.is_some_and(|w| !name.contains(w)) { continue; }
             r.row("package", name, "`godspeed info <name>` lists its versions");
-            shown += 1;
         }
-        if shown == 0 {
-            r.row("package", "none", if word.is_some() { "no package's name holds that word" } else { "the registry lists none" });
-        }
+        chain_note(r, &v, "");
         Ok(())
     });
 }
@@ -152,8 +155,8 @@ pub fn info(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots
         let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
         let mut buf = [0u8; INDEX_MAX];
         let Some(text) = index_text(s, base, &v, &name, &mut buf)? else {
-            chain_row(r, &v);
             r.fail("package", which, "never published on this registry");
+            chain_note(r, &v, "");
             return Ok(());
         };
         let mut rel = Releases::new();
@@ -164,7 +167,7 @@ pub fn info(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots
                 return Ok(());
             }
         };
-        chain_row(r, &v);
+        chain_note(r, &v, "");
         let latest = idx.latest().map(|l| l.version);
         for rel in idx.releases {
             let c = cell(format_args!("{}", rel.version));
@@ -431,8 +434,8 @@ fn finish(r: &mut Rows, which: &str, v: &chain::Verified<'_>, f: Fetched, ready:
     }.as_str());
     r.row("binary", f.arch, cell(format_args!("{} bytes, its size and digest the manifest's", f.size)).as_str());
     r.row("requests", f.requests.as_str(), "what its contract asks for; nothing is granted by fetching it");
-    r.row(if f.already { "already kept" } else { "kept" }, f.dest.as_str(), "verified");
-    r.row("installed", "no", "this machine cannot start a program from disk yet (design 9.2): kept, not running");
+    r.row(if f.already { "already fetched" } else { "fetched" }, f.dest.as_str(), "verified");
+    r.row("installed", "no", "this machine cannot start a program from disk yet (design 9.2): fetched, not running");
     Ok(())
 }
 
@@ -466,8 +469,8 @@ fn each_kept(ctx: &ServiceContext, mut f: impl FnMut(&str, &str, &str)) -> Resul
     Ok(())
 }
 
-/// `godspeed list`: what is kept here, and where it came from.
-pub fn list(ctx: &ServiceContext, r: &mut Rows) {
+/// `godspeed list fetched`: what has been fetched here, and where it came from. None is no rows.
+pub fn list_fetched(ctx: &ServiceContext, r: &mut Rows) {
     let mut count = 0u32;
     let mut origins = [[0u8; 256]; 1];
     let walked = each_kept(ctx, |p, n, v| {
@@ -476,20 +479,24 @@ pub fn list(ctx: &ServiceContext, r: &mut Rows) {
         let got = gs::fs::Fs::new(ctx).read_into(path.as_str(), &mut origins[0]).unwrap_or(0);
         let text = core::str::from_utf8(&origins[0][..got]).unwrap_or("");
         let reg = text.lines().find_map(|l| l.strip_prefix("registry ")).and_then(|l| l.split_whitespace().next()).unwrap_or("?");
-        r.row(cell(format_args!("{}/{}@{}", p, n, v)).as_str(), cell(format_args!("from {}", reg)).as_str(), "kept, not installed");
+        r.row(cell(format_args!("{}/{}@{}", p, n, v)).as_str(), cell(format_args!("from {}", reg)).as_str(), "fetched, not installed");
         count += 1;
     });
     match walked {
-        Ok(()) if count == 0 => r.row("kept", "none", "`godspeed fetch <publisher/name>` keeps a verified copy"),
-        Ok(()) => {}
-        Err(gs::Error::NotFound) => r.row("kept", "none", "`godspeed fetch <publisher/name>` keeps a verified copy"),
-        Err(e) => r.fail("kept", DIR, cell(format_args!("could not be listed: {:?}", e)).as_str()),
+        Ok(()) | Err(gs::Error::NotFound) if count == 0 => r.note(format_args!("`godspeed fetch <publisher/name>` fetches and verifies one")),
+        Ok(()) | Err(gs::Error::NotFound) => {}
+        Err(e) => r.fail("fetched", DIR, cell(format_args!("could not be listed: {:?}", e)).as_str()),
     }
 }
 
-/// `godspeed uninstall <publisher/name>[@version]`: remove the kept copy, one version or every one. Nothing
-/// of the package's own data is touched: a kept package has run nowhere, so it has none.
-pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, which: &str) {
+/// `godspeed list installed`: none, and why - nothing can be installed yet (9.2). An empty list, not a refusal.
+pub fn list_installed(r: &mut Rows) {
+    r.note(format_args!("nothing can be installed on this machine yet (design 9.2); `godspeed list fetched` shows what has been fetched"));
+}
+
+/// `godspeed remove <publisher/name>[@version]`: delete a fetched copy, one version or every one. Nothing of
+/// the package's own data is touched: a fetched package has run nowhere, so it has none.
+pub fn remove(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     let (name, version) = match spec(which) {
         Ok(x) => x,
         Err(why) => return r.fail("usage", which, why),
@@ -504,8 +511,8 @@ pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     }
     match fs.exists(target.as_str()) {
         Ok(true) => {}
-        Ok(false) => return r.fail("kept", which, "not kept here: `godspeed list` says what is"),
-        Err(e) => return r.fail("kept", which, cell(format_args!("could not be checked: {:?}", e)).as_str()),
+        Ok(false) => return r.fail("fetched", which, "not fetched here: `godspeed list fetched` says what is"),
+        Err(e) => return r.fail("fetched", which, cell(format_args!("could not be checked: {:?}", e)).as_str()),
     }
     if let Err(e) = fs.delete_all(target.as_str()) {
         return r.fail("removed", target.as_str(), cell(format_args!("{:?} - {}", e, fs.reason())).as_str());
@@ -520,5 +527,5 @@ pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     let mut pubdir = Path::new();
     pubdir.push(DIR).push(name.publisher());
     empty(pubdir.as_str(), &mut fs);
-    r.row("removed", target.as_str(), "the kept copy; it had not run, so it has no data to keep");
+    r.row("removed", target.as_str(), "the fetched copy; it had not run, so it has no data to keep");
 }

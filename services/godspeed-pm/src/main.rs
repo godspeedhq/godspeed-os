@@ -18,13 +18,15 @@
 //!   the defaults on first start, so it always shows what is in effect (10.8).
 //! - `godspeed check` - reach the registry in use over TLS, verified to the roots in `tls-roots`, and
 //!   say what it answered. Each step is a row, and a failure says which step and why.
-//! - `godspeed search [<word>]`, `godspeed info <publisher/name>`, `godspeed fetch <publisher/name>[@version]`,
-//!   `godspeed list` and `godspeed uninstall <publisher/name>[@version]` - the packages the registry's signed
-//!   metadata vouches for, verified on this machine by the shared crate's own checks, and a verified copy
-//!   KEPT under `/system/packages/` (`packages.rs`, `chain.rs`).
-//! - `godspeed install` - refused, with the reason: this machine cannot start a program from disk yet (9.2),
-//!   so a package can be kept here, verified, and not run. Calling a kept package installed would be the
-//!   development convenience the CLI's contract forbids presenting as installation.
+//! - `godspeed search <word>`, `godspeed info <publisher/name>`, `godspeed fetch <publisher/name>[@version]`,
+//!   `godspeed list available | fetched | installed` and `godspeed remove <publisher/name>[@version]` - the
+//!   packages the registry's signed metadata vouches for, verified on this machine by the shared crate's own
+//!   checks, and a verified copy FETCHED to `/system/packages/` (`packages.rs`, `chain.rs`). A list answers
+//!   with its packages only; an empty one is no rows, not a failure.
+//! - `godspeed install` and `uninstall` - refused, with the reason: this machine cannot start a program from
+//!   disk yet (9.2), so a package can be fetched here, verified, and not run, and `list installed` is empty.
+//!   Calling a fetched package installed would be the development convenience the CLI's contract forbids
+//!   presenting as installation.
 
 #![no_std]
 #![no_main]
@@ -92,14 +94,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         (Some("check"), None) => check(&ctx, &mut r),
-        (Some("search"), word) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::search(&ctx, r, ready, roots, word)),
+        (Some("search"), Some(word)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::search(&ctx, r, ready, roots, Some(word))),
+        (Some("search"), _) => r.fail("usage", "godspeed search <word>", "a word is needed; `godspeed list available` lists everything"),
         (Some("info"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::info(&ctx, r, ready, roots, name)),
         (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name)),
-        (Some("list"), None) => packages::list(&ctx, &mut r),
-        (Some("uninstall"), Some(name)) if words.clone().next().is_none() => packages::uninstall(&ctx, &mut r, name),
+        (Some("list"), Some("available")) if words.clone().next().is_none() => with_ready(&ctx, &mut r, |ready, roots, r| packages::search(&ctx, r, ready, roots, None)),
+        (Some("list"), Some("fetched")) if words.clone().next().is_none() => packages::list_fetched(&ctx, &mut r),
+        (Some("list"), Some("installed")) if words.clone().next().is_none() => packages::list_installed(&mut r),
+        (Some("list"), _) => r.fail("usage", "godspeed list available | fetched | installed", "say which"),
+        (Some("remove"), Some(name)) if words.clone().next().is_none() => packages::remove(&ctx, &mut r, name),
         (Some("install"), _) => r.fail("install", "not built",
             "this machine cannot start a program from disk yet (design 9.2); `godspeed fetch` keeps a verified copy"),
-        _ => r.fail("usage", "godspeed search | info | fetch | list | uninstall | registry | config | check",
+        (Some("uninstall"), _) => r.fail("uninstall", "not built",
+            "nothing is installed, because nothing can be yet (design 9.2); `godspeed remove` deletes a fetched copy"),
+        _ => r.fail("usage", "godspeed search | info | fetch | list | remove | registry | config | check",
                     "`godspeed help` says what each does"),
     }
     r.send(&ctx);
@@ -111,16 +119,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 pub(crate) struct Rows {
     t: Table,
     failed: bool,
+    /// The `status` row's note: what a list's rows do not say about themselves (that the registry's chain
+    /// verified, or why a list is empty). The shell prints it under the table.
+    note: Cell,
 }
 
 impl Rows {
     fn new(cols: &[&str]) -> Rows {
-        Rows { t: Table::new(cols), failed: false }
+        Rows { t: Table::new(cols), failed: false, note: Cell::new() }
     }
 
     pub(crate) fn row(&mut self, item: &str, value: &str, note: &str) {
         let cells: [Value; 3] = [self.t.intern(item.as_bytes()), self.t.intern(value.as_bytes()), self.t.intern(note.as_bytes())];
         self.t.add_row(&cells);
+    }
+
+    /// Set the status row's note.
+    pub(crate) fn note(&mut self, args: core::fmt::Arguments<'_>) {
+        self.note = cell(args);
     }
 
     pub(crate) fn fail(&mut self, item: &str, value: &str, note: &str) {
@@ -130,7 +146,8 @@ impl Rows {
 
     fn send(mut self, ctx: &ServiceContext) {
         let st = if self.failed { "failed" } else { "ok" };
-        self.row("status", st, "-");
+        let note = if self.note.n == 0 { cell(format_args!("-")) } else { core::mem::replace(&mut self.note, Cell::new()) };
+        self.row("status", st, note.as_str());
         let mut sink = BufSink { buf: [0u8; 8 * 1024], len: 0 };
         self.t.encode(&mut sink);
         let Some(dst) = gs::ipc::peer_at(ctx, 0) else { return };

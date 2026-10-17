@@ -12,10 +12,10 @@ crate is already called `godspeed`; it appears in `status` while a command runs 
 ## Status, as built and honest (2026-10-17)
 
 Built: the registries, the settings, the registry check, and (2026-10-17, branch `feat/packages`) **search,
-info, fetch, list and uninstall**, every answer verified on this machine against the registry's signed
-metadata by the shared package crate's own checks (the CLI repository's `godspeed-package`). **Install is
-not built**: a fetched package is KEPT, verified, under `/system/packages/`, and cannot run, because the
-supervisor starts only the programs built into the image (design 9.2). `osdev test godspeed` runs every
+info, fetch, list and remove**, every answer verified on this machine against the registry's signed
+metadata by the shared package crate's own checks (the CLI repository's `godspeed-package`). **Install and
+uninstall are not built**: a fetched package is verified and kept under `/system/packages/`, and cannot run,
+because the supervisor starts only the programs built into the image (design 9.2). `osdev test godspeed` runs every
 command against a real disk and the real registry over verified TLS through QEMU's user network, fetching
 `godspeed/hello` (its registry checks are skipped, not passed, when the machine running the test is
 offline). Packages are QEMU-verified only, x86; no hardware card yet. On hardware: `godspeed check` verified the registry and got `HTTP/1.1 200 OK` on all five
@@ -26,12 +26,14 @@ RNG and RNG200, the JH7110's TRNG).
 ## 1. The command
 
 ```
-godspeed search [<word>]                           the packages the registry vouches for, or those whose name holds the word
+godspeed search <word>                             the packages the registry vouches for whose name holds the word
 godspeed info <publisher/name>                     one package's published versions
-godspeed fetch <publisher/name>[@version]          verify a package end to end and keep it here - kept, not installed
-godspeed list                                      the packages kept here
-godspeed uninstall <publisher/name>[@version]      remove a kept copy, one version or every one
-godspeed install                                   not built: says why
+godspeed fetch <publisher/name>[@version]          verify a package end to end and fetch it here - fetched, not installed
+godspeed list available                            every package the registry in use offers
+godspeed list fetched                              the packages fetched here
+godspeed list installed                            the packages installed: none yet, and why
+godspeed remove <publisher/name>[@version]         delete a fetched copy, one version or every one
+godspeed install | uninstall                       not built: says why
 godspeed registry                                  the registries this machine knows; one is in use
 godspeed registry add <name> <url> <root> [yes]    know another; asks [y/N] before trusting its root
 godspeed registry use <name>                       search and install from that one from now on
@@ -150,17 +152,24 @@ the shared crate's):
 
 | command | rows |
 |---|---|
-| `search` | `verified` (the chain's versions, and whether this was first contact), then a `package` row per name |
-| `info` | `verified`, then a `version` row per release: when, by whom, and which is the latest |
-| `fetch` | `verified`, `package`, `signed` (the key, active or retired), `binary` (this machine's architecture and its size), `requests` (what the contract asks for; nothing is granted), `kept` (the folder), `installed no` |
-| `list` | a row per kept `publisher/name@version`, with the registry it came from |
-| `uninstall` | `removed` and the folder |
+| `search`, `list available` | a `package` row per name; the chain's versions, and whether this was first contact, in the status note |
+| `info` | a `version` row per release: when, by whom, and which is the latest; the chain in the status note |
+| `fetch` | `verified`, `package`, `signed` (the key, active or retired), `binary` (this machine's architecture and its size), `requests` (what the contract asks for; nothing is granted), `fetched` (the folder), `installed no` |
+| `list fetched` | a row per fetched `publisher/name@version`, with the registry it came from |
+| `list installed` | none yet: the status note says why |
+| `remove` | `removed` and the folder |
 
-**Where a package is kept**: `/system/packages/<publisher>/<name>/<version>/`, holding `<arch>.elf` (this
+**A list is its entries and nothing else**, so `count` counts them; what a list's rows do not say about
+themselves (the chain it was verified by, why it is empty) is the status row's note, which the console prints
+under the table. **An empty list is not a failure**: the console says `0 packages`, the status is `ok`, and
+piped, only the status row is left (`where item!=status | count` is then 0). A bare `godspeed search` and a
+bare `godspeed list` are usage errors: each says what to add.
+
+**Where a package is fetched to**: `/system/packages/<publisher>/<name>/<version>/`, holding `<arch>.elf` (this
 machine's only), `manifest.toml`, `manifest.sig`, `contract.toml` and `origin` (the registry, when, the
 architecture and the signing key). A fetch is written beside it as `<version>.partial` and renamed into place
-only once every file is verified, so a half-fetched package is never listed. Fetching a version already kept
-leaves it as it is.
+only once every file is verified, so a half-fetched package is never listed. Fetching a version already
+fetched leaves it as it is.
 
 **A pin that changed** since this machine first reached a registry is refused - changing it is trusting
 another registry - until the operator removes `/system/services/godspeed/trust/<registry>/`, after which the
@@ -176,24 +185,24 @@ nothing is said twice.
 
 ## 5. Pipes
 
-`godspeed search`, `info`, `list`, `registry`, `config` and `check` are reports, so they pipe as records
+`godspeed search`, `info`, `list available | fetched | installed`, `registry`, `config` and `check` are reports, so they pipe as records
 (`item`, `value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```
-godspeed search | where item=package
-godspeed search | where item=package | count
+godspeed search hello | where item=package
+godspeed list available | where item=package | count
 godspeed registry | where item=default
 godspeed config | where note=file
 godspeed check | where item=tls
 ```
 
-`godspeed fetch`, `uninstall` and `install`, `godspeed config set` and `godspeed registry add`, `use` and
+`godspeed fetch`, `remove`, `install` and `uninstall`, `godspeed config set` and `godspeed registry add`, `use` and
 `remove` are actions and refuse to start a pipe, with the sentence naming the reports.
 
 ## 6. What it holds
 
 Its supervisor row grants exactly four peers - the shell for its answer, `fs` for its settings, roots,
-trust record and kept packages, `net-stack` for the registry's connection, `time` for the date - and no
+trust record and fetched packages, `net-stack` for the registry's connection, `time` for the date - and no
 privilege of any kind. Packages added no peer and no privilege. Pinned in
 `COMMANDMENTS.baseline.toml`. The TLS client is `sdk/tls`; the connection is `net-stack`'s op 23, a TCP
 connection held as a capability (`gs::net::Net::connect`). The `[y/N]` before a root is trusted is asked by

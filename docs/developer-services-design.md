@@ -626,7 +626,10 @@ connection held as a capability (`net-stack` op 23, `docs/tcp-design.md`); `gs::
 `gs::task::hw_random`; and RDRAND behind x86's random seam, which had answered `None` - so on a PC whose
 CPU has no RDRAND, TLS refuses to run, and says so.
 
-**Built, 2026-10-17 (branch `feat/packages`): `godspeed search`, `info`, `fetch`, `list` and `uninstall`** -
+**Built, 2026-10-17 (branch `feat/packages`): `godspeed search`, `info`, `fetch`, `list available | fetched |
+installed` and `remove`** (the operator's names, 2026-10-17: `list` with what to list, `fetched` for a verified
+copy that is not installed, an empty list an answer rather than a refusal, `uninstall` kept for when install
+exists) -
 10.1's first version, fetch, verify, keep, list and remove. Every answer is verified on the machine by the
 shared crate's own checks (10.6), in the CLI's order: root 1 by the pin, each rotation by the root before
 it, then timestamp, snapshot, namespaces, the package's index, its manifest by digest, the manifest's
