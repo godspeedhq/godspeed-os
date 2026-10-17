@@ -44,7 +44,7 @@ static TASK_STATE: [AtomicU8; MAX_TASKS] =
     [const { AtomicU8::new(TaskState::Dead as u8) }; MAX_TASKS];
 /// Bytes of a task name the kernel keeps (`TASK_NAMES` below). Bounded and flat (26.6): a fixed 32
 /// bytes per slot, no heap, no interner, no lifetimes.
-const TASK_NAME_MAX: usize = 32;
+const TASK_NAME_MAX: usize = crate::task::PEER_NAME_BYTES;
 
 /// Per-task NAME, OWNED rather than borrowed.
 ///
@@ -2491,8 +2491,8 @@ fn drain_pending_kstack(cid: usize) {
     }
 }
 
-/// The longest death notice: a name, NUL, `K` and the killer's name (each name at most 64 bytes).
-const DEATH_NOTE_MAX: usize = 2 * 64 + 16;
+/// The longest death notice: a name, NUL, `K` and the killer's name (each name at most TASK_NAME_MAX bytes).
+const DEATH_NOTE_MAX: usize = 2 * TASK_NAME_MAX + 16;
 
 /// Build the death notice for `name` into `note`, returning its length: the name, a NUL, then how
 /// it ended - `K` and the name of the task that called `kill`, `F`, the fault kind and the address
@@ -2500,7 +2500,7 @@ const DEATH_NOTE_MAX: usize = 2 * 64 + 16;
 /// to the NUL (CLAUDE.md 6.2, amendment 2026-10-11; `E`, 14.5 amendment 2026-10-17).
 fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_MAX]) -> usize {
     let nb = name.as_bytes();
-    let mut n = nb.len().min(64);
+    let mut n = nb.len().min(TASK_NAME_MAX);
     note[..n].copy_from_slice(&nb[..n]);
     note[n] = 0;
     n += 1;
@@ -2509,7 +2509,7 @@ fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_
             note[n] = crate::task::death::KILLED;
             n += 1;
             let kb = task_name(by).as_bytes();
-            let k = kb.len().min(64);
+            let k = kb.len().min(TASK_NAME_MAX);
             note[n..n + k].copy_from_slice(&kb[..k]);
             n + k
         }

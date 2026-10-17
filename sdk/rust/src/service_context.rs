@@ -500,7 +500,7 @@ impl SpawnRequest {
         let mut n = 0usize;
         for (label, cap) in pairs {
             let lb = label.as_bytes();
-            // The kernel's limit, `PEER_NAME_BYTES` (24): this accepted 32, and the kernel refused
+            // The kernel's limit, `PEER_NAME_BYTES`: this once accepted more than the kernel did, and the kernel refused
             // the spawn for a label it had been told was fine (`backlog/fixed/80` S5).
             if lb.is_empty() || lb.len() > PEER_NAME_BYTES { return false; }
             if n + 1 + lb.len() + 2 > buf.len() { return false; }
@@ -627,8 +627,8 @@ pub mod supcmd {
     pub const FAILED:  u8 = 1;
     pub const UNKNOWN: u8 = 2;
 
-    /// Longest command payload: opcode + core + a name and its peers.
-    pub const MAX: usize = 128;
+    /// Longest command payload: opcode + core + a name and its peers, each at most `NAME_MAX` bytes.
+    pub const MAX: usize = 6 + (super::MAX_SEND_PEERS + 1) * (super::NAME_MAX + 1);
 
     /// Build `MARKER op <core> name[\0peer]*` into `buf`, returning its length.
     pub fn encode(buf: &mut [u8; MAX], op: u8, core: u32, name: &str, peers: &[&str]) -> Option<usize> {
@@ -714,16 +714,23 @@ pub const SPAWN_PAYLOAD_MAX: usize = 128;
 /// `log::BOOT_READ_CHUNK`; a reader's buffer is exactly this size, so the kernel never writes past it.
 pub const BOOT_READ_CHUNK: usize = 512;
 
-const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
+/// MUST match `kernel::task::SERVICE_CTX_MAGIC`. It names the page's LAYOUT, and changes when the layout does.
+const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D6;
 /// MUST match `kernel::task::MAX_SEND_PEERS` - this indexes the kernel-written context page.
 const MAX_SEND_PEERS:      usize = 6;
-const PEER_NAME_BYTES:     usize = 24;
-/// The longest name the kernel's name directory holds (`kernel/src/ipc/names.rs`), and so the longest a
-/// service can be reached by. It is NOT `PEER_NAME_BYTES`: that one sizes a send-peer's LABEL in the context
-/// page the kernel writes, whose layout every built program reads, so it cannot grow without breaking every
-/// program already built. Acquiring by name never touches that page, and was refused past 24 bytes for no
-/// reason - which made an installed package called `godspeed/selfcheck-service` unreachable by its name.
-pub const NAME_MAX:        usize = 32;
+/// MUST match `kernel::task::PEER_NAME_BYTES`: a send-peer's name in the page the kernel writes.
+const PEER_NAME_BYTES:     usize = NAME_MAX;
+/// The longest name the kernel holds - a task's, a send-peer's, a directory entry's - and so the longest a
+/// program can run under and be reached by. 128 since 2026-10-18: an installed package runs under its
+/// `publisher/name`, which may be that long. It was 24 for a peer and for acquiring by name, and 32 for a
+/// task, and a 26-byte package name was then unreachable by its own clients. Growing it changed the context
+/// page's layout, so its magic changed with it, and a package built before that is refused at start
+/// (`LAYOUT_RELEASE`).
+pub const NAME_MAX:        usize = 128;
+/// The first GodspeedOS release whose program layout this one runs: the context page and `TaskStat`, which
+/// changed when names grew to 128 bytes. A package built for an earlier release would read them wrongly, so
+/// the supervisor refuses to start it and says its publisher must rebuild it.
+pub const LAYOUT_RELEASE:  &str  = "0.29.0";
 
 #[repr(C)]
 struct SendPeerEntry {
@@ -803,7 +810,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 328;   // 320 + irq_count(4) + irqs[4] - the granted vector (D1b)
+const SERVICE_CONTEXT_DATA_SIZE: usize = 952;   // 320 + irq_count(4) + irqs[4] (D1b); then each of the 6 send-peer names 24 -> 128 bytes (2026-10-18), +624
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -868,8 +875,8 @@ pub struct TaskStat {
     pub mem_limit:   u64,
     /// Byte length of the name stored in `name`.
     pub name_len:    usize,
-    /// Task name bytes (zero-padded to 32 bytes).
-    pub name:        [u8; 32],
+    /// Task name bytes (zero-padded to `NAME_MAX` bytes).
+    pub name:        [u8; NAME_MAX],
     /// Number of times this service has been restarted (0 on a fresh boot / first spawn, +1 per
     /// respawn). Saturating u64 - effectively unbounded.
     pub restart_count: u64,
@@ -884,7 +891,7 @@ pub struct TaskStat {
 impl TaskStat {
     /// Return the task name as a `&str`.
     pub fn name_str(&self) -> &str {
-        let len = self.name_len.min(32);
+        let len = self.name_len.min(NAME_MAX);
         core::str::from_utf8(&self.name[..len]).unwrap_or("?")
     }
 
@@ -3551,15 +3558,16 @@ impl ServiceContext {
     /// is dead, `valid` will be false - and also when the caller lacks the
     /// INTROSPECT cap the kernel requires, which this cannot tell apart.
     pub fn task_stat(&self, slot: u32) -> TaskStat {
-        let mut buf = [0u8; 80];
+        // The kernel's `STAT_SIZE`: 176 bytes since names grew to 128 (`handle_task_stat`).
+        let mut buf = [0u8; 176];
         // SAFETY: syscall(16) = TaskStat; buf is a local array on the user stack.
         let ret = unsafe {
-            raw_syscall(16, slot as u64, buf.as_mut_ptr() as u64, 80)
+            raw_syscall(16, slot as u64, buf.as_mut_ptr() as u64, 176)
         };
         if ret != 0 {
             return TaskStat {
                 valid: false, state: 0, core: 0,
-                mem_used: 0, mem_limit: 0, name_len: 0, name: [0u8; 32],
+                mem_used: 0, mem_limit: 0, name_len: 0, name: [0u8; NAME_MAX],
                 restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
             };
         }
@@ -3571,16 +3579,16 @@ impl ServiceContext {
                                               buf[12], buf[13], buf[14], buf[15]]);
         let mem_limit   = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19],
                                               buf[20], buf[21], buf[22], buf[23]]);
-        let mut name = [0u8; 32];
-        let copy_len = name_len.min(32);
+        let mut name = [0u8; NAME_MAX];
+        let copy_len = name_len.min(NAME_MAX);
         name[..copy_len].copy_from_slice(&buf[24..24 + copy_len]);
-        let restart_count = u64::from_le_bytes([buf[56], buf[57], buf[58], buf[59],
-                                                buf[60], buf[61], buf[62], buf[63]]);
+        let restart_count = u64::from_le_bytes([buf[152], buf[153], buf[154], buf[155],
+                                                buf[156], buf[157], buf[158], buf[159]]);
         let queue_depth = buf[3];
-        let run_ticks   = u64::from_le_bytes([buf[64], buf[65], buf[66], buf[67],
-                                              buf[68], buf[69], buf[70], buf[71]]);
-        let uptime_secs = u64::from_le_bytes([buf[72], buf[73], buf[74], buf[75],
-                                              buf[76], buf[77], buf[78], buf[79]]);
+        let run_ticks   = u64::from_le_bytes([buf[160], buf[161], buf[162], buf[163],
+                                              buf[164], buf[165], buf[166], buf[167]]);
+        let uptime_secs = u64::from_le_bytes([buf[168], buf[169], buf[170], buf[171],
+                                              buf[172], buf[173], buf[174], buf[175]]);
         TaskStat { valid, state, core, mem_used, mem_limit, name_len: copy_len, name,
                    restart_count, queue_depth, run_ticks, uptime_secs }
     }

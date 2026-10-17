@@ -775,7 +775,8 @@ const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
 /// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
 /// name alone; a peer list needs more. Bounded and small (26.6) - the longest real payload is
 /// well under half of this.
-const SPAWN_PAYLOAD_MAX: usize = 128;
+/// A spawn request's peer list, NUL-joined: every peer at the longest a name may be.
+const SPAWN_PAYLOAD_MAX: usize = crate::task::MAX_SEND_PEERS * (crate::task::PEER_NAME_BYTES + 1);
 
 
 // ---------------------------------------------------------------------------------------------
@@ -1069,8 +1070,8 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     }
 
     let name_len = req.name_len as usize;
-    if name_len == 0 || name_len > 64 {
-        crate::kprintln!("task: SpawnImage refused - name length {} (must be 1..=64)", name_len);
+    if name_len == 0 || name_len > crate::task::PEER_NAME_BYTES {
+        crate::kprintln!("task: SpawnImage refused - name length {} (must be 1..={})", name_len, crate::task::PEER_NAME_BYTES);
         return -1;
     }
     let name_bytes = match read_user_bytes(req.name_ptr, name_len) { Some(b) => b, None => return -1 };
@@ -1131,7 +1132,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     if ni > 0 {
         // Each entry is at least 1 + 1 + 2 bytes; the buffer is read once, like every other input.
         let ilen = ni * (2 + PEER_NAME_BYTES + 2);
-        let ibuf = match read_user_bytes(req.installs_ptr, ilen.min(512)) {
+        let ibuf = match read_user_bytes(req.installs_ptr, ilen.min(crate::task::MAX_SEND_PEERS * (2 + PEER_NAME_BYTES + 2))) {
             Some(b) => b,
             None    => return -1,
         };
@@ -1216,7 +1217,7 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
+    if len == 0 || len > crate::task::PEER_NAME_BYTES { return -1; }
     let name_bytes = match read_user_bytes(name_ptr, len) {
         Some(b) => b,
         None    => return -1,
@@ -1293,7 +1294,7 @@ fn handle_exit(status: u64) -> i64 {
 /// after, including the name that is actually broken.
 fn warn_once_for(name: &str) -> bool {
     const MAX_NAMES: usize = 16;
-    const NAME_MAX: usize = 32;
+    const NAME_MAX: usize = crate::task::PEER_NAME_BYTES;
     static SEEN: crate::smp::SpinLock<([[u8; NAME_MAX]; MAX_NAMES], [u8; MAX_NAMES], usize)> =
         crate::smp::SpinLock::new(([[0; NAME_MAX]; MAX_NAMES], [0; MAX_NAMES], 0));
     let b = name.as_bytes();
@@ -1321,7 +1322,7 @@ fn warn_once_for(name: &str) -> bool {
 /// caller with neither, `ACQUIRE_NAME_NOT_REGISTERED` (-20) or `ACQUIRE_CAP_TABLE_FULL` (-21).
 fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
+    if len == 0 || len > crate::task::PEER_NAME_BYTES { return -1; }
     let name_bytes = match read_user_bytes(name_ptr, len) {
         Some(b) => b,
         None    => return -1,
@@ -2087,7 +2088,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;
-            if len == 0 || len > 64 { return -1; }
+            if len == 0 || len > crate::task::PEER_NAME_BYTES { return -1; }
             let name_bytes = match read_user_bytes(arg1, len) {
                 Some(b) => b,
                 None    => return -1,
@@ -2145,11 +2146,12 @@ fn handle_remove_cap(slot: u64) -> i64 {
 // Syscall: TaskStat (16) - read task state for a given slot index.
 // ---------------------------------------------------------------------------
 
-/// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 80).
+/// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 176).
 ///
 /// Requires the INTROSPECT capability (READ) - discloses any task's state (§3.1).
 ///
-/// Buffer layout (80 bytes = STAT_SIZE - kept in sync with the writes below):
+/// Buffer layout (176 bytes = STAT_SIZE - kept in sync with the writes below; 80 until 2026-10-18, when names
+/// grew from 32 bytes to 128):
 ///   [0]       valid:         u8  (1 = live, 0 = dead/unused)
 ///   [1]       state:         u8  (0=Ready, 1=Running, 2=BlockedOnRecv, 3=BlockedOnSend, 4=Dead)
 ///   [2]       core:          u8
@@ -2157,14 +2159,14 @@ fn handle_remove_cap(slot: u64) -> i64 {
 ///   [4..8]    name_len:      u32 LE
 ///   [8..16]   mem_used:      u64 LE
 ///   [16..24]  mem_limit:     u64 LE
-///   [24..56]  name:          [u8; 32] (truncated; zero-padded)
-///   [56..64]  restart_count: u64 LE
-///   [64..72]  run_ticks:     u64 LE
-///   [72..80]  uptime_secs:   u64 LE
+///   [24..152] name:          [u8; 128] (zero-padded)
+///   [152..160] restart_count: u64 LE
+///   [160..168] run_ticks:     u64 LE
+///   [168..176] uptime_secs:   u64 LE
 ///
 /// Returns 0 on success, -1 on invalid args.
 fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-    const STAT_SIZE: usize = 80;
+    const STAT_SIZE: usize = 176;
     // TaskStat discloses any task's full snapshot - requires INTROSPECT (READ)
     // (§3.1; docs/introspection-capability.md).
     if !scheduler::current_task_holds_resource(
@@ -2178,7 +2180,7 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let stat = scheduler::task_stat(slot as usize);
 
     let name_bytes = stat.name.as_bytes();
-    let copy_len   = name_bytes.len().min(32);
+    let copy_len   = name_bytes.len().min(128);
     let name_len   = copy_len as u32;
 
     let mut buf = [0u8; STAT_SIZE];
@@ -2191,9 +2193,9 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     buf[16..24].copy_from_slice(&stat.mem_limit.to_le_bytes());
     buf[24..24 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
     // restart_count is u64 (was a u32 endpoint generation at buf[56..60]); queue_depth moved to buf[3].
-    buf[56..64].copy_from_slice(&stat.restart_count.to_le_bytes());
-    buf[64..72].copy_from_slice(&stat.run_ticks.to_le_bytes());
-    buf[72..80].copy_from_slice(&stat.uptime_secs.to_le_bytes());
+    buf[152..160].copy_from_slice(&stat.restart_count.to_le_bytes());
+    buf[160..168].copy_from_slice(&stat.run_ticks.to_le_bytes());
+    buf[168..176].copy_from_slice(&stat.uptime_secs.to_le_bytes());
 
     if write_user_bytes(buf_ptr, &buf) { 0 } else { -1 }
 }

@@ -1523,7 +1523,7 @@ struct DevEvent {
     what: u8,
     vid: u16,
     pid: u16,
-    name: [u8; 16],
+    name: [u8; godspeed_sdk::service_context::NAME_MAX],
     nlen: u8,
 }
 
@@ -1542,22 +1542,22 @@ const DEATHS: usize = 32;
 /// One service's newest death notice: when, how many, and how (the kernel's words, `death`).
 #[derive(Clone, Copy)]
 struct Death {
-    /// 32, not 16: an installed package runs as `publisher/name`, and two of those cut to 16 collide.
-    name: [u8; 32],
+    /// The whole name, never cut: an installed package runs as `publisher/name`, and two cut short can collide.
+    name: [u8; godspeed_sdk::service_context::NAME_MAX],
     nlen: u8,
     count: u32,
     secs: u32,
     how: u8,
     kind: u8,
     addr: u64,
-    by: [u8; 16],
+    by: [u8; godspeed_sdk::service_context::NAME_MAX],
     blen: u8,
 }
 
 impl DevEvents {
     fn new(ctx: &ServiceContext) -> Self {
-        let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; 16], nlen: 0 };
-        let none = Death { name: [0; 32], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0 };
+        let none = Death { name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; godspeed_sdk::service_context::NAME_MAX], blen: 0 };
         DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32,
                     deaths: [none; DEATHS] }
     }
@@ -1566,7 +1566,7 @@ impl DevEvents {
     /// fault kind and the address. A notice without it (none should arrive) is kept as `how` 0.
     fn note_death(&mut self, ctx: &ServiceContext, name: &str, how: &[u8]) {
         let nb = name.as_bytes();
-        let nl = nb.len().min(32);
+        let nl = nb.len().min(godspeed_sdk::service_context::NAME_MAX);
         let secs = gs::task::uptime_secs(ctx).max(0) as u32;
         // This name's entry, else an empty one, else the oldest.
         let i = match self.deaths.iter().position(|d| d.nlen as usize == nl && d.name[..nl] == nb[..nl]) {
@@ -1582,7 +1582,7 @@ impl DevEvents {
             },
         };
         let d = &mut self.deaths[i];
-        d.name = [0; 32];
+        d.name = [0; godspeed_sdk::service_context::NAME_MAX];
         d.name[..nl].copy_from_slice(&nb[..nl]);
         d.nlen = nl as u8;
         d.count = d.count.wrapping_add(1);
@@ -1592,8 +1592,8 @@ impl DevEvents {
             Some(&death::KILLED) => {
                 d.how = death::KILLED;
                 let b = &how[1..];
-                let bl = b.len().min(16);
-                d.by = [0; 16];
+                let bl = b.len().min(godspeed_sdk::service_context::NAME_MAX);
+                d.by = [0; godspeed_sdk::service_context::NAME_MAX];
                 d.by[..bl].copy_from_slice(&b[..bl]);
                 d.blen = bl as u8;
             }
@@ -1616,8 +1616,8 @@ impl DevEvents {
     /// `[OK, since, deaths, secs, how, kind, addr, by_len, by...]`, as `supcmd::DEATH` documents.
     fn death_answer(&self, name: &str, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
         let nb = name.as_bytes();
-        let nl = nb.len().min(32);
-        let none = Death { name: [0; 32], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let nl = nb.len().min(godspeed_sdk::service_context::NAME_MAX);
+        let none = Death { name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; godspeed_sdk::service_context::NAME_MAX], blen: 0 };
         let d = self.deaths.iter().find(|d| d.nlen != 0 && d.nlen as usize == nl && d.name[..nl] == nb[..nl])
             .copied().unwrap_or(none);
         out[0] = supcmd::OK;
@@ -1636,7 +1636,7 @@ impl DevEvents {
     /// hardware event, and the record is short.
     fn note(&mut self, ctx: &ServiceContext, what: u8, name: &str, vid: u16, pid: u16) {
         if !drives_device(name) { return; }
-        let mut e = DevEvent { secs: gs::task::uptime_secs(ctx).max(0) as u32, what, vid, pid, name: [0; 16], nlen: 0 };
+        let mut e = DevEvent { secs: gs::task::uptime_secs(ctx).max(0) as u32, what, vid, pid, name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0 };
         let n = name.len().min(e.name.len());
         e.name[..n].copy_from_slice(&name.as_bytes()[..n]);
         e.nlen = n as u8;

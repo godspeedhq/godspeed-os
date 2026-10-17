@@ -235,6 +235,15 @@ pub fn package(ctx: &ServiceContext, publisher: &str, name: &str, version: &str,
     if man.name.publisher() != publisher || man.name.name() != name || ver.as_str() != version {
         return Err(text(format_args!("the manifest names another package or version than its folder")));
     }
+    // BUILT FOR A LAYOUT THIS MACHINE RUNS. A program reads the page the kernel writes for it at start, and
+    // that page's layout changed at `LAYOUT_RELEASE` (names grew to 128 bytes). One built for an earlier
+    // release would misread its own peers, so it is refused here, before anything of it runs.
+    let layout: godspeed_package::Version = godspeed_sdk::service_context::LAYOUT_RELEASE.parse()
+        .map_err(|_| text(format_args!("this machine's layout release is not a version")))?;
+    if man.os_release < layout {
+        return Err(text(format_args!("it was built for GodspeedOS {}, before {} changed what a program reads at start - its publisher must rebuild it for {} or later",
+            man.os_release, layout, layout)));
+    }
     let mut c = [0u8; CONTRACT_MAX];
     let cl = read(&mut fs, godspeed_package::CONTRACT_FILE, &mut c)?;
     if Sha256Digest::of(&c[..cl]) != man.contract {

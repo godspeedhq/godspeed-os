@@ -51,14 +51,14 @@ if $reg > 0 {
     echo '===== packages: the registry lists them, and each verifies from the disk ====='
     godspeed search selfcheck | assert contains godspeed/selfcheck-service
     godspeed search selfcheck | assert contains godspeed/selfcheck-driver
-    godspeed list versions godspeed/selfcheck-service | assert contains 0.1.0
-    godspeed list versions godspeed/selfcheck-service | assert contains 0.3.0
+    godspeed list versions godspeed/selfcheck-service | assert contains 1.0.0
+    godspeed list versions godspeed/selfcheck-service | assert contains 1.2.0
     for p in selfcheck-utility selfcheck-app selfcheck-driver {
         assert ok godspeed fetch godspeed/$p
     }
-    assert ok godspeed fetch godspeed/selfcheck-service@0.2.0
-    assert ok godspeed fetch godspeed/selfcheck-service@0.3.0
-    assert ok godspeed fetch godspeed/selfcheck-service@0.1.0
+    assert ok godspeed fetch godspeed/selfcheck-service@1.1.0
+    assert ok godspeed fetch godspeed/selfcheck-service@1.2.0
+    assert ok godspeed fetch godspeed/selfcheck-service@1.0.0
     # Every copy checks from the disk alone - signature, key, contract, binary - and none is damaged.
     godspeed verify | where package contains selfcheck- | where status=DAMAGED | assert empty
     godspeed verify | where package contains selfcheck- | assert contains intact
@@ -80,16 +80,16 @@ if $reg > 0 {
 
     echo ''
     echo '===== packages: a service is installed, upgraded while it runs, and replaced by an older one ====='
-    assert ok godspeed install godspeed/selfcheck-service@0.2.0 yes
+    assert ok godspeed install godspeed/selfcheck-service@1.1.0 yes
     godspeed list installed | where package=godspeed/selfcheck-service | assert contains running
-    # 0.2.0 and 0.3.0 both declare `handover`: printed above as "replaced live" where this machine has a
+    # 1.1.0 and 1.2.0 both declare `handover`: printed above as "replaced live" where this machine has a
     # hardware random source for the keys, and as a stop and start where it has none.
     assert ok godspeed upgrade godspeed/selfcheck-service yes
-    godspeed list installed | where package=godspeed/selfcheck-service | assert contains 0.3.0
+    godspeed list installed | where package=godspeed/selfcheck-service | assert contains 1.2.0
     godspeed list installed | where package=godspeed/selfcheck-service | assert contains running
-    # 0.1.0 does not declare it: a stop and start, checked before the running one is stopped.
-    assert ok godspeed install godspeed/selfcheck-service@0.1.0 yes
-    godspeed list installed | where package=godspeed/selfcheck-service | assert contains 0.1.0
+    # 1.0.0 does not declare it: a stop and start, checked before the running one is stopped.
+    assert ok godspeed install godspeed/selfcheck-service@1.0.0 yes
+    godspeed list installed | where package=godspeed/selfcheck-service | assert contains 1.0.0
     godspeed list installed | where package=godspeed/selfcheck-service | assert contains running
 
     echo ''

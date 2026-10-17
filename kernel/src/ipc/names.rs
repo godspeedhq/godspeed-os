@@ -41,7 +41,7 @@ macro_rules! name_trace {
 use crate::smp::SpinLock;
 
 const MAX_ENTRIES: usize = 128;
-const NAME_MAX:    usize = 32;
+const NAME_MAX:    usize = crate::task::PEER_NAME_BYTES;
 
 #[derive(Clone, Copy)]
 struct NameEntry {

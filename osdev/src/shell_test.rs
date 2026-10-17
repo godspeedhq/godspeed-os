@@ -8443,11 +8443,11 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let none = run!(b"godspeed search zzzz\r", 180);
         check!(none.contains("0 packages") && none.contains("verified: root"), "a word nothing matches is an empty list, not a failure, with the chain it was checked by");
         let info = run!(b"godspeed info godspeed/hello\r", 180);
-        check!(info.contains("godspeed/hello 0.1.0") && info.contains("latest; published") && info.contains("bankole"),
+        check!(info.contains("godspeed/hello 0.2.0") && info.contains("latest; published") && info.contains("bankole"),
                "`godspeed info` is a card headed by the release: the latest, when and by whom");
         check!(info.contains("The service template") && info.contains("licence") && info.contains("GPL-2.0-only") && !info.contains("ITEM"),
                "the card gives the manifest's description and licence, and is not a three-column table");
-        check!(info.contains("built for") && info.contains("0.28.0") && info.contains("ships") && info.contains("this machine's, x86_64, is one"),
+        check!(info.contains("built for") && info.contains("0.29.0") && info.contains("ships") && info.contains("this machine's, x86_64, is one"),
                "and the release it was built for, the architectures it ships and whether this machine's is one");
         check!(info.contains("requests") && info.contains("log_write") && info.contains("an active key of the publisher's"),
                "and what its contract requests and who signed it");
@@ -8455,7 +8455,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(nope.contains("never published on this registry"), "a package the snapshot does not list is said to be unpublished");
 
         let fetched = run!(b"godspeed fetch godspeed/hello\r", 240);
-        check!(fetched.contains("/system/packages/godspeed/hello/0.1.0") && fetched.contains("fetched"),
+        check!(fetched.contains("/system/packages/godspeed/hello/0.2.0") && fetched.contains("fetched"),
                "`godspeed fetch` verifies the package and fetches it to /system/packages/");
         check!(fetched.contains("x86_64") && fetched.contains("its size and digest the manifest's"),
                "it keeps this machine's binary, checked against the manifest");
@@ -8466,16 +8466,16 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
                "`godspeed fetch` draws a progress bar while the binary downloads");
         check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
-        let kept = run!(b"dir /system/packages/godspeed/hello/0.1.0\r", 60);
+        let kept = run!(b"dir /system/packages/godspeed/hello/0.2.0\r", 60);
         check!(kept.contains("x86_64.elf") && kept.contains("manifest.toml") && kept.contains("manifest.sig")
                && kept.contains("contract.toml") && kept.contains("origin") && !kept.contains("aarch64.elf"),
                "the folder holds the binary, the documents that prove it, and where it came from - and no other architecture's");
-        let twice = run!(b"godspeed fetch godspeed/hello@0.1.0\r", 240);
+        let twice = run!(b"godspeed fetch godspeed/hello@0.2.0\r", 240);
         check!(twice.contains("already fetched"), "fetching a fetched version again leaves it as it is");
         let listed = run!(b"godspeed list fetched\r", 60);
         check!(listed.contains("PACKAGE") && listed.contains("VERSION") && listed.contains("FROM") && listed.contains("SIZE"),
                "`godspeed list fetched` is a list with real columns");
-        check!(listed.contains("godspeed/hello") && listed.contains("0.1.0") && listed.contains("default"), "it shows the package, its version and registry");
+        check!(listed.contains("godspeed/hello") && listed.contains("0.2.0") && listed.contains("default"), "it shows the package, its version and registry");
         check!(listed.contains("KiB") && listed.contains("1 package,"), "with its size, and the count and total under the list");
         let verified = run!(b"godspeed verify\r", 120);
         check!(verified.contains("intact") && verified.contains("1 checked, 0 damaged"), "`godspeed verify` checks the fetched copy from the disk: intact");
@@ -8496,17 +8496,17 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let refused = run!(b"godspeed fetch godspeed/hello | count\r", 30);
         check!(refused.contains("are actions, not reports"), "`godspeed fetch` refuses to start a pipe");
         let missing = run!(b"godspeed fetch godspeed/hello@9.9.9\r", 240);
-        check!(missing.contains("not published") && missing.contains("0.1.0"), "a version not published is refused, naming the ones that are");
+        check!(missing.contains("not published") && missing.contains("0.2.0"), "a version not published is refused, naming the ones that are");
 
         // INSTALL: the supervisor checks the fetched copy from the disk again and starts it, under its package name.
         let notfetched = run!(b"godspeed install godspeed/nothing-here yes\r", 60);
         check!(notfetched.contains("not fetched here"), "installing what is not fetched is refused, naming `godspeed fetch`");
         let inst = run!(b"godspeed install godspeed/hello yes\r", 180);
-        check!(inst.contains("godspeed/hello 0.1.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
+        check!(inst.contains("godspeed/hello 0.2.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
                "`godspeed install` asks once, naming everything the package would be given, and `yes` answers it");
         check!(inst.contains("installed") && inst.contains("running, as the task godspeed/hello") && inst.contains("privilege"),
                "the supervisor started it, under its package name, with no privilege");
-        check!(inst.contains("installed godspeed/hello 0.1.0 started") && inst.contains("checked from disk"),
+        check!(inst.contains("installed godspeed/hello 0.2.0 started") && inst.contains("checked from disk"),
                "the supervisor says it checked the copy from the disk before starting it");
         check!(inst.contains("hello: started"), "and the installed program ran");
         let li = run!(b"godspeed list installed\r", 60);
@@ -8533,10 +8533,10 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
 
         // A UTILITY: installed, run by its name for one command line, its output shown and piped, its status said.
         let uf = run!(b"godspeed fetch godspeed/hello-utility\r", 240);
-        check!(uf.contains("godspeed/hello-utility 0.1.0") && uf.contains("fetched") && uf.contains("a utility: `godspeed install` makes it a command"),
+        check!(uf.contains("godspeed/hello-utility 0.2.0") && uf.contains("fetched") && uf.contains("a utility: `godspeed install` makes it a command"),
                "`godspeed fetch` fetches a utility package and says what installing it does");
         let ui = run!(b"godspeed install godspeed/hello-utility yes\r", 180);
-        check!(ui.contains("godspeed/hello-utility 0.1.0 asks for nothing (no peers, no privilege) and becomes a command, run when typed")
+        check!(ui.contains("godspeed/hello-utility 0.2.0 asks for nothing (no peers, no privilege) and becomes a command, run when typed")
                && ui.contains("a utility: type `hello-utility"),
                "installing a utility asks once and says how to run it");
         check!(ui.contains("checked from disk - a utility, run when typed") && !ui.contains("hello-utility' spawned OK"),
@@ -8563,12 +8563,12 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(ug.contains("unknown: hello-utility"), "and its name is no longer a command");
         let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
 
-        // A SERVICE, by its own name: installed, started now and kept running. 0.3.0 and 0.4.0 declare `handover`.
-        let _ = run!(b"godspeed fetch godspeed/hello-service@0.5.0\r", 240);
-        let si = run!(b"godspeed install godspeed/hello-service@0.5.0 yes\r", 180);
-        check!(si.contains("godspeed/hello-service 0.5.0 asks for nothing (no peers, no privilege) and starts at every boot"),
+        // A SERVICE, by its own name: installed, started now and kept running. 0.8.0 and 0.9.0 declare `handover`; 0.7.0 does not.
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.8.0\r", 240);
+        let si = run!(b"godspeed install godspeed/hello-service@0.8.0 yes\r", 180);
+        check!(si.contains("godspeed/hello-service 0.8.0 asks for nothing (no peers, no privilege) and starts at every boot"),
                "installing a service says it starts at every boot");
-        check!(si.contains("hello-service 0.5.0: started") && si.contains("running, as the task godspeed/hello-service"),
+        check!(si.contains("hello-service 0.8.0: started") && si.contains("running, as the task godspeed/hello-service"),
                "`godspeed/hello-service` is started by the supervisor and runs");
         // A LIVE HANDOVER: upgraded while it runs, its count carried to the new version, nothing stopped.
         let _ = run!(b"date\r", 30);
@@ -8582,32 +8582,40 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
                 up.push_str(&collect_until(&buf, &mut cursor, b"\n", Duration::from_secs(5)).unwrap_or_default());
             }
         }
-        check!(up.contains("upgrade from 0.5.0") && up.contains("0.6.0"), "`godspeed upgrade` offers 0.6.0 in place of 0.5.0");
+        check!(up.contains("upgrade from 0.8.0") && up.contains("0.9.0"), "`godspeed upgrade` offers 0.9.0 in place of 0.8.0");
         check!(up.contains("task: spawn 'godspeed/hello-service' beside the running one: a live handover"),
                "the kernel starts the new version beside the running one, under the same name");
-        check!(up.contains("hello-service 0.5.0: handing over at") && up.contains("hello-service 0.6.0: took over, live, at"),
+        check!(up.contains("hello-service 0.8.0: handing over at") && up.contains("hello-service 0.9.0: took over, live, at"),
                "the running version hands its state over, and the new one takes it");
         let carried = up.split("took over, live, at ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
         check!(carried > 0, "the count it took over is the one the old version had, not zero: the state carried across");
-        check!(up.contains("live, with no restart") && !up.contains("died, restarting") && !up.contains("hello-service 0.6.0: started") && !up.contains("wrong key"),
+        check!(up.contains("live, with no restart") && !up.contains("died, restarting") && !up.contains("hello-service 0.9.0: started") && !up.contains("wrong key"),
                "it was replaced live: no death, no restart, no fresh start");
         let lr = run!(b"godspeed list installed\r", 60);
-        check!(lr.contains("godspeed/hello-service") && lr.contains("0.6.0") && lr.contains("running"), "0.6.0 is the installed one, running");
+        check!(lr.contains("godspeed/hello-service") && lr.contains("0.9.0") && lr.contains("running"), "0.9.0 is the installed one, running");
         // VERSIONS: every release, newest first, and what each is here. Then an older one installed by its version.
         let lv = run!(b"godspeed list versions godspeed/hello-service\r", 180);
-        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.6.0") && lv.contains("0.1.0")
-               && lv.contains("installed") && lv.contains("6 versions, the latest 0.6.0"),
+        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.9.0") && lv.contains("0.7.0")
+               && lv.contains("installed") && lv.contains("9 versions, the latest 0.9.0"),
                "`godspeed list versions` lists every release, newest first, the installed one marked");
-        check!(lv.find("0.6.0").unwrap_or(usize::MAX) < lv.find("0.1.0").unwrap_or(0), "newest first");
-        let _ = run!(b"godspeed fetch godspeed/hello-service@0.1.0\r", 240);
-        let dg = run!(b"godspeed install godspeed/hello-service@0.1.0 yes\r", 180);
-        check!(dg.contains("a DOWNGRADE from the installed 0.6.0, whose data stays as that version left it"),
+        check!(lv.find("0.9.0").unwrap_or(usize::MAX) < lv.find("0.7.0").unwrap_or(0), "newest first");
+        // A VERSION BUILT BEFORE 0.29.0 (names to 128 bytes) is refused, and the running one is left alone.
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.6.0\r", 240);
+        let old = run!(b"godspeed install godspeed/hello-service@0.6.0 yes\r", 180);
+        check!(old.contains("built for GodspeedOS 0.28.0") && old.contains("must rebuild it"),
+               "a package built for a release before the layout change is refused, and says its publisher must rebuild it");
+        let still = run!(b"godspeed list installed\r", 60);
+        check!(still.contains("godspeed/hello-service") && still.contains("0.9.0") && still.contains("running"),
+               "the refused install leaves the running version running");
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.7.0\r", 240);
+        let dg = run!(b"godspeed install godspeed/hello-service@0.7.0 yes\r", 180);
+        check!(dg.contains("a DOWNGRADE from the installed 0.9.0, whose data stays as that version left it"),
                "installing an older version says it is a downgrade, and what that means for its data");
-        check!(dg.contains("installed godspeed/hello-service 0.1.0 started") && dg.contains("stopped and started"),
-               "0.1.0 cannot hand over, so it replaces 0.6.0 by a stop and start - and says so");
+        check!(dg.contains("installed godspeed/hello-service 0.7.0 started") && dg.contains("stopped and started"),
+               "0.7.0 cannot hand over, so it replaces 0.9.0 by a stop and start - and says so");
         let lv2 = run!(b"godspeed list installed\r", 60);
-        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.1.0") && !lv2.contains("0.6.0"), "the older version is the installed one now");
-        for v in ["0.5.0", "0.6.0"] {
+        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.7.0") && !lv2.contains("0.9.0"), "the older version is the installed one now");
+        for v in ["0.6.0", "0.8.0", "0.9.0"] {
             let _ = run!(format!("godspeed remove godspeed/hello-service@{}\r", v).as_bytes(), 60);
         }
         let su = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);
@@ -8664,7 +8672,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fresh.contains("first contact: root 1 matched the pin"), "and the registry is met again from root 1");
 
         // DAMAGE on disk is found without the network.
-        let _ = run!(b"write /system/packages/godspeed/hello/0.1.0/contract.toml name = \"other\"\r", 60);
+        let _ = run!(b"write /system/packages/godspeed/hello/0.2.0/contract.toml name = \"other\"\r", 60);
         let damaged = run!(b"godspeed verify godspeed/hello\r", 120);
         check!(damaged.contains("DAMAGED") && damaged.contains("contract.toml is not the contract the manifest names"),
                "`godspeed verify` finds a fetched file changed on disk, and names it");
@@ -8715,8 +8723,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     if !offline {
         let sc = run!(b"selfcheck packages\r", 900);
         check!(sc.contains("failed 0") && !sc.contains("FAIL "), "`selfcheck packages` runs with no failure");
-        check!(sc.contains("replaced live, with no restart"), "its service upgrade 0.2.0 -> 0.3.0 is hot");
-        check!(sc.contains("stopped and started"), "and its replacement by 0.1.0 is cold");
+        check!(sc.contains("live, with no restart") && sc.contains("took over, live, at"), "its service upgrade 1.1.0 -> 1.2.0 is hot");
+        check!(sc.contains("stopped and started"), "and its replacement by 1.0.0 is cold");
         check!(!sc.contains("selfcheck-driver - its device"), "with QEMU's edu here, the driver is started, not skipped");
         check!(!sc.contains("registry is not reachable"), "the registry was reached, so nothing was skipped for it");
     }

@@ -34,6 +34,8 @@
 
 use godspeed as gs;
 use godspeed_sdk::{ServiceContext, Message};
+/// The longest task name the kernel holds; a victim's name is kept whole, never cut, so the kill names it.
+use godspeed_sdk::service_context::NAME_MAX;
 use core::fmt::Write as _;
 
 // Tuning - mirrors the shell's former max-carnage, bounded (§26.6).
@@ -313,14 +315,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // A comma-separated target ("nic-driver,net-stack") is a MULTI-TARGET run: EVERY listed service is
     // killed each round (semantics B - the cascade stress). Parse it once into a bounded fixed array.
     const MAX_TLIST: usize = 8;
-    let mut tlist: [[u8; 24]; MAX_TLIST] = [[0u8; 24]; MAX_TLIST];
+    let mut tlist: [[u8; NAME_MAX]; MAX_TLIST] = [[0u8; NAME_MAX]; MAX_TLIST];
     let mut tlist_len: [usize; MAX_TLIST] = [0usize; MAX_TLIST];
     let mut ntlist = 0usize;
     let target_list = target.contains(',');
     if target_list {
         for seg in target.split(',') {
             if seg.is_empty() || ntlist >= MAX_TLIST { continue; }
-            let sb = seg.as_bytes(); let l = sb.len().min(24);
+            let sb = seg.as_bytes(); let l = sb.len().min(NAME_MAX);
             tlist[ntlist][..l].copy_from_slice(&sb[..l]); tlist_len[ntlist] = l; ntlist += 1;
         }
     }
@@ -338,7 +340,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::io::print(&ctx, "\x1b[2J\x1b[H");
 
     // Per-service aggregate tally (bounded; constant memory regardless of round count).
-    let mut sv_name:    [[u8; 24]; MAX_SVC] = [[0u8; 24]; MAX_SVC];
+    let mut sv_name:    [[u8; NAME_MAX]; MAX_SVC] = [[0u8; NAME_MAX]; MAX_SVC];
     let mut sv_nlen:    [usize;    MAX_SVC] = [0usize;    MAX_SVC];
     let mut sv_killed:  [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
     let mut sv_flooded: [u64;      MAX_SVC] = [0u64;      MAX_SVC]; // AIMED, per-service
@@ -451,7 +453,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `observe*` is NOT skipped, see the C2-1 note there); for a comma list, every listed service; for
         // a single target, that one. (This said "one sweep over EVERY live service, evenly", which the
         // random subset below contradicts.)
-        let mut cand: [([u8; 24], usize); MAX_CAND] = [([0u8; 24], 0usize); MAX_CAND];
+        let mut cand: [([u8; NAME_MAX], usize); MAX_CAND] = [([0u8; NAME_MAX], 0usize); MAX_CAND];
         let mut ncand = 0usize;
         if target_random {
             // DYNAMIC victim set: SCAN the live task table (no hardcoded service list - a driver the
@@ -465,7 +467,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let nm = st.name_str();
                 if is_transient(nm) { continue; }
                 if (rng.next() & 1) == 1 {
-                    let b = nm.as_bytes(); let l = b.len().min(24);
+                    let b = nm.as_bytes(); let l = b.len().min(NAME_MAX);
                     cand[ncand].0[..l].copy_from_slice(&b[..l]); cand[ncand].1 = l; ncand += 1;
                 }
             }
@@ -476,7 +478,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if !st.valid || st.state == 4 { continue; }
                     let nm = st.name_str();
                     if is_transient(nm) { continue; }
-                    let b = nm.as_bytes(); let l = b.len().min(24);
+                    let b = nm.as_bytes(); let l = b.len().min(NAME_MAX);
                     cand[0].0[..l].copy_from_slice(&b[..l]); cand[0].1 = l; ncand = 1;
                     break;
                 }
@@ -490,7 +492,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         } else {
-            let tb = target.as_bytes(); let l = tb.len().min(24);
+            let tb = target.as_bytes(); let l = tb.len().min(NAME_MAX);
             cand[0].0[..l].copy_from_slice(&tb[..l]); cand[0].1 = l; ncand = 1;
         }
 
@@ -506,7 +508,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // sub-step. (`break 'carnage` exits the round loop; the kernel buffers the key across churn.)
             if let Some(b) = ctx.try_console_read() { if b == b'q' || b == b'Q' { ack_quit(&ctx); break 'carnage; } }
             let nl = cand[c].1;
-            let mut nbuf = [0u8; 24]; nbuf[..nl].copy_from_slice(&cand[c].0[..nl]);
+            let mut nbuf = [0u8; NAME_MAX]; nbuf[..nl].copy_from_slice(&cand[c].0[..nl]);
             let name = str_of(&nbuf[..nl]);
 
             // Find-or-add this service's tally slot (its kill + flood counts + cached flood cap share it).

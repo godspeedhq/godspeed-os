@@ -139,7 +139,9 @@ pub fn free_kstack(kstack_top: u64) {
 // ---------------------------------------------------------------------------
 
 pub const SERVICE_CTX_VA:    u64 = 0x3ff000;
-pub const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
+/// Says WHICH LAYOUT this page has, not only that it is one: changed with the layout (2026-10-18, names to
+/// 128 bytes), so a program built for an older layout finds the wrong magic rather than misreading fields.
+pub const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D6;
 
 /// VA where the xHCI controller's MMIO BAR is mapped into the driver's address
 /// space (§12). 4 GiB - well above the user stack (0x8000_0000) and ctx page.
@@ -240,8 +242,10 @@ const AUDIO_PWM_DMA_PAGES: u64 = 36;
 /// The cap itself is right (a fixed array, §26.6); the silence was the bug, and the loud reject below
 /// is the other half of this fix.
 pub const MAX_SEND_PEERS:  usize = 6;
-/// Maximum bytes per peer name stored in ServiceContextData.
-pub const PEER_NAME_BYTES: usize = 24;
+/// Maximum bytes per name the kernel holds: a task's, a send-peer's in ServiceContextData, a directory entry's.
+/// 128 since 2026-10-18 (was 24 for a peer, 32 for a task): an installed package runs under its
+/// `publisher/name`, which may be 128 bytes, and a name the kernel cuts short is one nobody can reach.
+pub const PEER_NAME_BYTES: usize = 128;
 
 /// One caller-supplied send-peer to install in a new task (Phase 0b, `docs/naming-design.md`):
 /// a `(label, Capability)` pair the supervisor hands the kernel at spawn, instead of the kernel
@@ -336,7 +340,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 328;   // 320 + irq_count(4) + irqs[4] - the granted vector (D1b)
+const SERVICE_CONTEXT_DATA_SIZE: usize = 952;   // 320 + irq_count(4) + irqs[4] (D1b); then each of the 6 send-peer names 24 -> 128 bytes (2026-10-18), +624
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
