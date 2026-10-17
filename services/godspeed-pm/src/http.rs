@@ -169,7 +169,7 @@ mod tests {
         let mut n = 0usize;
         let mut done = false;
         for p in parts {
-            done = body.feed(p, &mut |b: &[u8]| { got[n..n + b.len()].copy_from_slice(b); n += b.len(); }).unwrap();
+            done = body.feed(p, &mut |b: &[u8]| { got[n..n + b.len()].copy_from_slice(b); n += b.len(); }) == Ok(true);
         }
         (done, got, n)
     }
@@ -181,7 +181,7 @@ mod tests {
         assert!(done);
         assert_eq!(&got[..n], b"hello");
         let mut b = Body::Length(0);
-        assert!(b.feed(&[], &mut |_| {}).unwrap());
+        assert_eq!(b.feed(&[], &mut |_| {}), Ok(true));
     }
 
     #[test]
@@ -206,14 +206,13 @@ mod tests {
     #[test]
     fn head_reads_status_and_framing() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 821\r\nConnection: keep-alive\r\n\r\nformat = 1";
-        let end = head_end(raw).unwrap();
+        let end = head_end(raw).unwrap_or(0);
         assert_eq!(&raw[end..], b"format = 1");
-        let h = parse_head(&raw[..end]).unwrap();
-        assert_eq!(h, Head { status: 200, length: Some(821), chunked: false, close: false });
-        let h = parse_head(b"HTTP/1.1 404 Not Found\r\ntransfer-encoding: chunked\r\n\r\n").unwrap();
-        assert_eq!((h.status, h.chunked), (404, true));
-        let h = parse_head(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").unwrap();
-        assert_eq!((h.length, h.close), (Some(0), true));
+        assert_eq!(parse_head(&raw[..end]), Ok(Head { status: 200, length: Some(821), chunked: false, close: false }));
+        let h = parse_head(b"HTTP/1.1 404 Not Found\r\ntransfer-encoding: chunked\r\n\r\n").map(|h| (h.status, h.chunked));
+        assert_eq!(h, Ok((404, true)));
+        let h = parse_head(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").map(|h| (h.length, h.close));
+        assert_eq!(h, Ok((Some(0), true)));
         assert!(parse_head(b"SSH-2.0 hello\r\n\r\n").is_err());
         assert!(parse_head(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n").is_err());
     }

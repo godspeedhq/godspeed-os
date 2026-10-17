@@ -125,7 +125,7 @@ mod tests {
     fn reads_a_manifest_shape() {
         let got: [(usize, Result<Line<'_>, &str>); 7] = {
             let mut it = lines(MANIFEST);
-            core::array::from_fn(|_| it.next().unwrap())
+            core::array::from_fn(|_| it.next().unwrap_or((0, Err("missing"))))
         };
         assert_eq!(got[0], (1, Ok(Line::Pair("format", Val::Int(1)))));
         assert_eq!(got[1], (3, Ok(Line::Table("package"))));
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn escapes_are_reported_not_unescaped() {
         let mut it = lines("d = \"a \\\"quoted\\\" word\"\n");
-        assert_eq!(it.next().unwrap().1, Ok(Line::Pair("d", Val::Escaped("a \\\"quoted\\\" word"))));
+        assert_eq!(it.next().map(|x| x.1), Some(Ok(Line::Pair("d", Val::Escaped("a \\\"quoted\\\" word")))));
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         for bad in ["k = [1, 2]", "k = { a = 1 }", "k = 1.5", "k = \"open", "k = \"x\" y", "[t", "k = 01", "= 3", "k = -1",
                     "k = \"\u{1}\""] {
             let mut it = lines(bad);
-            assert!(it.next().unwrap().1.is_err(), "{}", bad);
+            assert!(it.next().is_some_and(|x| x.1.is_err()), "{}", bad);
         }
     }
 
