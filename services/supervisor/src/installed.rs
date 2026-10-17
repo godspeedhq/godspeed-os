@@ -351,10 +351,17 @@ impl Installed {
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
         // A handover-capable start carries a fresh KEY in its spawn mode, which only this supervisor can set: an offer
         // must carry it, so no client of the service can make it hand its state away (`gs::handover`).
-        let key = if checked.contract.handover { handover_key(ctx) } else { 0 };
-        if checked.contract.handover { req.probe_mode = godspeed::handover::mode(key, successor); }
+        // No hardware random source, no key, and so no handover for this start: it is recorded as unable, and an upgrade
+        // stops and starts it instead. A clock-derived key would be guessable (the commit's security review).
+        let key = if checked.contract.handover { handover_key(ctx) } else { None };
+        if checked.contract.handover && key.is_none() {
+            ctx.log_fmt(format_args!("supervisor: installed {} {}: no hardware random source for a handover key - it will be stopped and started on an upgrade, not handed over", pkg, version));
+        }
+        let can_hand_over = key.is_some();
+        let key = key.unwrap_or(0);
+        if can_hand_over { req.probe_mode = godspeed::handover::mode(key, successor); }
         if successor {
-            if !checked.contract.handover { return Err(text(format_args!("its contract does not declare `handover`"))); }
+            if !can_hand_over { return Err(text(format_args!("a handover needs a key from the hardware's random source, which this machine does not have"))); }
             req.flags |= SPAWN_FLAG_HANDOVER;
         }
         req.privileges = 0;
@@ -367,7 +374,7 @@ impl Installed {
                 ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s){}, checked from disk)",
                     pkg, version, checked.size, np, if driver { ", its device" } else { "" }));
                 if driver { self.class_of(pkg, checked.contract.pci_class); }
-                Ok(((utility, app), kept, (checked.contract.handover, key)))
+                Ok(((utility, app), kept, (can_hand_over, key)))
             }
             Err(e) => Err(text(format_args!("the kernel refused to start it: {:?}", e))),
         }
@@ -428,10 +435,9 @@ impl Installed {
 
 fn gs_ok() -> u8 { godspeed_sdk::service_context::supcmd::OK }
 
-/// A fresh handover key: the hardware's random source where there is one, mixed with the clock, 30 bits.
-fn handover_key(ctx: &ServiceContext) -> u32 {
-    let r = gs::task::hw_random(ctx).unwrap_or(0);
-    let t = gs::task::uptime_secs(ctx) as u32;
-    let k = (r ^ t.wrapping_mul(0x9E37_79B9)) & godspeed::handover::KEY_MASK;
-    if k == 0 { 1 } else { k }
+/// A fresh handover key, 30 bits from the hardware's random source - or `None` where there is none, which fails closed:
+/// that start cannot hand over. Never derived from the clock, which an attacker can guess.
+fn handover_key(ctx: &ServiceContext) -> Option<u32> {
+    let r = gs::task::hw_random(ctx)?;
+    Some((r & godspeed::handover::KEY_MASK).max(1))
 }
