@@ -102,6 +102,11 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     if checked.kind == godspeed_package::Kind::App {
         r.entry(&[C::S("console"), C::S("the screen and the keyboard while it runs"), C::S("an app is given it by its kind")]);
     }
+    if checked.kind == godspeed_package::Kind::Driver {
+        let class = checked.contract.pci_class.map_or(cell(format_args!("none named")), |c| cell(format_args!("{:06x}", c)));
+        r.entry(&[C::S("device"), C::S(cell(format_args!("the PCI device of class {}: its registers", class.as_str())).as_str()),
+                  C::S("where no IOMMU confines it, what the device itself can do, its driver can tell it to")]);
+    }
     for p in checked.contract.peers() {
         r.entry(&[C::S(p), C::S("a send capability to it"), C::S(if p == "supervisor" { "never granted to a package" } else { "" })]);
     }
@@ -110,6 +115,7 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     let kind = match checked.kind {
         godspeed_package::Kind::Utility => "a utility",
         godspeed_package::Kind::App => "an app",
+        godspeed_package::Kind::Driver => "a driver",
         _ => "a service",
     };
     r.note(format_args!("{}/{} {} requests these; {}; the operator answers each", f.publisher(), f.name(), f.version(), kind));
@@ -132,7 +138,8 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
         for p in grant.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             if p == "supervisor" { return r.fail("grant", p, "`supervisor` is never granted to a package"); }
             let console = p == "console" && checked.kind == godspeed_package::Kind::App;
-            if !console && !checked.contract.peers().any(|q| q == p) { return r.fail("grant", p, "its contract does not request it"); }
+            let device = p == "device" && checked.kind == godspeed_package::Kind::Driver;
+            if !console && !device && !checked.contract.peers().any(|q| q == p) { return r.fail("grant", p, "its contract does not request it"); }
             if granted[..ng].contains(&p) { continue; }
             if ng == MAX_PEERS { return r.fail("grant", grant, "more peers than a package is given"); }
             granted[ng] = p;

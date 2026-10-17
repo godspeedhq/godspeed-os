@@ -631,6 +631,7 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
         r.row("installed", "no", match m.kind {
             godspeed_package::Kind::Utility => "a utility: `godspeed install` makes it a command, run when typed",
             godspeed_package::Kind::App => "an app: `godspeed install` makes it a command that has the screen while it runs",
+            godspeed_package::Kind::Driver => "a driver: `godspeed install` starts it with its device, and at every boot",
             _ => "`godspeed install` starts it, and at every boot",
         });
         let _ = key;

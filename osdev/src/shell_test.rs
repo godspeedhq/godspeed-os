@@ -8212,6 +8212,9 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         "-device",  "ide-hd,drive=data,bus=ahci.0",
         "-cpu",     "qemu64,+rdrand",
         "-device",  "e1000,netdev=n0",
+        // QEMU's teaching device, for the driver package `godspeed/hello-driver` (class 00ff00, which no GodspeedOS
+        // driver claims), so a driver from the registry has a device of its own to drive.
+        "-device",  "edu",
         "-netdev",  "user,id=n0",
         "-smp",     &smp.to_string(), "-m", "512M",
         "-serial",  &format!("tcp::{port},server"),
@@ -8581,6 +8584,19 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let _ = run!(b"godspeed uninstall godspeed/hello-app yes\r", 60);
         let _ = run!(b"godspeed remove godspeed/hello-app\r", 60);
         let _ = run!(b"godspeed remove godspeed/hello-service\r", 60);
+
+        // A DRIVER: its device by PCI class, approved at install, found by the OS, registers only.
+        let df = run!(b"godspeed fetch godspeed/hello-driver\r", 240);
+        check!(df.contains("a driver: `godspeed install` starts it with its device"), "`godspeed fetch` says what installing a driver does");
+        let di = run!(b"godspeed install godspeed/hello-driver yes\r", 180);
+        check!(di.contains("asks for: device") && di.contains("driving that device"),
+               "installing a driver asks for its device, by name, and says it starts at every boot driving it");
+        check!(di.contains("its device, checked from disk"), "the supervisor starts it with its device");
+        check!(di.contains("hello-driver: device id 0x010000ed, alive true, 5! = 120"),
+               "the driver reads QEMU edu's identity, its liveness register inverts, and the device computes 5! = 120");
+        let du = run!(b"godspeed uninstall godspeed/hello-driver yes\r", 60);
+        check!(du.contains("uninstalled") && du.contains("stopped"), "and `godspeed uninstall` stops it");
+        let _ = run!(b"godspeed remove godspeed/hello-driver\r", 60);
 
         // A CHANGED PIN is trusting another registry: refused until the operator clears what this machine kept.
         let _ = run!(b"write /system/services/godspeed/trust/default/pin sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);

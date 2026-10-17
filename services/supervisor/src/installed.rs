@@ -29,6 +29,8 @@ use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_REQ_CONSOLE, SPAWN_
 
 /// The word an app's grant uses for the console - the screen and the keyboard while it runs - beside its peers.
 pub const CONSOLE_GRANT: &str = "console";
+/// ...and the word a driver's uses for its device.
+pub const DEVICE_GRANT: &str = "device";
 
 use crate::check::{self, Text, MAX_PEERS, PEER_MAX};
 
@@ -64,6 +66,8 @@ struct Entry {
     utility: bool,
     /// ...and an app: a utility that owns the console while it runs.
     app: bool,
+    /// A driver's device class, once it has been started with it: one installed driver per class.
+    pci_class: Option<u32>,
 }
 
 impl Entry {
@@ -110,6 +114,13 @@ impl Installed {
 
     /// Is `task` an installed package's? Its death is this module's to answer.
     pub fn has(&self, task: &str) -> bool { self.find(task).is_some() }
+
+    /// Record the device class `pkg` was started with.
+    fn class_of(&mut self, pkg: &str, class: Option<u32>) {
+        if let Some(i) = self.find(pkg) {
+            if let Some(mut e) = self.e[i] { e.pci_class = class; self.e[i] = Some(e); }
+        }
+    }
 
     /// Is `task` an installed UTILITY - one the shell may ask to run (`supcmd::SPAWN`)?
     pub fn is_utility(&self, task: &str) -> bool {
@@ -170,7 +181,8 @@ impl Installed {
     }
 
     fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32, (utility, app): (bool, bool)) {
-        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility, app };
+        let pci_class = self.e[slot].and_then(|x| x.pci_class);
+        let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility, app, pci_class };
         e.name[..pkg.len()].copy_from_slice(pkg.as_bytes());
         e.version[..version.len()].copy_from_slice(version.as_bytes());
         self.e[slot] = Some(e);
@@ -207,14 +219,16 @@ impl Installed {
             }
         };
         let app = checked.kind == Kind::App;
+        let driver = checked.kind == Kind::Driver;
         let utility = checked.kind == Kind::Utility || app;
         if utility && first.is_none() {
             ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - {}, run when typed", pkg, version,
                 if app { "an app" } else { "a utility" }));
             return Ok((utility, app));
         }
-        // The console: for an app, and only when the operator's answer gave it.
+        // The console: for an app, and only when the operator's answer gave it. The device, likewise, for a driver.
         let mut console = false;
+        let mut device = false;
         let mut peers: [&str; MAX_PEERS + 1] = [""; MAX_PEERS + 1];
         let mut np = 0usize;
         // The shell first: a utility's output goes to its first peer (`gs::program::Output`).
@@ -223,6 +237,11 @@ impl Installed {
             if p == CONSOLE_GRANT {
                 if !app { return Err(text(format_args!("its grant names the console, which only an app is given"))); }
                 console = true;
+                continue;
+            }
+            if p == DEVICE_GRANT {
+                if !driver { return Err(text(format_args!("its grant names a device, which only a driver is given"))); }
+                device = true;
                 continue;
             }
             if p == "supervisor" { return Err(text(format_args!("its grant names `supervisor`, which no package is given"))); }
@@ -242,6 +261,29 @@ impl Installed {
             if !console { return Err(text(format_args!("it is an app, and its grant does not give it the console"))); }
             req.flags |= SPAWN_FLAG_REQ_CONSOLE;
         }
+        if driver {
+            // ONE DEVICE, BY CLASS, REGISTERS ONLY. The class is the contract's, signed; the operator approved it
+            // ("device"); the kernel finds which device of that class this is from its own bus scan (a BDF of 0),
+            // exactly as for an in-tree driver named by class. No DMA arena and no interrupt, yet: a package
+            // reaches its device's registers and nothing more (docs/developer-services-design.md 13.1).
+            let Some(class) = checked.contract.pci_class else {
+                return Err(text(format_args!("it is a driver, and its contract names no device (hw_pci_class)")));
+            };
+            if !device { return Err(text(format_args!("it is a driver, and its grant does not give it its device"))); }
+            if checked.contract.pci_irq {
+                return Err(text(format_args!("its contract asks for an interrupt, which a package is not given yet - it would wait for one forever")));
+            }
+            if let Some(holder) = crate::in_tree_driver_of(class) {
+                return Err(text(format_args!("its device class {:06x} is driven by `{}`, which a package does not replace", class, holder)));
+            }
+            if let Some(other) = self.e.iter().flatten().find(|x| x.name() != pkg && x.pci_class == Some(class)) {
+                return Err(text(format_args!("its device class {:06x} is driven already by the installed {}", class, other.name())));
+            }
+            // Confined where an IOMMU can confine it, with no arena: the device itself cannot reach memory there.
+            req.hw_flags = godspeed_sdk::service_context::hwclass::pci(class, checked.contract.pci_bar, true);
+            req.bdf = 0;
+            req.dma_pages = 0;
+        }
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
         req.privileges = 0;
         let mut out = [0u8; 128];
@@ -249,8 +291,9 @@ impl Installed {
             Ok(cap) => {
                 // Nobody asked for a capability to it here; clients reach it by name, as every service.
                 if let Some(c) = cap { gs::cap::remove(ctx, c.into()); }
-                ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s), checked from disk)",
-                    pkg, version, checked.size, np));
+                ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s){}, checked from disk)",
+                    pkg, version, checked.size, np, if driver { ", its device" } else { "" }));
+                if driver { self.class_of(pkg, checked.contract.pci_class); }
                 Ok((utility, app))
             }
             Err(e) => Err(text(format_args!("the kernel refused to start it: {:?}", e))),

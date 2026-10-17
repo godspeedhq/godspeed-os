@@ -15627,7 +15627,8 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
     }
     let peers = core::str::from_utf8(&peers[..pn]).unwrap_or("");
     // What installing it does, from the note's kind: a service starts at every boot, a utility becomes a command.
-    let when = if note.contains("; an app;") { "becomes a command that has the screen and keyboard while it runs" }
+    let when = if note.contains("; a driver;") { "starts at every boot, driving that device" }
+        else if note.contains("; an app;") { "becomes a command that has the screen and keyboard while it runs" }
         else if note.contains("; a utility;") { "becomes a command, run when typed" } else { "starts at every boot" };
     let mut head = [0u8; 512];
     let head = match from {

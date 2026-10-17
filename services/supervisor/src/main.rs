@@ -991,6 +991,15 @@ mod meta;
 mod check;
 mod installed;
 
+/// The in-tree driver whose spawn row names PCI class `class`, if one does: a driver package is not given a device
+/// the OS already drives (`installed.rs`).
+fn in_tree_driver_of(class: u32) -> Option<&'static str> {
+    use godspeed_sdk::service_context::hwclass;
+    IMAGES.iter().chain(USB_IMAGES.iter())
+        .find(|row| row.8 & hwclass::PCI != 0 && row.8 & 0x00FF_FFFF == class)
+        .map(|row| row.0)
+}
+
 /// The test-probe image - 193 test modes in one binary (docs/probe-params-design.md).
 ///
 /// NOT PRESENT IN A BARE-METAL BUILD, and that is the point of it living here rather than in the
