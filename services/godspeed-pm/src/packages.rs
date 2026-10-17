@@ -28,10 +28,12 @@ use crate::{cell, Cell, Roots, Rows};
 
 /// Where kept packages live: one folder per publisher, package and version (10.5).
 pub const DIR: &str = "/system/packages/";
+// Sized to what each holds, as `chain.rs`'s are: `godspeed/hello`'s manifest is 821 bytes and its contract
+// 439, and an index grows by about 200 bytes a release.
 const INDEX_MAX: usize = 8 * 1024;
-const MANIFEST_MAX: usize = 8 * 1024;
+const MANIFEST_MAX: usize = 4 * 1024;
 const MSIG_MAX: usize = 1024;
-const CONTRACT_MAX: usize = 8 * 1024;
+const CONTRACT_MAX: usize = 4 * 1024;
 /// How many times a command is tried on a fresh connection when the server closed the last one part way.
 const ATTEMPTS: u32 = 3;
 

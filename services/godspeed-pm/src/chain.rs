@@ -21,12 +21,16 @@ use crate::config::Registry;
 use crate::https::{Fail, Session};
 
 /// The largest of each document read. Measured on the registry, 2026-10-17: root 1 is 1.1 KiB and grows only
-/// with keys; the snapshot holds a line per package, so it has the most room.
-pub const ROOT_MAX: usize = 8 * 1024;
-pub const SIG_MAX: usize = 4 * 1024;
-pub const TIMESTAMP_MAX: usize = 2 * 1024;
-pub const SNAPSHOT_MAX: usize = 32 * 1024;
-pub const NAMESPACES_MAX: usize = 16 * 1024;
+/// with keys; a signature file is about 200 bytes a signature; the snapshot holds a line per package (about
+/// 100 bytes), so it has the most room, some 150 packages. They live on the stack, which is 256 KiB for every
+/// service and already carries a TLS session, so each is sized to what it holds rather than generously: a
+/// document past its size is refused by name ([`Why::TooLarge`]), never cut.
+pub const ROOT_MAX: usize = 4 * 1024;
+pub const SIG_MAX: usize = 2 * 1024;
+const SMALL_SIG_MAX: usize = 1024;
+pub const TIMESTAMP_MAX: usize = 1024;
+pub const SNAPSHOT_MAX: usize = 16 * 1024;
+pub const NAMESPACES_MAX: usize = 8 * 1024;
 
 const TRUST_DIR: &str = "/system/services/godspeed/trust/";
 
@@ -122,11 +126,13 @@ pub fn text<'a>(buf: &'a [u8], what: &'static str) -> Result<&'a str, Why> {
     core::str::from_utf8(buf).map_err(|_| Why::NotText(what))
 }
 
-/// The buffers the chain's documents live in, so the verified views can borrow them.
+/// The buffers the chain's documents live in, so the verified views can borrow them. A rotated root is read
+/// into `namespaces` first, which is not in use until the rotations are done.
 pub struct Docs {
     pub root: [u8; ROOT_MAX], pub root_len: usize,
-    next: [u8; ROOT_MAX],
     sig: [u8; SIG_MAX],
+    ts_sig: [u8; SMALL_SIG_MAX],
+    snap_sig: [u8; SMALL_SIG_MAX],
     pub timestamp: [u8; TIMESTAMP_MAX], pub timestamp_len: usize,
     pub snapshot: [u8; SNAPSHOT_MAX], pub snapshot_len: usize,
     pub namespaces: [u8; NAMESPACES_MAX], pub namespaces_len: usize,
@@ -135,7 +141,7 @@ pub struct Docs {
 impl Docs {
     pub fn new() -> Docs {
         Docs {
-            root: [0; ROOT_MAX], root_len: 0, next: [0; ROOT_MAX], sig: [0; SIG_MAX],
+            root: [0; ROOT_MAX], root_len: 0, sig: [0; SIG_MAX], ts_sig: [0; SMALL_SIG_MAX], snap_sig: [0; SMALL_SIG_MAX],
             timestamp: [0; TIMESTAMP_MAX], timestamp_len: 0,
             snapshot: [0; SNAPSHOT_MAX], snapshot_len: 0,
             namespaces: [0; NAMESPACES_MAX], namespaces_len: 0,
@@ -232,16 +238,16 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
         };
         let mut rel = Path::new();
         rel.push("trust/root/").num(version + 1).push(".toml");
-        let Some(len) = doc(s, base, rel.as_str(), &mut d.next, "the next root")? else { break };
+        let Some(len) = doc(s, base, rel.as_str(), &mut d.namespaces[..ROOT_MAX], "the next root")? else { break };
         let mut sig_rel = Path::new();
         sig_rel.push("trust/root/").num(version + 1).push(".sig");
         let sig_len = required(s, base, sig_rel.as_str(), &mut d.sig, "the next root's signatures")?;
         {
             let current = Root::parse(text(&d.root[..d.root_len], "the root")?).map_err(|err| Why::Trust { what: "the root", err })?;
-            trust::verify_next_root(&current, text(&d.next[..len], "the next root")?, text(&d.sig[..sig_len], "its signatures")?)
+            trust::verify_next_root(&current, text(&d.namespaces[..len], "the next root")?, text(&d.sig[..sig_len], "its signatures")?)
                 .map_err(|err| Why::Trust { what: "the next root", err })?;
         }
-        d.root[..len].copy_from_slice(&d.next[..len]);
+        d.root[..len].copy_from_slice(&d.namespaces[..len]);
         d.root_len = len;
         root_changed = true;
     }
@@ -256,13 +262,9 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
 
     // 2. TIMESTAMP -> SNAPSHOT -> NAMESPACES.
     d.timestamp_len = required(s, base, "trust/timestamp.toml", &mut d.timestamp, "the timestamp")?;
-    let ts_sig = required(s, base, "trust/timestamp.sig", &mut d.sig, "the timestamp's signatures")?;
-    let mut sig_ts = [0u8; SIG_MAX];
-    sig_ts[..ts_sig].copy_from_slice(&d.sig[..ts_sig]);
+    let ts_sig = required(s, base, "trust/timestamp.sig", &mut d.ts_sig, "the timestamp's signatures")?;
     d.snapshot_len = required(s, base, "trust/snapshot.toml", &mut d.snapshot, "the snapshot")?;
-    let snap_sig = required(s, base, "trust/snapshot.sig", &mut d.sig, "the snapshot's signatures")?;
-    let mut sig_snap = [0u8; SIG_MAX];
-    sig_snap[..snap_sig].copy_from_slice(&d.sig[..snap_sig]);
+    let snap_sig = required(s, base, "trust/snapshot.sig", &mut d.snap_sig, "the snapshot's signatures")?;
     d.namespaces_len = required(s, base, "trust/namespaces.toml", &mut d.namespaces, "the namespaces")?;
     let ns_sig = required(s, base, "trust/namespaces.sig", &mut d.sig, "the namespaces' signatures")?;
 
@@ -270,10 +272,10 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
     let root = Root::parse(text(&d.root[..d.root_len], "the root")?).map_err(|err| Why::Trust { what: "the root", err })?;
     root.header.check_fresh(now).map_err(|err| Why::Trust { what: "the root", err })?;
     let timestamp = trust::verify_timestamp(&root, text(&d.timestamp[..d.timestamp_len], "the timestamp")?,
-                                            text(&sig_ts[..ts_sig], "the timestamp's signatures")?, now, seen_ts)
+                                            text(&d.ts_sig[..ts_sig], "the timestamp's signatures")?, now, seen_ts)
         .map_err(|err| Why::Trust { what: "the timestamp", err })?;
     let snapshot_text = text(&d.snapshot[..d.snapshot_len], "the snapshot")?;
-    let snapshot = trust::verify_snapshot(&root, &timestamp, snapshot_text, text(&sig_snap[..snap_sig], "the snapshot's signatures")?, now)
+    let snapshot = trust::verify_snapshot(&root, &timestamp, snapshot_text, text(&d.snap_sig[..snap_sig], "the snapshot's signatures")?, now)
         .map_err(|err| Why::Trust { what: "the snapshot", err })?;
     let namespaces = trust::verify_namespaces(&root, &snapshot, text(&d.namespaces[..d.namespaces_len], "the namespaces")?,
                                               text(&d.sig[..ns_sig], "the namespaces' signatures")?, now, seen_ns)

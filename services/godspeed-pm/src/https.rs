@@ -23,6 +23,10 @@ use crate::http::{head_end, parse_head, Body, Head};
 
 /// The largest record a server sends, header included (RFC 8446 5.2).
 const RECORD_MAX: usize = 5 + (1 << 14) + 256;
+/// What this client SENDS in one go: a ClientHello, a request line and its headers, an alert or the
+/// handshake's Finished - none near a full record, so the buffer for them is smaller and the 256 KiB stack
+/// keeps room for the trust chain (`chain.rs`).
+const OUT_MAX: usize = 4096;
 /// The status line and headers of one answer. The registry's are about 900 bytes, most of it a reporting
 /// header; an answer whose head is larger is refused rather than cut.
 const HEAD_MAX: usize = 4096;
@@ -68,7 +72,7 @@ pub struct Session<'c, 'b, 'n, 's> {
     timeout_secs: u32,
     tls: Client<'b, WebPkiVerifier<'b>>,
     stream: &'s mut gs::net::Stream<'n, 'c>,
-    out: &'b mut [u8; RECORD_MAX],
+    out: &'b mut [u8; OUT_MAX],
     rec: &'b mut [u8; RECORD_MAX],
     /// How many answers this connection has given.
     pub answered: u32,
@@ -84,7 +88,7 @@ pub fn session<T>(ctx: &ServiceContext, host: &str, port: u16, roots: &[&[u8]], 
         _ => return Err(Fail::NoRandom),
     };
     let mut handshake = [0u8; 16 * 1024];
-    let mut out = [0u8; RECORD_MAX];
+    let mut out = [0u8; OUT_MAX];
     let mut rec = [0u8; RECORD_MAX];
     let mut net = gs::net::Net::new(ctx);
     let ip = net.resolve(host).map_err(|_| Fail::Resolve)?;

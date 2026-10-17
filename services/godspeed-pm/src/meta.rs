@@ -12,8 +12,8 @@ use godspeed_package::{Arch, Artifact, Kind, Manifest, PackageIndex, PackageName
 use crate::toml_lines::{lines, Line, Val};
 
 /// The most releases of one package read. A package with more is refused by name rather than cut short:
-/// the newest might be the one not read.
-pub const MAX_RELEASES: usize = 64;
+/// the newest might be the one not read. (The index buffer, `packages.rs`, holds about 40.)
+pub const MAX_RELEASES: usize = 40;
 
 /// Why a document was refused, and on which line (0 when it is the document as a whole).
 #[derive(Clone, Copy, Debug)]
@@ -82,7 +82,7 @@ pub fn index<'a>(text: &'a str, rel: &'a mut Releases<'a>) -> Result<PackageInde
                 return Err(bad(at, "a release lacks its version, manifest, published or published_by"));
             };
             if rel.len == MAX_RELEASES {
-                return Err(bad(at, "more releases than this machine reads (64)"));
+                return Err(bad(at, "more releases than this machine reads (40)"));
             }
             rel.items[rel.len] = Release { version, manifest, published, published_by };
             rel.len += 1;
