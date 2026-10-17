@@ -130,4 +130,4 @@ godspeed = { path = "../../stdlib/rust" }
 godspeed-audio = { path = "../../sdk/audio" }
 # The package format and its verification, for an installed package (`src/installed.rs`): the same crate, at the same tag,
 # `godspeed-pm` checks a fetched copy with (docs/developer-services-design.md 10.6).
-godspeed-package = { git = "https://github.com/godspeedhq/godspeed-cli", rev = "8e396dd8535483b8c41db126c810425b16127cd9", default-features = false }
+godspeed-package = { git = "https://github.com/godspeedhq/godspeed-cli", rev = "e7f53c2f2f04173a730bf43e53a02503471762ba", default-features = false }
