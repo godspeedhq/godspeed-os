@@ -156,14 +156,14 @@ the shared crate's):
 
 | command | rows |
 |---|---|
-| `search`, `list available` | a `package` row per name; the chain's versions, and whether this was first contact, in the status note |
-| `info` | a `version` row per release (when, by whom, the latest, the one described), then `description`, `license`, `built for` (the release, beside this machine's), `ships` (its architectures, and whether this machine's is one), `requests`, `signed` (the key and its standing); the chain in the status note. Checked as `fetch` checks it |
-| `fetch` | `verified`, `package`, `signed` (the key, active or retired), `binary` (this machine's architecture and its size), `requests` (what the contract asks for; nothing is granted), `fetched` (the folder), `installed no` |
-| `list fetched` | a row per fetched `publisher/name@version`, with the registry it came from and its size; the count and total in the status note |
+| `search`, `list available` | a list, `package latest description`: each package's latest version and description, from its own index and manifest by the verified digests (the first 40 described; the note says how many more); the count and the chain in the status note |
+| `info` | a CARD (`key value note`): `title` (the release, the latest or not, when and by whom), `about` (its description), `licence`, `built for` (the release, beside this machine's), `ships` (its architectures, and whether this machine's is one), `requests`, `signed` (the key, shortened, and its standing), `versions`; the chain, through the contract, in the status note. Checked as `fetch` checks it |
+| `fetch` | progress while it works (the chain's steps, then a bar as the binary downloads), then a CARD: `title` (fetched, or already fetched, and from where), `about` (the folder), `binary` (this machine's architecture and size), `built for`, `requests`, `signed`, `installed no`; the chain, through the binary, in the status note |
+| `list fetched` | a list, `package version from size state`, `size` in bytes (a pipe can compare it; the console shows KiB); the count and total in the status note |
 | `list installed` | none yet: the status note says why |
-| `list updates` | a row per fetched package: `<fetched> -> <newer>` with the command that fetches it, `up to date on <registry>`, or no longer listed there. Each is asked of the registry it came from, not the one in use |
-| `verify` | a row per fetched version, `intact` or `DAMAGED` and what is wrong; the count in the status note |
-| `trust` | a row per registry (its root, timestamp and namespaces versions, the root's expiry, and whether the pin it was reached under is the configuration's), then a row per publisher key and its standing |
+| `list updates` | a list, `package have latest status`: newer (with the command that fetches it), up to date, or no longer listed. Each is asked of the registry it came from, not the one in use |
+| `verify` | a list, `package version status detail`, `status` `intact` or `DAMAGED`; the count in the status note. A damaged copy fails the command |
+| `trust` | a CARD per registry: `title` (its name, in use or not), `root` (and its expiry), `timestamp`, `namespaces`, `pin` (and whether it is the configuration's), then a `key <publisher>/` row per key, whole, with its standing |
 | `trust reset` | `forgotten`, or `nothing to forget` |
 | `remove` | `removed` and the folder |
 
@@ -171,6 +171,11 @@ the shared crate's):
 recorded when it was fetched, the manifest against its folder, and the contract and the binary against the
 manifest's digests and sizes. Whether the registry still vouches for the key needs the network; `list
 updates` asks the registry, and a fresh `fetch` checks it again.
+
+**How it looks**, in the style `dir` set: two spaces in, upper-case headers, a footer line. A LIST has
+columns that name what it lists; a CARD, about one thing, has a title, a line about it, and the rest aligned
+under it; failures and the settings (`config`, `registry`, `check`) are `item value note`. Piped, every
+answer is the same records, the column names lower-case.
 
 **A list is its entries and nothing else**, so `count` counts them; what a list's rows do not say about
 themselves (the chain it was verified by, why it is empty) is the status row's note, which the console prints
@@ -203,8 +208,9 @@ nothing is said twice.
 (`item`, `value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```
-godspeed search hello | where item=package
-godspeed list available | where item=package | count
+godspeed search hello | where package=godspeed/hello
+godspeed list available | where package=godspeed/hello | count
+godspeed list fetched | where size>1000000
 godspeed registry | where item=default
 godspeed config | where note=file
 godspeed check | where item=tls

@@ -15450,12 +15450,21 @@ fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     }
     // PROGRESS, drawn in place on one line until the answer comes, then cleared.
     let drawn = core::cell::Cell::new(false);
+    // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
+    // the line does not offer it a second time.
+    let noticed_first = core::cell::Cell::new(None::<bool>);
     let show = |line: &[u8]| {
+        let already = match noticed_first.get() {
+            Some(a) => a,
+            None => { let a = ctx.cmd_noticed.get(); noticed_first.set(Some(a)); a }
+        };
+        let text = core::str::from_utf8(line).unwrap_or("");
+        let text = if already { text.trim_end().trim_end_matches("[q] quit").trim_end() } else { text };
         gs::io::print(ctx, "\r\x1b[2K");
-        gs::io::print(ctx, core::str::from_utf8(line).unwrap_or(""));
+        gs::io::print(ctx, text);
         drawn.set(true);
         // The line offers `q` itself, so the watch does not print a second notice under it.
-        if line.windows(8).any(|w| w == b"[q] quit") { ctx.quit_shown(); }
+        if !already && line.windows(8).any(|w| w == b"[q] quit") { ctx.quit_shown(); }
     };
     let built = build_godspeed_table(ctx, line, Some(&show));
     if drawn.get() { gs::io::print(ctx, "\r\x1b[2K"); }
