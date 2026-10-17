@@ -2756,7 +2756,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ioapic.rs | 9 | permitted |
 | arch/x86_64/acpi.rs | 5 | permitted |
 | arch/x86_64/iommu.rs | 79 | permitted |
-| arch/x86_64/mod.rs | 40 | permitted |
+| arch/x86_64/mod.rs | 36 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 22 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
@@ -3772,3 +3772,12 @@ J5005, and `godspeed check` completed a TLS handshake on each. And the compiler 
 block as an unnecessary `unsafe` (`unused_unsafe`: the intrinsic is a safe function on this toolchain), so
 this count holds one block more than the code needs. Removing it is a code change, left to be made on its
 own; until then the count records the block that exists.)*
+
+## `arch/x86_64/mod.rs` 40 -> 36 (2026-10-17): `__cpuid` is a safe function
+
+The note above found one unnecessary block; the compiler reports four, all in this file and all the same
+case: `core::arch::x86_64::__cpuid` is a safe function on this toolchain, so an `unsafe` around it asks for
+nothing. Removed from `hw_random` (leaf 1) and from the three in `cpu_identity` (leaves 0x80000000,
+0x80000002-4 and 0). The calls, their order and the extended-leaf guard are unchanged. `_rdrand32_step`
+keeps its block, which it needs. The `__cpuid` calls in `boot.rs` sit inside `unsafe fn` bodies, where the
+compiler does not flag them, and are left as they are.

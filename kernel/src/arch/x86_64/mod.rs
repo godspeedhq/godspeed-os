@@ -342,9 +342,8 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 /// word once in 2^32, so dropping it costs nothing measurable; a broken one then answers `None` after ten
 /// tries rather than handing a caller a constant it would use as a key.
 pub fn hw_random() -> Option<u32> {
-    // SAFETY: CPUID leaf 1 exists on every x86_64 CPU; it is unprivileged, has no side effects and
-    // touches no memory.
-    let ecx = unsafe { core::arch::x86_64::__cpuid(1) }.ecx;
+    // CPUID leaf 1 exists on every x86_64 CPU; `__cpuid` is a safe function, so no `unsafe` here.
+    let ecx = core::arch::x86_64::__cpuid(1).ecx;
     if ecx & (1 << 30) == 0 {
         return None;
     }
@@ -1298,13 +1297,13 @@ pub fn cpu_identity(buf: &mut [u8]) -> usize {
     let mut push = |b: u8, n: &mut usize| {
         if *n < buf.len() { buf[*n] = b; *n += 1; }
     };
-    // SAFETY: CPUID is unprivileged and universally available on x86_64. Leaf 0x80000000 reports the
-    // highest extended leaf supported, which is the documented way to ask before using 2..4.
-    let ext = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+    // `__cpuid` is a safe function: CPUID is unprivileged and on every x86_64 CPU. Leaf 0x80000000
+    // reports the highest extended leaf supported, which is the documented way to ask before using 2..4.
+    let ext = core::arch::x86_64::__cpuid(0x8000_0000).eax;
     if ext >= 0x8000_0004 {
         for leaf in 0x8000_0002u32..=0x8000_0004 {
-            // SAFETY: guarded by the `ext` check immediately above.
-            let r = unsafe { core::arch::x86_64::__cpuid(leaf) };
+            // Present: guarded by the `ext` check immediately above.
+            let r = core::arch::x86_64::__cpuid(leaf);
             for word in [r.eax, r.ebx, r.ecx, r.edx] {
                 for b in word.to_le_bytes() {
                     // The brand string is NUL-padded and often leading-space padded; keep it printable
@@ -1316,8 +1315,8 @@ pub fn cpu_identity(buf: &mut [u8]) -> usize {
         }
         return trim_len(buf, n);
     }
-    // SAFETY: leaf 0 is present on every x86_64 CPU.
-    let r = unsafe { core::arch::x86_64::__cpuid(0) };
+    // Leaf 0 is present on every x86_64 CPU.
+    let r = core::arch::x86_64::__cpuid(0);
     for word in [r.ebx, r.edx, r.ecx] {
         for b in word.to_le_bytes() { push(b, &mut n); }
     }

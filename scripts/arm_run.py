@@ -74,7 +74,9 @@ def main():
     ap.add_argument("--debug", action="store_true",
                     help="boot the DEBUG kernel - crash-loops fs on this port; diagnostics only")
     ap.add_argument("--usb", action="store_true")
-    ap.add_argument("--usbnet", action="store_true", help="attach a CDC-ECM USB-Ethernet device (user-net)")
+    ap.add_argument("--usbnet", action="store_true", help="attach a CDC-ECM USB-Ethernet device (user-net). NOTE: the dwc2 service drives only the "
+                    "Pi 2's SMSC LAN9514, not CDC-ECM, so this device is attached and never "
+                    "configured: no network under QEMU on this port (docs/arm32-status.md)")
     ap.add_argument("--sd", default=None, help="path to a raw SD-card image to attach (if=sd)")
     ap.add_argument("--usbdisk", default=None,
                     help="path to a raw image to attach as a USB mass-storage stick (block-driver "
@@ -96,7 +98,8 @@ def main():
     if args.usb:
         cmd += ["-device", "usb-kbd"]
     if args.usbnet:
-        # Attach a CDC-ECM USB-Ethernet device on QEMU's user-net so net-stack can DHCP/ARP/ping.
+        # A CDC-ECM USB-Ethernet device on QEMU's user-net. The dwc2 service speaks only the SMSC
+        # LAN9514's vendor requests, so nothing configures this one; see the --usbnet help.
         cmd += ["-netdev", "user,id=n0", "-device", "usb-net,netdev=n0"]
     if args.usbdisk:
         # A USB mass-storage stick: the storage target on a real Pi (the SD card holds the boot files).

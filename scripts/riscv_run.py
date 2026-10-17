@@ -93,11 +93,11 @@ def main():
     ap.add_argument("--settle", type=float, default=8.0,
                     help="seconds to wait after each typed line for its output")
     ap.add_argument("--net", action="store_true",
-                    help="attach an Intel e1000 on QEMU user-net, so nic-driver and net-stack can be "
-                         "exercised on this arch. The VisionFive's own MAC is a Synopsys DesignWare "
-                         "part that QEMU does not model at all, so this proves the PORT-NEUTRAL half "
-                         "of the stack (PCI discovery, the DMA arena, the frame IPC, ARP/DHCP/ICMP) "
-                         "and says nothing about the board's MAC registers.")
+                    help="attach an Intel e1000 on QEMU user-net. NOTE: nic-driver on riscv64 drives "
+                         "only the VisionFive's Synopsys DesignWare MAC (dwmac), which QEMU does not "
+                         "model, and the e1000 path is compiled for x86 alone, so this device is found "
+                         "on the PCI bus and never driven: there is no network under QEMU on this port "
+                         "(checked 2026-10-16). Kept for the PCI discovery it still exercises.")
     ap.add_argument("--pcap", default="",
                     help="with --net, dump every frame to this file so the wire can be read when the "
                          "guest disagrees with itself about what it sent")
@@ -130,7 +130,8 @@ def main():
            "-serial", "mon:stdio"]
     if a.net:
         # `virt` has a real PCIe host bridge (ECAM at 0x3000_0000, in the FDT), so this is an ordinary
-        # PCI device the arch's own enumeration finds - not a special case wired in for the test.
+        # PCI device the arch's own enumeration finds - not a special case wired in for the test. It
+        # stops there: nic-driver's riscv64 backend is the dwmac (see the --net help).
         cmd += ["-device", "e1000,netdev=n0", "-netdev", "user,id=n0"]
         if a.pcap:
             cmd += ["-object", "filter-dump,id=nicdump,netdev=n0,file=%s" % a.pcap]
