@@ -404,6 +404,8 @@ pub fn run(image_path: &Path, smp: u32) {
            && ping_out.contains("Ping statistics for 10.0.2.2")
            && (ping_out.contains("Reply from 10.0.2.2") || ping_out.contains("Request timed out")),
            "ping: continuous ICMP echo (count-limited) prints Windows-style output + stats (ping <gateway>)");
+    check!(!ping_out.contains("bytes of data:  [q] quit") && ping_out.matches("[q] quit").count() <= 1,
+           "ping: `[q] quit` is the shell's, at most once, never on the header line");
 
     // net stats: raw NIC register dump (chip state). On QEMU the e1000 path answers with CTRL/STATUS/etc.
     send(&mut write_half, b"net stats\r");

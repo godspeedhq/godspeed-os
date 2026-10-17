@@ -9810,12 +9810,9 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     };
     let b = bytes.min(1024);                          // matches net-stack's PING_MAX_PAYLOAD
     let bl = (b as u16).to_le_bytes();
-    // Continuous mode shows the q hint up front so it is obvious BEFORE the replies start scrolling.
-    if count.is_none() {
-        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:  [q] quit", ip[0], ip[1], ip[2], ip[3], b));
-    } else {
-        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
-    }
+    // No `[q] quit` here: the command's watch offers it once, 2 s in, like every wait in the shell. The
+    // header used to carry one too, so a continuous run printed it twice, once inside its own result.
+    out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
 
     let mut sent = 0u32; let mut recv = 0u32;
     let mut rmin = u16::MAX; let mut rmax = 0u16; let mut rsum = 0u64; let mut vcount = 0u32;
