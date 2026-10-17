@@ -28,7 +28,7 @@ use crate::https::{Fail, Session};
 /// **The snapshot is not held.** It is a line per package (about 100 bytes), so it grows with the registry; it is
 /// streamed to `snapshot.toml` in this registry's trust folder as it arrives, hashed on the way, verified from its
 /// digest (its signatures cover the digest, not the bytes), and read back a line at a time. What this machine
-/// reads of it is bounded by [`SNAPSHOT_FILE_MAX`] on disk and [`HEAD_MAX`] and [`LINE_MAX`] in memory, so the
+/// reads of it is bounded by [`SNAPSHOT_FILE_MAX`] on disk and [`SNAP_HEAD_MAX`] and [`SNAP_LINE_MAX`] in memory, so the
 /// registry's size no longer decides whether a command runs (the CLI repository's backlog, item 2, its first half).
 pub const ROOT_MAX: usize = 4 * 1024;
 pub const SIG_MAX: usize = 2 * 1024;
@@ -38,9 +38,9 @@ pub const NAMESPACES_MAX: usize = 8 * 1024;
 /// The largest snapshot kept: about two and a half million packages at 100 bytes a line. Past it, refused by name.
 pub const SNAPSHOT_FILE_MAX: u64 = 256 * 1024 * 1024;
 /// The most of the snapshot's start read to find its head - everything before its `index` lines.
-const HEAD_MAX: usize = 1024;
+const SNAP_HEAD_MAX: usize = 1024;
 /// The longest `index` line read back: a 128-byte name, its digest and the line's own words fit with room.
-const LINE_MAX: usize = 320;
+const SNAP_LINE_MAX: usize = 320;
 
 const TRUST_DIR: &str = "/system/services/godspeed/trust/";
 
@@ -265,7 +265,7 @@ fn fetch_snapshot(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
 }
 
 /// The snapshot's head, read from the start of the file at `path`.
-fn read_head<'b>(fs: &mut gs::fs::Fs<'_>, path: &str, buf: &'b mut [u8; HEAD_MAX]) -> Result<SnapshotHead<'b>, Why> {
+fn read_head<'b>(fs: &mut gs::fs::Fs<'_>, path: &str, buf: &'b mut [u8; SNAP_HEAD_MAX]) -> Result<SnapshotHead<'b>, Why> {
     let mut n = 0usize;
     while n < buf.len() {
         let got = fs.read_at(path, n as u64, &mut buf[n..]).map_err(Why::Store)?;
@@ -280,12 +280,12 @@ fn read_head<'b>(fs: &mut gs::fs::Fs<'_>, path: &str, buf: &'b mut [u8; HEAD_MAX
 
 /// Every `index` line of the kept snapshot, in order, to `f`: its package name and index digest, each checked as
 /// the whole snapshot would be (`IndexLines`). `f` returning false stops the walk. Read from the disk a chunk at a
-/// time, a line never longer than [`LINE_MAX`].
+/// time, a line never longer than [`SNAP_LINE_MAX`].
 pub fn each_index(ctx: &ServiceContext, snap: &SnapshotFile, f: &mut dyn FnMut(&str, &Sha256Digest) -> bool) -> Result<(), Why> {
     let mut fs = gs::fs::Fs::new(ctx);
     let mut lines = IndexLines::new();
     let mut chunk = [0u8; gs::fs::IO_CHUNK];
-    let mut line = [0u8; LINE_MAX];
+    let mut line = [0u8; SNAP_LINE_MAX];
     let mut ll = 0usize;
     // `read_at` takes offsets in whole 508-byte blocks, so the walk starts at the block holding the body and skips
     // into it.
@@ -436,7 +436,7 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
             (dg, len, staged, true)
         }
     };
-    let mut head_buf = [0u8; HEAD_MAX];
+    let mut head_buf = [0u8; SNAP_HEAD_MAX];
     let head = read_head(&mut fs, read_from.as_str(), &mut head_buf)?;
     trust::verify_snapshot_stream(&root, &timestamp, &digest, &head, text(&d.snap_sig[..snap_sig], "the snapshot's signatures")?, now)
         .map_err(|err| Why::Trust { what: "the snapshot", err })?;
