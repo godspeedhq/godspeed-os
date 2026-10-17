@@ -197,6 +197,28 @@ impl Installed {
     }
 
     /// Start `pkg` (`publisher/name`) at `version`, checked from the disk; remember it so its death restarts it.
+    /// Check `version` of `pkg` from the disk exactly as a start would, and start nothing. Run BEFORE a cold
+    /// replacement stops the running version, so a package that would not start leaves the running one alone
+    /// rather than costing a stop, a failed start and a restore. The start checks again: nothing is trusted from
+    /// this check but the decision to stop.
+    pub fn verify(&mut self, ctx: &ServiceContext, pkg: &str, version: &str) -> Result<(), Text> {
+        let Some((publisher, name)) = split(pkg) else { return Err(text(format_args!("`{}` is not a package name", pkg))) };
+        if !version_ok(version) { return Err(text(format_args!("`{}` is not a version", version))); }
+        let arch = this_arch().ok_or_else(|| text(format_args!("this machine's architecture has no package spelling")))?;
+        if self.image.is_none() {
+            self.image = Some(Region::alloc(ctx, IMAGE_MAX)
+                .map_err(|e| text(format_args!("no memory to hold an image ({:?})", e)))?);
+        }
+        let Some(region) = self.image.as_mut() else { return Err(text(format_args!("no memory to hold an image"))) };
+        let buf = region.bytes_mut();
+        check::package(ctx, publisher, name, version, Some(arch), &mut |off, bytes| {
+            let (o, end) = (off as usize, off as usize + bytes.len());
+            if end > buf.len() { return false; }
+            buf[o..end].copy_from_slice(bytes);
+            true
+        }).map(|_| ())
+    }
+
     pub fn start(&mut self, ctx: &ServiceContext, pkg: &str, version: &str) -> Result<(), Text> {
         let Some((publisher, name)) = split(pkg) else { return Err(text(format_args!("`{}` is not a package name", pkg))) };
         if !version_ok(version) { return Err(text(format_args!("`{}` is not a version", version))); }

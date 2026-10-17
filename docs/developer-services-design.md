@@ -1263,8 +1263,21 @@ lacks `handover`, the supervisor answers `[OK, 'R']` after an ordinary stop and 
 ### 14.2 When it falls back
 
 A restart, said in the answer (`replaced: stopped and started`), when the running version's contract or the new one's
-does not declare `handover`, or nothing is running. A successor that will not start leaves the running version running.
-A state that never arrives (the old version does not answer the offer) is said by the successor, which starts fresh.
+does not declare `handover`, when there is no hardware random source for a key, or when nothing is running. The
+direction does not decide it: a downgrade between two versions that both declare `handover` is live, and an upgrade to a
+version that drops it is a restart. A successor that will not start leaves the running version running. A state that
+never arrives (the old version does not answer the offer) is said by the successor, which starts fresh.
+
+**A restart checks before it stops.** The new version is checked from the disk - signature, key, contract, binary -
+before the running version is stopped (`Installed::verify`), so a package that would not start leaves the running one
+untouched instead of costing a stop, a failed start and a restore. The start checks again, as every start does. Between
+the stop and the new version registering its name nothing answers it; a client sees `EndpointDead` and reacquires (14.3).
+A restart is never side by side: two instances of a service not written for it could write the same files at once, and
+declaring `handover` is how a service says it can overlap with its successor.
+
+**A driver is always a restart.** A handover runs two instances for a moment, and two drivers would both program one
+device. The shared check refuses a driver whose contract declares `handover`, so such a package is never started, and
+`godspeed verify` says why.
 
 ### 14.3 Why an offer is checked
 

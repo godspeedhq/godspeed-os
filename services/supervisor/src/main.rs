@@ -128,7 +128,11 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                 let live = inst.hand_over(ctx, pkg, version);
                 let outcome = match live {
                     Ok(true) => Ok(b'H'),
-                    Ok(false) => { inst.stop(ctx, pkg); inst.start(ctx, pkg, version).map(|()| b'R') }
+                    // COLD: checked first, so a version that would not start never stops the one running.
+                    Ok(false) => inst.verify(ctx, pkg, version).and_then(|()| {
+                        inst.stop(ctx, pkg);
+                        inst.start(ctx, pkg, version).map(|()| b'R')
+                    }),
                     Err(why) => Err(why),
                 };
                 match outcome {

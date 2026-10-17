@@ -269,5 +269,11 @@ pub fn package(ctx: &ServiceContext, publisher: &str, name: &str, version: &str,
         off += got as u64;
     }
     verifier.finish().map_err(|_| text(format_args!("{} is not the size or digest the manifest names", file)))?;
+    // A DRIVER IS NEVER REPLACED LIVE. A handover runs two instances side by side for a moment, and two drivers on
+    // one device would both program it. Refused here, in the check every start and every `godspeed verify` runs,
+    // so a driver that declares it is never started at all rather than started and handed over badly.
+    if man.kind == Kind::Driver && requested.handover {
+        return Err(text(format_args!("it is a driver and its contract declares `handover` - a driver is stopped and started on an upgrade, never replaced live")));
+    }
     Ok(Checked { arch: artifact.arch.as_str(), size: artifact.size, contract: requested, kind: man.kind })
 }

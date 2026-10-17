@@ -53,7 +53,7 @@
   },
   "handover": {
           "type": "boolean",
-          "description": "This service can hand its state to a newer version of itself and end, so an upgrade replaces it without stopping it (`gs::handover`, CLAUDE.md 2.5 amendment 2026-10-17). A declaration, not a grant: it asks for nothing. Without it, an upgrade stops the old version and starts the new one."
+          "description": "This service can hand its state to a newer version of itself and end, so an upgrade replaces it without stopping it (`gs::handover`, CLAUDE.md 2.5 amendment 2026-10-17). A declaration, not a grant: it asks for nothing. Without it, an upgrade stops the old version and starts the new one. A service's only: a driver that declares it is refused, since two drivers would program one device."
         },
         "log_write": {
           "type": "boolean",
