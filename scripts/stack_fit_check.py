@@ -36,6 +36,29 @@ SUB_SP = re.compile(r"\bsub\s+sp,\s*sp,\s*#(0x[0-9a-f]+|\d+)(?:,\s*lsl\s*#(\d+))
 # it was written for", so the arch is TAUGHT rather than the call site skipped.
 SUB_SP_RV = re.compile(r"\baddi\s+sp,\s*sp,\s*-(0x[0-9a-f]+|\d+)")
 
+# ...and a LARGE riscv64 frame is not one instruction. `addi` takes a 12-bit immediate, so past 2 KiB the
+# compiler builds the size in a register and subtracts that:
+#
+#     addi  sp, sp, -0x1f0      <- the saved registers, which SUB_SP_RV reads
+#     lui   a4, 0x9             <- 0x9000, the rest: 36 KiB
+#     sub   sp, sp, a4          <- which nothing read
+#
+# So this checker censused the small half of every big riscv64 frame and passed. It reported the shell's
+# deepest frame as 5 KiB while `cmd_godspeed` was 64 KiB, and the shell ran off its stack on the VisionFive
+# inside `selfcheck packages` (2026-10-18) with this gate green - the blind case once more, on the arch it
+# had been taught for. The register is followed from its `lui`, through an `addi`/`addiw` adjustment, to the
+# `sub sp, sp, <reg>` that spends it.
+RV_LUI = re.compile(r"\blui\s+([a-z][a-z0-9]*),\s*(0x[0-9a-f]+|\d+)")
+RV_ADJ = re.compile(r"\baddiw?\s+([a-z][a-z0-9]*),\s*([a-z][a-z0-9]*),\s*(-?0x[0-9a-f]+|-?\d+)")
+RV_SUB_REG = re.compile(r"\bsub\s+sp,\s*sp,\s*([a-z][a-z0-9]*)\s*$")
+
+
+def _int(raw):
+    neg = raw.startswith("-")
+    raw = raw.lstrip("-")
+    v = int(raw, 16) if raw.startswith("0x") else int(raw)
+    return -v if neg else v
+
 # x86-64 grows the stack with `sub $0x...,%rsp` (AT&T, objdump's default). This was MISSING, so the
 # blind-guard above fired on every x86 service and the gate was simply unavailable on the
 # architecture every QEMU suite runs. It is the "a rule enforced on one path is enforced on none"
@@ -166,16 +189,26 @@ def frames(objdump, elf):
             "Nothing in this binary was measured. Set OBJDUMP to an objdump that reads this target's ELF\n"
             "(llvm-objdump reads every target). A check that measured nothing has not passed."
             % (objdump, elf, r.returncode, (r.stderr or r.stdout).strip()[:300]))
-    out, cur, total, probes, seed = {}, None, 0, 0, None
+    out, cur, total, probes, seed, rv = {}, None, 0, 0, None, {}
     for line in r.stdout.splitlines():
         m = FUNC.match(line)
         if m:
             if cur is not None:
                 out[cur] = max(total, probes)
-            cur, total, probes, seed = m.group(1), 0, 0, None
+            cur, total, probes, seed, rv = m.group(1), 0, 0, None, {}
             continue
         if cur is not None:
             total += _amount(line)
+            # A riscv64 frame too large for `addi`: the register its size was built in, then spent.
+            lui = RV_LUI.search(line)
+            if lui:
+                rv[lui.group(1)] = (_int(lui.group(2)) << 12) & 0xFFFFFFFF
+            adj = RV_ADJ.search(line)
+            if adj and adj.group(2) in rv and adj.group(2) != "sp":
+                rv[adj.group(1)] = rv[adj.group(2)] + _int(adj.group(3))
+            sub = RV_SUB_REG.search(line)
+            if sub and sub.group(1) in rv:
+                total += rv[sub.group(1)]
             probe = _probe_target(line, seed)
             if probe > probes:
                 probes = probe

@@ -15569,23 +15569,7 @@ fn cmd_godspeed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> 
     // CLEANUP lists first and asks; the package manager deletes only on the answer, which it is never told came
     // from a person - only what to do.
     if words[0] == "cleanup" {
-        let yes = nw == 2 && words[1] == "yes";
-        if nw > 2 || (nw == 2 && !yes) {
-            gs::io::println(ctx, "usage: godspeed cleanup [yes]");
-            return Err(ShellError::Unknown);
-        }
-        let t = godspeed_answer(ctx, "cleanup").ok_or(ShellError::Unknown)?;
-        let found = (0..t.nrows()).filter(|&r| t.cell_bytes(r, 0) != b"status").count();
-        let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
-        godspeed_present(ctx, t)?;
-        if found == 0 || failed { return Ok(()); }
-        gs::io::print(ctx, "Delete them? [y/N]: ");
-        if yes { gs::io::println(ctx, "yes (given on the command line)"); }
-        else if !read_confirm(ctx) {
-            gs::io::println(ctx, "godspeed: nothing was deleted");
-            return Ok(());
-        }
-        return godspeed_show(ctx, "cleanup delete");
+        return godspeed_cleanup(ctx, &words[..nw]);
     }
     // A PACKAGE FILE installs in two steps: checked and unpacked, then installed as any fetched package.
     if nw >= 2 && words[0] == "install" && words[1].ends_with(".gsp") {
@@ -15607,6 +15591,7 @@ fn cmd_godspeed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> 
 /// Upgrade is fetch-then-install of the newest release of something installed, with the version change in the
 /// question, since a new release may ask for more. Every package gets its own answer and one that fails does not
 /// stop the rest; the command fails if any did.
+#[inline(never)]
 fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> {
     let verb = words[0];
     // `purge`, for `uninstall` alone, before the `yes`: its fetched copies go too.
@@ -15620,53 +15605,37 @@ fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> 
     }
     let mut failed = false;
     let mut q = [0u8; 512];
-    // An upgrade asks two things once, before any package: what is installed, and what the registry has newest.
-    let (installed, updates) = if verb == "upgrade" {
-        let i = build_godspeed_table(ctx, "list installed", None);
-        let u = build_godspeed_table(ctx, "list updates", None);
-        if i.is_none() || u.is_none() {
-            gs::io::println(ctx, "godspeed: the package manager did not answer");
-            return Err(ShellError::Unknown);
-        }
-        (i, u)
-    } else { (None, None) };
-    let mut every = [[0u8; 80]; 8];
-    let mut lens = [0usize; 8];
-    let mut ne = 0usize;
+    // An upgrade asks two things once, before any package: what is installed, and what the registry has newest -
+    // read into a small plan, so neither answer table is on the stack while the packages are fetched and installed.
     let all = verb == "upgrade" && words[1] == "all";
-    if all {
-        if let Some(t) = installed.as_ref() {
-            if let Some(k) = table_col(t, b"package") {
-                for r in 0..t.nrows() {
-                    let b = t.cell_bytes(r, k);
-                    if b == b"status" || ne == every.len() || b.len() > 80 { continue; }
-                    every[ne][..b.len()].copy_from_slice(b);
-                    lens[ne] = b.len();
-                    ne += 1;
-                }
+    let plan = if verb == "upgrade" {
+        match upgrade_plan(ctx, if all { None } else { Some(words[1]) }) {
+            Some(p) => p,
+            None => {
+                gs::io::println(ctx, "godspeed: the package manager did not answer");
+                return Err(ShellError::Unknown);
             }
         }
-        if ne == 0 { gs::io::println(ctx, "  nothing is installed, so nothing to upgrade"); return Ok(()); }
-    }
+    } else { UpgradePlan::EMPTY };
+    if all && plan.n == 0 { gs::io::println(ctx, "  nothing is installed, so nothing to upgrade"); return Ok(()); }
     let listed = if all { None } else { Some(words[1]) };
     let names = listed.into_iter().flat_map(|l| l.split(',')).map(str::trim).filter(|p| !p.is_empty())
-        .chain((0..ne).map(|i| core::str::from_utf8(&every[i][..lens[i]]).unwrap_or("")));
+        .chain((0..if all { plan.n } else { 0 }).map(|i| plan.pkg(i)));
     for pkg in names {
         match verb {
             "install" => { if !install_one(ctx, pkg, None, yes, &mut q) { failed = true; } }
             "upgrade" => {
-                let Some(have) = table_lookup(&installed, pkg, b"version") else {
+                let Some(i) = plan.find(pkg) else {
                     gs::io::println_fmt(ctx, format_args!("godspeed: {} is not installed: `godspeed install` it", pkg));
                     failed = true;
                     continue;
                 };
-                let have = core::str::from_utf8(have.as_bytes()).unwrap_or("?");
-                let latest = table_lookup(&updates, pkg, b"latest");
-                let latest = latest.as_ref().map(|l| core::str::from_utf8(l.as_bytes()).unwrap_or("-")).unwrap_or("-");
-                if latest == "-" {
-                    let why = table_lookup(&updates, pkg, b"status");
+                let have = plan.have(i);
+                let latest = plan.latest(i);
+                if latest == "-" || latest.is_empty() {
+                    let why = plan.why(i);
                     gs::io::println_fmt(ctx, format_args!("godspeed: no newer {} can be found: {}", pkg,
-                        why.as_ref().map(|w| core::str::from_utf8(w.as_bytes()).unwrap_or("")).unwrap_or("the registry did not list it")));
+                        if why.is_empty() { "the registry did not list it" } else { why }));
                     failed = true;
                     continue;
                 }
@@ -15703,6 +15672,59 @@ fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> 
     if failed { Err(ShellError::Unknown) } else { Ok(()) }
 }
 
+/// What an upgrade needs of the two lists, held small: each installed package (all of them for `upgrade all`, else
+/// the ones named), the version installed, the newest the registry has, and why not where it has none.
+struct UpgradePlan {
+    n: usize,
+    pkgs: [[u8; 80]; 8], pl: [usize; 8],
+    haves: [[u8; 24]; 8], hl: [usize; 8],
+    latests: [[u8; 24]; 8], ll: [usize; 8],
+    whys: [[u8; 120]; 8], wl: [usize; 8],
+}
+
+impl UpgradePlan {
+    const EMPTY: UpgradePlan = UpgradePlan {
+        n: 0, pkgs: [[0; 80]; 8], pl: [0; 8], haves: [[0; 24]; 8], hl: [0; 8],
+        latests: [[0; 24]; 8], ll: [0; 8], whys: [[0; 120]; 8], wl: [0; 8],
+    };
+    fn s(b: &[u8]) -> &str { core::str::from_utf8(b).unwrap_or("") }
+    fn pkg(&self, i: usize) -> &str { Self::s(&self.pkgs[i][..self.pl[i]]) }
+    fn have(&self, i: usize) -> &str { Self::s(&self.haves[i][..self.hl[i]]) }
+    fn latest(&self, i: usize) -> &str { Self::s(&self.latests[i][..self.ll[i]]) }
+    fn why(&self, i: usize) -> &str { Self::s(&self.whys[i][..self.wl[i]]) }
+    fn find(&self, pkg: &str) -> Option<usize> { (0..self.n).find(|&i| self.pkg(i) == pkg) }
+}
+
+/// The installed list and the update list, asked once and read into an [`UpgradePlan`]: every installed package, or
+/// those `named` (comma-separated) that are. `None` when the package manager did not answer either.
+#[inline(never)]
+fn upgrade_plan(ctx: &ShellCtx, named: Option<&str>) -> Option<UpgradePlan> {
+    let installed = build_godspeed_table(ctx, "list installed", None);
+    let updates = build_godspeed_table(ctx, "list updates", None);
+    if installed.is_none() || updates.is_none() { return None; }
+    let mut plan = UpgradePlan::EMPTY;
+    let put = |dst: &mut [u8], b: &[u8]| { let n = b.len().min(dst.len()); dst[..n].copy_from_slice(&b[..n]); n };
+    if let Some(t) = installed.as_ref() {
+        if let (Some(k), Some(v)) = (table_col(t, b"package"), table_col(t, b"version")) {
+            for r in 0..t.nrows() {
+                let b = t.cell_bytes(r, k);
+                if b == b"status" || plan.n == plan.pkgs.len() || b.len() > 80 { continue; }
+                let p = core::str::from_utf8(b).unwrap_or("");
+                if let Some(list) = named {
+                    if !list.split(',').map(str::trim).any(|x| x == p) { continue; }
+                }
+                let i = plan.n;
+                plan.pl[i] = put(&mut plan.pkgs[i], b);
+                plan.hl[i] = put(&mut plan.haves[i], t.cell_bytes(r, v));
+                if let Some(l) = table_lookup(&updates, p, b"latest") { plan.ll[i] = put(&mut plan.latests[i], l.as_bytes()); }
+                if let Some(w) = table_lookup(&updates, p, b"status") { plan.wl[i] = put(&mut plan.whys[i], w.as_bytes()); }
+                plan.n += 1;
+            }
+        }
+    }
+    Some(plan)
+}
+
 /// `MAJOR.MINOR.PATCH` as numbers, for ordering; anything else orders first.
 fn semver(v: &str) -> (u64, u64, u64) {
     let mut it = v.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
@@ -15722,6 +15744,37 @@ fn table_lookup(t: &Option<Table>, key: &str, field: &[u8]) -> Option<String8L> 
     Some(out)
 }
 
+/// `godspeed cleanup [yes]`: the listing, then the question, then the delete. Its own frame, so the answer table it
+/// reads is on the stack only while it does (SHELL STACK, below).
+#[inline(never)]
+fn godspeed_cleanup(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> {
+    let yes = words.len() == 2 && words[1] == "yes";
+    if words.len() > 2 || (words.len() == 2 && !yes) {
+        gs::io::println(ctx, "usage: godspeed cleanup [yes]");
+        return Err(ShellError::Unknown);
+    }
+    let (found, failed) = {
+        let t = godspeed_answer(ctx, "cleanup").ok_or(ShellError::Unknown)?;
+        let found = (0..t.nrows()).filter(|&r| t.cell_bytes(r, 0) != b"status").count();
+        let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
+        godspeed_present(ctx, t)?;
+        (found, failed)
+    };
+    if found == 0 || failed { return Ok(()); }
+    gs::io::print(ctx, "Delete them? [y/N]: ");
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+    else if !read_confirm(ctx) {
+        gs::io::println(ctx, "godspeed: nothing was deleted");
+        return Ok(());
+    }
+    godspeed_show(ctx, "cleanup delete")
+}
+
+/// SHELL STACK: every `godspeed` path below holds an answer `Table` (about 12 KiB) only inside a small function that
+/// reads what it needs from it and returns, before the next request goes deeper. Folded together, `cmd_godspeed` was
+/// one 64 KiB frame and `godspeed_lifecycle` 53 KiB; inside a script (`selfcheck packages`, under the script runner's
+/// own 44 KiB) that ran the shell off the end of its 256 KiB stack on the VisionFive, 2026-10-18.
+///
 /// `godspeed install <file>.gsp [yes] [accept-old]` (`docs/developer-services-design.md` 15): the package manager
 /// checks the file through the registry's whole chain, offline, and unpacks it where a fetch would have left it;
 /// then it is installed exactly as a fetched package is, with the same question.
@@ -15730,6 +15783,7 @@ fn table_lookup(t: &Option<Table>, key: &str, field: &[u8]) -> Option<String8L> 
 /// SECOND question, asked first: the operator may accept that a key revoked since would not show. `yes` does not
 /// answer it - so a script that says `yes` never accepts that risk by accident - and `accept-old` does. Anything
 /// else wrong with the file is refused with no question.
+#[inline(never)]
 fn godspeed_install_file(ctx: &ShellCtx, cwd: &Cwd, words: &[&str]) -> Result<(), ShellError> {
     let (mut yes, mut accept) = (false, false);
     for w in &words[1..] {
@@ -15745,6 +15799,19 @@ fn godspeed_install_file(ctx: &ShellCtx, cwd: &Cwd, words: &[&str]) -> Result<()
     let mut pbuf = [0u8; PATH_MAX];
     let Some(path) = resolve_or_err(ctx, cwd, words[0], &mut pbuf) else { return Err(ShellError::Unknown) };
     let path = core::str::from_utf8(path).unwrap_or("");
+    let Some(title) = unpack_file(ctx, path, words[0], yes, accept)? else { return Ok(()) };
+    let title = core::str::from_utf8(title.as_bytes()).unwrap_or("");
+    let Some((pkg, version)) = title.split_once(' ') else { return Err(ShellError::Unknown) };
+    let mut q = [0u8; 512];
+    let mut sb = [0u8; 512];
+    let spec = fmt_into(&mut sb, format_args!("{}@{}", pkg, version));
+    if install_one(ctx, spec, None, yes, &mut q) { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// The package file checked and unpacked, its age asked about first when it must be: the release it holds
+/// (`<publisher/name> <version>`), or `None` when the operator said no. The answer tables live in this frame only.
+#[inline(never)]
+fn unpack_file(ctx: &ShellCtx, path: &str, shown: &str, yes: bool, accept: bool) -> Result<Option<String8L>, ShellError> {
     let mut q = [0u8; 512];
     let mut t = godspeed_answer(ctx, fmt_into(&mut q, format_args!("unpack {}{}", path, if accept { " accept-old" } else { "" })))
         .ok_or(ShellError::Unknown)?;
@@ -15757,45 +15824,54 @@ fn godspeed_install_file(ctx: &ShellCtx, cwd: &Cwd, words: &[&str]) -> Result<()
         gs::io::print_fmt(ctx, format_args!("{} {}. Install it anyway? [y/N]: ",
             core::str::from_utf8(title.as_bytes()).unwrap_or(""), core::str::from_utf8(question.as_bytes()).unwrap_or("")));
         if !read_confirm(ctx) {
-            gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed - nothing of it was kept", words[0]));
-            return Ok(());
+            gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed - nothing of it was kept", shown));
+            return Ok(None);
         }
         t = godspeed_answer(ctx, fmt_into(&mut q, format_args!("unpack {} accept-old", path))).ok_or(ShellError::Unknown)?;
     }
     // The release it unpacked, from the card's title: `<publisher/name> <version>`.
     let title = row(&t, b"title", 1).unwrap_or_else(String8L::new);
     godspeed_present(ctx, t)?;
-    let title = core::str::from_utf8(title.as_bytes()).unwrap_or("");
-    let Some((pkg, version)) = title.split_once(' ') else { return Err(ShellError::Unknown) };
-    let mut sb = [0u8; 512];
-    let spec = fmt_into(&mut sb, format_args!("{}@{}", pkg, version));
-    if install_one(ctx, spec, None, yes, &mut q) { Ok(()) } else { Err(ShellError::Unknown) }
+    Ok(Some(title))
 }
 
 /// One `install`: what the release asks for, the question, then the install with the answer. False when it failed;
 /// a "no" is not a failure. `from`, for an upgrade, is the version installed now.
-fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> bool {
-    let Some(t) = build_godspeed_table(ctx, fmt_into(q, format_args!("install {}", spec)), None) else { return false };
-    let status = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status");
-    if status.is_none_or(|r| t.cell_bytes(r, 1) == b"failed") {
-        // Not fetched, or the copy did not check out: the answer says which.
-        let _ = godspeed_show(ctx, fmt_into(q, format_args!("install {}", spec)));
-        return false;
-    }
-    // `<pkg> <version> requests these; ...`: the release the question is about.
-    let note = status.map(|r| core::str::from_utf8(t.cell_bytes(r, 2)).unwrap_or("")).unwrap_or("");
-    let release = note.split(" requests").next().unwrap_or(spec);
+#[inline(never)]
+/// What a release asks for, read from the package manager's answer: its status note and the peers its contract
+/// requests. `None` when the answer failed or did not come. The table is in this frame alone.
+#[inline(never)]
+fn install_asks(ctx: &ShellCtx, spec: &str, q: &mut [u8; 512]) -> Option<([u8; 512], usize, [u8; 256], usize)> {
+    let t = build_godspeed_table(ctx, fmt_into(q, format_args!("install {}", spec)), None)?;
+    let status = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status")?;
+    if t.cell_bytes(status, 1) == b"failed" { return None; }
+    let mut note = [0u8; 512];
+    let nb = t.cell_bytes(status, 2);
+    let nl = nb.len().min(note.len());
+    note[..nl].copy_from_slice(&nb[..nl]);
     let mut peers = [0u8; 256];
     let mut pn = 0usize;
     for r in 0..t.nrows() {
-        if Some(r) == status { continue; }
+        if r == status { continue; }
         let p = t.cell_bytes(r, 0);
         if pn + p.len() + 2 > peers.len() { break; }
         if pn > 0 { peers[pn] = b','; pn += 1; }
         peers[pn..pn + p.len()].copy_from_slice(p);
         pn += p.len();
     }
-    let peers = core::str::from_utf8(&peers[..pn]).unwrap_or("");
+    Some((note, nl, peers, pn))
+}
+
+fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> bool {
+    let Some((note_b, nl, peers_b, pn)) = install_asks(ctx, spec, q) else {
+        // Not fetched, or the copy did not check out: the answer says which.
+        let _ = godspeed_show(ctx, fmt_into(q, format_args!("install {}", spec)));
+        return false;
+    };
+    // `<pkg> <version> requests these; ...`: the release the question is about.
+    let note = core::str::from_utf8(&note_b[..nl]).unwrap_or("");
+    let release = note.split(" requests").next().unwrap_or(spec);
+    let peers = core::str::from_utf8(&peers_b[..pn]).unwrap_or("");
     // What installing it does, from the note's kind: a service starts at every boot, a utility becomes a command.
     let when = if note.contains("; a driver;") { "starts at every boot, driving that device" }
         else if note.contains("; an app;") { "becomes a command that has the screen and keyboard while it runs" }
@@ -15866,6 +15942,7 @@ fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
 }
 
 /// One `godspeed` command's answer, its progress drawn in place on one line until it comes, then cleared.
+#[inline(never)]
 fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
     // PROGRESS, drawn in place on one line until the answer comes, then cleared.
     let drawn = core::cell::Cell::new(false);
@@ -15891,6 +15968,7 @@ fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
 }
 
 /// An answer shown: the card or the list, then its status note. Err when it failed.
+#[inline(never)]
 fn godspeed_present(ctx: &ShellCtx, mut t: Table) -> Result<(), ShellError> {
     let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
     let answered = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status");
