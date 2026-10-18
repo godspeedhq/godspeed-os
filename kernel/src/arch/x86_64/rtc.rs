@@ -130,12 +130,27 @@ pub fn set_wall_clock(_epoch: i64) -> bool { false }   // the CMOS RTC is the au
 /// good value instead. A single kernel-owned clock cache (like MONOTONIC_TICKS or the boot stamp), not
 /// service state. `date` keeps the raw read (an on-demand display tolerates a rare one-off).
 static LAST_NOW_EPOCH: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+/// Whether a read is being HELD (rejected, so `last` is returned), and since which read: said when it starts and
+/// when it ends. A hold is not harmless: every bounded wait above measures its deadline in these seconds, so
+/// while they stand still no such wait ends. It used to happen in silence.
+static HOLDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HOLD_RAW: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 pub fn now_epoch_monotonic() -> i64 {
     use core::sync::atomic::Ordering;
     let last     = LAST_NOW_EPOCH.load(Ordering::Relaxed);
     // The pure decision lives in `crate::clock` (hardware-free, host-unit-tested); this wrapper just
     // supplies the live RTC read and the high-water-mark store.
-    let accepted = crate::clock::deglitch_epoch(epoch_secs(read_datetime()), last);
+    let raw      = epoch_secs(read_datetime());
+    let accepted = crate::clock::deglitch_epoch(raw, last);
+    let held     = last != 0 && accepted == last && raw != last;
+    if held && !HOLDING.swap(true, Ordering::Relaxed) {
+        HOLD_RAW.store(raw, Ordering::Relaxed);
+        crate::kprintln!("rtc: a CMOS read of {} is {} s from the last good {} - holding {} until the clock passes it (deadlines measured in these seconds do not move meanwhile)",
+            raw, raw - last, last, last);
+    } else if !held && accepted != last && HOLDING.swap(false, Ordering::Relaxed) {
+        crate::kprintln!("rtc: the clock moved on to {} - the hold that began with a read of {} is over",
+            accepted, HOLD_RAW.load(Ordering::Relaxed));
+    }
     LAST_NOW_EPOCH.store(accepted, Ordering::Relaxed);
     accepted
 }
