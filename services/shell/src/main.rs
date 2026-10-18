@@ -1196,15 +1196,18 @@ const _: () = assert!(
 /// and `help` subcommands are appended automatically in `complete_keyword` (every utility answers
 /// `<util> version` / `<util> help`), so they are NOT listed here.
 /// `selfcheck`'s first word: its parts, taken from `SELFCHECK_PARTS` - the list that runs them - so a new part
-/// completes the moment it exists and a removed one stops completing; and `save`.
-const SELFCHECK_WORDS: [&str; SELFCHECK_PARTS.len() + 1] = {
-    let mut w = [""; SELFCHECK_PARTS.len() + 1];
+/// completes the moment it exists and a removed one stops completing; then `save`, and the universal
+/// `version` and `help` it offered when it was one of `INFO_CMDS`.
+const SELFCHECK_WORDS: [&str; SELFCHECK_PARTS.len() + 3] = {
+    let mut w = [""; SELFCHECK_PARTS.len() + 3];
     let mut i = 0;
     while i < SELFCHECK_PARTS.len() {
         w[i] = SELFCHECK_PARTS[i].0;
         i += 1;
     }
     w[i] = "save";
+    w[i + 1] = "version";
+    w[i + 2] = "help";
     w
 };
 
@@ -1401,7 +1404,8 @@ const CMDNAME_AFTER: &[(&str, &str)] = &[
 /// every one of these is a keyword command, so a new one belongs here (conventions rule 9).
 const INFO_CMDS: &[&str] = &[
     "about", "version", "mem", "sock", "uptime", "status", "roster", "clear",
-    "result", "selfcheck", "caps", "help",
+    // `selfcheck` is NOT one: it takes its parts' names, which `SUBCMD_FIRST` completes (`SELFCHECK_WORDS`).
+    "result", "caps", "help",
     // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
     // absent on purpose - its argument is a path, so it keeps path completion; "repeat" has its own
     // command-name completion case; "busiest" completes its column keywords via SUBCMD_FIRST).
