@@ -32,11 +32,11 @@ const RECORD_MAX: usize = 5 + (1 << 14) + 256;
 const OUT_MAX: usize = 4096;
 /// The status line and headers of one answer. The registry's are about 900 bytes, most of it a reporting
 /// header; an answer whose head is larger is refused rather than cut.
-const HEAD_MAX: usize = 4096;
+pub(crate) const HEAD_MAX: usize = 4096;
 /// A pause between reads that found nothing. `net-stack` keeps taking a download's frames in while this
 /// waits (it polls every millisecond while frames arrive, into a 256 KiB window), so the pause costs the
 /// download nothing but a little latency; it is short so that latency stays small.
-const IDLE_MS: u64 = 2;
+pub(crate) const IDLE_MS: u64 = 2;
 
 /// Where it ended, when it did not succeed.
 #[derive(Clone, Copy, Debug)]
@@ -284,7 +284,7 @@ impl Session<'_, '_, '_, '_> {
                 // What came after the headers in this record is the start of the body.
                 from += end - before;
             }
-            let h = head.unwrap_or(Head { status: 0, length: None, chunked: false, close: true });
+            let h = head.unwrap_or(Head::new(0, None, false, true));
             let deliver = h.status == 200;
             let mut refused = false;
             let done = body.feed(&self.rec[from..range.end], &mut |b: &[u8]| {
@@ -304,7 +304,7 @@ impl Session<'_, '_, '_, '_> {
 }
 
 /// The request: HTTP/1.1, kept alive for the next one, nothing a server could mistake for anything else.
-fn request(out: &mut [u8; 512], host: &str, path: &str) -> usize {
+pub(crate) fn request(out: &mut [u8; 512], host: &str, path: &str) -> usize {
     let mut n = 0usize;
     for part in ["GET ", path, " HTTP/1.1\r\nHost: ", host, "\r\nUser-Agent: godspeed/0.2\r\nAccept: */*\r\n",
                  "Connection: keep-alive\r\n\r\n"] {

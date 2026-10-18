@@ -358,6 +358,22 @@ pub fn url(s: &str) -> Result<Url<'_>, &'static str> {
 /// path ending in `/`, no query) do not apply to one page read and thrown away. `base` is the whole path.
 pub fn page(s: &str) -> Result<Url<'_>, &'static str> {
     let rest = s.strip_prefix("https://").ok_or("an address to check is https:// only: the transport is TLS")?;
+    page_parts(rest, 443)
+}
+
+/// A link `download` takes: `https://` (checked by TLS, `true`) or plain `http://` (`false`), port 443 or 80 by
+/// default, any path and query.
+pub fn link(s: &str) -> Result<(Url<'_>, bool), &'static str> {
+    if let Some(rest) = s.strip_prefix("https://") {
+        return page_parts(rest, 443).map(|u| (u, true));
+    }
+    if let Some(rest) = s.strip_prefix("http://") {
+        return page_parts(rest, 80).map(|u| (u, false));
+    }
+    Err("a link begins http:// or https://")
+}
+
+fn page_parts(rest: &str, default_port: u16) -> Result<Url<'_>, &'static str> {
     let (authority, path) = match rest.find(['/', '?']) {
         Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], &rest[i..]),
         Some(_) => return Err("a query goes after a path: https://host/path?query"),
@@ -368,7 +384,7 @@ pub fn page(s: &str) -> Result<Url<'_>, &'static str> {
     }
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h, p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("the port is a number, 1 to 65535")?),
-        None => (authority, 443),
+        None => (authority, default_port),
     };
     if !is_dns_name(host) {
         return Err("the host must be a DNS name, which TLS checks the certificate against");
@@ -525,6 +541,14 @@ impl Out<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_link_is_http_or_https_with_its_port() {
+        assert_eq!(link("https://example.com/a?b=1").map(|(u, t)| (u.host, u.port, u.base, t)), Ok(("example.com", 443, "/a?b=1", true)));
+        assert_eq!(link("http://example.com").map(|(u, t)| (u.port, u.base, t)), Ok((80, "/", false)));
+        assert_eq!(link("http://example.com:8080/f.bin").map(|(u, _)| u.port), Ok(8080));
+        assert!(link("ftp://example.com/f").is_err());
+    }
+
     use super::*;
 
     const PIN_B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

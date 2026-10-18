@@ -37,6 +37,7 @@ mod install;
 mod keys;
 mod config;
 mod default_root;
+mod download;
 mod http;
 mod https;
 mod meta;
@@ -98,6 +99,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
         }
         (Some("check"), None) => check(&ctx, &mut r, None),
+        // `download`, the shell's own command (`utilities/65_download.md`): the shell resolved the path.
+        (Some("download"), Some(link)) => match (words.next(), words.next()) {
+            (Some(dest), None) => download(&ctx, &mut r, link, dest),
+            _ => r.fail("usage", "download <link> [to <file>]", "one link, and where to put it"),
+        },
         (Some("check"), Some(page)) if words.clone().next().is_none() => check(&ctx, &mut r, Some(page)),
         (Some("search"), Some(word)) => match page_from(&mut words) {
             Ok(from) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, Some(word), from)),
@@ -575,6 +581,39 @@ fn registry_remove(ctx: &ServiceContext, name: &str, r: &mut Rows) {
     }
 }
 
+/// `download <link> <path>`: the settings, the clock if it is set, and the roots, then `download::run`.
+#[inline(never)]
+fn download(ctx: &ServiceContext, r: &mut Rows, link: &str, dest: &str) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let n = match load(ctx, r, &mut buf) {
+        Ok(n) => n,
+        Err(why) => return r.fail("config", "unreadable", why.as_str()),
+    };
+    let c = config::parse(Some(&buf[..n]));
+    if let Some(p) = c.problem {
+        return r.fail("config", config::PATH, problem_text(&p).as_str());
+    }
+    // The clock only matters to https; a plain http download needs none, so its absence is not a failure here.
+    let (now, clock_word) = match gs::task::wall_clock(ctx) {
+        Some((t, src)) if t > 0 => (Some(t as u64), match src {
+            ClockSource::Rtc => "hardware clock",
+            ClockSource::Ntp => "network time",
+            ClockSource::Floor => "floor from the last boot (a lower bound)",
+            ClockSource::Unset => "unset",
+        }),
+        _ => (None, "unset"),
+    };
+    let folder = c.get("tls-roots");
+    let mut store = Roots::new();
+    if !read_roots(ctx, r, folder, &mut store) { return; }
+    let mut roots: [&[u8]; MAX_ROOTS] = [&[]; MAX_ROOTS];
+    for i in 0..store.count { roots[i] = &store.store[i][..store.lens[i]]; }
+    let setup = download::Setup {
+        roots: &roots[..store.count], now, clock_word, folder, timeout: config::number_of(c.get("timeout-secs")),
+    };
+    download::run(ctx, r, link, dest, &setup);
+}
+
 /// Reach the registry over verified TLS, one row per step.
 #[inline(never)]
 /// `godspeed check`: the registry in use, one row per step. With an address, that one page instead, read to its
@@ -846,6 +885,9 @@ pub(crate) fn failure(f: &https::Fail, folder: &str, clock: &str) -> (&'static s
                 CertProblem::BadRoot => cell(format_args!("a file in {} is not a certificate", folder)),
                 other => cell(format_args!("the certificate was refused: {:?}", other)),
             },
+            // 40 is handshake_failure: nothing offered was acceptable. This client offers ECDSA signatures only, so a
+            // server whose only certificate is RSA - common still - answers exactly this.
+            TlsError::AlertReceived(40) => cell(format_args!("the server refused the handshake (alert 40) - most often it has only an RSA certificate, and this client checks ECDSA only")),
             TlsError::AlertReceived(a) => cell(format_args!("the server ended the handshake (alert {})", a)),
             TlsError::HelloRetryRequest => cell(format_args!("the server does not take X25519, the one key exchange offered")),
             TlsError::ProtocolVersion => cell(format_args!("the server does not speak TLS 1.3")),

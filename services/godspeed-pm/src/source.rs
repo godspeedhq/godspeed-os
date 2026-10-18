@@ -168,9 +168,9 @@ impl Source for GspSource<'_> {
         -> Result<Head, Fail> {
         let want = path.trim_start_matches('/');
         let Some(e) = self.entries[..self.count].iter().find(|e| &e.path[..e.path_len] == want.as_bytes()).copied() else {
-            return Ok(Head { status: 404, length: Some(0), chunked: false, close: false });
+            return Ok(Head::new(404, Some(0), false, false));
         };
-        let head = Head { status: 200, length: Some(e.size), chunked: false, close: false };
+        let head = Head::new(200, Some(e.size), false, false);
         if !on_head(&head) { return Err(Fail::Refused); }
         let mut fs = gs::fs::Fs::new(self.ctx);
         let mut chunk = [0u8; gs::fs::IO_CHUNK];

@@ -2365,6 +2365,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
         "ask"     => cmd_ask(ctx, s["ask".len()..].trim()),
         "godspeed" => cmd_godspeed(ctx, cwd, s["godspeed".len()..].trim()),
+        "download" => cmd_download(ctx, cwd, s["download".len()..].trim()),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -5435,6 +5436,9 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("speaker-test", "audio tone"),
     ("amixer", "audio volume"),
     ("alsamixer", "audio volume"),
+    // Files from the web (utilities/65_download.md).
+    ("wget",  "download"),
+    ("curl",  "download"),
 ];
 
 /// The hint for a word we do not have, if there is one worth giving.
@@ -5462,6 +5466,7 @@ const UTILS: &[&str] = &[
     "hardware",
     "ask",
     "godspeed",
+    "download",
     "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5726,6 +5731,14 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
+        "download" => help_block(ctx, "download", "a file from a web server, saved here", &[
+            ("download <link>", "saved in this folder, named from the link's last part; https:// is checked, http:// is taken and said to be unchecked", "download https://example.com/file.zip"),
+            ("download <link> to <file>", "saved as that file instead", "download https://example.com/a.bin to /users/default/a.bin"),
+            ("while it runs", "a bar with the percentage, the size and the time left; [q] quits, and nothing is kept", ""),
+            ("the file", "written as <file>.partial and renamed when its last byte is in, so a file there is always whole; an existing file is never replaced", ""),
+            ("redirects", "followed, up to 5; an https:// link sent to http:// is refused unless you typed http:// yourself", ""),
+            ("the roots", "the same certificate authorities as `godspeed`: /system/services/godspeed/roots/", ""),
+        ], false),
         "godspeed" => help_block(ctx, "godspeed", "the native package manager - packages verified against the registry's signed metadata, kept here", &[
             ("godspeed search <word> [from <n>]", "the packages whose name holds the word, from the registry's verified snapshot, 40 a page", "godspeed search hello"),
             ("godspeed info <publisher/name>[@version]", "its versions, then what it is: description, licence, the release it was built for, what it ships and requests, who signed it", "godspeed info godspeed/hello"),
@@ -6440,6 +6453,7 @@ static HELP: &[HelpRow] = &[
     Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
     Row("ask \"<question>\"", "plain questions about this machine: health, what failed, why a service restarted"),
     Row("godspeed registry | config | check", "the package manager: its registries, its settings, the registry reached over verified TLS"),
+    Row("download <link> [to <file>]", "a file from a web server, saved here: https:// checked, http:// said to be unchecked"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("random [n]", "words from the hardware random number generator"),
@@ -15452,6 +15466,42 @@ fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>)
             None
         }
     }
+}
+
+/// `download <link> [to <file>]` (`utilities/65_download.md`): the link and an absolute path to the program that
+/// does it - the package manager's, which holds the network, the disk, the clock and the trusted roots already. The
+/// path is resolved here, where the folder this was typed in is known.
+#[inline(never)]
+fn cmd_download(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    let mut words = arg.split_whitespace();
+    let (link, to) = match (words.next(), words.next(), words.next(), words.next()) {
+        (Some(l), None, None, None) => (l, None),
+        (Some(l), Some("to"), Some(f), None) => (l, Some(f)),
+        _ => {
+            gs::io::println(ctx, "usage: download <link> [to <file>] - `download help` says more");
+            return Err(ShellError::Unknown);
+        }
+    };
+    if !link.starts_with("http://") && !link.starts_with("https://") {
+        gs::io::println(ctx, "download: a link begins http:// or https://");
+        return Err(ShellError::Unknown);
+    }
+    // Named from the link when no file is: its last path part, without a query; `index.html` for a bare site.
+    let name = match to {
+        Some(f) => f,
+        None => {
+            let rest = link.splitn(2, "://").nth(1).unwrap_or("");
+            let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
+            let path = path.split(['?', '#']).next().unwrap_or("/");
+            let last = path.rsplit('/').next().unwrap_or("");
+            if last.is_empty() { "index.html" } else { last }
+        }
+    };
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(path) = resolve_or_err(ctx, cwd, name, &mut pbuf) else { return Err(ShellError::Unknown) };
+    let path = core::str::from_utf8(path).unwrap_or("");
+    let mut q = [0u8; 512];
+    godspeed_show(ctx, fmt_into(&mut q, format_args!("download {} {}", link, path)))
 }
 
 /// `godspeed registry [add | use | remove]`, `godspeed config [set]`, `godspeed check`

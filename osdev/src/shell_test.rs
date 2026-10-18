@@ -12119,6 +12119,33 @@ pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
     println!("download: the registry's 10 MB: {:.1} s at the host, guest says: {}", took, speed);
     check!(out.contains("HTTP/1.1 200") && out.contains("10000000 bytes"), "the registry's 10 MB test file arrives, all of it");
 
+    // ---- `download` (utilities/65_download.md): the registry's 10 MB file to disk, checked, then plain http ----
+    let t0 = std::time::Instant::now();
+    let got = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin\r", 900);
+    println!("download: `download` of the registry's 10 MB file: {:.1} s at the host", t0.elapsed().as_secs_f64());
+    println!("download: it said:\n{}", got.trim_end_matches("gsh>").trim());
+    check!(got.contains("/users/default/10mb.bin") && got.contains("9.5 MiB") && got.contains("https"),
+           "`download <https link>` saves the file in this folder, named from the link, and says it was checked");
+    let listed = run!(b"dir /users/default\r", 30);
+    // `dir` rounds sizes; `download` itself refuses to keep a file unless every byte the server stated arrived and was written.
+    check!(listed.contains("10mb.bin") && listed.contains("9.5 MiB") && !listed.contains(".partial"),
+           "the saved file is there at its size, and no .partial is left");
+    let again = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin\r", 60);
+    check!(again.contains("already exists"), "an existing file is never replaced");
+    let plain = run!(b"download http://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin to /users/default/plain.bin\r", 900);
+    check!(plain.contains("/users/default/plain.bin") && plain.contains("NOT checked"),
+           "`download <http link> to <file>` saves it there, and says nothing checked it");
+    let missing = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/nope.bin\r", 60);
+    let after = run!(b"dir /users/default\r", 30);
+    check!(missing.contains("HTTP 404") && !after.contains("nope.bin"), "a 404 is said, and nothing is saved");
+    let rsa = run!(b"download http://proof.ovh.net/files/1Mb.dat\r", 120);
+    check!(rsa.contains("ECDSA") && !run!(b"dir /users/default\r", 30).contains("1Mb.dat"),
+           "a redirect to https is followed, and a certificate this client cannot check is said and nothing saved");
+    let bad = run!(b"download ftp://example.com/f\r", 30);
+    check!(bad.contains("http:// or https://"), "a link that is not http or https is refused with the reason");
+    let piped = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin | count\r", 30);
+    check!(piped.contains("pipe"), "download is an action and refuses to start a pipe");
+
     // THE DISK'S HALF: a download is written as it arrives, so it is no faster than this.
     let t0 = std::time::Instant::now();
     let copied = run!(b"copy /big.bin /big-copy.bin\r", 600);

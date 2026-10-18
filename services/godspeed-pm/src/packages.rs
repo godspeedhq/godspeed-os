@@ -1228,7 +1228,7 @@ pub fn fetched(ctx: &ServiceContext, out: &mut [Fetched; MAX_FETCHED], more: &mu
     Ok(n)
 }
 
-fn size_text(bytes: u64) -> Cell {
+pub(crate) fn size_text(bytes: u64) -> Cell {
     if bytes < 1024 { cell(format_args!("{} B", bytes)) }
     else if bytes < 1024 * 1024 { cell(format_args!("{}.{} KiB", bytes / 1024, bytes % 1024 * 10 / 1024)) }
     else { cell(format_args!("{}.{} MiB", bytes >> 20, (bytes & 0xfffff) * 10 >> 20)) }
@@ -1370,7 +1370,7 @@ pub(crate) fn time_text(secs: i64, got: u64, total: u64) -> Cell {
 }
 
 /// A bar of `width` cells, `filled` of them `#`.
-fn bar(filled: usize, width: usize) -> Cell {
+pub(crate) fn bar(filled: usize, width: usize) -> Cell {
     let mut c = Cell::new();
     for i in 0..width { let _ = c.write_str(if i < filled { "#" } else { "-" }); }
     c

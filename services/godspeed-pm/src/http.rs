@@ -13,6 +13,34 @@ pub struct Head {
     pub chunked: bool,
     /// The server will close the connection after this answer.
     pub close: bool,
+    /// Where a redirect points (`Location`), when the answer has one that fits.
+    pub location: Location,
+}
+
+impl Head {
+    /// An answer with this status and framing and no `Location`.
+    pub const fn new(status: u16, length: Option<u64>, chunked: bool, close: bool) -> Head {
+        Head { status, length, chunked, close, location: Location::NONE }
+    }
+}
+
+/// A `Location` header's value, bounded: one longer than this is not kept, and a redirect to it is refused
+/// rather than followed somewhere cut short.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Location { b: [u8; LOCATION_MAX], n: u16, too_long: bool }
+
+/// The longest redirect target kept.
+pub const LOCATION_MAX: usize = 512;
+
+impl Location {
+    pub const NONE: Location = Location { b: [0; LOCATION_MAX], n: 0, too_long: false };
+    /// The target, or `None` when there was none or it did not fit.
+    pub fn get(&self) -> Option<&str> {
+        if self.n == 0 || self.too_long { return None; }
+        core::str::from_utf8(&self.b[..self.n as usize]).ok()
+    }
+    /// The answer named a target too long to keep.
+    pub fn too_long(&self) -> bool { self.too_long }
 }
 
 /// The body's framing, as the headers said it.
@@ -136,7 +164,7 @@ pub fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
         return Err("the answer does not begin with an HTTP/1.x status line");
     }
     let status: u16 = parts.next().and_then(|s| s.parse().ok()).ok_or("the status is not a number")?;
-    let mut h = Head { status, length: None, chunked: false, close: version == "HTTP/1.0" };
+    let mut h = Head::new(status, None, false, version == "HTTP/1.0");
     for line in lines {
         let Some((name, value)) = line.split_once(':') else { continue };
         let value = value.trim();
@@ -150,6 +178,13 @@ pub fn parse_head(head: &[u8]) -> Result<Head, &'static str> {
         } else if name.eq_ignore_ascii_case("connection") {
             if value.eq_ignore_ascii_case("close") { h.close = true; }
             if value.eq_ignore_ascii_case("keep-alive") { h.close = false; }
+        } else if name.eq_ignore_ascii_case("location") {
+            if value.len() > LOCATION_MAX {
+                h.location.too_long = true;
+            } else {
+                h.location.b[..value.len()].copy_from_slice(value.as_bytes());
+                h.location.n = value.len() as u16;
+            }
         }
     }
     // An answer that has no body by definition (1xx, 204, 304) is length zero.
@@ -188,7 +223,7 @@ mod tests {
     fn chunked_body_across_every_split() {
         let wire: &[u8] = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-T: 1\r\n\r\n";
         for split in 0..wire.len() {
-            let mut b = Body::for_head(&Head { status: 200, length: None, chunked: true, close: false });
+            let mut b = Body::for_head(&Head::new(200, None, true, false));
             let (done, got, n) = run(&mut b, &[&wire[..split], &wire[split..]]);
             assert!(done, "split {}", split);
             assert_eq!(&got[..n], b"Wikipedia");
@@ -197,9 +232,9 @@ mod tests {
 
     #[test]
     fn chunked_body_refuses_what_is_not_chunked() {
-        let mut b = Body::for_head(&Head { status: 200, length: None, chunked: true, close: false });
+        let mut b = Body::for_head(&Head::new(200, None, true, false));
         assert!(b.feed(b"zz\r\n", &mut |_| {}).is_err());
-        let mut b = Body::for_head(&Head { status: 200, length: None, chunked: true, close: false });
+        let mut b = Body::for_head(&Head::new(200, None, true, false));
         assert!(b.feed(b"2\r\nabX", &mut |_| {}).is_err());
     }
 
@@ -208,12 +243,22 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 821\r\nConnection: keep-alive\r\n\r\nformat = 1";
         let end = head_end(raw).unwrap_or(0);
         assert_eq!(&raw[end..], b"format = 1");
-        assert_eq!(parse_head(&raw[..end]), Ok(Head { status: 200, length: Some(821), chunked: false, close: false }));
+        assert_eq!(parse_head(&raw[..end]), Ok(Head::new(200, Some(821), false, false)));
         let h = parse_head(b"HTTP/1.1 404 Not Found\r\ntransfer-encoding: chunked\r\n\r\n").map(|h| (h.status, h.chunked));
         assert_eq!(h, Ok((404, true)));
         let h = parse_head(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n").map(|h| (h.length, h.close));
         assert_eq!(h, Ok((Some(0), true)));
         assert!(parse_head(b"SSH-2.0 hello\r\n\r\n").is_err());
         assert!(parse_head(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n").is_err());
+    }
+
+    #[test]
+    fn a_redirect_keeps_where_it_points() {
+        let h = parse_head(b"HTTP/1.1 301 Moved\r\nLocation: https://example.com/a?b=1\r\nContent-Length: 0\r\n\r\n");
+        assert_eq!(h.map(|h| h.status), Ok(301));
+        assert_eq!(h.as_ref().ok().and_then(|h| h.location.get()), Some("https://example.com/a?b=1"));
+        let long = [b"HTTP/1.1 302 Found\r\nLocation: /".as_slice(), &[b'x'; 600], b"\r\n\r\n"].concat();
+        assert_eq!(parse_head(&long).map(|h| (h.location.get().is_none(), h.location.too_long())), Ok((true, true)));
+        assert_eq!(parse_head(b"HTTP/1.1 200 OK\r\n\r\n").map(|h| h.location.get().is_none()), Ok(true));
     }
 }

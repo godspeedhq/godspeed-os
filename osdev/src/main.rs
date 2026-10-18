@@ -4002,7 +4002,8 @@ fn run_download_test() {
     disk_image::install_bootloader(limine_dir, &image_path);
     let _ = std::fs::create_dir_all("build/tests");
     let persist = "build/tests/persist_download.img";
-    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    // 64 MiB: two 10 MB downloads and a 4 MiB copy beside the tree `fs` lays down.
+    std::fs::write(persist, vec![0u8; 64 * 1024 * 1024]).expect("create disk");
     format_superblock(persist);
     let root = std::fs::read("osdev/fixtures/gts-root-r4.der").expect("osdev/fixtures/gts-root-r4.der");
     gsfs_add_file(persist, "gts-root-r4.der", &root);

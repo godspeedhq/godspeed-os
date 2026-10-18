@@ -70,6 +70,7 @@
   - [`hardware`](utilities/hardware.md)
   - [`ask`](utilities/ask.md)
   - [`godspeed`](utilities/godspeed.md)
+  - [`download`](utilities/download.md)
   - [`spawncap`](utilities/spawncap.md)
   - [`sock`](utilities/sock.md)
   - [`tcp`](utilities/tcp.md)

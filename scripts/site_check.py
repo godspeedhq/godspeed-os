@@ -97,7 +97,8 @@ def check_intro_counts():
              "eighty-four": 84, "eighty-five": 85, "eighty-six": 86,
              "eighty-seven": 87, "eighty-eight": 88, "eighty-nine": 89,
              "ninety": 90, "ninety-one": 91, "ninety-two": 92, "ninety-three": 93,
-             "ninety-four": 94, "ninety-five": 95, "four": 4, "five": 5}
+             "ninety-four": 94, "ninety-five": 95, "ninety-six": 96, "ninety-seven": 97,
+             "ninety-eight": 98, "ninety-nine": 99, "four": 4, "five": 5}
     page = read(os.path.join(SITE, "introduction.md"))
     total = inc = 0
     for p in glob.glob(os.path.join(SITE, "**", "*.md"), recursive=True):
