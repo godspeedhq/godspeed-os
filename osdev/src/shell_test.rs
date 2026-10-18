@@ -11960,10 +11960,20 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             let stopped = run!(b"hello-utility Cy\r", 60);
             check!(!stopped.contains("hello, Cy") && stopped.contains("hello-utility: not run - its signing key is not one this machine's operator trusts"),
                    "and the supervisor's check at the next start refuses what it signed, saying why on the shell's own line");
-            let _ = run!(b"godspeed uninstall godspeed/hello-utility yes\r", 60);
-            let _ = run!(b"godspeed remove godspeed/hello-utility@0.9.0\r", 60);
-            let _ = run!(b"godspeed uninstall godspeed/hello-utility yes\r", 60);
-            let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
+            // PURGE: uninstalled AND every fetched version deleted, in one command that asks first, naming both.
+            send(&mut write_half, b"godspeed uninstall godspeed/hello-utility purge\r");
+            let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(30)).unwrap_or_default();
+            check!(asked.contains("and every fetched version of it is deleted") && asked.contains("a package file you keep is not touched"),
+                   "`godspeed uninstall ... purge` asks first, saying the fetched copies go too");
+            let kept = run!(b"n\r", 60);
+            check!(kept.contains("left installed"), "answered no, nothing is uninstalled or deleted");
+            let purged = run!(b"godspeed uninstall godspeed/hello-utility purge yes\r", 120);
+            check!(purged.contains("uninstalled") && purged.contains("removed") && !purged.contains("`godspeed remove` deletes it"),
+                   "`purge yes` uninstalls it and deletes its fetched copies, with no question");
+            let none_left = run!(b"godspeed list fetched\r", 60);
+            check!(!none_left.contains("hello-utility"), "and no version of it is left fetched");
+            let file_kept = run!(b"dir /users/default\r", 30);
+            check!(file_kept.contains("hello-utility-0.2.0.gsp"), "the package file the operator keeps is not touched");
         } else {
             // `net` FIRST, ON PURPOSE: with no link, net-stack holds the shell's requests and answers every one of them
             // after the shell has moved on. Those late answers used to land on the endpoint the next command's

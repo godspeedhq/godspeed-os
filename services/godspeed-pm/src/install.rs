@@ -232,7 +232,7 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
 
 /// `godspeed uninstall <pkg>`: stop it and take it off the list. Its fetched copy stays (`godspeed remove` deletes it).
 #[inline(never)]
-pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, pkg: &str) {
+pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, pkg: &str, purge: bool) {
     let mut v = [0u8; 24];
     let Some(vl) = installed_version(ctx, pkg, &mut v) else {
         return r.fail("installed", pkg, "not installed here: `godspeed list installed` says what is");
@@ -243,7 +243,9 @@ pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, pkg: &str) {
     r.columns(&["key", "value", "note"]);
     r.row("title", cell(format_args!("{} {}", pkg, version)).as_str(), "uninstalled");
     r.row("about", match stopped { Ok(()) => "stopped", Err(_) => "was not running" }, "and will not start at boot, or run when typed");
-    r.row("kept", cell(format_args!("{}{}/{}", check::DIR, pkg, version)).as_str(), "the fetched copy; `godspeed remove` deletes it");
+    if !purge {
+        r.row("kept", cell(format_args!("{}{}/{}", check::DIR, pkg, version)).as_str(), "the fetched copy; `godspeed uninstall ... purge` or `godspeed remove` deletes it");
+    }
 }
 
 /// `godspeed list installed`: the list, with whether the supervisor has each running. Columns `package version state`.

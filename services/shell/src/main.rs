@@ -5736,7 +5736,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("godspeed trust [reset <registry>]", "what this machine has accepted from each registry, and the publishers' keys; reset forgets one (asks [y/N])", "godspeed trust"),
             ("godspeed install <publisher/name>[,...] [yes]", "start a fetched package now and at every boot; asks [y/N], naming what it would be given", "godspeed install godspeed/hello"),
             ("godspeed upgrade <publisher/name>[,...] | all [yes]", "fetch the newest release of what is installed and install it in its place; asks [y/N]", "godspeed upgrade all"),
-            ("godspeed uninstall <publisher/name>[,...] [yes]", "stop it and no longer start it at boot; the fetched copy stays", "godspeed uninstall godspeed/hello"),
+            ("godspeed uninstall <publisher/name>[,...] [purge] [yes]", "stop it and no longer start it at boot; the fetched copy stays, unless `purge`", "godspeed uninstall godspeed/hello purge"),
             ("godspeed registry", "the registries this machine knows; exactly one is in use", "godspeed registry"),
             ("godspeed registry add <name> <url> <root>", "know another registry; asks [y/N] before trusting its signing root", "godspeed registry add mirror https://mirror.example/ sha256:..."),
             ("godspeed registry use <name>", "search and install from that one from now on", "godspeed registry use mirror"),
@@ -6142,7 +6142,8 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("godspeed remove <publisher/name>@<version>", "that version only", "godspeed remove godspeed/hello@0.1.0"),
         ], false),
         ("godspeed", "uninstall") => help_block(ctx, "godspeed uninstall", "stop an installed package, and no longer start it at boot", &[
-            ("godspeed uninstall <publisher/name>[,<publisher/name>...] [yes]", "each asked [y/N], unless `yes`", "godspeed uninstall godspeed/hello"),
+            ("godspeed uninstall <publisher/name>[,<publisher/name>...] [yes]", "each asked [y/N], unless `yes`; the fetched copy stays, for a reinstall", "godspeed uninstall godspeed/hello"),
+            ("godspeed uninstall <publisher/name>[,...] purge [yes]", "and delete every fetched version of it too - what `remove` did after; a package file you keep is not touched", "godspeed uninstall godspeed/hello purge"),
             ("what stays", "the fetched copy: `godspeed remove` deletes it", "godspeed remove godspeed/hello"),
         ], false),
         ("godspeed", "install") => help_block(ctx, "godspeed install", "start a fetched package, now and at every boot", &[
@@ -15577,10 +15578,13 @@ fn cmd_godspeed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> 
 /// stop the rest; the command fails if any did.
 fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> {
     let verb = words[0];
-    let yes = words.len() == 3 && words[2] == "yes";
-    if words.len() > 3 || (words.len() == 3 && !yes) {
+    // `purge`, for `uninstall` alone, before the `yes`: its fetched copies go too.
+    let purge = verb == "uninstall" && words.get(2) == Some(&"purge");
+    let rest = &words[2 + purge as usize..];
+    let yes = rest == ["yes"];
+    if rest.len() > 1 || (rest.len() == 1 && !yes) {
         gs::io::println_fmt(ctx, format_args!("usage: godspeed {} <publisher/name>[,<publisher/name>...]{} [yes]", verb,
-            if verb == "upgrade" { " | all" } else { "" }));
+            if verb == "upgrade" { " | all" } else if verb == "uninstall" { " [purge]" } else { "" }));
         return Err(ShellError::Unknown);
     }
     let mut failed = false;
@@ -15651,13 +15655,17 @@ fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> 
                 if !install_one(ctx, spec, Some(have), yes, &mut q) { failed = true; }
             }
             _ => {
-                gs::io::print_fmt(ctx, format_args!("uninstall {}? It stops, and no longer starts at boot or runs when typed; its fetched copy stays. [y/N]: ", pkg));
+                if purge {
+                    gs::io::print_fmt(ctx, format_args!("uninstall {} and delete it? It stops, no longer starts at boot or runs when typed, and every fetched version of it is deleted; a package file you keep is not touched. [y/N]: ", pkg));
+                } else {
+                    gs::io::print_fmt(ctx, format_args!("uninstall {}? It stops, and no longer starts at boot or runs when typed; its fetched copy stays. [y/N]: ", pkg));
+                }
                 if yes { gs::io::println(ctx, "yes (given on the command line)"); }
                 else if !read_confirm(ctx) {
                     gs::io::println_fmt(ctx, format_args!("godspeed: {} left installed", pkg));
                     continue;
                 }
-                if godspeed_show(ctx, fmt_into(&mut q, format_args!("uninstall {}", pkg))).is_err() { failed = true; }
+                if godspeed_show(ctx, fmt_into(&mut q, format_args!("uninstall {}{}", pkg, if purge { " purge" } else { "" }))).is_err() { failed = true; }
             }
         }
     }

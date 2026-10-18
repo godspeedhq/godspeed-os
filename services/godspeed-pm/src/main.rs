@@ -155,8 +155,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             _ => r.fail("usage", "godspeed install <file>.gsp [yes] [accept-old]", "a package file, as the CLI writes one"),
         },
         (Some("install"), None) => r.fail("usage", "godspeed install <publisher/name>[@version]", "a fetched package to install"),
-        (Some("uninstall"), Some(name)) if words.clone().next().is_none() => install::uninstall(&ctx, &mut r, name),
-        (Some("uninstall"), _) => r.fail("usage", "godspeed uninstall <publisher/name>", "one installed package"),
+        (Some("uninstall"), Some(name)) if words.clone().next().is_none() => install::uninstall(&ctx, &mut r, name, false),
+        // PURGE: uninstalled, and every fetched version of it deleted - what `uninstall` and `remove` did as two
+        // commands. The shell asked first, naming both. A package file the operator keeps is theirs, not touched.
+        (Some("uninstall"), Some(name)) => match (words.next(), words.next()) {
+            (Some("purge"), None) => {
+                install::uninstall(&ctx, &mut r, name, true);
+                if !r.failed { packages::purge_fetched(&ctx, &mut r, name); }
+            }
+            _ => r.fail("usage", "godspeed uninstall <publisher/name> [purge]", "`purge` deletes its fetched copies too"),
+        },
+        (Some("uninstall"), _) => r.fail("usage", "godspeed uninstall <publisher/name> [purge]", "one installed package"),
         _ => r.fail("usage", "godspeed search | info | fetch | list | verify | remove | trust | registry | config | check",
                     "`godspeed help` says what each does"),
     }

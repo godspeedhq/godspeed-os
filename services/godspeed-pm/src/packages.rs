@@ -1394,6 +1394,19 @@ pub fn updates(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Ro
 
 /// `godspeed remove <publisher/name>[@version]`: delete a fetched copy, one version or every one. Nothing of
 /// the package's own data is touched: a fetched package has run nowhere, so it has none.
+/// `godspeed uninstall <pkg> purge`, after the uninstall: every fetched version deleted. None fetched is not a
+/// failure here - nothing is left, which is what was asked.
+pub fn purge_fetched(ctx: &ServiceContext, r: &mut Rows, pkg: &str) {
+    let Ok((name, _)) = spec(pkg) else { return r.fail("usage", pkg, "a package is publisher/name") };
+    let mut dir = Path::new();
+    dir.push(DIR).push(name.publisher()).push("/").push(name.name());
+    match gs::fs::Fs::new(ctx).exists(dir.as_str()) {
+        Ok(true) => remove(ctx, r, pkg),
+        Ok(false) => r.row("removed", "nothing", "no fetched copy was here"),
+        Err(e) => r.fail("fetched", pkg, cell(format_args!("could not be checked: {:?}", e)).as_str()),
+    }
+}
+
 pub fn remove(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     let (name, version) = match spec(which) {
         Ok(x) => x,

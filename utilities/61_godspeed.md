@@ -49,6 +49,7 @@ godspeed install <publisher/name> grant <p>,...    the same with the peers named
 godspeed install <file>.gsp [yes] [accept-old]     a package file, with no network (4d)
 godspeed upgrade <publisher/name>[,...] | all [yes] fetch the newest release of what is installed and install it; asks
 godspeed uninstall <publisher/name>[,...] [yes]    stop them, and no longer start them at boot; asks [y/N] for each
+godspeed uninstall <publisher/name>[,...] purge [yes]  and delete every fetched version too; asks [y/N], naming both
 godspeed registry                                  the registries this machine knows; one is in use
 godspeed registry add <name> <url> <root> [yes]    know another; asks [y/N] before trusting its root
 godspeed registry use <name>                       search and install from that one from now on
