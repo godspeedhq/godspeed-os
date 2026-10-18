@@ -1215,7 +1215,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("selfcheck", &SELFCHECK_WORDS),
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
-    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "trust", "registry", "config", "check"]),
+    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "cleanup", "trust", "registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -5737,6 +5737,7 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("godspeed install <publisher/name>[,...] [yes]", "start a fetched package now and at every boot; asks [y/N], naming what it would be given", "godspeed install godspeed/hello"),
             ("godspeed upgrade <publisher/name>[,...] | all [yes]", "fetch the newest release of what is installed and install it in its place; asks [y/N]", "godspeed upgrade all"),
             ("godspeed uninstall <publisher/name>[,...] [purge] [yes]", "stop it and no longer start it at boot; the fetched copy stays, unless `purge`", "godspeed uninstall godspeed/hello purge"),
+            ("godspeed cleanup [yes]", "delete every fetched copy nothing uses; asks [y/N]; package files are not touched", "godspeed cleanup"),
             ("godspeed registry", "the registries this machine knows; exactly one is in use", "godspeed registry"),
             ("godspeed registry add <name> <url> <root>", "know another registry; asks [y/N] before trusting its signing root", "godspeed registry add mirror https://mirror.example/ sha256:..."),
             ("godspeed registry use <name>", "search and install from that one from now on", "godspeed registry use mirror"),
@@ -6118,6 +6119,11 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("godspeed trust reset <registry> [yes]", "forget what was accepted from it, so the next command meets it again from root 1 against its pin; asks [y/N] unless `yes`", "godspeed trust reset default"),
             ("godspeed trust add <publisher> <key> [yes]", "trust a key YOURSELF for one publisher, so an unpublished package file it signed (`godspeed package --gsp`) installs with no registry; asks [y/N] unless `yes`", "godspeed trust add alice ed25519:..."),
             ("godspeed trust remove <publisher> <key>", "stop trusting it: its packages no longer start, since the supervisor checks this list at every start", ""),
+        ], false),
+        ("godspeed", "cleanup") => help_block(ctx, "godspeed cleanup", "delete what the package manager keeps that nothing uses", &[
+            ("godspeed cleanup [yes]", "lists every fetched copy that is not the installed version - left by `uninstall`, never installed, or older than an upgrade - and what an interrupted fetch left; asks [y/N] before deleting, unless `yes`", "godspeed cleanup"),
+            ("what it never touches", "the installed version of anything, a package file (.gsp) wherever it is, the registries' trust and the settings", ""),
+            ("godspeed cleanup | count", "piped, the listing alone: nothing is deleted", ""),
         ], false),
         ("godspeed", "inspect") => help_block(ctx, "godspeed inspect", "check a release as installing it would - and keep nothing", &[
             ("godspeed inspect <file>.gsp", "a package file, with no network: its chain as of the day it was made, its signature, contract and this machine's binary; says if installing it would ask about its age", "godspeed inspect hello.gsp"),
@@ -15556,6 +15562,27 @@ fn cmd_godspeed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> 
         let path = core::str::from_utf8(path).unwrap_or("");
         return godspeed_show(ctx, fmt_into(&mut q, format_args!("inspect {}", path)));
     }
+    // CLEANUP lists first and asks; the package manager deletes only on the answer, which it is never told came
+    // from a person - only what to do.
+    if words[0] == "cleanup" {
+        let yes = nw == 2 && words[1] == "yes";
+        if nw > 2 || (nw == 2 && !yes) {
+            gs::io::println(ctx, "usage: godspeed cleanup [yes]");
+            return Err(ShellError::Unknown);
+        }
+        let t = godspeed_answer(ctx, "cleanup").ok_or(ShellError::Unknown)?;
+        let found = (0..t.nrows()).filter(|&r| t.cell_bytes(r, 0) != b"status").count();
+        let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
+        godspeed_present(ctx, t)?;
+        if found == 0 || failed { return Ok(()); }
+        gs::io::print(ctx, "Delete them? [y/N]: ");
+        if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+        else if !read_confirm(ctx) {
+            gs::io::println(ctx, "godspeed: nothing was deleted");
+            return Ok(());
+        }
+        return godspeed_show(ctx, "cleanup delete");
+    }
     // A PACKAGE FILE installs in two steps: checked and unpacked, then installed as any fetched package.
     if nw >= 2 && words[0] == "install" && words[1].ends_with(".gsp") {
         return godspeed_install_file(ctx, cwd, &words[1..nw]);
@@ -19078,6 +19105,8 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
                 | (Some("verify"), _) | (Some("trust"), None) => None,
             // A report; a file named by a full path, because a pipe stage is not given the folder it was typed in.
             (Some("inspect"), Some(x)) if !x.ends_with(".gsp") || x.starts_with('/') => None,
+            // Piped, `cleanup` is the listing alone: nothing is asked, so nothing is deleted.
+            (Some("cleanup"), None) => None,
             (Some("inspect"), _) => Some("pipe: in a pipe, name the package file by its full path, as in godspeed inspect /users/default/hello-0.3.0.gsp"),
             _ => Some("pipe: pipe a report: godspeed search, info, inspect, list, registry, config or check"),
         },

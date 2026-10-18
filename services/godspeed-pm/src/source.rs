@@ -191,7 +191,7 @@ impl Source for GspSource<'_> {
 // ---- making a `.gsp` on this machine ------------------------------------------------------------------------
 
 /// Where a recording keeps each document until the file is written: one numbered file a document.
-const STAGING: &str = "/system/scratch/godspeed/gsp/";
+pub const STAGING: &str = "/system/scratch/godspeed/gsp/";
 /// The largest path a staged or kept file is read from.
 const FS_PATH_MAX: usize = 200;
 

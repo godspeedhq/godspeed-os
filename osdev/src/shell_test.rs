@@ -11960,6 +11960,25 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             let stopped = run!(b"hello-utility Cy\r", 60);
             check!(!stopped.contains("hello, Cy") && stopped.contains("hello-utility: not run - its signing key is not one this machine's operator trusts"),
                    "and the supervisor's check at the next start refuses what it signed, saying why on the shell's own line");
+            // CLEANUP: 0.9.0 is installed and 0.2.0 still fetched, and an interrupted fetch left a `.partial`.
+            let _ = run!(b"mkdir /system/packages/godspeed/hello-utility/0.1.0.partial\r", 30);
+            send(&mut write_half, b"godspeed cleanup\r");
+            let listed = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(60)).unwrap_or_default();
+            check!(listed.contains("older than the installed 0.9.0") && listed.contains("left by an interrupted fetch")
+                       && listed.contains("Package files (.gsp) are not touched") && !listed.contains("0.9.0   not"),
+                   "`godspeed cleanup` lists the copy nothing uses and the leftover, not the installed version, and asks");
+            let declined = run!(b"n\r", 60);
+            check!(declined.contains("nothing was deleted"), "answered no, nothing is deleted");
+            let still = run!(b"godspeed list fetched\r", 60);
+            check!(still.contains("0.2.0"), "and the copy is still there");
+            let cleaned = run!(b"godspeed cleanup yes\r", 120);
+            check!(cleaned.contains("deleted 1 fetched copy") && cleaned.contains("1 leftover"), "`godspeed cleanup yes` deletes them, with no question");
+            let after = run!(b"godspeed list fetched\r", 60);
+            check!(!after.contains("0.2.0") && after.contains("0.9.0"), "and the installed version is kept");
+            let empty = run!(b"godspeed cleanup\r", 60);
+            check!(empty.contains("nothing to clean up") && !empty.contains("[y/N]"), "with nothing to clean, it says so and asks nothing");
+            let file_kept_c = run!(b"dir /users/default\r", 30);
+            check!(file_kept_c.contains("hello-utility-0.2.0.gsp"), "and the package file is not touched");
             // PURGE: uninstalled AND every fetched version deleted, in one command that asks first, naming both.
             send(&mut write_half, b"godspeed uninstall godspeed/hello-utility purge\r");
             let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(30)).unwrap_or_default();

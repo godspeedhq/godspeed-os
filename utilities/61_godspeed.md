@@ -50,6 +50,7 @@ godspeed install <file>.gsp [yes] [accept-old]     a package file, with no netwo
 godspeed upgrade <publisher/name>[,...] | all [yes] fetch the newest release of what is installed and install it; asks
 godspeed uninstall <publisher/name>[,...] [yes]    stop them, and no longer start them at boot; asks [y/N] for each
 godspeed uninstall <publisher/name>[,...] purge [yes]  and delete every fetched version too; asks [y/N], naming both
+godspeed cleanup [yes]                             delete every fetched copy nothing uses, and interrupted fetches; asks [y/N]
 godspeed registry                                  the registries this machine knows; one is in use
 godspeed registry add <name> <url> <root> [yes]    know another; asks [y/N] before trusting its root
 godspeed registry use <name>                       search and install from that one from now on
@@ -316,6 +317,15 @@ is listed as coming from `(operator)`. Nothing tells this machine if that key le
 withdraws it, and what it signed no longer starts, since the supervisor checks the list at every start.
 
 `godspeed inspect <file>.gsp` checks either kind and keeps nothing.
+
+## 4e. Cleaning up
+
+`godspeed uninstall` keeps the fetched copy, so a reinstall needs no network; `godspeed uninstall <pkg> purge`
+deletes it too. What is left over time - copies `uninstall` kept, packages fetched and never installed, older
+versions after an upgrade, and what an interrupted fetch left - `godspeed cleanup` lists and, after `[y/N]`,
+deletes (`yes` answers it; piped, it only lists). It cleans only the package manager's own store,
+`/system/packages/`, and its scratch folder: never the installed version of anything, never a package file
+(`.gsp`) wherever it is, since those are the operator's, and never the registries' trust or the settings.
 
 ## 5. Pipes
 

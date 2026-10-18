@@ -155,6 +155,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             _ => r.fail("usage", "godspeed install <file>.gsp [yes] [accept-old]", "a package file, as the CLI writes one"),
         },
         (Some("install"), None) => r.fail("usage", "godspeed install <publisher/name>[@version]", "a fetched package to install"),
+        // What the package manager keeps that nothing uses: listed, and deleted only once the shell has asked.
+        (Some("cleanup"), None) => packages::cleanup(&ctx, &mut r, false),
+        (Some("cleanup"), Some("delete")) if words.clone().next().is_none() => packages::cleanup(&ctx, &mut r, true),
+        (Some("cleanup"), _) => r.fail("usage", "godspeed cleanup [yes]", "lists what nothing uses and asks before deleting it"),
         (Some("uninstall"), Some(name)) if words.clone().next().is_none() => install::uninstall(&ctx, &mut r, name, false),
         // PURGE: uninstalled, and every fetched version of it deleted - what `uninstall` and `remove` did as two
         // commands. The shell asked first, naming both. A package file the operator keeps is theirs, not touched.

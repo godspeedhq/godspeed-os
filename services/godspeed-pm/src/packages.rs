@@ -1255,6 +1255,103 @@ pub fn list_fetched(ctx: &ServiceContext, r: &mut Rows) {
     }
 }
 
+/// `MAJOR.MINOR.PATCH` as numbers, for ordering; anything else orders first.
+fn semver(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// `godspeed cleanup`: what the package manager keeps that nothing uses, listed - and with `delete`, deleted. It
+/// cleans ONLY its own store: every fetched copy that is not the installed version of something installed (left by
+/// `uninstall`, fetched and never installed, or older than an upgrade), and what an interrupted fetch or save left
+/// behind (`.partial` folders, the staging folder of `fetch ... offline`). It never touches the installed version, a
+/// `.gsp` file wherever it is - those are the operator's - the registries' trust records, or the settings. The shell
+/// lists first and asks; `delete` is sent only after the answer.
+#[inline(never)]
+pub fn cleanup(ctx: &ServiceContext, r: &mut Rows, delete: bool) {
+    let mut all = [Fetched::EMPTY; MAX_FETCHED];
+    let mut more = false;
+    let n = match fetched(ctx, &mut all, &mut more) {
+        Ok(n) => n,
+        Err(e) => return r.fail("fetched", DIR, cell(format_args!("could not be listed: {:?}", e)).as_str()),
+    };
+    let mut fs = gs::fs::Fs::new(ctx);
+    r.columns(&["package", "version", "why", "size"]);
+    let (mut count, mut total, mut failed) = (0usize, 0u64, 0usize);
+    for f in all.iter().take(n) {
+        let pkg = cell(format_args!("{}/{}", f.publisher(), f.name()));
+        let mut iv = [0u8; 24];
+        let why = match crate::install::installed_version(ctx, pkg.as_str(), &mut iv) {
+            Some(l) if &iv[..l] == f.version().as_bytes() => continue,
+            Some(l) => {
+                let have = core::str::from_utf8(&iv[..l]).unwrap_or("?");
+                if semver(f.version()) < semver(have) { cell(format_args!("older than the installed {}", have)) }
+                else { cell(format_args!("not the installed version ({})", have)) }
+            }
+            None => cell(format_args!("not installed")),
+        };
+        let mut dir = Path::new();
+        dir.push(DIR).push(f.publisher()).push("/").push(f.name()).push("/").push(f.version());
+        if delete {
+            if let Err(e) = fs.delete_all(dir.as_str()) {
+                failed += 1;
+                r.entry(&[C::S(pkg.as_str()), C::S(f.version()), C::S(cell(format_args!("NOT deleted: {:?}", e)).as_str()), C::N(f.bytes)]);
+                continue;
+            }
+        }
+        r.entry(&[C::S(pkg.as_str()), C::S(f.version()), C::S(why.as_str()), C::N(f.bytes)]);
+        count += 1;
+        total += f.bytes;
+    }
+    // What an interrupted fetch or save left: a `.partial` beside a version, and the staging folder of a save.
+    let mut leftovers = 0usize;
+    let mut pubs = [[0u8; 64]; 16];
+    let mut pl = [0usize; 16];
+    let mut np = 0usize;
+    let _ = fs.list_dir(DIR, |e| { if e.is_dir && np < 16 { pl[np] = copy_into(&mut pubs[np], e.name); np += 1; } true });
+    for i in 0..np {
+        let mut d1 = Path::new();
+        d1.push(DIR).push(Fetched::s(&pubs[i][..pl[i]]));
+        let mut names = [[0u8; 64]; 32];
+        let mut nl = [0usize; 32];
+        let mut nn = 0usize;
+        let _ = fs.list_dir(d1.as_str(), |e| { if e.is_dir && nn < 32 { nl[nn] = copy_into(&mut names[nn], e.name); nn += 1; } true });
+        for j in 0..nn {
+            let mut d2 = d1;
+            d2.push("/").push(Fetched::s(&names[j][..nl[j]]));
+            let mut parts = [[0u8; 48]; 8];
+            let mut ql = [0usize; 8];
+            let mut nq = 0usize;
+            let _ = fs.list_dir(d2.as_str(), |e| {
+                if e.is_dir && e.name.ends_with(b".partial") && nq < 8 { ql[nq] = copy_into(&mut parts[nq], e.name); nq += 1; }
+                true
+            });
+            for k in 0..nq {
+                let mut d3 = d2;
+                d3.push("/").push(Fetched::s(&parts[k][..ql[k]]));
+                if !delete || fs.delete_all(d3.as_str()).is_ok() {
+                    leftovers += 1;
+                    r.entry(&[C::S(d3.as_str()), C::S("-"), C::S("left by an interrupted fetch"), C::N(0)]);
+                }
+            }
+        }
+    }
+    if fs.exists(crate::source::STAGING).unwrap_or(false) && (!delete || fs.delete_all(crate::source::STAGING).is_ok()) {
+        leftovers += 1;
+        r.entry(&[C::S(crate::source::STAGING), C::S("-"), C::S("left by an interrupted `fetch ... offline`"), C::N(0)]);
+    }
+    if delete && failed > 0 {
+        return r.fail("cleanup", DIR, cell(format_args!("{} copy(ies) could not be deleted; the rest were", failed)).as_str());
+    }
+    if count == 0 && leftovers == 0 {
+        return r.note(format_args!("nothing to clean up: every fetched copy is the installed version. Package files (.gsp) are never touched"));
+    }
+    r.note(format_args!("{} {} fetched cop{}, {}{}{}. Package files (.gsp) are not touched",
+        if delete { "deleted" } else { "would delete" }, count, if count == 1 { "y" } else { "ies" }, size_text(total).as_str(),
+        if leftovers > 0 { cell(format_args!(", and {} leftover(s) of an interrupted fetch", leftovers)) } else { Cell::new() }.as_str(),
+        if more { "; more are fetched than one listing shows - run it again after" } else { "" }));
+}
+
 /// A bar of `width` cells, `filled` of them `#`.
 fn bar(filled: usize, width: usize) -> Cell {
     let mut c = Cell::new();
