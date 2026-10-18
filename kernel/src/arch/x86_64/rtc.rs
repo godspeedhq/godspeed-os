@@ -14,6 +14,9 @@ use portable_atomic::AtomicU64;
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
 
+/// Held for a whole clock read: the index/data port pair is one reader's at a time (`read_datetime_raw`).
+static CMOS: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
 /// The packed wall-clock datetime captured once at boot (see `read_datetime` for the layout).
 /// 0 until `capture_boot_time` runs. `uptime` reads it via InspectKernel query 12 and subtracts
 /// it from the current time - a wall-clock delta, portable across APIC timer modes (a tick
@@ -178,6 +181,16 @@ fn year_plausible(packed: u64) -> bool {
 /// no need to disable interrupts). Decodes BCD and 12-hour mode per status
 /// register B, so the returned fields are always binary and 24-hour.
 fn read_datetime_raw() -> u64 {
+    // ONE READER AT A TIME. A CMOS register is read by writing its number to 0x70 and then reading 0x71, and
+    // that pair is not atomic: two cores reading the clock at once can interleave, so one core's 0x71 returns
+    // the register the OTHER selected - a year where a minute belongs, a minute where an hour does. Every
+    // field then decodes, the double-read below can agree on the mixture, and the result is a plausible time
+    // that is wrong by seconds, hours or years. Measured in QEMU on 2026-10-18 as reads 55 s and 14 s
+    // BEHIND, and eleven years ahead, every few seconds; and a read a little AHEAD that the high-water mark
+    // accepted stands `now_epoch_monotonic` still until real time catches it, which stretches every deadline
+    // in the system that long. Read under this lock, the pair is one reader's. The callers are syscalls,
+    // the spawn path and boot - no interrupt handler reads the clock - so the lock cannot be re-entered.
+    let _cmos = CMOS.lock();
     wait_update_clear();
     let (mut sec, mut min, mut hour) = (cmos_read(0), cmos_read(2), cmos_read(4));
     let (mut day, mut month, mut year, mut century) =
