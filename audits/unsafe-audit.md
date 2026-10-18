@@ -19,7 +19,7 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/memory.rs` | 2 | permitted (§18.1 - a task's own memory, 2026-10-17 amendment) |
+| `sdk/rust/src/memory.rs` | 3 | permitted (§18.1 - a task's own memory, 2026-10-17 amendment) |
 | `sdk/rust/src/service_context.rs` | **80** | **grandfathered floor** (§18.5; +1 `exit`, 2026-10-17 amendment; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
@@ -61,7 +61,7 @@ stack. No kernel change and no new syscall: `AllocMem` (6) already maps the page
 
 | File | Lines | Why |
 |------|-------|-----|
-| `sdk/rust/src/memory.rs` | new, 2 | `Region::bytes` and `Region::bytes_mut`: one `slice::from_raw_parts` and one `from_raw_parts_mut` over exactly the pages a successful `AllocMem` mapped for this task, which only the constructor can produce. Zeroed by the kernel, so initialised; unmapped only at the task's death, so they outlive the value; the value is neither Clone nor Copy, and the mutable slice is borrowed through `&mut self`, so no two live slices alias. Not an allocator: there is no free. |
+| `sdk/rust/src/memory.rs` | new, 2 | `Region::bytes` and `Region::bytes_mut`: one `slice::from_raw_parts` and one `from_raw_parts_mut` over exactly the pages a successful `AllocMem` mapped for this task, which only the constructor can produce. Zeroed by the kernel, so initialised; unmapped only at the task's death, so they outlive the value; the value is neither Clone nor Copy, and the mutable slice is borrowed through `&mut self`, so no two live slices alias. Not an allocator: there is no free. 2026-10-18, 3: `Region::words_mut`, the same pages as `u32` for a device FIFO read a word at a time (the AIC8800's SDIO read buffer, `services/wifi-driver`): page-aligned, so aligned for u32; a whole number of pages, so `len / 4` words fit exactly; every bit pattern is a valid u32; borrowed through `&mut self` like `bytes_mut`. |
 
 ---
 

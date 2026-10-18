@@ -606,7 +606,7 @@ Five limits were stacked, each below the link:
 | limit | was | now |
 |---|---|---|
 | receive window | 8 KiB in the connection, no scaling: at most `window / round trip`, about 320 KiB/s over 25 ms | 256 KiB per connection, a region net-stack asks the kernel for once at start (`Tcp::give_buffers`), with the window-scale option (RFC 7323) negotiated on the SYN. A slot that cannot have one keeps the 8 KiB arena and says so |
-| taking frames in | one poll is one batch from the driver, two full frames at most (a message is 4 KiB), and polls ran every 100 ms, or every 10 ms while a client read | while a poll finds frames the next is owed in 1 ms (`STREAM_POLL_MS`), and a read drains the driver while frames keep coming, for up to 5 ms (`RECV_DRAIN_MS`) |
+| taking frames in | one poll is one batch from the driver, two full frames at most (a message is 4 KiB), and polls ran every 100 ms, or every 10 ms while a client read | while polls find frames they run back to back in 4 ms bursts (`STREAM_BURST_MS`) with a look for a client between that does not wait - a 1 ms interval was a scheduler tick on the VisionFive, 465 batches a second, and its 24-frame ring overflowed - and a read drains the driver while frames keep coming, for up to 5 ms (`RECV_DRAIN_MS`) |
 | one read | 2048 bytes | a whole message, 4095 bytes |
 | the TLS reader | asked for each record's 5-byte header on its own, a round trip for five bytes | reads ahead into its record buffer and keeps the rest for the next record |
 | a request's timeout | `timeout-secs` from the request's START, so a download longer than 30 s failed on a working link | measured from the last byte that moved: a stall, not a total |

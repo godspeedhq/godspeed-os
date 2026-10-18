@@ -60,4 +60,14 @@ impl Region {
         // Copy means this is the only live slice of the region.
         unsafe { core::slice::from_raw_parts_mut(self.va as *mut u8, self.len) }
     }
+
+    /// The region as 32-bit words, to write: for a device FIFO that is read a word at a time (a WiFi chip's
+    /// SDIO read buffer, larger than any stack can hold). The same memory as [`bytes`](Region::bytes), in
+    /// the machine's own byte order.
+    pub fn words_mut(&mut self) -> &mut [u32] {
+        // SAFETY: as `bytes_mut`. The base is page-aligned, so it is aligned for u32, and the length is a whole
+        // number of pages, so `len / 4` words lie exactly inside the mapping. Every bit pattern is a valid u32.
+        // `&mut self` makes this the only live view of the region.
+        unsafe { core::slice::from_raw_parts_mut(self.va as *mut u32, self.len / 4) }
+    }
 }

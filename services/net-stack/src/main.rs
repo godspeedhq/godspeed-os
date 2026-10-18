@@ -1689,17 +1689,20 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
 /// 200 ms. Ten wakes a second is also the ceiling on what this costs: each is ONE drain request to
 /// `nic-driver`, and only when nothing else woke us.
 const POLL_MS: u64 = 100;
-/// The poll interval WHILE FRAMES ARE ARRIVING: a millisecond. A download's frames queue in the driver's
-/// receive ring, and nothing takes them out but a poll. At `POLL_MS` a window of data waited up to 100 ms to
-/// be read in, which is a download paced by this service's own clock rather than by the link - a 2 KiB
-/// window refilled ten times a second was 9 KiB/s on the VisionFive over WiFi AND Ethernet, and 5.5 KiB/s
-/// in QEMU (2026-10-18). Back to `POLL_MS` as soon as a poll finds nothing, so an idle machine costs what it
-/// did.
-const STREAM_POLL_MS: u64 = 1;
+/// WHILE FRAMES ARE ARRIVING there is no poll interval at all: a download's frames queue in the driver's
+/// receive ring, and nothing takes them out but a poll. At `POLL_MS` a window of data waited up to 100 ms to be
+/// read in - a 2 KiB window refilled ten times a second was 9 KiB/s on the VisionFive over WiFi AND Ethernet,
+/// and 5.5 KiB/s in QEMU (2026-10-18) - and a 1 ms interval was no better on a board, where any wait is a
+/// scheduler tick. So while polls find frames they run back to back in bursts (`STREAM_BURST_MS`), with a look
+/// for a client between bursts that does not wait. Back to `POLL_MS` as soon as a poll finds nothing, so an
+/// idle machine costs what it did.
 /// How long a READ may spend taking in what the driver already holds before it answers. A reader waiting
 /// on a connection is when the bytes are owed soonest, so it drains the driver while frames keep coming,
 /// up to this: bounded, so one connection's reader cannot keep the service from its other clients.
 const RECV_DRAIN_MS: u64 = 5;
+/// How long one burst of taking frames may run before a client is looked for. Short, so a request waits no
+/// more than this; long enough that the burst, not the gaps between, is what the time is spent on.
+const STREAM_BURST_MS: u64 = 4;
 /// How long a connect waits for a closing connection's slot when the table is full (`OP_CONNECT`). TIME_WAIT
 /// here is 2 s, and a FIN exchange is a round trip or two, so 4 s covers both; a client asking for a
 /// connection waits 20 s for its answer.
@@ -2865,7 +2868,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     /// When the last poll step ran. The poll is owed every `POLL_MS`, and this is what makes that a
     /// schedule rather than a hope - see the loop below.
     let mut last_poll: u64 = 0;
-    /// Whether the last poll found frames: while it does, the poll is owed every `STREAM_POLL_MS`.
+    /// Whether the last poll found frames: while it does, polls run back to back (`STREAM_BURST_MS`).
     let mut streaming = false;
     // When this service last reached the top of its wait. See `SLOW_PASS_MS`.
     let mut last_pass: u64 = 0;
@@ -3124,8 +3127,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Any work owed on a schedule has to be driven by the schedule. Gating it on the
                     // service being idle means the busier it gets, the less it keeps its promises -
                     // which is exactly backwards.
-                    let interval = if streaming { STREAM_POLL_MS } else { POLL_MS };
-                    if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= ticks_ms(&ctx, interval) {
+                    let interval = if streaming { 0 } else { ticks_ms(&ctx, POLL_MS) };
+                    if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= interval {
                         last_poll = gs::driver::wait::ticks(&ctx);
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
                                             dns_server, status };
@@ -3135,6 +3138,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
                         streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks)
                             && tcpst.conns.iter().any(|c| c.state == tcp::State::Established);
+                        // WHILE FRAMES ARE ARRIVING, KEEP TAKING THEM, for up to STREAM_BURST_MS: one poll is one
+                        // batch, two full frames at most, and a wait between batches is a scheduler tick on a
+                        // board however short it is asked to be. Paced by the tick, the VisionFive took 465
+                        // batches a second - 1.3 MB/s at most - while a gigabit sender filled its 24-frame ring
+                        // and lost the rest (`RBU`, 2026-10-18). A displaced client request ends the burst.
+                        let burst = gs::driver::wait::ticks(&ctx);
+                        while streaming && !pending.has_work()
+                            && gs::driver::wait::ticks(&ctx).wrapping_sub(burst) < ticks_ms(&ctx, STREAM_BURST_MS)
+                        {
+                            last_poll = gs::driver::wait::ticks(&ctx);
+                            streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                        }
                     }
                     // AND THE ASK DEADLINES, HERE AS WELL AS AT THE TOP. This wait goes round without
                     // returning to the top of the serve loop for as long as no message arrives, so a
@@ -3142,7 +3157,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // in QEMU, an NTP query nobody answered got its "no reply" eight seconds late, after
                     // `time` had already given up on it (2026-10-02).
                     asks.expire(&ctx);
-                    if let Some(m) = gs::ipc::recv_within_ms(&ctx, if streaming { STREAM_POLL_MS } else { POLL_MS }) { break m; }
+                    // Streaming, a client is looked for WITHOUT waiting and the burst goes on: a wait of any
+                    // length here is a tick, and a tick is frames lost.
+                    if streaming {
+                        if let Some(m) = gs::ipc::try_recv(&ctx) { break m; }
+                        if pending.has_work() { continue 'serve; }
+                        continue;
+                    }
+                    if let Some(m) = gs::ipc::recv_within_ms(&ctx, POLL_MS) { break m; }
                     // ---- DO NOT SLEEP ON WORK WE ALREADY HAVE ----
                     //
                     // The poll step just ran, and `nic_req`'s sifting displaces any client request
