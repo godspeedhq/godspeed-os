@@ -153,6 +153,9 @@ const DNS_REPLY_MARGIN_SECS: i64 = 2;
 /// This is the same ordering `backlog/28` established for the stash budgets
 /// (`POLL_BUDGET_MS < HOLD_MS < shortest client deadline`) - DNS was simply never brought into it.
 const DNS_BUDGET_SECS: i64 = 4;
+/// How long a DNS query goes unanswered before it is asked again, within the same budget (`dns_resolve`).
+/// A resolver answers in tens of milliseconds; a second's silence is a lost datagram, not a slow server.
+const DNS_RESEND_MS: u64 = 1000;
 const _: () = assert!(DNS_BUDGET_SECS < CLIENT_MIN_DEADLINE_SECS,
     "net-stack must answer a DNS request - even to say it failed - BEFORE its client stops waiting, \
      or every late answer desyncs the reply stream");
@@ -616,8 +619,10 @@ impl Displaced {
     ///
     /// Entries are expired from the FRONT only, which is sound because they were kept in arrival
     /// order: once the head is young enough, so is everything behind it.
+    /// The fourth value is how long the request was held, in milliseconds: its client has been waiting that
+    /// long already, and a reply that takes its whole patience on top arrives after it has given up.
     fn take(&mut self, ctx: &ServiceContext, out: &mut [u8; HELD_BYTES])
-            -> Option<(usize, Option<(u64, u8)>, Cap)> {
+            -> Option<(usize, Option<(u64, u8)>, Cap, u64)> {
         let now = gs::driver::wait::ticks(ctx);
         while self.live > 0 {
             let h = match self.held[self.head].take() { Some(h) => h, None => return None };
@@ -652,7 +657,7 @@ impl Displaced {
                     "net-stack: serving a held client request (op {}) after {} ms in the stash",
                     h.body.get(2).copied().unwrap_or(0), age_ms));
             }
-            return Some((h.len, h.badge, h.reply));
+            return Some((h.len, h.badge, h.reply, age_ms));
         }
         None
     }
@@ -1190,14 +1195,24 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
     // only way to get it - and a send that fails is reported rather than discarded, which is what a
     // caller waiting on a reply needs to know.
     if nic_req(ctx, pending, &req, LINK_SECS).is_none() { *timeouts += 1; }
+    // ASKED AGAIN, NOT WAITED OUT. One query and nothing but listening meant one lost datagram - QEMU's DNS
+    // forwarder, a WiFi retry that gave up - cost this server its whole share of the client's patience, and
+    // every request held behind it waited too: four package commands in a row failed that way. A resolver
+    // re-asks; so does this, every `DNS_RESEND_MS`, within the same deadline. The same transaction id and
+    // port, so a reply to either copy matches, and a second reply is a stray frame like any other. (A resend
+    // used to drain the reply it should have caught, when the driver tied a receive to every send; it no
+    // longer does - see below.)
+    let mut last_sent = gs::driver::wait::ticks(ctx);
+    let mut asked = 1u32;
     let mut reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     // BOUNDED BY THE CLOCK (the note above `UDP_BUDGET_MS`). `LINK_SECS` rather than `DANCE_SECS` per
     // poll so one silent poll cannot eat half the budget on its own.
     loop {
         if deadline.expired() {
             ctx.log_fmt(format_args!(
-                "net-stack: DNS gave up after {} ms - answering the client rather than letting it time out \
-                 (a late answer would desync its reply stream)", budget_ms));
+                "net-stack: DNS gave up after {} ms and {} queries to {}.{}.{}.{} - answering the client rather than \
+                 letting it time out (a late answer would desync its reply stream)", budget_ms, asked,
+                dns_server[0], dns_server[1], dns_server[2], dns_server[3]));
             return None;
         }
         let (matched, answer_arp) = {
@@ -1272,6 +1287,11 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
         // pacing for the same reason - a poll is a question, and asking it twelve times in a row does
         // not make the answer arrive sooner.
         deadline.pause();
+        if gs::driver::wait::ticks(ctx).wrapping_sub(last_sent) >= ticks_ms(ctx, DNS_RESEND_MS) {
+            if nic_req(ctx, pending, &req, LINK_SECS).is_none() { *timeouts += 1; }
+            last_sent = gs::driver::wait::ticks(ctx);
+            asked += 1;
+        }
         reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     }
 }
@@ -2975,8 +2995,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // driver conversation and is arriving LATE; one from the queue arrived directly. When a
         // client says it got no answer, that difference is the first thing worth knowing.
         let mut from_stash = true;
+        // How long this request waited in the stash before being served: spent from its client's patience.
+        let mut held_ms = 0u64;
         let (pl_raw, badge, reply_cap) = match pending.take(&ctx, &mut heldbuf) {
-            Some((len, badge, reply)) => (&heldbuf[..len], badge, reply),
+            Some((len, badge, reply, age)) => { held_ms = age; (&heldbuf[..len], badge, reply) }
             None => {
                 // WAIT FOR A CLIENT, BUT NOT FOREVER - answer for ourselves in the gaps.
                 //
@@ -3788,8 +3810,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let header_patience = if pl_raw.len() == pl.len() + 2 { pl_raw.get(1).copied() } else { None };
                 let patience = header_patience.filter(|p| *p > 0)
                                  .map(|p| p as i64).unwrap_or(CLIENT_MIN_DEADLINE_SECS);
-                let usable = (patience - DNS_REPLY_MARGIN_SECS).max(1);
-                let per_server_ms = ((usable * 1000) / 2).max(500) as u64;
+                // What is LEFT of it: a request held in the stash has spent that much already, and a lookup
+                // given the whole of it again answered a client that had stopped waiting (2026-10-18: three
+                // held 1 to 3 s, each then given 8 s, each answered after its client said `OutcomeUnknown`).
+                let usable_ms = ((patience - DNS_REPLY_MARGIN_SECS) * 1000 - held_ms as i64).max(1000);
+                let per_server_ms = (usable_ms / 2).max(500) as u64;
                 for server in [dns_server, [8, 8, 8, 8]] {
                     let mut got = false;
                     ip = dns_resolve(&ctx, pending, per_server_ms, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,

@@ -847,8 +847,13 @@ struct CacheEntry {
 }
 
 impl CacheEntry {
+    /// ALL ZEROS, and that is load-bearing: an empty entry is one with no name (`name_len == 0`), so the
+    /// whole table is zero and lives in `.bss`, which costs a program's image nothing. It used to mark empty
+    /// with `slot: u32::MAX`, which put the table in `.data` - stored in every program's file - and when names
+    /// grew to 128 bytes that was 4 KiB more in each of the forty-odd services the Pi 2's kernel embeds, and
+    /// pushed that kernel past the context page it must end below.
     const fn empty() -> Self {
-        CacheEntry { slot: u32::MAX, name_len: 0, name: [0u8; NAME_MAX] }
+        CacheEntry { slot: 0, name_len: 0, name: [0u8; NAME_MAX] }
     }
 }
 
@@ -1306,14 +1311,14 @@ impl ServiceContext {
             let cache = &mut *core::ptr::addr_of_mut!(SEND_CAP_CACHE);
             for entry in cache.iter_mut() {
                 if entry.name_len as usize == len && &entry.name[..len] == bytes {
-                    if entry.slot != u32::MAX && entry.slot != new_slot { stale = Some(entry.slot); }
+                    if entry.slot != new_slot { stale = Some(entry.slot); }
                     entry.slot = new_slot;
                     placed = true;
                     break;
                 }
             }
             if !placed {
-                let free = cache.iter().position(|e| e.slot == u32::MAX);
+                let free = cache.iter().position(|e| e.name_len == 0);
                 let i = match free {
                     Some(i) => i,
                     None => {
@@ -4507,7 +4512,7 @@ impl ServiceContext {
         // SAFETY: single-threaded service process.
         unsafe {
             for entry in SEND_CAP_CACHE.iter() {
-                if entry.slot != u32::MAX
+                if entry.name_len != 0
                     && entry.name_len as usize == len
                     && &entry.name[..len] == bytes
                 {
