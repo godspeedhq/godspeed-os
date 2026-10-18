@@ -15,4 +15,4 @@ godspeed-tls = { path = "../../sdk/tls" }
 # The package contract the developer CLI publishes against: its trust metadata, signatures, digests and
 # artifact checks, no_std and heapless (`docs/developer-services-design.md` 10.6, option 1: a git dependency
 # on a tagged release of the CLI repository, the smallest of the three; the choice is recorded there).
-godspeed-package = { git = "https://github.com/godspeedhq/godspeed-cli", rev = "e6ea1666566c28f0567dcc98ea77416a63ee91be", default-features = false }
+godspeed-package = { git = "https://github.com/godspeedhq/godspeed-cli", rev = "9c3d4502beb024ce7599dca0d482b73735f029ec", default-features = false }

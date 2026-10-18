@@ -11818,3 +11818,188 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
     child.kill().ok();
     child.wait().ok();
 }
+
+/// `osdev test gsp`: a package carried as ONE FILE (`docs/developer-services-design.md` 15). Boot 1 is online: a
+/// fetch saves the release as a `.gsp`, the machine forgets the registry, and the file installs as on a machine
+/// that was never online. Boot 2 is the same disk with NO network and the clock 60 days on: the file is checked
+/// offline, its age is asked about, `yes` does not answer that, and `accept-old` does.
+pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("gsp: PASS - {}", $label); pass += 1; }
+        else { println!("gsp: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let mut transcript: Vec<u8> = Vec::new();
+
+    for boot in 1..=2 {
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-cpu",     "qemu64,+rdrand",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]);
+        if boot == 1 {
+            cmd.args(["-device", "e1000,netdev=n0", "-netdev", "user,id=n0"]);
+        } else {
+            // No network at all, and the clock 60 days past the file's day.
+            let later = std::time::SystemTime::now() + Duration::from_secs(60 * 86_400);
+            let secs = later.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let (days, rem) = (secs / 86_400, secs % 86_400);
+            let z = days as i64 + 719_468;
+            let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + i64::from(month <= 2);
+            cmd.args(["-nic", "none", "-rtc",
+                &format!("base={year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60)]);
+        }
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("gsp: QEMU launch failed: {e}"); std::process::exit(1); } };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+            Some(s) => s,
+            None => { child.kill().ok(); eprintln!("gsp: no shell serial"); std::process::exit(1); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+            child.kill().ok(); eprintln!("gsp: never reached a prompt"); std::process::exit(1);
+        }
+        macro_rules! run { ($c:expr, $secs:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+        }}; }
+
+        if boot == 1 {
+            let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+            // The disk is not flashed here: osdev formatted it and put the unpublished file on it.
+            let _ = run!(b"godspeed config\r", 60);
+            // MADE ON THE MACHINE: a fetch that keeps every document it read, as one file.
+            let saved = run!(b"godspeed fetch godspeed/hello-utility offline\r", 300);
+            check!(saved.contains("saved") && saved.contains("/users/default/hello-utility-0.2.0.gsp") && saved.contains("installs it with no network"),
+                   "`godspeed fetch ... offline` writes the verified release as one file, named from it, in this folder");
+            let listed = run!(b"dir /users/default\r", 30);
+            check!(listed.contains("hello-utility-0.2.0.gsp"), "the file is on the disk");
+            // The fetched copy the save left goes: what is checked next must come from the file or the registry.
+            let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
+            // INSPECTED, the file and the registry's copy alike: every check, nothing kept.
+            let insp = run!(b"godspeed inspect hello-utility-0.2.0.gsp\r", 300);
+            check!(insp.contains("inspected from a package file") && insp.contains("nothing was kept, nothing installed")
+                       && insp.contains("offline, as of"),
+                   "`godspeed inspect <file>.gsp` checks the file through the whole chain and keeps nothing");
+            let reg = run!(b"godspeed inspect godspeed/hello-utility\r", 300);
+            check!(reg.contains("inspected from default") && reg.contains("verified against the registry"),
+                   "`godspeed inspect <publisher/name>` checks the registry's release the same way, and keeps nothing");
+            let still = run!(b"godspeed list fetched\r", 60);
+            check!(!still.contains("hello-utility"), "inspecting kept nothing: it is not fetched");
+            // A MACHINE THAT HAS NEVER BEEN ONLINE: no fetched copy, no record of the registry.
+            let _ = run!(b"godspeed trust reset default yes\r", 60);
+            let inst = run!(b"godspeed install hello-utility-0.2.0.gsp yes\r", 300);
+            check!(inst.contains("unpacked from a package file") && inst.contains("offline, as of"),
+                   "installing the file checks it offline and unpacks it, saying as of when");
+            check!(inst.contains("asks for nothing") && inst.contains("a utility: type `hello-utility"),
+                   "then it installs as any fetched package, with the same question");
+            let ran = run!(b"hello-utility Ada\r", 60);
+            check!(ran.contains("hello, Ada"), "and it runs");
+            // NOT A PACKAGE FILE: refused, with no question.
+            let _ = run!(b"write /users/default/bad.gsp hello\r", 30);
+            let bad = run!(b"godspeed install bad.gsp yes\r", 60);
+            check!(bad.contains("not a Godspeed package file") && !bad.contains("[y/N]"),
+                   "a file that is not a package file is refused by name, with no question");
+
+            // UNPUBLISHED (`godspeed package --local`): no registry vouches for it, so only a key the operator trusts.
+            const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+            let refused = run!(b"godspeed install /hello-utility-0.9.0.gsp yes\r", 120);
+            check!(refused.contains("which this machine's operator does not trust for godspeed/")
+                       && refused.contains("godspeed trust add godspeed") && !refused.contains("installed godspeed/hello-utility 0.9.0"),
+                   "an unpublished file is refused until the operator trusts its key, and the refusal says how");
+            send(&mut write_half, format!("godspeed trust add godspeed {KEY}\r").as_bytes());
+            let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20)).unwrap_or_default();
+            check!(asked.contains("with no registry vouching for it") && asked.contains("only `godspeed trust remove` ends it"),
+                   "`godspeed trust add` asks first, saying what trusting a key directly means");
+            let added = run!(b"y\r", 60);
+            check!(added.contains("trusted by this machine's operator"), "answered yes, the key is trusted");
+            let shown = run!(b"godspeed trust\r", 60);
+            check!(shown.contains("operator") && shown.contains(KEY), "`godspeed trust` lists the operator's key apart from the registries'");
+            let looked = run!(b"godspeed inspect /hello-utility-0.9.0.gsp\r", 120);
+            check!(looked.contains("inspected from an UNPUBLISHED package file") && looked.contains("OPERATOR trusts"),
+                   "`godspeed inspect` checks the unpublished file and says who vouches for it");
+            let local = run!(b"godspeed install /hello-utility-0.9.0.gsp yes\r", 180);
+            check!(local.contains("unpacked from an UNPUBLISHED package file") && local.contains("a utility: type `hello-utility"),
+                   "with its key trusted, the unpublished file installs as any package, with the same question");
+            check!(local.contains("unpacking godspeed/hello-utility 0.9.0") && !local.contains("downloading godspeed/hello-utility 0.9.0"),
+                   "and its progress says it is unpacking the file, not downloading");
+            let ran_local = run!(b"hello-utility Bo\r", 60);
+            check!(ran_local.contains("hello, Bo"), "and it runs");
+            let listed_local = run!(b"godspeed list fetched\r", 60);
+            check!(listed_local.contains("(operator)"), "`godspeed list fetched` says it came from the operator, not a registry");
+            let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
+            check!(removed.contains("no longer trusted"), "`godspeed trust remove` withdraws the key");
+            let stopped = run!(b"hello-utility Cy\r", 60);
+            check!(!stopped.contains("hello, Cy") && stopped.contains("hello-utility: not run - its signing key is not one this machine's operator trusts"),
+                   "and the supervisor's check at the next start refuses what it signed, saying why on the shell's own line");
+            let _ = run!(b"godspeed uninstall godspeed/hello-utility yes\r", 60);
+            let _ = run!(b"godspeed remove godspeed/hello-utility@0.9.0\r", 60);
+            let _ = run!(b"godspeed uninstall godspeed/hello-utility yes\r", 60);
+            let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
+        } else {
+            // `net` FIRST, ON PURPOSE: with no link, net-stack holds the shell's requests and answers every one of them
+            // after the shell has moved on. Those late answers used to land on the endpoint the next command's
+            // answer arrives on, and the `inspect` below then read as "not a record stream" (found here,
+            // 2026-10-18). The shell's requests now go through its reply mailbox; this is the test that they do.
+            let netless = run!(b"net\r", 30);
+            check!(netless.contains("link     down"), "`net` answers with no network");
+            let old_insp = run!(b"godspeed inspect hello-utility-0.2.0.gsp\r", 300);
+            check!(old_insp.contains("installing it would ask"), "inspecting an old file says installing it would ask");
+            check!(!old_insp.contains("does not read as an answer"), "and `net`'s late answers did not become this command's");
+            // OLD: asked, and `yes` does not answer it.
+            send(&mut write_half, b"godspeed install hello-utility-0.2.0.gsp yes\r");
+            let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(300)).unwrap_or_default();
+            check!(asked.contains("its registry check ran out on") && asked.contains("days ago") && asked.contains("Install it anyway?"),
+                   "a file older than offline-max-age-days asks, saying how old its check is");
+            check!(asked.contains("`yes` on the line does not answer the question below"), "and `yes` on the line does not answer it");
+            let no = run!(b"n\r", 60);
+            check!(no.contains("not installed - nothing of it was kept"), "answering no keeps nothing");
+            let none = run!(b"godspeed list fetched\r", 60);
+            check!(!none.contains("hello-utility"), "and nothing was unpacked");
+            // `accept-old` answers it.
+            let ok = run!(b"godspeed install hello-utility-0.2.0.gsp yes accept-old\r", 300);
+            check!(ok.contains("accepted although old") && ok.contains("a utility: type `hello-utility"),
+                   "`accept-old` accepts it, the card says so, and it installs with no network");
+            let ran = run!(b"hello-utility offline\r", 60);
+            check!(ran.contains("hello, offline"), "and it runs");
+            let origin = run!(b"read /system/packages/godspeed/hello-utility/0.2.0/origin\r", 30);
+            check!(origin.contains("from-file /users/default/hello-utility-0.2.0.gsp") && origin.contains("accepted although old"),
+                   "its origin records the file and the acceptance");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        transcript.extend_from_slice(format!("\n===== boot {boot} =====\n").as_bytes());
+        transcript.extend_from_slice(&buf.lock().unwrap());
+    }
+    let _ = std::fs::write("build/tests/gsp_serial.log", &transcript);
+    println!("\ngsp: {pass} passed, {fail} failed (serial: build/tests/gsp_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}

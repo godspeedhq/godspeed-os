@@ -34,12 +34,14 @@
 mod chain;
 mod check;
 mod install;
+mod keys;
 mod config;
 mod default_root;
 mod http;
 mod https;
 mod meta;
 mod packages;
+mod source;
 mod toml_lines;
 
 use core::fmt::Write as _;
@@ -102,7 +104,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         },
         (Some("search"), _) => r.fail("usage", "godspeed search <word>", "a word is needed; `godspeed list available` lists everything"),
         (Some("info"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::info(&ctx, r, ready, roots, name)),
-        (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name)),
+        (Some("fetch"), Some(name)) if words.clone().next().is_none() => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name, None)),
+        (Some("fetch"), Some(name)) => match (words.next(), words.next(), words.next()) {
+            (Some("save"), Some(file), None) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::fetch(&ctx, r, ready, roots, name, Some(file))),
+            _ => r.fail("usage", "godspeed fetch <publisher/name>[@version] [offline]", "`offline` writes it as one file too, for a machine with no network"),
+        },
         (Some("list"), Some("available")) => match page_from(&mut words) {
             Ok(from) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, None, from)),
             Err(()) => r.fail("usage", "godspeed list available [from <n>]", "`from` and a number: where the page starts"),
@@ -117,6 +123,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         (Some("list"), _) => r.fail("usage", "godspeed list available | fetched | installed | updates | versions <publisher/name>", "say which"),
         (Some("verify"), which) if words.clone().next().is_none() => packages::verify(&ctx, &mut r, which),
         (Some("trust"), None) => trust_show(&ctx, &mut r),
+        // The operator's own keys, for unpublished package files (`keys.rs`). The shell asks before `add`.
+        (Some("trust"), Some(verb @ ("add" | "remove"))) => match (words.next(), words.next(), words.next()) {
+            (Some(p), Some(k), None) if verb == "add" => keys::add(&ctx, &mut r, p, k),
+            (Some(p), Some(k), None) => keys::remove(&ctx, &mut r, p, k),
+            _ => r.fail("usage", "godspeed trust add | remove <publisher> <key>", "a publisher and the key, as `godspeed key show` prints it"),
+        },
         (Some("trust"), Some("reset")) => match (words.next(), words.next()) {
             (Some(name), None) => trust_reset(&ctx, &mut r, name),
             _ => r.fail("usage", "godspeed trust reset <registry>", "one registry, by the name `godspeed registry` lists"),
@@ -129,6 +141,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             _ => r.fail("usage", "godspeed install <publisher/name>[@version] [grant <peer>,... | grant none]",
                         "the shell asks about each peer the contract requests"),
         },
+        // A PACKAGE FILE: `unpack` is the shell's first step of `godspeed install <file>.gsp`, which then installs
+        // what it unpacked as any fetched package (`docs/developer-services-design.md` 15).
+        // A FILE, or a release on the registry: checked as installing would check it, and nothing kept.
+        (Some("inspect"), Some(file)) if words.clone().next().is_none() && file.ends_with(".gsp") => unpack(&ctx, &mut r, file, false, true),
+        (Some("inspect"), Some(name)) if words.clone().next().is_none() =>
+            with_ready(&ctx, &mut r, None, |ready, roots, r| packages::inspect(&ctx, r, ready, roots, name)),
+        (Some("inspect"), _) => r.fail("usage", "godspeed inspect <publisher/name>[@version] | <file>.gsp",
+                                       "a release on the registry, or a package file"),
+        (Some("unpack"), Some(file)) => match (words.next(), words.next()) {
+            (None, _) => unpack(&ctx, &mut r, file, false, false),
+            (Some("accept-old"), None) => unpack(&ctx, &mut r, file, true, false),
+            _ => r.fail("usage", "godspeed install <file>.gsp [yes] [accept-old]", "a package file, as the CLI writes one"),
+        },
         (Some("install"), None) => r.fail("usage", "godspeed install <publisher/name>[@version]", "a fetched package to install"),
         (Some("uninstall"), Some(name)) if words.clone().next().is_none() => install::uninstall(&ctx, &mut r, name),
         (Some("uninstall"), _) => r.fail("usage", "godspeed uninstall <publisher/name>", "one installed package"),
@@ -138,6 +163,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     r.send(&ctx);
     // DONE. The shell ends this program once it has the end-of-stream byte.
     gs::ipc::park(&ctx);
+}
+
+/// `unpack <file>`: the settings it needs, and the clock if it is set. Unlike every registry command, a package file
+/// is checked with the clock unset - its chain is checked as of its own date - and then only installs if accepted.
+#[inline(never)]
+fn unpack(ctx: &ServiceContext, r: &mut Rows, file: &str, accept_old: bool, inspect: bool) {
+    let mut buf = [0u8; config::FILE_MAX];
+    let n = match load(ctx, r, &mut buf) {
+        Ok(n) => n,
+        Err(why) => return r.fail("config", "unreadable", why.as_str()),
+    };
+    let c = config::parse(Some(&buf[..n]));
+    if let Some(p) = c.problem {
+        return r.fail("config", config::PATH, problem_text(&p).as_str());
+    }
+    let clock = match gs::task::wall_clock(ctx) {
+        Some((now, _)) if now > 0 => Some(now as u64),
+        _ => None,
+    };
+    let max_bytes = config::number_of(c.get("max-package-mib")) as u64 * 1024 * 1024;
+    let max_age = config::number_of(c.get("offline-max-age-days")) as u64;
+    packages::unpack(ctx, r, &c.in_use(), max_bytes, clock, max_age, file, accept_old, inspect);
 }
 
 /// `[from <n>]` at the end of a listing: where its page starts. Nothing is 0; anything else is a usage error.
@@ -344,7 +391,7 @@ fn config_show(ctx: &ServiceContext, key: Option<&str>, r: &mut Rows) {
             return r.fail(k, "not a plain setting", "registries are `godspeed registry`: the list, and the one in use");
         }
         let Some(i) = config::KEYS.iter().position(|x| x.name == k) else {
-            return r.fail(k, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib");
+            return r.fail(k, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib, offline-max-age-days");
         };
         let (v, src) = c.values[i];
         r.row(k, v, src.word());
@@ -366,7 +413,7 @@ fn config_set(ctx: &ServiceContext, key: &str, value: &str, r: &mut Rows) {
         return r.fail(key, "not set here", "registries are `godspeed registry add`, `use` and `remove`");
     }
     if !config::KEYS.iter().any(|k| k.name == key) {
-        return r.fail(key, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib");
+        return r.fail(key, "not a setting", "the settings are tls-roots, timeout-secs, max-package-mib, offline-max-age-days");
     }
     if let Err(why) = config::check(key, value) {
         return r.fail(key, value, why);
@@ -699,6 +746,11 @@ fn list_updates(ctx: &ServiceContext, r: &mut Rows) {
         if done[i] { continue; }
         let reg_name = cell(format_args!("{}", all[i].registry()));
         for j in i..n { if all[j].registry() == reg_name.as_str() { done[j] = true; } }
+        // Trusted by the operator, from a file: no registry has a newer one to offer.
+        if reg_name.as_str() == check::OPERATOR {
+            r.note(format_args!("an unpublished package trusted by the operator is updated by installing a newer file"));
+            continue;
+        }
         with_ready(ctx, r, Some(reg_name.as_str()), |ready, roots, r| packages::updates(ctx, r, ready, roots, &all[..n]));
     }
 }
@@ -716,6 +768,7 @@ fn trust_show(ctx: &ServiceContext, r: &mut Rows) {
         return r.fail("problem", config::PATH, problem_text(&p).as_str());
     }
     chain::show(ctx, r, c.registries(), c.in_use().name);
+    keys::show(ctx, r);
 }
 
 /// `godspeed trust reset <registry>`. The shell asked `[y/N]` first.

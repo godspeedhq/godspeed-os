@@ -202,6 +202,13 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                         Ok(()) => true,
                         Err(why) => {
                             ctx.log_fmt(format_args!("supervisor: installed {} NOT run: {}", name, why.as_str()));
+                            // The reason goes back too, so the person who typed the command reads it on their
+                            // screen and not only on a serial line they may not have.
+                            let w = why.as_str().as_bytes();
+                            let len = w.len().min(body.len() - 1);
+                            body[0] = supcmd::FAILED;
+                            body[1..1 + len].copy_from_slice(&w[..len]);
+                            body_len = 1 + len;
                             false
                         }
                     }

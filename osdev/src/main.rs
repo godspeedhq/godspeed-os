@@ -1747,6 +1747,7 @@ fn cmd_test(suite: &str) {
         "fs-reuse"       => run_fs_reuse_test(),
         "jobs"           => run_jobs_test(),
         "godspeed"       => run_godspeed_test(),
+        "gsp"            => run_gsp_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
         "cross-isa"      => run_cross_isa_test(),
@@ -3964,6 +3965,28 @@ fn run_godspeed_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
     format_superblock(persist);
     crate::shell_test::run_godspeed(&image_path, persist, 2);
+}
+
+/// `osdev test gsp`: a package carried as one `.gsp` file, made on the machine and installed with no network.
+fn run_gsp_test() {
+    println!("
+=== gsp: a package as one file, installed offline ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_gsp.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    // An UNPUBLISHED package file, signed by a throwaway test key (`osdev/fixtures/README.md`): the machine cannot
+    // fetch one, so it is on the disk from the start, at the root, and the tree `fs` lays down goes beside it.
+    let fixture = std::fs::read("osdev/fixtures/hello-utility-0.9.0.gsp").expect("osdev/fixtures/hello-utility-0.9.0.gsp");
+    gsfs_add_file(persist, "hello-utility-0.9.0.gsp", &fixture);
+    gsfs_layout(persist);
+    crate::shell_test::run_gsp(&image_path, persist, 2);
 }
 
 fn run_jobs_test() {

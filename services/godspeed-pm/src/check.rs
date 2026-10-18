@@ -23,11 +23,34 @@ use crate::toml_lines::{lines, strings, Line, Val};
 pub const DIR: &str = "/system/packages/";
 /// Where each registry's trust record is kept: `<TRUST><registry>/`.
 pub const TRUST: &str = "/system/services/godspeed/trust/";
+/// The keys this machine's OPERATOR trusts directly, for an unpublished package file: `<publisher> <key>` a line.
+/// Apart from every registry's record, so neither can stand in for the other (`docs/developer-services-design.md`
+/// 15.6). Outside `TRUST`, whose names are registries'.
+pub const OPERATOR_KEYS: &str = "/system/services/godspeed/keys";
+/// The largest that file is read.
+pub const OPERATOR_KEYS_MAX: usize = 4 * 1024;
+/// The name an operator-trusted copy is listed as coming from: not a name a registry can have.
+pub const OPERATOR: &str = "(operator)";
+
+/// Does this machine's operator trust `key` (as `ed25519:<hex>`) for `publisher`? Only a line naming both does.
+pub fn operator_trusts(fs: &mut gs::fs::Fs<'_>, publisher: &str, key: &str) -> Result<bool, gs::Error> {
+    let mut buf = [0u8; OPERATOR_KEYS_MAX];
+    let n = match fs.read_into(OPERATOR_KEYS, &mut buf) {
+        Ok(n) => n,
+        Err(gs::Error::NotFound) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    Ok(text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).any(|l| {
+        let mut w = l.split_whitespace();
+        w.next() == Some(publisher) && w.next() == Some(key) && w.next().is_none()
+    }))
+}
 
 pub const MANIFEST_MAX: usize = 4 * 1024;
 pub const MSIG_MAX: usize = 1024;
 pub const CONTRACT_MAX: usize = 4 * 1024;
-pub const ORIGIN_MAX: usize = 512;
+pub const ORIGIN_MAX: usize = 1024;
 pub const NAMESPACES_MAX: usize = 8 * 1024;
 /// The most send peers a contract may request and still be installed.
 pub const MAX_PEERS: usize = 8;
@@ -197,13 +220,24 @@ pub fn package(ctx: &ServiceContext, publisher: &str, name: &str, version: &str,
     if field("signed-by ") != key.as_str() {
         return Err(text(format_args!("signed by another key than the one recorded when it was fetched")));
     }
+    // TRUSTED BY THE OPERATOR, not by a registry: the key must still be on this machine's list for this publisher,
+    // so removing it there stops the package at its next start.
+    if field("trusted ") == "operator" {
+        match operator_trusts(&mut fs, publisher, key.as_str()) {
+            Ok(true) => {}
+            Ok(false) => return Err(text(format_args!(
+                "its signing key is not one this machine's operator trusts for {} - an unpublished package needs `godspeed trust add`",
+                publisher))),
+            Err(e) => return Err(text(format_args!("the operator's trusted keys could not be read: {:?}", e))),
+        }
+    }
     let registry = field("registry ").split(' ').next().unwrap_or("");
-    if registry.is_empty() || registry.contains('/') || registry.contains("..") {
+    if field("trusted ") != "operator" && (registry.is_empty() || registry.contains('/') || registry.contains("..")) {
         return Err(text(format_args!("origin names no registry it came from")));
     }
 
     // The key's standing in this machine's trust record for that registry.
-    {
+    if field("trusted ") != "operator" {
         let mut ns = [0u8; NAMESPACES_MAX];
         let mut p = Text { b: [0; 160], n: 0 };
         let _ = core::fmt::Write::write_fmt(&mut p, format_args!("{}{}/namespaces.toml", TRUST, registry));

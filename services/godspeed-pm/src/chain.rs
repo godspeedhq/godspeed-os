@@ -18,7 +18,8 @@ use godspeed_package::trust::{self, IndexLines, Namespaces, Role, Root, Snapshot
 use godspeed_package::{Sha256Digest, Sha256Stream};
 
 use crate::config::Registry;
-use crate::https::{Fail, Session};
+use crate::https::Fail;
+use crate::source::Source;
 
 /// The largest of each document HELD. Measured on the registry, 2026-10-17: root 1 is 1.1 KiB and grows only
 /// with keys; a signature file is about 200 bytes a signature. They live on the stack, which is 256 KiB for every
@@ -94,7 +95,7 @@ impl Path {
 
 /// GET `base + rel` into `buf`. `Ok(None)` for a 404, `Ok(Some(len))` for a 200; anything else, or a body
 /// larger than `buf`, is a [`Why`].
-pub fn doc(s: &mut Session<'_, '_, '_, '_>, base: &str, rel: &str, buf: &mut [u8], what: &'static str)
+pub fn doc(s: &mut dyn Source, base: &str, rel: &str, buf: &mut [u8], what: &'static str)
     -> Result<Option<usize>, Why> {
     let mut path = Path::new();
     path.push(base).push(rel);
@@ -122,7 +123,7 @@ pub fn doc(s: &mut Session<'_, '_, '_, '_>, base: &str, rel: &str, buf: &mut [u8
 }
 
 /// [`doc`], where a 404 is as much a failure as any other status.
-pub fn required(s: &mut Session<'_, '_, '_, '_>, base: &str, rel: &str, buf: &mut [u8], what: &'static str)
+pub fn required(s: &mut dyn Source, base: &str, rel: &str, buf: &mut [u8], what: &'static str)
     -> Result<usize, Why> {
     let mut path = Path::new();
     path.push(base).push(rel);
@@ -138,21 +139,32 @@ pub fn text<'a>(buf: &'a [u8], what: &'static str) -> Result<&'a str, Why> {
 
 /// The buffers the chain's documents live in, so the verified views can borrow them. A rotated root is read
 /// into `namespaces` first, which is not in use until the rotations are done.
-pub struct Docs {
+pub struct Docs<'r> {
     pub root: [u8; ROOT_MAX], pub root_len: usize,
     sig: [u8; SIG_MAX],
     ts_sig: [u8; SMALL_SIG_MAX],
     snap_sig: [u8; SMALL_SIG_MAX],
     pub timestamp: [u8; TIMESTAMP_MAX], pub timestamp_len: usize,
     pub namespaces: [u8; NAMESPACES_MAX], pub namespaces_len: usize,
+    /// Offline, the publishers' keys as this machine last accepted them online, when that record is newer than
+    /// the file's. Lent only by a check from a file: online, the TLS session is on the stack, and this has no use.
+    record: Option<&'r mut [u8; NAMESPACES_MAX]>, record_len: usize,
 }
 
-impl Docs {
-    pub fn new() -> Docs {
+impl<'r> Docs<'r> {
+    /// For an offline check: `record` holds this machine's own record of the keys while it is compared.
+    pub fn with_record(record: &'r mut [u8; NAMESPACES_MAX]) -> Docs<'r> {
+        let mut d = Docs::new();
+        d.record = Some(record);
+        d
+    }
+
+    pub fn new() -> Docs<'r> {
         Docs {
             root: [0; ROOT_MAX], root_len: 0, sig: [0; SIG_MAX], ts_sig: [0; SMALL_SIG_MAX], snap_sig: [0; SMALL_SIG_MAX],
             timestamp: [0; TIMESTAMP_MAX], timestamp_len: 0,
             namespaces: [0; NAMESPACES_MAX], namespaces_len: 0,
+            record: None, record_len: 0,
         }
     }
 }
@@ -177,7 +189,29 @@ pub struct Verified<'d> {
     pub namespaces: Namespaces<'d>,
     /// True when this run reached the registry for the first time.
     pub first_contact: bool,
+    /// Checked from a file, not the registry: the chain was valid until its timestamp's `expires`, and was checked
+    /// as of just before then. Nothing of this machine's record of the registry was changed.
+    pub offline: bool,
+    /// Offline, this machine's own newer record of the publishers' keys, which a release must ALSO satisfy: a
+    /// key revoked since the file was made is refused (`docs/developer-services-design.md` 15.3, rule 1).
+    pub record: Option<Namespaces<'d>>,
 }
+
+impl Verified<'_> {
+    /// Does the registry vouch for `key` signing a release of `publisher`'s published at `published`? Online, the
+    /// namespaces just verified decide. Offline, the file's must, AND this machine's newer record when it has one.
+    pub fn trusts_release(&self, publisher: &str, key: &godspeed_package::PublicKey, published: &str) -> Result<(), TrustError> {
+        self.namespaces.trusts_release(publisher, key, published)?;
+        match &self.record {
+            Some(r) => r.trusts_release(publisher, key, published),
+            None => Ok(()),
+        }
+    }
+}
+
+/// An instant just before `expires` (`YYYY-MM-DDTHH:MM:SSZ`): the same digits without the `Z`, which sorts below
+/// it and above every earlier time. A file's chain is checked as of this, the last moment it was valid.
+fn just_before(expires: &str) -> &str { expires.strip_suffix('Z').unwrap_or(expires) }
 
 fn store_dir(reg: &Registry<'_>) -> Path {
     let mut p = Path::new();
@@ -209,7 +243,7 @@ fn read_seen(text: &str) -> (Option<u64>, Option<u64>, Option<(u64, Sha256Digest
 /// GET the snapshot into `partial`, sized by its `Content-Length` before a byte of it arrives, hashed as it is
 /// written. Its digest and length. A snapshot that does not say its size, or says more than
 /// [`SNAPSHOT_FILE_MAX`], is refused by name; nothing is guessed at.
-fn fetch_snapshot(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &str, fs: &mut gs::fs::Fs<'_>,
+fn fetch_snapshot(ctx: &ServiceContext, s: &mut dyn Source, base: &str, fs: &mut gs::fs::Fs<'_>,
                   partial: &str) -> Result<(Sha256Digest, u64), Why> {
     let mut path = Path::new();
     path.push(base).push("trust/snapshot.toml");
@@ -327,11 +361,14 @@ pub fn index_of(ctx: &ServiceContext, v: &Verified<'_>, name: &str) -> Result<Op
 
 /// Verify the chain through namespaces for the registry in use, at `now` (`YYYY-MM-DDTHH:MM:SSZ`).
 #[inline(never)]
-pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &str, reg: &Registry<'_>, now: &str,
-                  d: &'d mut Docs) -> Result<Verified<'d>, Why> {
+pub fn verify<'d>(ctx: &ServiceContext, s: &mut dyn Source, base: &str, reg: &Registry<'_>, now: &str,
+                  d: &'d mut Docs<'_>) -> Result<Verified<'d>, Why> {
     let mut fs = gs::fs::Fs::new(ctx);
     let dir = store_dir(reg);
     let at = |name: &str| { let mut p = dir; p.push(name); p };
+    // A FILE is as of the day it was made: checked as of then, against nothing this machine has seen, and
+    // recording nothing - what a file says never moves this machine's view of the registry (15.3).
+    let offline = s.offline();
 
     // 1. THE ROOT: the one this machine already trusts, or root 1 checked against the pin.
     let mut pin_buf = [0u8; 128];
@@ -404,6 +441,9 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
         Err(gs::Error::NotFound) => (None, None, None),
         Err(e) => return Err(Why::Store(e)),
     };
+    // Offline, an older timestamp or namespaces than this machine has seen is not a rollback: the file is simply
+    // older than the machine's last look. A newer record of the keys is applied instead, after the chain.
+    let (seen_ts, seen_ns_check, kept) = if offline { (None, None, None) } else { (seen_ts, seen_ns, kept) };
 
     // 2. TIMESTAMP -> SNAPSHOT (on disk) -> NAMESPACES.
     d.timestamp_len = required(s, base, "trust/timestamp.toml", &mut d.timestamp, "the timestamp")?;
@@ -412,17 +452,37 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
     d.namespaces_len = required(s, base, "trust/namespaces.toml", &mut d.namespaces, "the namespaces")?;
     let ns_sig = required(s, base, "trust/namespaces.sig", &mut d.sig, "the namespaces' signatures")?;
 
-    let d: &'d Docs = d;
+    // This machine's record of the publishers' keys, for an offline check to answer to as well.
+    if offline {
+        d.record_len = match d.record.as_deref_mut() {
+            None => 0,
+            Some(buf) => match fs.read_into(at("namespaces.toml").as_str(), buf) {
+                Ok(n) => n,
+                Err(gs::Error::NotFound) => 0,
+                Err(e) => return Err(Why::Store(e)),
+            },
+        };
+    }
+
+    let d: &'d Docs<'_> = d;
+    // Offline, "now" is the last moment the file's chain was valid.
+    let ts_text = text(&d.timestamp[..d.timestamp_len], "the timestamp")?;
+    let now = if offline {
+        just_before(Timestamp::parse(ts_text).map_err(|err| Why::Trust { what: "the timestamp", err })?.header.expires)
+    } else {
+        now
+    };
     let root = Root::parse(text(&d.root[..d.root_len], "the root")?).map_err(|err| Why::Trust { what: "the root", err })?;
     root.header.check_fresh(now).map_err(|err| Why::Trust { what: "the root", err })?;
-    let timestamp = trust::verify_timestamp(&root, text(&d.timestamp[..d.timestamp_len], "the timestamp")?,
+    let timestamp = trust::verify_timestamp(&root, ts_text,
                                             text(&d.ts_sig[..ts_sig], "the timestamp's signatures")?, now, seen_ts)
         .map_err(|err| Why::Trust { what: "the timestamp", err })?;
 
     // The snapshot the timestamp names: the one kept here already, or downloaded to a staging file beside it.
     fs.create_dir_all(dir.as_str()).map_err(Why::Store)?;
-    let kept_path = at("snapshot.toml");
-    let staged = at("snapshot.partial");
+    // A file's snapshot is staged apart and never replaces the one kept: it may be older.
+    let kept_path = at(if offline { "snapshot.offline" } else { "snapshot.toml" });
+    let staged = at(if offline { "snapshot.offline.partial" } else { "snapshot.partial" });
     let reuse = match kept {
         Some((v, dg, len)) if v == timestamp.snapshot_version && dg == timestamp.snapshot_digest =>
             fs.stat(kept_path.as_str()).ok().filter(|st| st.size == len).map(|_| (dg, len)),
@@ -441,14 +501,38 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
     trust::verify_snapshot_stream(&root, &timestamp, &digest, &head, text(&d.snap_sig[..snap_sig], "the snapshot's signatures")?, now)
         .map_err(|err| Why::Trust { what: "the snapshot", err })?;
     let namespaces = trust::verify_namespaces_by_head(&root, &head, text(&d.namespaces[..d.namespaces_len], "the namespaces")?,
-                                                      text(&d.sig[..ns_sig], "the namespaces' signatures")?, now, seen_ns)
+                                                      text(&d.sig[..ns_sig], "the namespaces' signatures")?, now, seen_ns_check)
         .map_err(|err| Why::Trust { what: "the namespaces", err })?;
     let snapshot = SnapshotFile { version: head.header.version, path: kept_path, len, body: head.len as u64, fetched };
     if fetched {
         // Every `index` line checked once, as it would be in memory, before the file replaces the one kept.
         each_index(ctx, &SnapshotFile { path: staged, ..snapshot }, &mut |_, _| true)?;
         let _ = fs.delete(kept_path.as_str());
-        fs.rename(staged.as_str(), "snapshot.toml").map_err(Why::Store)?;
+        fs.rename(staged.as_str(), if offline { "snapshot.offline" } else { "snapshot.toml" }).map_err(Why::Store)?;
+    }
+    if offline {
+        // THE NEWER RECORD OF THE KEYS WINS (15.3, rule 1). This machine's, when it is newer than the file's, must
+        // vouch for the release too. When the file's is newer, or the machine has none (never online), the file's
+        // becomes this machine's record: it was verified above, and it is what the supervisor checks an installed
+        // package's key against at every start. An older record never replaces a newer one, and nothing else of
+        // the registry's view - root, timestamp, the versions seen - is moved by a file.
+        let mine = match d.record_len {
+            0 => None,
+            n => {
+                let t = text(d.record.as_deref().map_or(&[][..], |b| &b[..n]), "this machine's record of the keys")?;
+                Some(Namespaces::parse(t).map_err(|err| Why::Trust { what: "this machine's record of the keys", err })?)
+            }
+        };
+        let record = match mine {
+            Some(m) if m.header.version > namespaces.header.version => Some(m),
+            Some(m) if m.header.version == namespaces.header.version => None,
+            _ => {
+                fs.write(at("namespaces.toml").as_str(), &d.namespaces[..d.namespaces_len]).map_err(Why::Store)?;
+                None
+            }
+        };
+        let _ = seen_ns;
+        return Ok(Verified { root, timestamp, snapshot, namespaces, first_contact, offline, record });
     }
 
     // The metadata held together: remember how far this machine has seen, so it never goes back.
@@ -468,7 +552,7 @@ pub fn verify<'d>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
     seen.push(" ").num(len).push("\n");
     fs.write(at("seen").as_str(), &seen.b[..seen.n]).map_err(Why::Store)?;
 
-    Ok(Verified { root, timestamp, snapshot, namespaces, first_contact })
+    Ok(Verified { root, timestamp, snapshot, namespaces, first_contact, offline, record: None })
 }
 
 /// `godspeed trust`: what this machine has accepted from each registry the configuration knows - the root, the

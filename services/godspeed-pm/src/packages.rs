@@ -21,7 +21,8 @@ use godspeed_package::{trust::KeyStatus, Arch, ArtifactVerifier, ManifestSignatu
 
 use crate::chain::{self, Docs, Path, Why};
 use crate::config;
-use crate::https::{self, Fail, Session};
+use crate::https::{self, Fail};
+use crate::source::{GspSource, Recorder, Source};
 use crate::meta::{self, Artifacts, Releases};
 use crate::toml_lines::{lines, Line, Val};
 use crate::{cell, Cell, Roots, Rows, C};
@@ -34,7 +35,7 @@ const INDEX_MAX: usize = 8 * 1024;
 const MANIFEST_MAX: usize = 4 * 1024;
 const CONTRACT_MAX: usize = 4 * 1024;
 // The sizes of the documents a fetched copy keeps are `check.rs`'s, which reads them back.
-use crate::check::{MSIG_MAX, ORIGIN_MAX};
+use crate::check::{self, MSIG_MAX, ORIGIN_MAX};
 /// How many times a command is tried on a fresh connection when the server closed the last one part way.
 const ATTEMPTS: u32 = 3;
 /// The most fetched versions one listing reads. More are said, not dropped in silence.
@@ -75,7 +76,7 @@ fn spec(s: &str) -> Result<(PackageName<'_>, Option<Version>), &'static str> {
 /// Run `f` on a session to the registry `ready` names, again on a fresh one when the server closed the last
 /// part way, and turn what went wrong into a row.
 fn on_registry(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots,
-               mut f: impl FnMut(&mut Session<'_, '_, '_, '_>, &mut Rows) -> Result<(), Why>) {
+               mut f: impl FnMut(&mut dyn Source, &mut Rows) -> Result<(), Why>) {
     let mut list: [&[u8]; crate::MAX_ROOTS] = [&[]; crate::MAX_ROOTS];
     for i in 0..roots.count { list[i] = &roots.store[i][..roots.lens[i]]; }
     let mut attempt = 0u32;
@@ -91,12 +92,12 @@ fn on_registry(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Ro
         if matches!(why, Why::Net(Fail::Closed)) && attempt < ATTEMPTS {
             continue;
         }
-        let (item, text) = why_text(&why, ready);
+        let (item, text) = why_text(&why, &ready.reg);
         return r.fail(item, ready.url.host, text.as_str());
     }
 }
 
-fn why_text(why: &Why, ready: &Ready<'_>) -> (&'static str, Cell) {
+fn why_text(why: &Why, reg: &config::Registry<'_>) -> (&'static str, Cell) {
     match why {
         Why::Net(f) => crate::failure(f, config::DEFAULT_ROOTS, "the clock"),
         Why::Missing { path, status } => ("registry", cell(format_args!("{} answered HTTP {}", path.as_str(), status))),
@@ -104,10 +105,10 @@ fn why_text(why: &Why, ready: &Ready<'_>) -> (&'static str, Cell) {
         Why::NotText(what) => ("registry", cell(format_args!("{} is not text", what))),
         Why::Trust { what, err } => ("trust", cell(format_args!("{}: {} - nothing was kept", what, err))),
         Why::PinMismatch => ("trust", cell(format_args!(
-            "the registry's root 1 is not the root {} pins ({}) - nothing from it is trusted", ready.reg.name, ready.reg.pin))),
+            "the registry's root 1 is not the root {} pins ({}) - nothing from it is trusted", reg.name, reg.pin))),
         Why::PinChanged => ("trust", cell(format_args!(
             "the pin for {} changed since this machine first reached it: `godspeed trust reset {}` to trust the new one",
-            ready.reg.name, ready.reg.name))),
+            reg.name, reg.name))),
         Why::Store(e) => ("trust", cell(format_args!("this machine's record of the registry: {:?}", e))),
     }
 }
@@ -130,7 +131,8 @@ fn chain_note_through(r: &mut Rows, v: &chain::Verified<'_>, prefix: &str, tail:
     r.note(format_args!("{}verified: root {} -> timestamp {} -> snapshot {}{} -> namespaces {}{} ({})", prefix,
         v.root.header.version, v.timestamp.header.version, v.snapshot.version, if v.snapshot.fetched { "" } else { " (kept)" },
         v.namespaces.header.version, tail,
-        if v.first_contact { "first contact: root 1 matched the pin" } else { "against the root this machine already trusts" }));
+        if v.offline { "checked offline, from the file, as of its own day" }
+        else if v.first_contact { "first contact: root 1 matched the pin" } else { "against the root this machine already trusts" }));
 }
 
 /// A key as people read it: `ed25519:` and the first and last eight hex digits. `godspeed trust` shows keys whole.
@@ -237,7 +239,7 @@ pub fn search(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roo
 }
 
 /// The package's index, verified against the snapshot kept on disk, or `None` if the registry has never published it.
-fn index_text<'b>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &str, v: &chain::Verified<'_>,
+fn index_text<'b>(ctx: &ServiceContext, s: &mut dyn Source, base: &str, v: &chain::Verified<'_>,
                   name: &PackageName<'_>, buf: &'b mut [u8; INDEX_MAX]) -> Result<Option<&'b str>, Why> {
     let full = cell(format_args!("{}", name));
     match chain::index_of(ctx, v, full.as_str())? {
@@ -247,7 +249,7 @@ fn index_text<'b>(ctx: &ServiceContext, s: &mut Session<'_, '_, '_, '_>, base: &
 }
 
 /// The package's index, which must be exactly the bytes `listed` names.
-fn index_by_digest<'b>(s: &mut Session<'_, '_, '_, '_>, base: &str, name: &PackageName<'_>,
+fn index_by_digest<'b>(s: &mut dyn Source, base: &str, name: &PackageName<'_>,
                        listed: &godspeed_package::Sha256Digest, buf: &'b mut [u8; INDEX_MAX]) -> Result<Option<&'b str>, Why> {
     let mut rel = Path::new();
     rel.push("index/").push(name.publisher()).push("/").push(name.name()).push(".toml");
@@ -308,7 +310,7 @@ fn registry_dir(name: &PackageName<'_>, version: Version) -> Path {
 /// A release's manifest by the digest the index names, its signature by a key the namespaces vouch for at
 /// the release's publication time, and its contract by the manifest's digest, agreeing with the manifest.
 /// `Ok(None)` after a row saying which check failed.
-fn documents(s: &mut Session<'_, '_, '_, '_>, base: &str, v: &chain::Verified<'_>, name: &PackageName<'_>, which: &str,
+fn documents(s: &mut dyn Source, base: &str, v: &chain::Verified<'_>, name: &PackageName<'_>, which: &str,
              release: &Release<'_>, b: &mut Bufs, r: &mut Rows) -> Result<Option<Checked>, Why> {
     let pkg = registry_dir(name, release.version);
     let mut p = pkg;
@@ -328,7 +330,7 @@ fn documents(s: &mut Session<'_, '_, '_, '_>, base: &str, v: &chain::Verified<'_
             return Ok(None);
         }
     };
-    v.namespaces.trusts_release(name.publisher(), &signature.key, release.published)
+    v.trusts_release(name.publisher(), &signature.key, release.published)
         .map_err(|err| Why::Trust { what: "the publisher's key", err })?;
     let mtext = chain::text(&b.m[..ml], "the manifest")?;
     let mut arts = Artifacts::new();
@@ -542,7 +544,27 @@ fn local_dir(name: &PackageName<'_>, version: &str) -> Path {
 
 /// `godspeed fetch <publisher/name>[@version]`: verify everything, and keep it.
 #[inline(never)]
-pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str) {
+pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str, save: Option<&str>) {
+    fetch_or_inspect(ctx, r, ready, roots, which, save, false);
+}
+
+/// `godspeed inspect <publisher/name>[@version]`: everything `fetch` checks, against the registry, with the binary
+/// for this machine streamed through its digest - and nothing kept. What `info` cannot say: that it would verify.
+#[inline(never)]
+pub fn inspect(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str) {
+    fetch_or_inspect(ctx, r, ready, roots, which, None, true);
+}
+
+#[inline(never)]
+fn fetch_or_inspect(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str, save: Option<&str>,
+                    inspect: bool) {
+    // `save <folder>`: where the file goes, a full path; the shell sends the folder `godspeed fetch ... offline` was
+    // typed in. The file is named from the release, `<name>-<version>.gsp`, once the release is known.
+    let save = match save {
+        None => None,
+        Some(d) if d.starts_with('/') && d.len() < 120 && !d.contains("..") => Some(d.trim_end_matches('/')),
+        Some(d) => return r.fail("usage", d, "a package file for a machine with no network goes in a folder: `godspeed fetch <publisher/name> offline`"),
+    };
     let (name, wanted) = match spec(which) {
         Ok(x) => x,
         Err(why) => return r.fail("usage", which, why),
@@ -551,135 +573,235 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
         return r.fail("arch", env!("GODSPEED_PM_TARGET"), "no package architecture is named for this machine's target");
     };
     let mut docs = Docs::new();
-    let base = ready.url.base;
+    let mut iso = [0u8; 20];
+    let now = chain::iso(ready.now, &mut iso);
+    let how = Keep { reg: &ready.reg, base: ready.url.base, now, max_bytes: ready.max_bytes, offline: None, inspect };
+    let Some(dir) = save else {
+        return on_registry(ctx, r, ready, roots, |s, r| keep(ctx, s, r, &how, &name, wanted, which, arch, &mut docs).map(|_| ()));
+    };
     on_registry(ctx, r, ready, roots, |s, r| {
-        let mut iso = [0u8; 20];
-        let now = chain::iso(ready.now, &mut iso);
-        crate::progress(ctx, format_args!("  checking {}: root - timestamp - snapshot - namespaces", ready.reg.name));
-        let v = chain::verify(ctx, s, base, &ready.reg, now, &mut docs)?;
+        // EVERY DOCUMENT THE FETCH READS IS KEPT, and the file is made only after all of them verified.
+        let mut rec = match Recorder::new(ctx, s) {
+            Ok(rec) => rec,
+            Err(e) => { r.fail("save", dir, e.text()); return Ok(()); }
+        };
+        let Some(version) = keep(ctx, &mut rec, r, &how, &name, wanted, which, arch, &mut docs)? else { return Ok(()) };
+        let leaf = cell(format_args!("{}-{}.gsp", name.name(), version));
+        let out = cell(format_args!("{}/{}", dir, leaf.as_str()));
+        let (leaf, out) = (leaf.as_str(), out.as_str());
+        // What a fetch need not read again, this machine already holds, verified: every root from root 1 (a machine
+        // that has never been online trusts only that one), the snapshot kept, a binary fetched before.
+        let mut n = 1u64;
+        loop {
+            let mut rel = Path::new();
+            rel.push("trust/root/").num(n).push(".toml");
+            let mut buf = [0u8; chain::ROOT_MAX];
+            if chain::doc(&mut rec, how.base, rel.as_str(), &mut buf, "a root")?.is_none() { break; }
+            let mut sig = Path::new();
+            sig.push("trust/root/").num(n).push(".sig");
+            let mut sbuf = [0u8; chain::SIG_MAX];
+            chain::required(&mut rec, how.base, sig.as_str(), &mut sbuf, "a root's signatures")?;
+            n += 1;
+            if n > 32 { break; }
+        }
+        let snap = cell(format_args!("/system/services/godspeed/trust/{}/snapshot.toml", how.reg.name));
+        if !rec.has("trust/snapshot.toml") {
+            if let Err(e) = rec.add_file("trust/snapshot.toml", snap.as_str()) { r.fail("save", out, e.text()); return Ok(()); }
+        }
+        let vtext = cell(format_args!("{}", version));
+        let mut bin_rel = registry_dir(&name, version);
+        bin_rel.push(arch.artifact_file());
+        if !rec.has(bin_rel.as_str()) {
+            let mut kept = local_dir(&name, vtext.as_str());
+            kept.push("/").push(arch.artifact_file());
+            if let Err(e) = rec.add_file(bin_rel.as_str(), kept.as_str()) { r.fail("save", out, e.text()); return Ok(()); }
+        }
+        let partial_leaf = cell(format_args!("{}.partial", leaf));
+        let partial = cell(format_args!("{}/{}", dir, partial_leaf.as_str()));
+        match rec.write(partial.as_str(), leaf, out) {
+            Ok(size) => r.row("saved", out, cell(format_args!("{}, for {}: `godspeed install {}` installs it with no network",
+                size_text(size).as_str(), arch.as_str(), leaf)).as_str()),
+            Err(e) => r.fail("save", out, e.text()),
+        }
+        Ok(())
+    });
+}
+
+/// An `origin` record being written, at most `check.rs`'s `ORIGIN_MAX` - what it reads back: whole, or marked `over` and not written at all.
+struct Origin { b: [u8; ORIGIN_MAX], n: usize, over: bool }
+
+impl core::fmt::Write for Origin {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if self.n + s.len() > self.b.len() { self.over = true; return Err(core::fmt::Error); }
+        self.b[self.n..self.n + s.len()].copy_from_slice(s.as_bytes());
+        self.n += s.len();
+        Ok(())
+    }
+}
+
+/// How a release is kept: from which registry, as of when, and - for a `.gsp` - what the file is and how old it
+/// may be.
+pub struct Keep<'a> {
+    pub reg: &'a config::Registry<'a>,
+    pub base: &'a str,
+    /// The time to record it fetched at: the clock, or `unknown` where it is not set.
+    pub now: &'a str,
+    pub max_bytes: u64,
+    pub offline: Option<Offline<'a>>,
+    /// `godspeed inspect`: every check, this machine's binary against its digest included, and nothing kept -
+    /// for a release on the registry and for one in a file alike.
+    pub inspect: bool,
+}
+
+/// A `.gsp`: where it is, this machine's clock (None where it is not set), how old a file installs without the
+/// question, and whether the operator has accepted an older one.
+pub struct Offline<'a> {
+    pub file: &'a str,
+    pub clock: Option<u64>,
+    pub max_age_days: u64,
+    pub accept_old: bool,
+}
+
+/// Days since 1970-01-01 of `YYYY-MM-DD...`, the date trust metadata is dated in.
+fn epoch_days(iso: &str) -> Option<u64> {
+    let y: i64 = iso.get(0..4)?.parse().ok()?;
+    let m: i64 = iso.get(5..7)?.parse().ok()?;
+    let d: i64 = iso.get(8..10)?.parse().ok()?;
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    u64::try_from(era * 146_097 + doe - 719_468).ok()
+}
+
+/// Verify a release through the whole chain from `s` and keep it in `/system/packages/`: what `fetch` does with
+/// the registry and what a `.gsp` does with its file. The version kept, or `None` after a row saying why not.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn keep(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, how: &Keep<'_>, name: &PackageName<'_>,
+        wanted: Option<Version>, which: &str, arch: godspeed_package::Arch, docs: &mut Docs<'_>) -> Result<Option<Version>, Why> {
+        let (base, now) = (how.base, how.now);
+        crate::progress(ctx, format_args!("  checking {}: root - timestamp - snapshot - namespaces", how.reg.name));
+        let v = chain::verify(ctx, s, base, how.reg, now, docs)?;
+        // FRESHNESS, the one thing about a file the operator may choose to accept (15.3): its chain is as of the
+        // day its timestamp ran out, and a key revoked since would not show. Everything else was checked above.
+        let mut fresh = Cell::new();
+        if let Some(off) = &how.offline {
+            let expires = v.timestamp.header.expires;
+            let date = expires.get(..10).unwrap_or(expires);
+            let age = match (off.clock, epoch_days(expires)) {
+                (Some(now), Some(then)) => Some((now / 86_400).saturating_sub(then)),
+                _ => None,
+            };
+            let old = age.is_none_or(|a| a > off.max_age_days);
+            if old && !off.accept_old && !how.inspect {
+                r.columns(&["key", "value", "note"]);
+                let title = match wanted { Some(w) => cell(format_args!("{} {}", name, w)), None => cell(format_args!("{}", name)) };
+                r.row("title", title.as_str(), "from a package file, checked offline");
+                let q = match age {
+                    Some(a) => cell(format_args!("its registry check ran out on {}, {} days ago. A key revoked since then would not show", date, a)),
+                    None => cell(format_args!("its registry check ran out on {}, and this machine's clock is not set, so how old that is cannot be told. A key revoked since then would not show", date)),
+                };
+                r.row("question", "accept-old", q.as_str());
+                r.note(format_args!("nothing was kept: `godspeed install {} accept-old` installs it anyway", off.file));
+                return Ok(None);
+            }
+            fresh = match (age, old) {
+                (Some(a), true) if how.inspect => cell(format_args!(
+                    "offline, as of {} ({} days ago) - installing it would ask, older than offline-max-age-days", date, a)),
+                (None, _) if how.inspect => cell(format_args!(
+                    "offline, as of {} - installing it would ask, as this machine's clock is not set", date)),
+                (Some(a), false) => cell(format_args!("offline, as of {} ({} days ago)", date, a)),
+                (Some(a), true) => cell(format_args!("offline, as of {} ({} days ago) - accepted although old", date, a)),
+                (None, _) => cell(format_args!("offline, as of {} - accepted with the clock not set", date)),
+            };
+        }
         crate::progress(ctx, format_args!("  checking {}: index - manifest - signature - contract", name));
         let mut ibuf = [0u8; INDEX_MAX];
-        let Some(text) = index_text(ctx, s, base, &v, &name, &mut ibuf)? else {
+        let Some(text) = index_text(ctx, s, base, &v, name, &mut ibuf)? else {
             r.fail("package", which, "never published on this registry");
-            return Ok(());
+            return Ok(None);
         };
         let mut rels = Releases::new();
         let idx = match meta::index(text, &mut rels) {
             Ok(i) => i,
-            Err(b) => { r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(()); }
+            Err(b) => { r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(None); }
         };
-        let Some(release) = release_of(&idx, wanted, r) else { return Ok(()) };
+        let Some(release) = release_of(&idx, wanted, r) else { return Ok(None) };
         let mut b = Bufs::new();
-        let Some(c) = documents(s, base, &v, &name, which, &release, &mut b, r)? else { return Ok(()) };
+        let Some(c) = documents(s, base, &v, name, which, &release, &mut b, r)? else { return Ok(None) };
         let mut arts = Artifacts::new();
-        let Ok(read) = meta::manifest(chain::text(&b.m[..c.ml], "the manifest")?, &mut arts) else { return Ok(()) };
+        let Ok(read) = meta::manifest(chain::text(&b.m[..c.ml], "the manifest")?, &mut arts) else { return Ok(None) };
         let m = read.manifest;
         let Some(artifact) = m.artifacts.iter().find(|a| a.arch == arch).copied() else {
             r.fail("arch", arch.as_str(), "the package has no binary for this machine");
-            return Ok(());
+            return Ok(None);
         };
-        if artifact.size > ready.max_bytes {
+        if artifact.size > how.max_bytes {
             r.fail("size", cell(format_args!("{} bytes", artifact.size)).as_str(), "larger than max-package-mib allows");
-            return Ok(());
+            return Ok(None);
         }
         let vtext = cell(format_args!("{}", release.version));
-        let dest = local_dir(&name, vtext.as_str());
+        let dest = local_dir(name, vtext.as_str());
         let mut fs = gs::fs::Fs::new(ctx);
         let key = cell(format_args!("{}", c.key));
         let key_status = key_note(&v, name.publisher(), &c.key);
         let mut req = Cell::new();
         requests(chain::text(&b.c[..c.cl], "the contract")?, &mut req);
-        let already = fs.exists(dest.as_str()).unwrap_or(false);
-        if !already {
-            let mut staging = dest;
-            staging.push(".partial");
-            let _ = fs.delete_all(staging.as_str());
-            fs.create_dir_all(staging.as_str()).map_err(Why::Store)?;
-
-            // The binary, streamed to disk and checked as it arrives: never held, never kept unverified.
-            let mut bin_rel = registry_dir(&name, release.version);
+        // INSPECTED, not kept: this machine's binary is checked against the manifest as it is read, and nothing
+        // is written anywhere.
+        let inspect = how.inspect;
+        if inspect {
+            let mut bin_rel = registry_dir(name, release.version);
             bin_rel.push(arch.artifact_file());
-            let mut bin = staging;
-            bin.push("/").push(arch.artifact_file());
-            fs.create_sized(bin.as_str(), artifact.size).map_err(Why::Store)?;
-            let mut verifier = ArtifactVerifier::new(artifact);
-            let mut chunk = [0u8; gs::fs::IO_CHUNK];
-            let (mut held, mut written) = (0usize, 0u64);
-            let mut store_err: Option<gs::Error> = None;
-            let mut bad_bytes = false;
             let mut path = Path::new();
             path.push(base).push(bin_rel.as_str());
-            let mut got = 0u64;
-            let mut shown = u64::MAX;
-            // Said as the PACKAGE, not the file: `x86_64.elf` is how it is stored, not what is being fetched.
-            let what = cell(format_args!("{} {} ({})", name, release.version, arch.as_str()));
-            let total = artifact.size;
+            let mut verifier = ArtifactVerifier::new(artifact);
+            let mut bad = false;
             let head = s.get(path.as_str(), &mut |bytes: &[u8]| {
-                if verifier.update(bytes).is_err() { bad_bytes = true; return false; }
-                got += bytes.len() as u64;
-                // The bar, redrawn when it moves by a twentieth (and at the end), never per record.
-                let step = got * 28 / total.max(1);
-                if step != shown || got == total {
-                    shown = step;
-                    crate::progress(ctx, format_args!("  downloading {}  [{}]  {} / {}   [q] quit", what.as_str(), bar(step as usize, 28).as_str(),
-                        size_text(got).as_str(), size_text(total).as_str()));
-                }
-                let mut rest = bytes;
-                while !rest.is_empty() {
-                    let take = rest.len().min(chunk.len() - held);
-                    chunk[held..held + take].copy_from_slice(&rest[..take]);
-                    held += take;
-                    rest = &rest[take..];
-                    if held == chunk.len() {
-                        if let Err(e) = fs.write_at(bin.as_str(), written, &chunk) { store_err = Some(e); return false; }
-                        written += held as u64;
-                        held = 0;
-                    }
-                }
+                if verifier.update(bytes).is_err() { bad = true; return false; }
                 true
             });
-            if bad_bytes {
-                let _ = fs.delete_all(staging.as_str());
-                r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(), "its bytes are not the ones the manifest names; nothing was kept");
-                return Ok(());
+            if bad || head.map(|h| h.status != 200).unwrap_or(true) || verifier.finish().is_err() {
+                r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(),
+                       "the file does not hold this machine's binary as the signed manifest names it");
+                return Ok(None);
             }
-            if let Some(e) = store_err {
-                let _ = fs.delete_all(staging.as_str());
-                return Err(Why::Store(e));
+        }
+        let already = !inspect && fs.exists(dest.as_str()).unwrap_or(false);
+        if !already && !inspect {
+            // WHERE IT CAME FROM, whole. This was built in a 200-byte path buffer, which a registry line, a key and
+            // a date already fill: `published` was cut off every copy, and with it the retired-key rule the boot check
+            // applies. A text that does not fit is now refused, never cut.
+            let mut origin = Origin { b: [0; ORIGIN_MAX], n: 0, over: false };
+            let _ = write!(origin, "registry {} {}\nfetched {}\narch {}\nsigned-by {}\npublished {}\n",
+                           how.reg.name, how.reg.url, now, arch.as_str(), key.as_str(), release.published);
+            // A copy from a file says so, with the date its chain was valid until and whether that was accepted
+            // as old: the next look at the registry checks these again (15.3).
+            if let Some(off) = &how.offline {
+                let _ = write!(origin, "from-file {}\nchecked-as-of {}\nchecked {}\n",
+                               off.file, v.timestamp.header.expires, fresh.as_str());
             }
-            let head = head.map_err(|e| { let _ = fs.delete_all(staging.as_str()); Why::Net(e) })?;
-            if head.status != 200 {
-                let _ = fs.delete_all(staging.as_str());
-                return Err(Why::Missing { path: bin_rel, status: head.status });
+            if origin.over {
+                r.fail("origin", which, "where it came from does not fit the record kept beside it; nothing was kept");
+                return Ok(None);
             }
-            if held > 0 {
-                fs.write_at(bin.as_str(), written, &chunk[..held]).map_err(Why::Store)?;
+            let docs = [(&b"manifest.toml"[..], &b.m[..c.ml]), (&b"manifest.sig"[..], &b.s[..c.sl]),
+                        (godspeed_package::CONTRACT_FILE.as_bytes(), &b.c[..c.cl])];
+            if !store(ctx, s, r, base, name, release.version, arch, artifact, dest, vtext.as_str(), &docs, &origin.b[..origin.n])? {
+                return Ok(None);
             }
-            if verifier.finish().is_err() {
-                let _ = fs.delete_all(staging.as_str());
-                r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(), "it is not the size or digest the manifest names; nothing was kept");
-                return Ok(());
-            }
-
-            // The documents that prove it, beside it, and where it came from.
-            for (file, bytes) in [("manifest.toml", &b.m[..c.ml]), ("manifest.sig", &b.s[..c.sl]), (godspeed_package::CONTRACT_FILE, &b.c[..c.cl])] {
-                let mut p = staging;
-                p.push("/").push(file);
-                fs.write(p.as_str(), bytes).map_err(Why::Store)?;
-            }
-            let mut origin = Path::new();
-            origin.push("registry ").push(ready.reg.name).push(" ").push(ready.reg.url).push("\nfetched ").push(now)
-                  .push("\narch ").push(arch.as_str()).push("\nsigned-by ").push(key.as_str())
-                  .push("\npublished ").push(release.published).push("\n");
-            let mut op = staging;
-            op.push("/origin");
-            fs.write(op.as_str(), &origin.b[..origin.n]).map_err(Why::Store)?;
-            fs.rename(staging.as_str(), vtext.as_str()).map_err(Why::Store)?;
         }
         r.columns(&["key", "value", "note"]);
         r.row("title", cell(format_args!("{} {}", name, release.version)).as_str(),
-              cell(format_args!("{} from {}", if already { "already fetched" } else { "fetched" }, ready.reg.name)).as_str());
-        r.row("about", dest.as_str(), "verified: kept here, not installed");
+              cell(format_args!("{} from {}", if inspect { "inspected" } else if already { "already fetched" } else if how.offline.is_some() { "unpacked" } else { "fetched" },
+                  if how.offline.is_some() { "a package file" } else { how.reg.name })).as_str());
+        match &how.offline {
+            Some(off) if inspect => r.row("about", off.file, "verified offline: nothing was kept, nothing installed"),
+            None if inspect => r.row("about", how.reg.url, "verified against the registry: nothing was kept, nothing installed"),
+            _ => r.row("about", dest.as_str(), "verified: kept here, not installed"),
+        }
         r.row("binary", cell(format_args!("{}, {}", arch.as_str(), size_text(artifact.size).as_str())).as_str(), "its size and digest the manifest's");
         let (built, os_note) = os_cells(&m);
         r.row("built for", built.as_str(), os_note.as_str());
@@ -692,9 +814,319 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
             _ => "`godspeed install` starts it, and at every boot",
         });
         let _ = key;
+        if how.offline.is_some() {
+            r.row("checked", fresh.as_str(), "from a package file; checked again the next time this machine reaches the registry");
+        }
         chain_note_through(r, &v, "", " -> index -> manifest -> signature -> contract -> binary");
-        Ok(())
+        Ok(Some(release.version))
+}
+
+/// `godspeed install <file>.gsp`, its first half: check the package file through the whole chain, offline, and
+/// unpack it into `/system/packages/` exactly as a fetch would leave it (`docs/developer-services-design.md` 15).
+/// A file older than `max_age_days`, or any file where the clock is not set, is not kept until the operator
+/// accepts that (`accept_old`); the shell asks. Installing it is then what installing a fetched package always
+/// is, so this answers with the release it kept, for the shell to ask about.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn unpack(ctx: &ServiceContext, r: &mut Rows, reg: &config::Registry<'_>, max_bytes: u64, clock: Option<u64>,
+              max_age_days: u64, file: &str, accept_old: bool, inspect: bool) {
+    let Some(arch) = this_arch() else {
+        return r.fail("arch", env!("GODSPEED_PM_TARGET"), "no package architecture is named for this machine's target");
+    };
+    let mut src = match GspSource::open(ctx, file) {
+        Ok(s) => s,
+        Err(e) => return r.fail("file", file, e.text()),
+    };
+    // WHICH PACKAGE: a package file holds one index and one release. Its name and version come from the paths,
+    // and are then checked like any other request - the index must list the version, the signed manifest must
+    // name both.
+    let (mut nb, mut nl, mut indexes) = ([0u8; 160], 0usize, 0usize);
+    let (mut vb, mut vl, mut releases) = ([0u8; 32], 0usize, 0usize);
+    // The release's own path, `publisher/name/version`: what names an UNPUBLISHED file, which has no index.
+    let (mut rb, mut rl) = ([0u8; 200], 0usize);
+    src.each_path(&mut |p, _| {
+        if let Some(n) = p.strip_prefix("index/").and_then(|n| n.strip_suffix(".toml")) {
+            indexes += 1;
+            if n.len() <= nb.len() { nb[..n.len()].copy_from_slice(n.as_bytes()); nl = n.len(); }
+        }
+        if let Some(rest) = p.strip_prefix("packages/").and_then(|x| x.strip_suffix("/manifest.toml")) {
+            releases += 1;
+            if rest.len() <= rb.len() { rb[..rest.len()].copy_from_slice(rest.as_bytes()); rl = rest.len(); }
+            if let Some(v) = rest.rsplit('/').next().filter(|v| v.len() <= vb.len()) {
+                vb[..v.len()].copy_from_slice(v.as_bytes());
+                vl = v.len();
+            }
+        }
     });
+    let unpublished = !src.has("trust/timestamp.toml");
+    if releases != 1 || (indexes != 1 && !(unpublished && indexes == 0)) {
+        return r.fail("file", file, cell(format_args!("it holds {} package(s) and {} release(s); a package file holds one of each",
+            indexes, releases)).as_str());
+    }
+    if unpublished && indexes == 0 {
+        // `publisher/name/version`: the name is all but the last part.
+        let rest = core::str::from_utf8(&rb[..rl]).unwrap_or("");
+        let n = rest.rsplit_once('/').map_or("", |(n, _)| n);
+        nb[..n.len()].copy_from_slice(n.as_bytes());
+        nl = n.len();
+    }
+    let name_text = core::str::from_utf8(&nb[..nl]).unwrap_or("");
+    let Ok(name) = PackageName::parse(name_text) else { return r.fail("file", file, "the package it holds has no valid name") };
+    let Ok(version) = core::str::from_utf8(&vb[..vl]).unwrap_or("").parse::<Version>() else {
+        return r.fail("file", file, "the release it holds has no valid version");
+    };
+    let mut iso = [0u8; 20];
+    let now = match clock { Some(c) => chain::iso(c, &mut iso), None => "unknown" };
+    // UNPUBLISHED: no registry documents at all, so nothing but this machine's operator can vouch for its key.
+    if unpublished {
+        let mut kept = LocalKeep { name: &name, version, arch, file, now, max_bytes, inspect };
+        if let Err(why) = keep_local(ctx, &mut src, r, &mut kept) {
+            let (item, text) = match why {
+                Why::Net(_) => ("file", cell(format_args!("it could not be read to the end - copy it again"))),
+                w => why_text(&w, reg),
+            };
+            r.fail(item, file, text.as_str());
+        }
+        return;
+    }
+    let how = Keep { reg, base: "", now, max_bytes, offline: Some(Offline { file, clock, max_age_days, accept_old }), inspect };
+    let mut record = [0u8; chain::NAMESPACES_MAX];
+    let mut docs = Docs::with_record(&mut record);
+    match keep(ctx, &mut src, r, &how, &name, Some(version), file, arch, &mut docs) {
+        Ok(_) => {}
+        // Nothing here was a network: a read that stopped part way is the file, or the disk under it.
+        Err(Why::Net(_)) => r.fail("file", file, "it could not be read to the end - copy it again"),
+        Err(why) => {
+            let (item, text) = why_text(&why, reg);
+            r.fail(item, file, text.as_str());
+        }
+    }
+}
+
+/// Keep a checked release in `dest`: its binary for `arch` streamed from `s` into a staging folder and checked
+/// against `artifact` as it arrives (never held, never kept unverified), `docs` written beside it - the manifest, its
+/// signature and the contract, already checked - and `origin`, then the folder renamed into place. False after a row
+/// saying why nothing was kept. One function whether the release came from the registry, a package file, or a file
+/// whose key this machine's operator trusts, so they cannot be kept differently.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, name: &PackageName<'_>, version: Version,
+         arch: godspeed_package::Arch, artifact: godspeed_package::Artifact, dest: Path, vtext: &str,
+         docs: &[(&[u8], &[u8]); 3], origin: &[u8]) -> Result<bool, Why> {
+        let mut fs = gs::fs::Fs::new(ctx);
+        let mut staging = dest;
+        staging.push(".partial");
+        let _ = fs.delete_all(staging.as_str());
+        fs.create_dir_all(staging.as_str()).map_err(Why::Store)?;
+
+        // The binary, streamed to disk and checked as it arrives: never held, never kept unverified.
+        let mut bin_rel = registry_dir(name, version);
+        bin_rel.push(arch.artifact_file());
+        let mut bin = staging;
+        bin.push("/").push(arch.artifact_file());
+        fs.create_sized(bin.as_str(), artifact.size).map_err(Why::Store)?;
+        let mut verifier = ArtifactVerifier::new(artifact);
+        let mut chunk = [0u8; gs::fs::IO_CHUNK];
+        let (mut held, mut written) = (0usize, 0u64);
+        let mut store_err: Option<gs::Error> = None;
+        let mut bad_bytes = false;
+        let mut path = Path::new();
+        path.push(base).push(bin_rel.as_str());
+        let mut got = 0u64;
+        let mut shown = u64::MAX;
+        // Said as the PACKAGE, not the file: `x86_64.elf` is how it is stored, not what is being fetched.
+        let what = cell(format_args!("{} {} ({})", name, version, arch.as_str()));
+        // From a package file nothing is downloaded: it is copied out of the file, and said so.
+        let verb = if s.offline() { "unpacking" } else { "downloading" };
+        let total = artifact.size;
+        let head = s.get(path.as_str(), &mut |bytes: &[u8]| {
+            if verifier.update(bytes).is_err() { bad_bytes = true; return false; }
+            got += bytes.len() as u64;
+            // The bar, redrawn when it moves by a twentieth (and at the end), never per record.
+            let step = got * 28 / total.max(1);
+            if step != shown || got == total {
+                shown = step;
+                crate::progress(ctx, format_args!("  {} {}  [{}]  {} / {}   [q] quit", verb, what.as_str(), bar(step as usize, 28).as_str(),
+                    size_text(got).as_str(), size_text(total).as_str()));
+            }
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                let take = rest.len().min(chunk.len() - held);
+                chunk[held..held + take].copy_from_slice(&rest[..take]);
+                held += take;
+                rest = &rest[take..];
+                if held == chunk.len() {
+                    if let Err(e) = fs.write_at(bin.as_str(), written, &chunk) { store_err = Some(e); return false; }
+                    written += held as u64;
+                    held = 0;
+                }
+            }
+            true
+        });
+        if bad_bytes {
+            let _ = fs.delete_all(staging.as_str());
+            r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(), "its bytes are not the ones the manifest names; nothing was kept");
+            return Ok(false);
+        }
+        if let Some(e) = store_err {
+            let _ = fs.delete_all(staging.as_str());
+            return Err(Why::Store(e));
+        }
+        let head = head.map_err(|e| { let _ = fs.delete_all(staging.as_str()); Why::Net(e) })?;
+        if head.status != 200 {
+            let _ = fs.delete_all(staging.as_str());
+            return Err(Why::Missing { path: bin_rel, status: head.status });
+        }
+        if held > 0 {
+            fs.write_at(bin.as_str(), written, &chunk[..held]).map_err(Why::Store)?;
+        }
+        if verifier.finish().is_err() {
+            let _ = fs.delete_all(staging.as_str());
+            r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(), "it is not the size or digest the manifest names; nothing was kept");
+            return Ok(false);
+        }
+
+        // The documents that prove it, beside it, and where it came from.
+        for (file, bytes) in docs {
+            let mut p = staging;
+            p.push("/").push(core::str::from_utf8(file).unwrap_or(""));
+            fs.write(p.as_str(), bytes).map_err(Why::Store)?;
+        }
+        let mut op = staging;
+        op.push("/origin");
+        fs.write(op.as_str(), origin).map_err(Why::Store)?;
+        fs.rename(staging.as_str(), vtext).map_err(Why::Store)?;
+        Ok(true)
+}
+
+/// An unpublished package file being kept: what it holds and how.
+struct LocalKeep<'a> {
+    name: &'a PackageName<'a>,
+    version: Version,
+    arch: godspeed_package::Arch,
+    file: &'a str,
+    now: &'a str,
+    max_bytes: u64,
+    inspect: bool,
+}
+
+/// An UNPUBLISHED package file (`godspeed package --gsp`): no registry has vouched for it, so its signature must be by
+/// a key this machine's operator trusts for its publisher (`godspeed trust add`). Then everything else is checked as
+/// for any release - the manifest names it, the contract is the one the manifest names, this machine's binary is the
+/// one it names - and it is kept by the same `store` a fetch uses, its origin saying who vouched for it.
+#[inline(never)]
+fn keep_local(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, k: &mut LocalKeep<'_>) -> Result<(), Why> {
+    let (name, version, arch, file) = (k.name, k.version, k.arch, k.file);
+    let pkg = registry_dir(name, version);
+    let mut b = Bufs::new();
+    let mut p = pkg;
+    p.push("manifest.toml");
+    let ml = chain::required(s, "", p.as_str(), &mut b.m, "the manifest")?;
+    let mut p = pkg;
+    p.push("manifest.sig");
+    let sl = chain::required(s, "", p.as_str(), &mut b.s, "the manifest's signature")?;
+    let sig_text = chain::text(&b.s[..sl], "the manifest's signature")?;
+    let signature = match ManifestSignature::parse(sig_text).and_then(|g| g.verify(&b.m[..ml]).map(|()| g)) {
+        Ok(g) => g,
+        Err(e) => {
+            r.fail("signature", file, cell(format_args!("{:?} - the manifest is not the one its signer signed; nothing was kept", e)).as_str());
+            return Ok(());
+        }
+    };
+    let key = cell(format_args!("{}", signature.key));
+    match check::operator_trusts(&mut gs::fs::Fs::new(ctx), name.publisher(), key.as_str()) {
+        Ok(true) => {}
+        Ok(false) => {
+            r.fail("trust", file, cell(format_args!(
+                "an unpublished package signed by {}, which this machine's operator does not trust for {}/ - `godspeed trust add {} {}` trusts it, if you know whose it is",
+                short_key(&signature.key).as_str(), name.publisher(), name.publisher(), key.as_str())).as_str());
+            return Ok(());
+        }
+        Err(e) => return Err(Why::Store(e)),
+    }
+    let mtext = chain::text(&b.m[..ml], "the manifest")?;
+    let mut arts = Artifacts::new();
+    let m = match meta::manifest(mtext, &mut arts) {
+        Ok(m) => m.manifest,
+        Err(e) => { r.fail("manifest", file, cell(format_args!("line {}: {}", e.line, e.why)).as_str()); return Ok(()); }
+    };
+    if m.name != *name || m.version != version {
+        r.fail("manifest", file, "the signed manifest names another package or version than the file's paths; nothing was kept");
+        return Ok(());
+    }
+    let mut p = pkg;
+    p.push(godspeed_package::CONTRACT_FILE);
+    let cl = chain::required(s, "", p.as_str(), &mut b.c, "the contract")?;
+    if godspeed_package::Sha256Digest::of(&b.c[..cl]) != m.contract {
+        r.fail("contract", file, "it is not the contract the signed manifest names; nothing was kept");
+        return Ok(());
+    }
+    let ctext = chain::text(&b.c[..cl], "the contract")?;
+    if !contract_identity(ctext).is_some_and(|(cn, cv)| m.validate_against_contract(cn, cv, |_| {})) {
+        r.fail("contract", file, "the contract's name or version is not the package's; nothing was kept");
+        return Ok(());
+    }
+    let Some(artifact) = m.artifacts.iter().find(|a| a.arch == arch).copied() else {
+        r.fail("arch", arch.as_str(), "the package has no binary for this machine");
+        return Ok(());
+    };
+    if artifact.size > k.max_bytes {
+        r.fail("size", cell(format_args!("{} bytes", artifact.size)).as_str(), "larger than max-package-mib allows");
+        return Ok(());
+    }
+    let vtext = cell(format_args!("{}", version));
+    let dest = local_dir(name, vtext.as_str());
+    let mut fs = gs::fs::Fs::new(ctx);
+    let already = !k.inspect && fs.exists(dest.as_str()).unwrap_or(false);
+    if k.inspect {
+        let mut bin = pkg;
+        bin.push(arch.artifact_file());
+        let mut verifier = ArtifactVerifier::new(artifact);
+        let mut bad = false;
+        let head = s.get(bin.as_str(), &mut |bytes: &[u8]| {
+            if verifier.update(bytes).is_err() { bad = true; return false; }
+            true
+        });
+        if bad || head.map(|h| h.status != 200).unwrap_or(true) || verifier.finish().is_err() {
+            r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(),
+                   "the file does not hold this machine's binary as the signed manifest names it");
+            return Ok(());
+        }
+    } else if !already {
+        let mut origin = Origin { b: [0; ORIGIN_MAX], n: 0, over: false };
+        let _ = write!(origin, "trusted operator\nfetched {}\narch {}\nsigned-by {}\nfrom-file {}\n",
+                       k.now, arch.as_str(), key.as_str(), file);
+        if origin.over {
+            r.fail("origin", file, "where it came from does not fit the record kept beside it; nothing was kept");
+            return Ok(());
+        }
+        let docs = [(&b"manifest.toml"[..], &b.m[..ml]), (&b"manifest.sig"[..], &b.s[..sl]),
+                    (godspeed_package::CONTRACT_FILE.as_bytes(), &b.c[..cl])];
+        if !store(ctx, s, r, "", name, version, arch, artifact, dest, vtext.as_str(), &docs, &origin.b[..origin.n])? {
+            return Ok(());
+        }
+    }
+    let mut req = Cell::new();
+    requests(ctext, &mut req);
+    r.columns(&["key", "value", "note"]);
+    r.row("title", cell(format_args!("{} {}", name, version)).as_str(),
+          if k.inspect { "inspected from an UNPUBLISHED package file" } else if already { "already fetched" }
+          else { "unpacked from an UNPUBLISHED package file" });
+    r.row("about", if k.inspect { file } else { dest.as_str() },
+          if k.inspect { "verified: nothing was kept, nothing installed" } else { "verified: kept here, not installed" });
+    r.row("binary", cell(format_args!("{}, {}", arch.as_str(), size_text(artifact.size).as_str())).as_str(), "its size and digest the manifest's");
+    let (built, os_note) = os_cells(&m);
+    r.row("built for", built.as_str(), os_note.as_str());
+    r.row("requests", req.as_str(), "what its contract asks for; fetching grants nothing");
+    r.row("signed", short_key(&signature.key).as_str(), "a key this machine's OPERATOR trusts for the publisher - no registry vouches for it");
+    r.row("installed", "no", match m.kind {
+        godspeed_package::Kind::Utility => "a utility: `godspeed install` makes it a command, run when typed",
+        godspeed_package::Kind::App => "an app: `godspeed install` makes it a command that has the screen while it runs",
+        godspeed_package::Kind::Driver => "a driver: `godspeed install` starts it with its device, and at every boot",
+        _ => "`godspeed install` starts it, and at every boot",
+    });
+    r.note(format_args!("verified: signature (a key the operator trusts) -> manifest -> contract -> binary; nothing tells this machine if that key leaks"));
+    Ok(())
 }
 
 // ---- what is fetched here --------------------------------------------------------------------------------
@@ -778,7 +1210,9 @@ pub fn fetched(ctx: &ServiceContext, out: &mut [Fetched; MAX_FETCHED], more: &mu
                 let mut ob = [0u8; ORIGIN_MAX];
                 let got = fs.read_into(op.as_str(), &mut ob).unwrap_or(0);
                 let text = core::str::from_utf8(&ob[..got]).unwrap_or("");
-                let reg = text.lines().find_map(|l| l.strip_prefix("registry ")).and_then(|l| l.split_whitespace().next()).unwrap_or("?");
+                let operator = text.lines().any(|l| l == "trusted operator");
+                let reg = text.lines().find_map(|l| l.strip_prefix("registry ")).and_then(|l| l.split_whitespace().next())
+                    .unwrap_or(if operator { check::OPERATOR } else { "?" });
                 f.rl = copy_into(&mut f.registry, reg.as_bytes());
                 out[n] = f;
                 n += 1;

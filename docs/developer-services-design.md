@@ -1307,3 +1307,131 @@ would move the screen with the state, and is not built. The kernel's part is one
 
 `godspeed/hello-service` 0.5.0 and 0.6.0 count the seconds they run (0.3.0 and 0.4.0 speak the earlier, unchecked offer, and are refused); upgraded from one to the other in QEMU, the new
 version logs `took over, live, at N seconds` with the old version's count, and nothing died or restarted.
+
+## 15. Offline packages: the `.gsp` file (approved 2026-10-18, built; QEMU-verified)
+
+A package can travel as one file and install on a machine with no network: copied to a USB stick, shared
+directly, kept for a machine that is never online. The operator asked for it, and for the file to be
+trusted through the registry rather than through a new kind of trust.
+
+### 15.1 What a `.gsp` is
+
+**A slice of the registry, in a file.** It holds the very documents a fetch reads, under the very paths the
+registry serves them at:
+
+```text
+trust/root/1.toml  trust/root/1.sig   ... every root up to the current one
+trust/timestamp.toml  trust/timestamp.sig
+trust/snapshot.toml   trust/snapshot.sig
+trust/namespaces.toml trust/namespaces.sig
+index/<publisher>/<name>.toml
+packages/<publisher>/<name>/<version>/manifest.toml
+packages/<publisher>/<name>/<version>/manifest.sig
+packages/<publisher>/<name>/<version>/contract.toml
+packages/<publisher>/<name>/<version>/<arch>.elf     one per architecture it carries
+```
+
+So installing from one runs the same code as fetching from the registry. godspeed-pm reads the registry
+through a `Source`; the network is one source and a `.gsp` is another, answering each path from the file.
+Nothing about what is checked, or in what order, differs between the two.
+
+The layout is a header line, then each entry as a line naming its size and path followed by exactly that
+many bytes, then an end line. It is read in one pass for its table of entries (at most 64), and an entry is
+read by its offset. Defined once, in the shared `godspeed-package` crate, so the CLI that writes it and
+godspeed-pm that reads it cannot disagree.
+
+### 15.2 Why it can be trusted
+
+Every GodspeedOS image pins the default registry's root key. The file carries the chain that root
+starts:
+
+```text
+pinned root (in the OS image)
+  -> later roots, each signed by the one before it
+  -> the timestamp, naming the snapshot
+  -> the snapshot, naming the namespaces and the package's index
+  -> the namespaces: this publisher's key is active
+  -> the index: this version was published
+  -> the manifest's signature, by that key
+  -> the contract and the binary, by digest
+```
+
+A machine that has never been online already trusts the first link, so it can check every other one from
+the file. No new authority is introduced: the registry vouches for the publisher exactly as it does online.
+
+### 15.3 Freshness: what a file cannot know
+
+The documents are as of the day the file was made. The registry's timestamp is valid for a day, so a file
+is checked AS OF the moment its chain was valid - just before its timestamp's expiry - and its age is
+measured from there. What that cannot show is a key revoked after the file was made. Three rules:
+
+1. **A newer record on this machine wins.** If the machine has been online since, it holds a newer record
+   of the publishers' keys, and that one decides: a revocation it has seen refuses the file.
+2. **A recent file installs** and says it was checked offline, with the date.
+3. **An old one asks** (older than `offline-max-age-days`, 30 by default, in
+   `/system/services/godspeed/config`), and so does any file on a machine whose clock is not set - the Pis
+   and the VisionFive have no clock chip:
+
+   ```text
+   godspeed/hello 0.3.0 was checked against the registry 41 days ago (2026-09-07).
+   A key revoked since then would not show. Install it anyway? [y/N]
+   ```
+
+   `yes` does not answer this question, so a script that says `yes` does not accept the risk by accident;
+   the word `accept-old` does. An acceptance is recorded with the package and shown on its card
+   (`accepted offline, checked as of 2026-09-07`).
+
+**Only freshness is a choice.** A bad signature, a digest that does not match, or a key this machine knows
+is revoked is refused with no question.
+
+The next time the machine is online, packages installed from a file are checked against the current
+registry; one whose key has since been revoked is said, loudly, and left running - stopping it is the
+operator's decision, not the package manager's.
+
+### 15.4 Commands
+
+The name of a package file is never typed when it is made, as nobody names a `.deb` when making one: the flag says
+what the file is FOR, and the file is named from the release, `<name>-<version>.gsp`, so a second one never
+overwrites the first.
+
+```text
+godspeed fetch <pkg>[@version] --offline [--arch <arch>|all]   the CLI, on a workstation: a published release
+godspeed package --local                                        the CLI: an UNPUBLISHED one, signed by your key (15.6)
+godspeed fetch <pkg>[@version] offline                          on a Godspeed machine, into the current folder
+godspeed install <file>.gsp [yes] [accept-old]                  on a Godspeed machine
+godspeed inspect <file>.gsp | <pkg>[@version]                   either side: every check installing makes, nothing kept
+```
+
+`inspect` takes a file or a package name. Given a name it is the same check against the registry, this machine's
+binary streamed through its digest - what `info`, which reads only the registry's metadata, cannot say.
+
+### 15.5 What does not change
+
+The supervisor never reads a `.gsp`. godspeed-pm unpacks it into `/system/packages/<publisher>/<name>/<version>/`,
+the layout a fetch leaves, checking as it goes, and from there installing is what it always was: the
+supervisor checks the copy on disk at install, at every boot and at every restart.
+### 15.6 An unpublished package: a key the operator trusts
+
+A package built with no network has never been published, so no registry has vouched for its key, and 15.2's
+chain does not exist. `godspeed package --local` writes the file anyway - its manifest, signature, contract and
+binaries, and no registry documents - and the machine installs it only if its OPERATOR trusts the signing key for
+that publisher:
+
+```text
+godspeed trust add <publisher> <key> [yes]     asks first, saying what it means
+godspeed trust remove <publisher> <key>
+```
+
+The key is kept in its own list (`/system/services/godspeed/keys`), apart from every registry's record, so neither
+can stand in for the other; `godspeed trust` shows it as its own card. A copy installed this way records `trusted
+operator` in its origin and is listed as coming from `(operator)`, a name no registry can have.
+
+What it does not have, said wherever it shows: **nothing tells this machine if that key leaks.** No registry can
+revoke it; only `godspeed trust remove` does, and the supervisor's check at every start reads the list again
+(`check.rs`, `operator_trusts`), so a key removed stops what it signed at its next start. A key trusted for one
+publisher vouches for that publisher alone. The list is on `/system`, exactly as protected as every other trust
+record (12); the residual there is unchanged.
+
+`godspeed inspect` reads an unpublished file too, on the machine and in the CLI, and says that no registry vouches
+for it.
+

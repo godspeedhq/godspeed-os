@@ -1215,7 +1215,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("selfcheck", &SELFCHECK_WORDS),
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
-    ("godspeed", &["search", "info", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "trust", "registry", "config", "check"]),
+    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "trust", "registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -2364,7 +2364,7 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
         "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
         "ask"     => cmd_ask(ctx, s["ask".len()..].trim()),
-        "godspeed" => cmd_godspeed(ctx, s["godspeed".len()..].trim()),
+        "godspeed" => cmd_godspeed(ctx, cwd, s["godspeed".len()..].trim()),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -6116,9 +6116,16 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("godspeed", "trust") => help_block(ctx, "godspeed trust", "what this machine has accepted from each registry", &[
             ("godspeed trust", "per registry: its root, timestamp and namespaces versions, the root's expiry, the pin it was reached under; then each publisher's keys and their standing", "godspeed trust"),
             ("godspeed trust reset <registry> [yes]", "forget what was accepted from it, so the next command meets it again from root 1 against its pin; asks [y/N] unless `yes`", "godspeed trust reset default"),
+            ("godspeed trust add <publisher> <key> [yes]", "trust a key YOURSELF for one publisher, so an unpublished package file it signed (`godspeed package --gsp`) installs with no registry; asks [y/N] unless `yes`", "godspeed trust add alice ed25519:..."),
+            ("godspeed trust remove <publisher> <key>", "stop trusting it: its packages no longer start, since the supervisor checks this list at every start", ""),
+        ], false),
+        ("godspeed", "inspect") => help_block(ctx, "godspeed inspect", "check a release as installing it would - and keep nothing", &[
+            ("godspeed inspect <file>.gsp", "a package file, with no network: its chain as of the day it was made, its signature, contract and this machine's binary; says if installing it would ask about its age", "godspeed inspect hello.gsp"),
+            ("godspeed inspect <publisher/name>[@version]", "the same on the registry, this machine's binary included - what `info` does not download", "godspeed inspect godspeed/hello"),
         ], false),
         ("godspeed", "fetch") => help_block(ctx, "godspeed fetch", "verify a package and fetch it here - fetched, not installed", &[
             ("godspeed fetch <publisher/name>[@version]", "the latest, or the version named", "godspeed fetch godspeed/hello@0.1.0"),
+            ("godspeed fetch <publisher/name>[@version] offline", "and write it here as one file too, <name>-<version>.gsp, which `godspeed install` installs on a machine with no network", "godspeed fetch godspeed/hello offline"),
             ("what is checked", "the manifest by the index's digest, its signature by a key the signed namespaces vouch for, the contract and this machine's binary by the manifest's digests and sizes", ""),
             ("where it goes", "/system/packages/<publisher>/<name>/<version>/: the binary, manifest, signature, contract and where it came from", ""),
             ("what it does not do", "run it, or grant what its contract requests: `godspeed install` does that, and asks first", ""),
@@ -6140,6 +6147,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ], false),
         ("godspeed", "install") => help_block(ctx, "godspeed install", "start a fetched package, now and at every boot", &[
             ("godspeed install <publisher/name>[@version][,...] [yes]", "the newest fetched version, or the one named; each asked [y/N], naming what it would be given, unless `yes`", "godspeed install godspeed/hello"),
+            ("godspeed install <file>.gsp [yes] [accept-old]", "a package file, with no network: checked through its chain as of the day it was made (or, unpublished, by a key `godspeed trust add` trusts), then asked about as any package; a file older than offline-max-age-days is asked about first, and only `accept-old` answers that", "godspeed install hello.gsp"),
             ("godspeed install <publisher/name> grant <peer>,... | grant none", "give only some of the peers its contract requests, without the question", "godspeed install godspeed/hello grant none"),
             ("what it is given", "the send peers its contract requests and you approve, never `supervisor`, and no privilege", ""),
             ("what is checked", "the copy on disk, again, by the supervisor, before every start: signature, key, contract, binary", ""),
@@ -13541,8 +13549,14 @@ fn net_query(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64, tag: Opti
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
         }
+        // THROUGH THE REPLY MAILBOX (`gs::call::request_once`, the kernel's reply-matched `CallDeadline`), not
+        // `request_with_reply_deadline`, which hands the peer a reply cap to the shell's MAIN endpoint. This loop
+        // asks again every second, so a peer that holds requests - net-stack with no link - answers every one of
+        // them after the shell has its answer or has given up, and those late answers landed on the endpoint pipe
+        // stages send to: the next command's answer began with net-stack's status and did not decode (`osdev test
+        // gsp`, 2026-10-18). In the mailbox a late answer waits for the SDK to discard it before the next request.
         // quit-ok: 1 s a pass of a loop that reads `q` before every pass
-        if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) {
+        if let Ok(r) = gs::call::request_once(ctx, peer, msg, 1) {
             // A TAGGED channel checks the answer belongs to the question. An overtaken reply is
             // discarded and the poll continues rather than being believed - which is the entire point
             // of the tag, and is what `net_query`'s blind drain above could only approximate.
@@ -15414,12 +15428,15 @@ fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>)
     }
     match Table::decode(cap.bytes()) {
         Ok(t) => Some(t),
-        Err(_) => {
-            gs::io::println(ctx, if cap.bytes().is_empty() {
-                "godspeed: no answer came, so the shell ended it"
+        Err(why) => {
+            // Which way it failed to read, and how much came: an answer that does not decode is a defect in one of
+            // the two sides, and the reason is the first thing anybody chasing it needs.
+            if cap.bytes().is_empty() {
+                gs::io::println(ctx, "godspeed: no answer came, so the shell ended it");
             } else {
-                "godspeed: what came back does not read as an answer"
-            });
+                gs::io::println_fmt(ctx, format_args!("godspeed: what came back does not read as an answer ({}, {} bytes{})",
+                    why, cap.bytes().len(), if cap.overflow { ", more than the shell holds" } else { "" }));
+            }
             None
         }
     }
@@ -15429,7 +15446,7 @@ fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>)
 /// (`utilities/61_godspeed.md`). The table without its `status` row, as a grid; the command fails when
 /// the status says so.
 #[inline(never)]
-fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
+fn cmd_godspeed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
     if arg.trim().is_empty() {
         gs::io::println(ctx, "usage: godspeed search | info | fetch | install | upgrade | uninstall | list | verify | remove | trust | registry | config | check - `godspeed help` says what each does");
         return Err(ShellError::Unknown);
@@ -15471,6 +15488,34 @@ fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         }
         line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
     }
+    // TRUSTING A KEY DIRECTLY is asked first, with what it means: no registry vouches for what it signs, and nothing
+    // but this machine's operator can withdraw it.
+    if nw >= 4 && words[0] == "trust" && words[1] == "add" {
+        let yes = nw == 5 && words[4] == "yes";
+        if nw > 5 || (nw == 5 && !yes) {
+            gs::io::println(ctx, "usage: godspeed trust add <publisher> <key> [yes]");
+            return Err(ShellError::Unknown);
+        }
+        gs::io::println_fmt(ctx, format_args!(
+            "anything signed by {} will be trusted as coming from {}/, with no registry vouching for it.", words[3], words[2]));
+        gs::io::println(ctx, "  Nothing tells this machine if that key leaks; only `godspeed trust remove` ends it.");
+        if !yes {
+            gs::io::print(ctx, " Trust this key? [y/N]: ");
+            if !read_confirm(ctx) {
+                gs::io::println(ctx, "godspeed: cancelled - nothing was trusted");
+                return Ok(());
+            }
+        }
+        let mut n = 0usize;
+        for (i, w) in words[..4].iter().enumerate() {
+            let b = w.as_bytes();
+            if n + b.len() + 1 > line_buf.len() { break; }
+            if i > 0 { line_buf[n] = b' '; n += 1; }
+            line_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
+    }
     // FORGETTING A REGISTRY'S TRUST is asked first too: the next command trusts whatever root 1 matches the pin.
     if nw >= 3 && words[0] == "trust" && words[1] == "reset" {
         let yes = nw == 4 && words[3] == "yes";
@@ -15496,6 +15541,23 @@ fn cmd_godspeed(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
             n += b.len();
         }
         line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
+    }
+    // FOR A MACHINE WITH NO NETWORK: the file goes in the folder this was typed in, named from the release.
+    if nw == 3 && words[0] == "fetch" && words[2] == "offline" {
+        let mut q = [0u8; 512];
+        return godspeed_show(ctx, fmt_into(&mut q, format_args!("fetch {} save {}", words[1], cwd.as_str())));
+    }
+    // A PACKAGE FILE is named by a path the shell resolves, so `hello.gsp` is the one in this folder.
+    if nw == 2 && words[0] == "inspect" && words[1].ends_with(".gsp") {
+        let mut pbuf = [0u8; PATH_MAX];
+        let Some(path) = resolve_or_err(ctx, cwd, words[1], &mut pbuf) else { return Err(ShellError::Unknown) };
+        let mut q = [0u8; 512];
+        let path = core::str::from_utf8(path).unwrap_or("");
+        return godspeed_show(ctx, fmt_into(&mut q, format_args!("inspect {}", path)));
+    }
+    // A PACKAGE FILE installs in two steps: checked and unpacked, then installed as any fetched package.
+    if nw >= 2 && words[0] == "install" && words[1].ends_with(".gsp") {
+        return godspeed_install_file(ctx, cwd, &words[1..nw]);
     }
     // INSTALL AND UNINSTALL are asked first too, one package at a time: `grant` names the answer outright.
     if nw >= 2 && (words[0] == "install" || words[0] == "uninstall" || words[0] == "upgrade") && !(nw >= 3 && words[2] == "grant") {
@@ -15621,6 +15683,56 @@ fn table_lookup(t: &Option<Table>, key: &str, field: &[u8]) -> Option<String8L> 
     Some(out)
 }
 
+/// `godspeed install <file>.gsp [yes] [accept-old]` (`docs/developer-services-design.md` 15): the package manager
+/// checks the file through the registry's whole chain, offline, and unpacks it where a fetch would have left it;
+/// then it is installed exactly as a fetched package is, with the same question.
+///
+/// A file whose registry check is older than `offline-max-age-days`, or any file while the clock is not set, is a
+/// SECOND question, asked first: the operator may accept that a key revoked since would not show. `yes` does not
+/// answer it - so a script that says `yes` never accepts that risk by accident - and `accept-old` does. Anything
+/// else wrong with the file is refused with no question.
+fn godspeed_install_file(ctx: &ShellCtx, cwd: &Cwd, words: &[&str]) -> Result<(), ShellError> {
+    let (mut yes, mut accept) = (false, false);
+    for w in &words[1..] {
+        match *w {
+            "yes" => yes = true,
+            "accept-old" => accept = true,
+            _ => {
+                gs::io::println(ctx, "usage: godspeed install <file>.gsp [yes] [accept-old]");
+                return Err(ShellError::Unknown);
+            }
+        }
+    }
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(path) = resolve_or_err(ctx, cwd, words[0], &mut pbuf) else { return Err(ShellError::Unknown) };
+    let path = core::str::from_utf8(path).unwrap_or("");
+    let mut q = [0u8; 512];
+    let mut t = godspeed_answer(ctx, fmt_into(&mut q, format_args!("unpack {}{}", path, if accept { " accept-old" } else { "" })))
+        .ok_or(ShellError::Unknown)?;
+    let row = |t: &Table, key: &[u8], col: usize| (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == key)
+        .map(|r| { let mut c = String8L::new(); c.set(t.cell_bytes(r, col)); c });
+    if let Some(question) = row(&t, b"question", 2) {
+        let title = row(&t, b"title", 1).unwrap_or_else(String8L::new);
+        // Said BEFORE the question, so the answer is the next thing on its line.
+        if yes { gs::io::println(ctx, "  (`yes` on the line does not answer the question below; `accept-old` does)"); }
+        gs::io::print_fmt(ctx, format_args!("{} {}. Install it anyway? [y/N]: ",
+            core::str::from_utf8(title.as_bytes()).unwrap_or(""), core::str::from_utf8(question.as_bytes()).unwrap_or("")));
+        if !read_confirm(ctx) {
+            gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed - nothing of it was kept", words[0]));
+            return Ok(());
+        }
+        t = godspeed_answer(ctx, fmt_into(&mut q, format_args!("unpack {} accept-old", path))).ok_or(ShellError::Unknown)?;
+    }
+    // The release it unpacked, from the card's title: `<publisher/name> <version>`.
+    let title = row(&t, b"title", 1).unwrap_or_else(String8L::new);
+    godspeed_present(ctx, t)?;
+    let title = core::str::from_utf8(title.as_bytes()).unwrap_or("");
+    let Some((pkg, version)) = title.split_once(' ') else { return Err(ShellError::Unknown) };
+    let mut sb = [0u8; 512];
+    let spec = fmt_into(&mut sb, format_args!("{}@{}", pkg, version));
+    if install_one(ctx, spec, None, yes, &mut q) { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
 /// One `install`: what the release asks for, the question, then the install with the answer. False when it failed;
 /// a "no" is not a failure. `from`, for an upgrade, is the version installed now.
 fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> bool {
@@ -15708,6 +15820,14 @@ fn fmt_into<'b>(buf: &'b mut [u8; 512], args: core::fmt::Arguments<'_>) -> &'b s
 /// Run one `godspeed` command and show its answer: progress while it works, then the card or the list.
 #[inline(never)]
 fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
+    match godspeed_answer(ctx, line) {
+        Some(t) => godspeed_present(ctx, t),
+        None => Err(ShellError::Unknown),
+    }
+}
+
+/// One `godspeed` command's answer, its progress drawn in place on one line until it comes, then cleared.
+fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
     // PROGRESS, drawn in place on one line until the answer comes, then cleared.
     let drawn = core::cell::Cell::new(false);
     // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
@@ -15728,7 +15848,11 @@ fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
     };
     let built = build_godspeed_table(ctx, line, Some(&show));
     if drawn.get() { gs::io::print(ctx, "\r\x1b[2K"); }
-    let mut t = match built { Some(t) => t, None => return Err(ShellError::Unknown) };
+    built
+}
+
+/// An answer shown: the card or the list, then its status note. Err when it failed.
+fn godspeed_present(ctx: &ShellCtx, mut t: Table) -> Result<(), ShellError> {
     let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
     let answered = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status");
     // The status row's note is what a list's rows do not say about themselves (the chain it was verified
@@ -18723,7 +18847,16 @@ fn spawn_watched(ctx: &ShellCtx, svc: &str, peers: &[&str], secs: i64) -> bool {
     let Some(n) = supcmd::encode(&mut buf, supcmd::SPAWN, 0xFFFF, svc, peers) else { return false };
     let reply = gs::call::request_watched(ctx, "supervisor", &Message::from_bytes(&buf[..n]), secs, ctx);
     if let Some(c) = gs::ipc::take_sent_cap(ctx) { gs::cap::remove(ctx, c); }
-    matches!(reply, Ok(r) if r.payload_bytes().first() == Some(&supcmd::OK))
+    match reply {
+        Ok(r) if r.payload_bytes().first() == Some(&supcmd::OK) => true,
+        Ok(r) => {
+            // WHY the supervisor refused an installed program: its check from the disk said, after the status.
+            let why = r.payload_bytes().get(1..).and_then(|w| core::str::from_utf8(w).ok()).filter(|w| !w.is_empty());
+            if let Some(why) = why { gs::io::println_fmt(ctx, format_args!("{}: not run - {}", svc, why)); }
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Is a task called `name` running?
@@ -18932,10 +19065,13 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
         "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
             (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
             (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade' and 'trust reset' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, list, verify, trust, registry, config and check"),
+            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset" | "add" | "remove")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade', 'trust reset', 'trust add' and 'trust remove' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, inspect, list, verify, trust, registry, config and check"),
             (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) | (Some("search"), _) | (Some("info"), _) | (Some("list"), _)
                 | (Some("verify"), _) | (Some("trust"), None) => None,
-            _ => Some("pipe: pipe a report: godspeed search, info, list, registry, config or check"),
+            // A report; a file named by a full path, because a pipe stage is not given the folder it was typed in.
+            (Some("inspect"), Some(x)) if !x.ends_with(".gsp") || x.starts_with('/') => None,
+            (Some("inspect"), _) => Some("pipe: in a pipe, name the package file by its full path, as in godspeed inspect /users/default/hello-0.3.0.gsp"),
+            _ => Some("pipe: pipe a report: godspeed search, info, inspect, list, registry, config or check"),
         },
         "churn" if arg.split_whitespace().next() == Some("verify") => None,
         "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),
@@ -21262,8 +21398,10 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 #[inline(always)]
 fn ask_watched(ctx: &ShellCtx, peer: &str, msg: &Message, secs: i64) -> Option<Message> {
     if !ctx.cmd_active.get() {
-        // quit-ok: between commands, where there is no command to quit; inside one, the watch below
-        return ctx.request_with_reply_deadline(peer, msg, secs);
+        // quit-ok: between commands, where there is no command to quit; inside one, the watch below.
+        // Through the reply mailbox, so an answer that comes after the deadline cannot become the next
+        // command's (`net_query` says how it did).
+        return gs::call::request_within(ctx, peer, msg, secs).ok();
     }
     gs::call::request_watched(ctx, peer, msg, secs, ctx).ok()
 }

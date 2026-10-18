@@ -44,7 +44,7 @@ pub struct Key {
 }
 
 /// Every plain setting, in the order the file and `godspeed config` show them.
-pub const KEYS: [Key; 3] = [
+pub const KEYS: [Key; 4] = [
     Key {
         name: "tls-roots",
         default: "/system/services/godspeed/roots/",
@@ -52,6 +52,11 @@ pub const KEYS: [Key; 3] = [
     },
     Key { name: "timeout-secs", default: "30", about: "how long one request may take" },
     Key { name: "max-package-mib", default: "64", about: "the largest package that will be downloaded" },
+    Key {
+        name: "offline-max-age-days",
+        default: "30",
+        about: "how old a package file's registry check may be before installing it asks (`accept-old`)",
+    },
 ];
 
 /// The folder the default root is written to on first start, and the root itself.
@@ -85,7 +90,7 @@ impl Source {
 /// The configuration as read. A file with a problem is never half used: `problem` makes every command
 /// refuse until it is fixed.
 pub struct Config<'f> {
-    pub values: [(&'f str, Source); 3],
+    pub values: [(&'f str, Source); KEYS.len()],
     regs: [Registry<'f>; MAX_REGISTRIES],
     nregs: usize,
     /// Which of `regs` is in use, and whether a `use` line said so.
@@ -275,6 +280,7 @@ pub fn check(key: &str, value: &str) -> Result<(), &'static str> {
         }
         "timeout-secs" => number(value, 1, 100, "timeout-secs is a whole number of seconds, 1 to 100"),
         "max-package-mib" => number(value, 1, 4096, "max-package-mib is a whole number, 1 to 4096"),
+        "offline-max-age-days" => number(value, 0, 3650, "offline-max-age-days is a whole number of days, 0 to 3650"),
         _ => Err("no such setting"),
     }
 }

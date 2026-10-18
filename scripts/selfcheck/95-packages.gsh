@@ -35,6 +35,7 @@ for p in selfcheck-service selfcheck-utility selfcheck-app selfcheck-driver {
 }
 godspeed list installed | where package contains selfcheck- | assert empty
 godspeed list fetched | where package contains selfcheck- | assert empty
+if delete selfcheck-utility-0.2.0.gsp { echo 'packages: cleared a package file left by an earlier run' }
 
 # ---- the gate: is the registry reachable? ----------------------------------------------------
 #
@@ -101,6 +102,22 @@ if $reg > 0 {
     } else {
         skip 'packages: selfcheck-driver - its device (QEMU edu) is not on this machine; it verified above'
     }
+
+    echo ''
+    echo '===== packages: one file, for a machine with no network ====='
+    # Made here from the registry's own documents, then installed from the file alone, as on a machine that
+    # cannot reach the registry. `accept-old` because a board with no clock chip asks about EVERY file's age
+    # (its clock is not set), and this run has nobody to answer; `osdev test gsp` asks that question in QEMU.
+    assert ok godspeed uninstall godspeed/selfcheck-utility yes
+    assert ok godspeed remove godspeed/selfcheck-utility
+    assert ok godspeed fetch godspeed/selfcheck-utility offline
+    assert ok godspeed inspect selfcheck-utility-0.2.0.gsp
+    assert ok godspeed remove godspeed/selfcheck-utility
+    godspeed list fetched | where package=godspeed/selfcheck-utility | assert empty
+    assert ok godspeed install selfcheck-utility-0.2.0.gsp yes accept-old
+    selfcheck-utility fromfile | assert contains given: fromfile
+    assert ok godspeed uninstall godspeed/selfcheck-utility yes
+    assert ok delete selfcheck-utility-0.2.0.gsp
 
     echo ''
     echo '===== packages: what is refused ====='

@@ -31,6 +31,9 @@ RNG and RNG200, the JH7110's TRNG).
 godspeed search <word> [from <n>]                  the packages the registry vouches for whose name holds the word, 40 a page
 godspeed info <publisher/name>[@version]           its versions, then what it is: description, licence, release, what it ships and requests, who signed it
 godspeed fetch <publisher/name>[@version]          verify a package end to end and fetch it here - fetched, not installed
+godspeed fetch <publisher/name>[@version] offline  and write it here as one file, <name>-<version>.gsp, for a machine with no network
+godspeed inspect <publisher/name>[@version]        every check installing makes, this machine's binary included - nothing kept
+godspeed inspect <file>.gsp                        the same for a package file, with no network
 godspeed list available [from <n>]                 every package the registry in use offers, 40 a page
 godspeed list fetched                              the packages fetched here, with their sizes
 godspeed list installed                            the packages installed, and whether each is running
@@ -39,8 +42,11 @@ godspeed verify [<publisher/name>[@version]]       check fetched copies again fr
 godspeed remove <publisher/name>[@version]         delete a fetched copy, one version or every one
 godspeed trust                                     what this machine has accepted from each registry, and the publishers' keys
 godspeed trust reset <registry> [yes]              forget it, so the next command meets it again from root 1; asks [y/N]
+godspeed trust add <publisher> <key> [yes]         trust a key yourself, for an unpublished package file; asks [y/N]
+godspeed trust remove <publisher> <key>            stop trusting it: what it signed no longer starts
 godspeed install <publisher/name>[,...] [yes]      start fetched packages, now and at every boot; asks [y/N] for each
 godspeed install <publisher/name> grant <p>,...    the same with the peers named, and no question
+godspeed install <file>.gsp [yes] [accept-old]     a package file, with no network (4d)
 godspeed upgrade <publisher/name>[,...] | all [yes] fetch the newest release of what is installed and install it; asks
 godspeed uninstall <publisher/name>[,...] [yes]    stop them, and no longer start them at boot; asks [y/N] for each
 godspeed registry                                  the registries this machine knows; one is in use
@@ -106,7 +112,8 @@ because the key is absent.
 |---|---|---|
 | `tls-roots` | `/system/services/godspeed/roots/` | the certificate authorities TLS accepts, one DER file each. On first start the folder is given ISRG Root X2, the root the registry's chain reaches; a folder that exists is never refilled, so a root removed stays removed |
 | `timeout-secs` | 30 | how long one request may take, 1 to 100, counted from its start. Looking the name up and connecting keep their own limits, 10 s and 20 s, so a smaller value does not shorten those |
-| `max-package-mib` | 64 | the largest package that will be downloaded, 1 to 4096. Nothing downloads yet |
+| `max-package-mib` | 64 | the largest package that will be downloaded, 1 to 4096 |
+| `offline-max-age-days` | 30 | how old a package file's registry check may be before installing it asks, 0 to 3650 (4d) |
 
 A registry is not a plain setting: `godspeed config set registry` is refused with the command that manages
 registries, and so is `trust-root`.
@@ -270,6 +277,44 @@ and the command fails then. A utility is never restarted and runs one at a time.
 name (`hello-utility`), or the full `publisher/name` when two publishers' utilities share one, which is refused
 rather than guessed between. A built-in command of the same name always wins: an installed utility can never
 replace `dir`.
+
+## 4d. Package files: installing with no network
+
+A package travels as one file, `<name>-<version>.gsp`, made where there is a network and installed where there
+is not (`docs/developer-services-design.md` 15):
+
+```
+gsh> godspeed fetch godspeed/hello offline          on a machine that can reach the registry
+gsh> godspeed install hello-0.3.0.gsp               on one that cannot, after copying it there
+```
+
+The developer CLI makes the same file on a workstation (`godspeed fetch godspeed/hello --offline`).
+
+**Trusted through the registry.** The file holds the documents a fetch reads, under the paths the registry
+serves them at, and is checked by the same code from the root this machine's image pins. Nothing about what
+is checked differs; only "now" does: a file is checked as of the last moment its timestamp was valid, and
+records nothing of the registry's view on this machine - except that a NEWER record of the publishers' keys
+wins, whichever side has it, so a key this machine knows was revoked refuses the file.
+
+**Its age is the one thing asked.** A file whose check is older than `offline-max-age-days`, or any file while
+the clock is not set (the Pis and the VisionFive have no clock chip), is asked about before anything is kept:
+
+```
+godspeed/hello 0.3.0 its registry check ran out on 2026-10-19, 59 days ago. A key revoked since then would
+not show. Install it anyway? [y/N]
+```
+
+`yes` on the line does NOT answer this - a script that says `yes` never accepts the risk by accident - and
+`accept-old` does. The acceptance is recorded in the copy's `origin` and shown on its card. A bad signature, a
+digest that does not match or a key known revoked is refused, with no question.
+
+**Unpublished packages.** `godspeed package --local` in the CLI makes a file nobody has published: no registry
+vouches for its key, so this machine installs it only if its operator trusts that key for that publisher,
+once - `godspeed trust add <publisher> <key>`, which asks and says what it means, and which the CLI prints. It
+is listed as coming from `(operator)`. Nothing tells this machine if that key leaks: `godspeed trust remove`
+withdraws it, and what it signed no longer starts, since the supervisor checks the list at every start.
+
+`godspeed inspect <file>.gsp` checks either kind and keeps nothing.
 
 ## 5. Pipes
 
