@@ -8219,7 +8219,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         "-smp",     &smp.to_string(), "-m", "512M",
         "-serial",  &format!("tcp::{port},server"),
         "-serial",  "null",
-        "-display", "none", "-no-reboot", "-no-shutdown",
+        // No `-no-reboot`: the suite reboots once, to see an installed service started at boot.
+        "-display", "none", "-no-shutdown",
     ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("godspeed: QEMU launch failed: {e}"); std::process::exit(1); } };
     let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
@@ -8727,6 +8728,23 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(sc.contains("stopped and started"), "and its replacement by 1.0.0 is cold");
         check!(!sc.contains("selfcheck-driver - its device"), "with QEMU's edu here, the driver is started, not skipped");
         check!(!sc.contains("registry is not reachable"), "the registry was reached, so nothing was skipped for it");
+
+        // ---- AT BOOT: an installed service starts on its own after a reboot, from the disk. `fs` mounts after
+        //      the supervisor is ready, so the supervisor's first read of the installed list can go unanswered;
+        //      it is asked again until `fs` answers (`Installed::try_boot`) rather than given up on.
+        let bi = run!(b"godspeed install godspeed/hello-service@0.7.0 yes\r", 180);
+        check!(bi.contains("installed godspeed/hello-service 0.7.0 started"), "a service is installed before the reboot");
+        send(&mut write_half, b"reboot now\r");
+        let up = collect_until(&buf, &mut cursor, b"supervisor: ready", Duration::from_secs(180)).unwrap_or_default();
+        let started = collect_until(&buf, &mut cursor, b"hello-service 0.7.0: started", Duration::from_secs(150));
+        check!(up.contains("supervisor: ready") && started.is_some(),
+               "after a reboot the installed service is started from the disk, by the supervisor, unasked");
+        let after = format!("{}{}", up, started.unwrap_or_default());
+        check!(!after.contains("could not be read") && !after.contains("no installed package started"),
+               "the boot read of the installed list waited for fs rather than giving up");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+        let bu = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);
+        check!(bu.contains("uninstalled"), "and is uninstalled again");
     }
 
     let _ = child.kill();

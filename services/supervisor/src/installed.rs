@@ -107,10 +107,27 @@ fn alive(ctx: &ServiceContext, name: &str) -> bool {
 pub struct Installed {
     e: [Option<Entry>; MAX_INSTALLED],
     image: Option<Region>,
+    /// The installed list is still to be read at boot: `fs` has not answered yet (`try_boot`).
+    boot_pending: bool,
+    /// When the boot read was first asked, in seconds of uptime, and whether the wait has been said.
+    boot_since: i64,
+    boot_said: bool,
 }
 
+/// How long the boot read waits for `fs` to answer before it says it gave up. `fs` mounts, and replays its
+/// journal, after the supervisor is ready; on a USB stick that is seconds, and a read asked before it is
+/// done is not answered in time. Not answered is not a "no": the list is asked again until `fs` says what
+/// is there, for this long at most.
+const BOOT_WAIT_SECS: i64 = 120;
+
 impl Installed {
-    pub fn new() -> Installed { Installed { e: [None; MAX_INSTALLED], image: None } }
+    pub fn new() -> Installed {
+        Installed { e: [None; MAX_INSTALLED], image: None, boot_pending: false, boot_since: 0, boot_said: false }
+    }
+
+    /// Is the installed list still to be read (`fs` has not answered yet)? The supervisor's loop then waits
+    /// with a bound rather than forever, and asks again (`try_boot`).
+    pub fn boot_pending(&self) -> bool { self.boot_pending }
 
     fn find(&self, name: &str) -> Option<usize> {
         self.e.iter().position(|x| x.is_some_and(|x| x.name() == name))
@@ -460,12 +477,40 @@ impl Installed {
 
     /// At boot: start every package [`LIST`] names. A missing list is nothing installed.
     pub fn boot(&mut self, ctx: &ServiceContext) {
+        self.boot_pending = true;
+        self.boot_since = gs::task::uptime_secs(ctx);
+        self.try_boot(ctx);
+    }
+
+    /// Read the installed list and start what is on it, if it is still owed. An answer from `fs` - the list,
+    /// or that there is none - settles it. NO answer does not: `fs` may still be mounting, so it is asked
+    /// again on the next pass, said once, for `BOOT_WAIT_SECS` at most, and then given up on out loud.
+    pub fn try_boot(&mut self, ctx: &ServiceContext) {
+        if !self.boot_pending { return; }
+        let waited = gs::task::uptime_secs(ctx) - self.boot_since;
         let mut list = [0u8; 1024];
         let n = match gs::fs::Fs::new(ctx).read_into(LIST, &mut list) {
             Ok(n) => n,
-            Err(gs::Error::NotFound) => return,
-            Err(e) => { ctx.log_fmt(format_args!("supervisor: {} could not be read ({:?}) - no installed package started", LIST, e)); return; }
+            Err(gs::Error::NotFound) => { self.boot_pending = false; return; }
+            Err(e @ (gs::Error::OutcomeUnknown | gs::Error::Unreachable | gs::Error::Busy | gs::Error::Unavailable))
+                if waited < BOOT_WAIT_SECS => {
+                if !self.boot_said {
+                    ctx.log_fmt(format_args!("supervisor: {} - fs has not answered yet ({:?}); installed packages start when it does (waiting {} s at most)",
+                        LIST, e, BOOT_WAIT_SECS));
+                    self.boot_said = true;
+                }
+                return;
+            }
+            Err(e) => {
+                self.boot_pending = false;
+                ctx.log_fmt(format_args!("supervisor: {} could not be read ({:?}) after {} s - no installed package started", LIST, e, waited));
+                return;
+            }
         };
+        self.boot_pending = false;
+        if self.boot_said {
+            ctx.log_fmt(format_args!("supervisor: {} read after {} s - starting the installed packages", LIST, waited));
+        }
         for line in core::str::from_utf8(&list[..n]).unwrap_or("").lines() {
             let mut it = line.split_whitespace();
             let (Some(pkg), Some(version)) = (it.next(), it.next()) else { continue };

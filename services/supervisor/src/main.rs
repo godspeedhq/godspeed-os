@@ -2511,9 +2511,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         gs::ipc::park(&ctx);
     }
     loop {
-        let msg = gs::ipc::recv(&ctx);
-        handle_message(&ctx, &mut name_map, &mut usb, &mut events, &mut inst, &msg);
-        name_map.release_handoff(&ctx);
+        // While the installed list is still owed (`fs` had not answered at boot), the wait is BOUNDED so the
+        // list is asked for again; once read, this blocks as it always did.
+        let msg = if inst.boot_pending() { gs::ipc::recv_within(&ctx, 2) } else { Some(gs::ipc::recv(&ctx)) };
+        if let Some(msg) = msg {
+            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &mut inst, &msg);
+            name_map.release_handoff(&ctx);
+        }
+        inst.try_boot(&ctx);
         // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
         // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
         // them, and logged "missed death notification" for each - and then each notification arrived and
