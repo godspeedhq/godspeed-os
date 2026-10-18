@@ -1,6 +1,6 @@
 # TCP for GodspeedOS: the design, and the two facts that shaped it
 
-> **Status: BUILT and shipping** (this header said "design, being built" until 2026-09-26, while the same document's own "HARDWARE VERIFIED" and "Working, and verified on the wire" sections said otherwise). `services/net-stack/src/tcp.rs` is 1,747 lines (2026-10-09); op 22 (listen, `OP_LISTEN` in `gs::net`), the shell's `tcp` and `serve`, `tcp selftest` (56 checks) and `gs::net::Net::tcp` / `Listener::accept` are all live. `docs/networking.md` recorded the commitment on
+> **Status: BUILT and shipping** (this header said "design, being built" until 2026-09-26, while the same document's own "HARDWARE VERIFIED" and "Working, and verified on the wire" sections said otherwise). `services/net-stack/src/tcp.rs` is 1,747 lines (2026-10-09); op 22 (listen, `OP_LISTEN` in `gs::net`), the shell's `tcp` and `serve`, `tcp selftest` (67 checks) and `gs::net::Net::tcp` / `Listener::accept` are all live. `docs/networking.md` recorded the commitment on
 > 2026-07-04 ("TCP/IPv4 is committed from the start, not far-future"); this is how it gets built, and
 > why it is not a port of anyone else's stack.
 
@@ -90,8 +90,11 @@ So TCP's own flow control *becomes* the enforcement of §26.6, instead of fighti
 the exact truth about what we can hold, and telling a peer the truth about capacity is Commandment VIII
 at the protocol level. No allocator, no growth, and the maximum footprint is readable off the source.
 
-Out-of-order reassembly gets a **small fixed number of held segments**, beyond which we drop and let
+Out-of-order reassembly gets a **small fixed number of tracked ranges**, beyond which we drop and let
 the peer retransmit. That is always-legal TCP and it is bounded. FreeBSD does far more; we should not.
+(Since 2026-10-18 a segment that arrives early is written straight into its place in the receive arena,
+which has room for the whole window by construction, and only its range is kept - see "Downloads at the
+speed of the link" below.)
 
 ## What we take from FreeBSD, and what we refuse
 
@@ -576,7 +579,8 @@ than its client did. A neighbour answers in milliseconds, so op 23 asks once (`a
 is unchanged, and still slow to the internet; recorded here rather than changed under it.
 
 **What it does not change.** The table is still `MAX_CONNS = 2` and the receive buffer still 2 KiB, and the
-connection's data still moves on the 100 ms poll. That is ample for a registry's index and trust files and
+connection's data still moves on the 100 ms poll. (All three of those but the table size changed on
+2026-10-18 - see the next sections.) That is ample for a registry's index and trust files and
 slow for a large package - roughly 20 KB/s at best - which is recorded here rather than discovered later.
 
 ### A finished connection its client closed kept its slot (2026-10-18)
@@ -591,3 +595,45 @@ which is why it had not shown.
 
 A client's close now marks its reader gone in ANY state and drops what is unread, and the reaper releases a
 closed connection whose reader is gone (`Conn::reapable`). The self-test has three checks for it.
+
+### Downloads at the speed of the link (2026-10-18)
+
+The operator's requirement: packages of many megabytes, and an upgrade of everything, must come down as fast as
+the internet connection allows. Measured first, in QEMU against a public speed-test server over verified TLS
+(`osdev test download`, which runs `godspeed check <url>` and reads its `speed` row): **113 KiB/s** for 1 MB.
+Five limits were stacked, each below the link:
+
+| limit | was | now |
+|---|---|---|
+| receive window | 8 KiB in the connection, no scaling: at most `window / round trip`, about 320 KiB/s over 25 ms | 256 KiB per connection, a region net-stack asks the kernel for once at start (`Tcp::give_buffers`), with the window-scale option (RFC 7323) negotiated on the SYN. A slot that cannot have one keeps the 8 KiB arena and says so |
+| taking frames in | one poll is one batch from the driver, two full frames at most (a message is 4 KiB), and polls ran every 100 ms, or every 10 ms while a client read | while a poll finds frames the next is owed in 1 ms (`STREAM_POLL_MS`), and a read drains the driver while frames keep coming, for up to 5 ms (`RECV_DRAIN_MS`) |
+| one read | 2048 bytes | a whole message, 4095 bytes |
+| the TLS reader | asked for each record's 5-byte header on its own, a round trip for five bytes | reads ahead into its record buffer and keeps the rest for the next record |
+| a request's timeout | `timeout-secs` from the request's START, so a download longer than 30 s failed on a working link | measured from the last byte that moved: a stall, not a total |
+| the PC NIC's receive ring | 8 descriptors (e1000 and RTL8168): a burst past eight frames was dropped, so the sender saw loss, never had more than 12.7 KiB in flight against a 64 KiB window, and retransmitted three to five times a second | 24, as GENET and dwmac already had; what the 64 KiB DMA arena holds |
+
+**Out-of-order data waits in the arena.** With a 256 KiB window one lost frame is followed by up to 180 more,
+and the four segments held aside before meant all but four of them were dropped - and with no selective
+acknowledgement the peer then sends them again one round trip at a time. Now a segment that arrives ahead of a
+gap is written to its place in the ring (the window is the ring's free space, so anything in the window has a
+place) and only its sequence range is recorded, up to `MAX_OOO = 16` ranges, merged as they touch. One resent
+segment fills the hole and everything behind it becomes readable. The self-test has checks for the ring's
+wrap, the ranges and the scale option.
+
+**One bug the change made, found on the wire.** QEMU's user network does not scale windows, so the field
+stops at 64 KiB of the 256 KiB arena. The window-update test compared the free space with what had been told,
+so it was always owed an update: a bare acknowledgement went out on every poll, and since that comes before new
+data, the TLS ClientHello was never sent and the handshake timed out. It now compares what CAN be told
+(`Conn::advertisable`), and the self-test checks it against a real 256 KiB arena.
+
+**Measured, QEMU, 10 MB over verified TLS:** 113 KiB/s before, 322 KiB/s with the window, the polling and the
+timeout, **681 KiB/s** with the larger NIC ring, with no retransmissions left in the capture. 1 MB, handshake
+included: 242 KiB/s. The 4 MiB disk copy beside it runs at about 5 MB/s, so the disk is not the limit. What
+limits it in QEMU now is the client: the advertised window falls to a few KiB because the 256 KiB arena is
+full of bytes `godspeed-pm` has not read yet, and it is decrypting AES-GCM in software on an emulated CPU.
+That is QEMU's figure; the hardware's is the one that counts, and is the next card.
+
+**What is still in the way, recorded rather than smoothed over.** Every byte still crosses net-stack and its
+client in 4 KiB messages and is copied at each hop - the constitution's choice (2.5, zero-copy is rejected), not
+an oversight - and a driver batch still carries two full frames. TLS is decrypted in software. Those are the
+next limits, and `osdev test download` is how the next change is measured.

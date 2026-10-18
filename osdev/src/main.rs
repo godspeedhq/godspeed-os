@@ -1748,6 +1748,7 @@ fn cmd_test(suite: &str) {
         "jobs"           => run_jobs_test(),
         "godspeed"       => run_godspeed_test(),
         "gsp"            => run_gsp_test(),
+        "download"       => run_download_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
         "cross-isa"      => run_cross_isa_test(),
@@ -3987,6 +3988,29 @@ fn run_gsp_test() {
     gsfs_add_file(persist, "hello-utility-0.9.0.gsp", &fixture);
     gsfs_layout(persist);
     crate::shell_test::run_gsp(&image_path, persist, 2);
+}
+
+/// `osdev test download`: how fast an HTTPS download runs, at sizes a package can be (needs this machine online).
+fn run_download_test() {
+    println!("
+=== download: HTTPS throughput, measured ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_download.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    let root = std::fs::read("osdev/fixtures/gts-root-r4.der").expect("osdev/fixtures/gts-root-r4.der");
+    gsfs_add_file(persist, "gts-root-r4.der", &root);
+    // 4 MiB to copy: the disk's half of a download, measured beside the network's.
+    let big: Vec<u8> = (0..4 * 1024 * 1024u32).map(|k| (k * 7 + k / 509) as u8).collect();
+    gsfs_add_file(persist, "big.bin", &big);
+    gsfs_layout(persist);
+    crate::shell_test::run_download(&image_path, persist, 2);
 }
 
 fn run_jobs_test() {

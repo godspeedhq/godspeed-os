@@ -97,7 +97,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             "`godspeed registry help` says what each does"),
             }
         }
-        (Some("check"), None) => check(&ctx, &mut r),
+        (Some("check"), None) => check(&ctx, &mut r, None),
+        (Some("check"), Some(page)) if words.clone().next().is_none() => check(&ctx, &mut r, Some(page)),
         (Some("search"), Some(word)) => match page_from(&mut words) {
             Ok(from) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::search(&ctx, r, ready, roots, Some(word), from)),
             Err(()) => r.fail("usage", "godspeed search <word> [from <n>]", "`from` and a number: where the page starts"),
@@ -576,7 +577,9 @@ fn registry_remove(ctx: &ServiceContext, name: &str, r: &mut Rows) {
 
 /// Reach the registry over verified TLS, one row per step.
 #[inline(never)]
-fn check(ctx: &ServiceContext, r: &mut Rows) {
+/// `godspeed check`: the registry in use, one row per step. With an address, that one page instead, read to its
+/// end and thrown away: how fast this machine downloads from there, through every step a fetch takes.
+fn check(ctx: &ServiceContext, r: &mut Rows, page: Option<&str>) {
     let mut buf = [0u8; config::FILE_MAX];
     let n = match load(ctx, r, &mut buf) {
         Ok(n) => n,
@@ -587,11 +590,16 @@ fn check(ctx: &ServiceContext, r: &mut Rows) {
         return r.fail("config", config::PATH, problem_text(&p).as_str());
     }
     let using = c.in_use();
-    let url = match config::url(using.url) {
-        Ok(u) => u,
-        Err(why) => return r.fail("registry", using.url, why),
+    let url = match page {
+        Some(p) => match config::page(p) {
+            Ok(u) => { r.row("page", p, "read to its end and thrown away"); u }
+            Err(why) => return r.fail("page", p, why),
+        },
+        None => match config::url(using.url) {
+            Ok(u) => { r.row("registry", using.url, cell(format_args!("{} (in use)", using.name)).as_str()); u }
+            Err(why) => return r.fail("registry", using.url, why),
+        },
     };
-    r.row("registry", using.url, cell(format_args!("{} (in use)", using.name)).as_str());
 
     let Some((now, source_word)) = clock(ctx, r) else { return };
     let (y, mo, d, h, mi) = config::civil(now);
@@ -607,14 +615,22 @@ fn check(ctx: &ServiceContext, r: &mut Rows) {
 
     // THE REQUEST.
     let timeout = config::number_of(c.get("timeout-secs"));
+    let began = gs::driver::wait::counter_ms(ctx);
     match https::get(ctx, url.host, url.port, url.base, &roots[..count], now, timeout) {
         Ok(a) => {
+            // HOW FAST, from the name lookup to the last byte: what a download of this size costs on this link.
+            let ms = gs::driver::wait::counter_ms(ctx).saturating_sub(began).max(1);
             r.row("address", cell(format_args!("{}.{}.{}.{}", a.ip[0], a.ip[1], a.ip[2], a.ip[3])).as_str(), url.host);
             r.row("tls", "verified", "TLS 1.3; the server's certificate chain reaches a trusted root and names it");
             let status = cell(format_args!("HTTP/1.1 {}{}", a.status, if a.status == 200 { " OK" } else { "" }));
             let size = cell(format_args!("{} bytes", a.total));
             if a.status == 200 { r.row("http", status.as_str(), size.as_str()); } else { r.fail("http", status.as_str(), size.as_str()); }
-            if a.status == 200 && a.kept_len > 0 {
+            if a.status == 200 && began != 0 {
+                let kib_s = a.total as u64 * 1000 / 1024 / ms;
+                r.row("speed", cell(format_args!("{} KiB/s", kib_s)).as_str(),
+                      cell(format_args!("{} bytes in {}.{:03} s, the handshake included", a.total, ms / 1000, ms % 1000)).as_str());
+            }
+            if a.status == 200 && a.kept_len > 0 && page.is_none() {
                 r.row("says", first_line(&a.kept[..a.kept_len]), "the first line of the registry's answer");
             }
         }

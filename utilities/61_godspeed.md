@@ -113,7 +113,7 @@ because the key is absent.
 | key | default | what it is |
 |---|---|---|
 | `tls-roots` | `/system/services/godspeed/roots/` | the certificate authorities TLS accepts, one DER file each. On first start the folder is given ISRG Root X2, the root the registry's chain reaches; a folder that exists is never refilled, so a root removed stays removed |
-| `timeout-secs` | 30 | how long one request may take, 1 to 100, counted from its start. Looking the name up and connecting keep their own limits, 10 s and 20 s, so a smaller value does not shorten those |
+| `timeout-secs` | 30 | how long a request may go with nothing moving on its connection, 1 to 100: a STALL, not a total, so a large download that keeps arriving is never cut off. Looking the name up and connecting keep their own limits, 10 s and 20 s, so a smaller value does not shorten those |
 | `max-package-mib` | 64 | the largest package that will be downloaded, 1 to 4096 |
 | `offline-max-age-days` | 30 | how old a package file's registry check may be before installing it asks, 0 to 3650 (4d) |
 
@@ -149,6 +149,11 @@ One row per step, stopping at the first that fails and saying why:
 A failure names the step and the reason in words a person can act on: an expired certificate (or a clock
 that is ahead), one not valid yet (or a clock behind), a chain that reaches no trusted root, a certificate
 for another name, no hardware random source, no network. TLS is never skipped: there is no `insecure` mode.
+
+**`godspeed check <https-url>`** reads that one page instead of the registry, through every step above, to its
+end, and throws it away: `page` replaces `registry`, `says` is left out, and a `speed` row says how fast it came,
+`KiB/s` and the bytes and seconds, the handshake included. It is how this machine's download speed is measured
+(`osdev test download`). The address may carry a query (`https://host/path?query`); it is still `https://` only.
 
 ## 4a. Packages
 

@@ -658,7 +658,7 @@ impl<'c, 'n: 'c, 'a: 'n> Conn<'c, 'n, 'a> {
     ///
     /// Any buffer size works: the request tells `net-stack` how much `buf` holds, and it takes no
     /// more than that off the connection, so nothing is read and then lost. One call moves at most
-    /// 2048 bytes. (Until 2026-10-10 it asked for everything and dropped what did not fit -
+    /// 4095 bytes, one message. (Until 2026-10-10 it asked for everything and dropped what did not fit -
     /// `backlog/fixed/80` G3.)
     ///
     /// **Authority:** this connection's `READ` right.
@@ -754,7 +754,8 @@ impl<'n, 'a: 'n> Stream<'n, 'a> {
     /// closed and that has been read to the end is released by `net-stack`, after which this returns
     /// [`Error::Revoked`] - that is the end of the stream.
     ///
-    /// One call moves at most 2048 bytes. **Authority:** this connection's `READ` right.
+    /// One call moves at most 4095 bytes, one message, so a buffer of 4 KiB is what a download wants.
+    /// **Authority:** this connection's `READ` right.
     pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let max = buf.len().min(u16::MAX as usize) as u16;
         let [lo, hi] = max.to_le_bytes();

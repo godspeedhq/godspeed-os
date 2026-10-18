@@ -867,7 +867,7 @@ default (26.4).
 | `registry` | `https://godspeed-registry.bankole-422.workers.dev` | where packages are read. `https://` only: anything else is refused with the reason, because the transport is TLS (10.3) |
 | `trust-root` | `sha256:d769d1a64c3105c8da0ffcc2f54aba1c3a16ce4ae707a6d206556f08824a146d` | the registry's trust root, pinned on first contact (the CLI README's own pin). After first contact the root the machine reached is remembered, and root rotation happens in-band, signed |
 | `tls-roots` | `/system/services/godspeed/roots/`, holding ISRG Root X2 | the certificate authorities TLS accepts, one file per root. Adding a CA is adding a file (10.3's table says why X2 suffices today) |
-| `timeout-secs` | 30 | how long one request may take before it is abandoned and said so (`[q] quit` still applies) |
+| `timeout-secs` | 30 | how long a request may go with NOTHING moving on its connection before it is abandoned and said so (`[q] quit` still applies). A download that is still arriving is never cut off by it, whatever its size |
 | `max-package-mib` | 64 | the largest package the utility will download, so a hostile index cannot fill the disk |
 
 **Changed 2026-10-16 by the operator: several registries, exactly one in use.** The `registry` and

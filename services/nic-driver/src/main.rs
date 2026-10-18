@@ -95,7 +95,7 @@ const TXD_STA_DD:   u8 = 1 << 0; // (TX) descriptor done
 // RX descriptor (16 B): addr@0, length(u16)@8, status(u8)@12, errors(u8)@13.
 const RXD_STA_DD:   u8 = 1 << 0; // (RX) descriptor done - a frame landed in this buffer
 
-// DMA-arena layout (64 KiB): TX ring + one TX frame buffer, then an RX ring + 8 x 2 KiB RX buffers.
+// DMA-arena layout (64 KiB): TX ring + one TX frame buffer, then an RX ring + 24 x 2 KiB RX buffers, then the tally.
 const TX_RING_OFF:   usize = 0x0000;
 const TX_RING_COUNT: usize = 8;
 const TX_RING_BYTES: u32   = (TX_RING_COUNT * 16) as u32;
@@ -115,14 +115,23 @@ const RX_RING_OFF:   usize = 0x2000;
 //
 // This is the silicon's requirement, borrowed as such (§26.14) - nothing about our design wanted
 // four. Eight descriptors is 128 bytes exactly, the smallest legal ring.
-const RX_RING_COUNT: usize = 8;
+//
+// TWENTY-FOUR NOW (384 bytes, three times the multiple), because eight was the DOWNLOAD's limit
+// (2026-10-18). A sender puts a window's worth on the wire at once, and the ring is all that holds a
+// burst until net-stack takes it: past eight frames the rest were dropped, the sender saw loss, and a
+// download in QEMU never had more than 12.7 KiB in flight against a 64 KiB window, with three to five
+// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too. It is what the
+// 64 KiB arena holds: 24 x 2 KiB from 0x3000 ends at 0xF000, and the tally goes after it.
+const RX_RING_COUNT: usize = 24;
 const RX_RING_BYTES: u32   = (RX_RING_COUNT * 16) as u32;
 const RX_BUF_OFF:    usize = 0x3000;
 const RX_BUF_SIZE:   usize = 2048;
-// After RX_BUF (8 x 2 KiB, so it now ends at 0x7000): a 64-byte, 64-byte-aligned buffer the NIC DMAs
+// After RX_BUF (24 x 2 KiB, so it ends at 0xF000): a 64-byte, 64-byte-aligned buffer the NIC DMAs
 // its hardware tally counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error
 // counts, read straight off silicon and INDEPENDENT of net-stack.
-const TALLY_OFF:     usize = 0x7000;
+const TALLY_OFF:     usize = 0xF000;
+const _: () = assert!(RX_BUF_OFF + RX_RING_COUNT * RX_BUF_SIZE <= TALLY_OFF && TALLY_OFF + 64 <= 0x10000,
+    "the RX buffers and the tally must fit the 64 KiB arena, apart");
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.

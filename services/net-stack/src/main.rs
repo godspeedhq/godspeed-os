@@ -1689,12 +1689,17 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
 /// 200 ms. Ten wakes a second is also the ceiling on what this costs: each is ONE drain request to
 /// `nic-driver`, and only when nothing else woke us.
 const POLL_MS: u64 = 100;
-/// How old the last poll may be when a client asks to READ a connection before one is run for it. A reader
-/// waiting on a connection is the one time the poll is owed sooner: the data it waits for may already be in
-/// the driver, and the window update that lets the peer send more goes out only from a poll. Waiting for the
-/// scheduled one, a 2 KiB window refilled at most every 100 ms - about 9 KiB/s on the VisionFive over WiFi
-/// AND Ethernet, and 5.5 KiB/s in QEMU (2026-10-18). Ten milliseconds bounds what a busy reader costs.
-const RECV_POLL_MS: u64 = 10;
+/// The poll interval WHILE FRAMES ARE ARRIVING: a millisecond. A download's frames queue in the driver's
+/// receive ring, and nothing takes them out but a poll. At `POLL_MS` a window of data waited up to 100 ms to
+/// be read in, which is a download paced by this service's own clock rather than by the link - a 2 KiB
+/// window refilled ten times a second was 9 KiB/s on the VisionFive over WiFi AND Ethernet, and 5.5 KiB/s
+/// in QEMU (2026-10-18). Back to `POLL_MS` as soon as a poll finds nothing, so an idle machine costs what it
+/// did.
+const STREAM_POLL_MS: u64 = 1;
+/// How long a READ may spend taking in what the driver already holds before it answers. A reader waiting
+/// on a connection is when the bytes are owed soonest, so it drains the driver while frames keep coming,
+/// up to this: bounded, so one connection's reader cannot keep the service from its other clients.
+const RECV_DRAIN_MS: u64 = 5;
 /// How long a connect waits for a closing connection's slot when the table is full (`OP_CONNECT`). TIME_WAIT
 /// here is 2 s, and a FIN exchange is a round trip or two, so 4 s covers both; a client asking for a
 /// connection waits 20 s for its answer.
@@ -2829,8 +2834,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // negative and cannot be produced on demand, so it is asserted where it can be, at a cost worth
     // paying. That cost is memory and arithmetic only - no frame is transmitted, no driver is asked
     // anything - and it is paid once, before the first client can be served.
+    // The self-test's large arena, handed on to the live table below rather than asked for twice.
+    let mut spare = None;
     {
-        let (p, f) = tcp::selftest(&ctx);
+        let (p, f) = tcp::selftest(&ctx, &mut spare);
         if f == 0 {
             ctx.log_fmt(format_args!("net-stack: tcp selftest PASS - {} checks", p));
         } else {
@@ -2858,6 +2865,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     /// When the last poll step ran. The poll is owed every `POLL_MS`, and this is what makes that a
     /// schedule rather than a hope - see the loop below.
     let mut last_poll: u64 = 0;
+    /// Whether the last poll found frames: while it does, the poll is owed every `STREAM_POLL_MS`.
+    let mut streaming = false;
     // When this service last reached the top of its wait. See `SLOW_PASS_MS`.
     let mut last_pass: u64 = 0;
     let mut slow_passes: u32 = 0;
@@ -2869,6 +2878,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let boot_tsc_hz = calibrate_tsc_hz(&ctx);
     let mut tcpst = tcp::Tcp::new(boot_tsc_hz, gs::driver::wait::ticks(&ctx));
     tcpst.warn_if_no_clock(&ctx);
+    // The large receive arenas, asked for once. A slot without one still works, at the small window - said.
+    let given = tcpst.give_buffers(&ctx, spare);
+    if given == tcp::MAX_CONNS {
+        ctx.log_fmt(format_args!("net-stack: tcp receive window {} KiB per connection, scaled (RFC 7323)", tcp::RCV_BIG / 1024));
+    } else {
+        ctx.log_fmt(format_args!("net-stack: tcp - only {} of {} connections have the {} KiB receive window; the rest keep {} KiB, so a download on them is slower",
+            given, tcp::MAX_CONNS, tcp::RCV_BIG / 1024, tcp::RCV_SMALL / 1024));
+    }
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
     // dance in place - a link that comes up after boot recovers without a reboot.
@@ -3107,7 +3124,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Any work owed on a schedule has to be driven by the schedule. Gating it on the
                     // service being idle means the busier it gets, the less it keeps its promises -
                     // which is exactly backwards.
-                    if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= ticks_ms(&ctx, POLL_MS) {
+                    let interval = if streaming { STREAM_POLL_MS } else { POLL_MS };
+                    if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= ticks_ms(&ctx, interval) {
                         last_poll = gs::driver::wait::ticks(&ctx);
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
                                             dns_server, status };
@@ -3115,7 +3133,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // every established connection carries its own peer MAC on the `Conn`,
                         // so `poll_one` addresses its frames correctly whatever is passed here.
                         let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
-                        poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                        streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks)
+                            && tcpst.conns.iter().any(|c| c.state == tcp::State::Established);
                     }
                     // AND THE ASK DEADLINES, HERE AS WELL AS AT THE TOP. This wait goes round without
                     // returning to the top of the serve loop for as long as no message arrives, so a
@@ -3123,7 +3142,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // in QEMU, an NTP query nobody answered got its "no reply" eight seconds late, after
                     // `time` had already given up on it (2026-10-02).
                     asks.expire(&ctx);
-                    if let Some(m) = gs::ipc::recv_within_ms(&ctx, POLL_MS) { break m; }
+                    if let Some(m) = gs::ipc::recv_within_ms(&ctx, if streaming { STREAM_POLL_MS } else { POLL_MS }) { break m; }
                     // ---- DO NOT SLEEP ON WORK WE ALREADY HAVE ----
                     //
                     // The poll step just ran, and `nic_req`'s sifting displaces any client request
@@ -3456,7 +3475,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }) {
                 let op = pl.first().copied().unwrap_or(COP_STAT);
                 let body = if pl.len() > 1 { &pl[1..] } else { &[][..] };
-                let mut resp = [0u8; 2048];
+                // A whole message's worth, less the tag byte the reply leads with: what one read can move.
+                let mut resp = [0u8; gs::ipc::MAX_BYTES - 1];
                 let n = match op {
                     // Reading takes READ; sending takes WRITE. The kernel has already checked the
                     // cap carries `right`; this enforces that the OPERATION is within it, which is
@@ -3465,19 +3485,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // no more: bytes read here leave the connection, so handing over more than the
                     // caller's buffer holds would lose them (`backlog/fixed/80` G3). No length: all of it.
                     COP_RECV if right & RIGHT_READ != 0 => {
-                        // A READER IS WAITING: poll now if the last one is more than RECV_POLL_MS old, so the
-                        // bytes already in the driver are read in and the window the last read freed is told
-                        // to the peer, rather than at the next scheduled poll up to 100 ms away.
-                        if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= ticks_ms(&ctx, RECV_POLL_MS) {
-                            last_poll = gs::driver::wait::ticks(&ctx);
-                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
-                            let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
-                            poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
-                        }
                         let max = match body {
                             [lo, hi, ..] => (u16::from_le_bytes([*lo, *hi]) as usize).min(resp.len()),
                             _ => resp.len(),
                         };
+                        // A READER IS WAITING: take in what the driver holds, while frames keep coming and
+                        // there is room for them, for at most RECV_DRAIN_MS - so the bytes it waits for are
+                        // read in now, and the window its last read freed is told to the peer, rather than
+                        // at the next scheduled poll. One poll is one batch, two full frames at most (a
+                        // message is 4 KiB), so one poll per read was a download paced by this loop.
+                        let t0 = gs::driver::wait::ticks(&ctx);
+                        let budget = ticks_ms(&ctx, RECV_DRAIN_MS);
+                        // A reader whose answer is already waiting is answered at once: the stream poll keeps
+                        // taking frames in between reads, so draining here as well only adds a driver round trip.
+                        while tcpst.conns[i].readable() < max
+                            && gs::driver::wait::ticks(&ctx).wrapping_sub(t0) < budget
+                            && tcpst.conns[i].window() as usize >= tcp::MSS
+                            && tcpst.conns[i].state != tcp::State::Closed
+                        {
+                            last_poll = gs::driver::wait::ticks(&ctx);
+                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                            let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
+                            streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                            // Nothing more in the driver: answer with what there is. And a reader with enough
+                            // to fill its answer is not kept waiting for more.
+                            if !streaming || tcpst.conns[i].readable() >= max { break; }
+                        }
                         tcpst.read(rid, &mut resp[..max])
                     }
                     COP_SEND if right & RIGHT_WRITE != 0 => {

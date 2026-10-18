@@ -6168,6 +6168,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("registry, clock, roots", "what the check used: the address, the date a certificate is checked against and its source, how many roots", ""),
             ("address, tls, http, says", "the registry's address, the verified handshake, its HTTP status and the first line it said", ""),
             ("a failure", "the step it stopped at and why: an expired certificate, an unknown root, no clock, no network", ""),
+            ("godspeed check <https-url>", "that page instead, read to its end and thrown away, with a speed row: how fast this machine downloads from there", "godspeed check https://example.com/"),
         ], false),
         ("ask", "evidence") => help_block(ctx, "ask evidence", "the same answer, with every line labelled and its source named", &[
             ("ask evidence \"<question>\"", "FACT: a source said it; INFERENCE: concluded by the named rule; UNKNOWN: nothing available establishes it", "ask evidence \"what failed?\""),

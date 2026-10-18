@@ -12,7 +12,10 @@
 //! kept, bounded.
 //!
 //! Every wait has a deadline. The name and the connection keep `gs::net`'s own (`NET_SECS`, 10 s, and
-//! `TCP_SECS`, 20 s); each request after them is bounded by `timeout-secs` from the configuration (10.8).
+//! `TCP_SECS`, 20 s); after them, a request ends when the connection has moved NOTHING, either way, for
+//! `timeout-secs` from the configuration (10.8). A bound on the whole request would be a bound on the size
+//! of what can be downloaded: at 30 s a package of a few megabytes failed on a working link. A stalled
+//! connection is what the setting exists to catch, and one that is still delivering is not stalled.
 //! Every way it can end is a [`Fail`] that says where: the clock, the randomness, the name, the connection,
 //! the handshake (with TLS's own reason, a certificate's included), or the server's answer.
 
@@ -30,9 +33,10 @@ const OUT_MAX: usize = 4096;
 /// The status line and headers of one answer. The registry's are about 900 bytes, most of it a reporting
 /// header; an answer whose head is larger is refused rather than cut.
 const HEAD_MAX: usize = 4096;
-/// A pause between reads that found nothing. The connection's data arrives on `net-stack`'s 100 ms poll,
-/// so reading faster finds nothing more.
-const IDLE_MS: u64 = 20;
+/// A pause between reads that found nothing. `net-stack` keeps taking a download's frames in while this
+/// waits (it polls every millisecond while frames arrive, into a 256 KiB window), so the pause costs the
+/// download nothing but a little latency; it is short so that latency stays small.
+const IDLE_MS: u64 = 2;
 
 /// Where it ended, when it did not succeed.
 #[derive(Clone, Copy, Debug)]
@@ -71,12 +75,18 @@ pub struct Session<'c, 'b, 'n, 's> {
     host: &'c str,
     pub ip: [u8; 4],
     timeout_secs: u32,
+    /// When the connection last moved a byte, either way: what `timeout-secs` is measured from.
+    moved_at: i64,
     tls: Client<'b, WebPkiVerifier<'b>>,
     stream: &'s mut gs::net::Stream<'n, 'c>,
     out: &'b mut [u8; OUT_MAX],
     rec: &'b mut [u8; RECORD_MAX],
     /// How many answers this connection has given.
     pub answered: u32,
+    /// `rec[..read_len]` was read from the connection, and `rec[..rec_len]` is the record last handed to TLS:
+    /// what follows it was read ahead, and is the start of the next one.
+    rec_len: usize,
+    read_len: usize,
     broken: bool,
 }
 
@@ -99,14 +109,13 @@ pub fn session<T>(ctx: &ServiceContext, host: &str, port: u16, roots: &[&[u8]], 
         let verifier = WebPkiVerifier::new(roots, host, now_secs);
         let (tls, n) = Client::start(hello, verifier, &mut handshake, &mut out).map_err(Fail::Tls)?;
         let mut s = Session {
-            ctx, host, ip: ip.0, timeout_secs, tls, stream: &mut stream, out: &mut out, rec: &mut rec,
-            answered: 0, broken: false,
+            ctx, host, ip: ip.0, timeout_secs, moved_at: gs::task::uptime_secs(ctx), tls, stream: &mut stream, out: &mut out, rec: &mut rec,
+            answered: 0, broken: false, rec_len: 0, read_len: 0,
         };
-        let start = gs::task::uptime_secs(ctx);
-        s.send_out(n, start)?;
+        s.send_out(n)?;
         // The handshake, to the point where application data may be sent.
         loop {
-            match s.read_event(start)? {
+            match s.read_event()? {
                 Some(Event::Connected) => break,
                 Some(Event::Closed) | None => return Err(Fail::Closed),
                 Some(_) => {}
@@ -115,7 +124,7 @@ pub fn session<T>(ctx: &ServiceContext, host: &str, port: u16, roots: &[&[u8]], 
         let result = f(&mut s);
         if !s.broken {
             if let Ok(n) = s.tls.close(s.out) {
-                let _ = s.send_out(n, gs::task::uptime_secs(ctx));
+                let _ = s.send_out(n);
             }
         }
         result
@@ -125,17 +134,24 @@ pub fn session<T>(ctx: &ServiceContext, host: &str, port: u16, roots: &[&[u8]], 
 }
 
 impl Session<'_, '_, '_, '_> {
-    fn late(&self, start: i64) -> bool {
-        gs::task::uptime_secs(self.ctx) - start >= self.timeout_secs as i64
+    /// Stalled: nothing has moved, either way, for `timeout-secs`.
+    fn stalled(&self) -> bool {
+        gs::task::uptime_secs(self.ctx) - self.moved_at >= self.timeout_secs as i64
     }
 
-    /// Send the first `n` bytes of `out`, as much as `net-stack` takes at a time, until the deadline.
-    fn send_out(&mut self, n: usize, start: i64) -> Result<(), Fail> {
+    fn moved(&mut self) {
+        self.moved_at = gs::task::uptime_secs(self.ctx);
+    }
+
+    /// Send the first `n` bytes of `out`, as much as `net-stack` takes at a time, until it stalls.
+    fn send_out(&mut self, n: usize) -> Result<(), Fail> {
         let mut off = 0usize;
         while off < n {
             let took = self.stream.send(&self.out[off..n]).map_err(|_| Fail::Transport)?;
-            if took == 0 {
-                if self.late(start) {
+            if took > 0 {
+                self.moved();
+            } else {
+                if self.stalled() {
                     return Err(Fail::Timeout);
                 }
                 gs::task::sleep_ms(self.ctx, IDLE_MS);
@@ -147,39 +163,50 @@ impl Session<'_, '_, '_, '_> {
 
     /// The next TLS event, with any reply TLS asks for sent. `None` means the connection ended (the peer
     /// closed it, or `net-stack` released it). A data event's bytes are `self.rec[range]`.
-    fn read_event(&mut self, start: i64) -> Result<Option<Event>, Fail> {
-        let mut have = 0usize;
+    fn read_event(&mut self) -> Result<Option<Event>, Fail> {
+        // What was read past the last record is the start of this one: to the front with it. Not before now,
+        // because the last record's bytes were the caller's until it asked for the next.
+        self.rec.copy_within(self.rec_len..self.read_len, 0);
+        let mut have = self.read_len - self.rec_len;
+        self.rec_len = 0;
+        self.read_len = have;
         loop {
-            // One whole record: its header says how long, so nothing is read past it.
+            // One whole record: its header says how long. READ AHEAD past it, as much as there is room for: a
+            // read is a round trip to `net-stack`, and asking for a record's 5-byte header on its own was one
+            // round trip for five bytes, for every 16 KiB of a download.
             let need = if have < 5 { 5 } else { record_len(&self.rec[..5]).map_err(Fail::Framing)? };
             if have < need {
-                let got = match self.stream.recv(&mut self.rec[have..need]) {
+                let got = match self.stream.recv(&mut self.rec[have..]) {
                     Ok(n) => n,
                     Err(_) if have == 0 => return Ok(None),
                     Err(_) => return Err(Fail::Transport),
                 };
-                if got == 0 {
-                    if self.late(start) {
+                if got > 0 {
+                    self.moved();
+                } else {
+                    if self.stalled() {
                         return Err(Fail::Timeout);
                     }
                     gs::task::sleep_ms(self.ctx, IDLE_MS);
                 }
                 have += got;
+                self.read_len = have;
                 continue;
             }
+            self.rec_len = need;
             let (event, n) = match self.tls.read_record(&mut self.rec[..need], self.out) {
                 Ok(r) => r,
                 Err(e) => {
                     // Tell the server why before going, as RFC 8446 6.2 asks; a courtesy, so a failure to
                     // send it changes nothing about what is reported.
                     if let Ok(n) = self.tls.failure_alert(self.out) {
-                        let _ = self.send_out(n, start);
+                        let _ = self.send_out(n);
                     }
                     return Err(Fail::Tls(e));
                 }
             };
             if n > 0 {
-                self.send_out(n, start)?;
+                self.send_out(n)?;
             }
             return Ok(Some(event));
         }
@@ -210,18 +237,19 @@ impl Session<'_, '_, '_, '_> {
 
     fn get_inner(&mut self, path: &str, on_head: &mut dyn FnMut(&Head) -> bool, sink: &mut dyn FnMut(&[u8]) -> bool)
         -> Result<Head, Fail> {
-        let start = gs::task::uptime_secs(self.ctx);
+        // A new request starts its own clock: the wait between two requests is the caller's, not a stall.
+        self.moved();
         let mut req = [0u8; 512];
         let len = request(&mut req, self.host, path);
         let n = self.tls.seal(&req[..len], self.out).map_err(Fail::Tls)?;
-        self.send_out(n, start)?;
+        self.send_out(n)?;
 
         let mut head_buf = [0u8; HEAD_MAX];
         let mut head_len = 0usize;
         let mut head: Option<Head> = None;
         let mut body = Body::Length(0);
         loop {
-            let range = match self.read_event(start)? {
+            let range = match self.read_event()? {
                 Some(Event::Data(r)) => r,
                 Some(Event::Closed) | None => {
                     // An answer with no stated length ends when the connection does.

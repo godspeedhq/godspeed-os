@@ -50,7 +50,7 @@ pub const KEYS: [Key; 4] = [
         default: "/system/services/godspeed/roots/",
         about: "the folder of certificate authorities TLS accepts, one DER file each",
     },
-    Key { name: "timeout-secs", default: "30", about: "how long one request may take" },
+    Key { name: "timeout-secs", default: "30", about: "how long a request may go with nothing moving" },
     Key { name: "max-package-mib", default: "64", about: "the largest package that will be downloaded" },
     Key {
         name: "offline-max-age-days",
@@ -354,6 +354,28 @@ pub fn url(s: &str) -> Result<Url<'_>, &'static str> {
     Ok(Url { host, port, base })
 }
 
+/// Any `https://host[:port][/path][?query]` page, for `godspeed check <url>`: a registry's root rules (a
+/// path ending in `/`, no query) do not apply to one page read and thrown away. `base` is the whole path.
+pub fn page(s: &str) -> Result<Url<'_>, &'static str> {
+    let rest = s.strip_prefix("https://").ok_or("an address to check is https:// only: the transport is TLS")?;
+    let (authority, path) = match rest.find(['/', '?']) {
+        Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], &rest[i..]),
+        Some(_) => return Err("a query goes after a path: https://host/path?query"),
+        None => (rest, "/"),
+    };
+    if path.len() > 400 || path.bytes().any(|b| b <= b' ' || b == b'#' || b >= 0x7f) {
+        return Err("the path has a character a URL path cannot, or is longer than 400");
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("the port is a number, 1 to 65535")?),
+        None => (authority, 443),
+    };
+    if !is_dns_name(host) {
+        return Err("the host must be a DNS name, which TLS checks the certificate against");
+    }
+    Ok(Url { host, port, base: path })
+}
+
 /// Letters, digits and hyphens in dot-separated labels, and not an address: TLS needs a name to check.
 fn is_dns_name(h: &str) -> bool {
     let b = h.as_bytes();
@@ -647,7 +669,7 @@ mod tests {
         assert_eq!(c.registries(), &regs);
         assert_eq!(c.in_use().name, "mirror");
         let new = text(&out, m);
-        assert!(new.contains("# how long one request may take\ntimeout-secs 30"));
+        assert!(new.contains("# how long a request may go with nothing moving\ntimeout-secs 30"));
         assert_eq!(new.matches("# The registries this machine knows").count(), 1);
         // Removing one keeps the rest.
         let k = with_registries(new, &regs[..1], "default", &mut buf).unwrap_or(0);

@@ -8307,7 +8307,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
     let one = run!(b"godspeed config timeout-secs\r", 60);
     check!(one.contains("45") && !one.contains("tls-roots"), "`godspeed config <key>` shows that one setting");
     let after = run!(b"read /system/services/godspeed/config\r", 30);
-    check!(after.contains("timeout-secs 45") && after.contains("# how long one request may take"),
+    check!(after.contains("timeout-secs 45") && after.contains("# how long a request may go with nothing moving"),
            "the new value is in the file and the comments around it are kept");
     let notset = run!(b"godspeed config set registry https://registry.example/\r", 60);
     check!(notset.contains("not set here") && notset.contains("godspeed registry"),
@@ -12036,5 +12036,89 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
     }
     let _ = std::fs::write("build/tests/gsp_serial.log", &transcript);
     println!("\ngsp: {pass} passed, {fail} failed (serial: build/tests/gsp_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// `osdev test download`: how fast this machine downloads over HTTPS, measured, at sizes a package can be.
+/// `godspeed check <url>` reads a page from a public speed-test server to its end and says how fast; the server's
+/// chain reaches GTS Root R4, which is put beside the registry's root for this (`osdev/fixtures/README.md`). It
+/// needs this machine online, and what it reports is QEMU's user network as well as this system's.
+pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("download: PASS - {}", $label); pass += 1; }
+        else { println!("download: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+        "-device", "e1000,netdev=n0", "-netdev", "user,id=n0",
+        // The wire, kept: when a download is slow or stalls, the capture says which side stopped.
+        "-object", "filter-dump,id=wire,netdev=n0,file=build/tests/download.pcap",
+    ]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("download: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("download: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("download: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+    let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+    let _ = run!(b"godspeed config\r", 60);
+    let copied = run!(b"copy /gts-root-r4.der /system/services/godspeed/roots/gts-root-r4.der\r", 30);
+    check!(!copied.contains("error") && !copied.contains("not found"), "GTS Root R4 is beside the registry's root");
+    let _ = run!(b"godspeed config set timeout-secs 20\r", 30);
+    // Not 16 MiB: that one size is refused by the server (403), 10 MB and 25 MB are not (2026-10-18).
+    for (bytes, secs) in [(1_000_000u64, 300u64), (10_000_000, 900)] {
+        let line = format!("godspeed check https://speed.cloudflare.com/__down?bytes={bytes}\r");
+        let t0 = std::time::Instant::now();
+        let out = run!(line.as_bytes(), secs);
+        let took = t0.elapsed().as_secs_f64();
+        let text = out.clone();
+        let speed = text.lines().find(|l| l.contains("speed")).unwrap_or("").trim().to_string();
+        println!("download: {} bytes: {:.1} s at the host, guest says: {}", bytes, took, speed);
+        check!(text.contains("HTTP/1.1 200") && text.contains(&format!("{bytes} bytes")),
+               format!("{bytes} bytes arrive, all of them"));
+    }
+    // THE DISK'S HALF: a download is written as it arrives, so it is no faster than this.
+    let t0 = std::time::Instant::now();
+    let copied = run!(b"copy /big.bin /big-copy.bin\r", 600);
+    let took = t0.elapsed().as_secs_f64();
+    println!("download: copying 4 MiB on the disk took {:.1} s at the host ({:.0} KiB/s, read and written)", took, 4096.0 / took);
+    check!(!copied.contains("error") && !copied.contains("failed"), "the 4 MiB copy completes");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::write("build/tests/download_serial.log", &*buf.lock().unwrap());
+    println!("\ndownload: {pass} passed, {fail} failed (serial: build/tests/download_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }

@@ -24,3 +24,10 @@ GODSPEED_SIGNING_KEY=<the seed> GODSPEED_OS=<this checkout> godspeed package --a
 
 Remake it when the OS's program layout changes (the shared check refuses a package built before
 `LAYOUT_RELEASE`); the suite will say so if it is stale.
+
+## `gts-root-r4.der`
+
+Google Trust Services' **GTS Root R4**, the ECDSA P-384 root that `speed.cloudflare.com`'s chain reaches, for
+`osdev test download`: the suite puts it beside the registry's root so `godspeed check <url>` can measure a
+download of any size from that server. A public certificate, nothing secret. Fetched from `https://i.pki.goog/r4.crt`;
+its SHA-256 fingerprint is `34:9D:FA:40:58:C5:E2:63:12:3B:39:8A:E7:95:57:3C:4E:13:13:C8:3F:E6:8F:93:55:6C:D5:E8:03:1B:3C:7D`.
