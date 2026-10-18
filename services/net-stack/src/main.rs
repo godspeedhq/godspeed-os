@@ -700,6 +700,12 @@ fn serve_while_dancing(ctx: &ServiceContext, pending: &mut Displaced, serve_stat
 fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
                   mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) -> bool {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
+    // A SECOND BOUND, on the tick counter: the seconds above are the wall clock, and a clock that stands
+    // still would hold this loop for as long as it does. Past `secs` plus a second by the counter, it ends and
+    // says what the seconds clock read, so a wedge of this kind is visible and over.
+    let tick0 = gs::driver::wait::ticks(ctx);
+    // None where the counter is uncalibrated: `ticks_ms` floors to one quantum there, which would end every drain.
+    let tick_bound = (gs::driver::wait::ticks_per_10ms(ctx) != 0).then(|| ticks_ms(ctx, secs.max(0) as u64 * 1000 + 1000));
     let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
@@ -718,6 +724,10 @@ fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serv
             }
         }
         if gs::task::epoch_secs_monotonic(ctx) - t0 >= secs { return false; }
+        if tick_bound.is_some_and(|b| gs::driver::wait::ticks(ctx).wrapping_sub(tick0) >= b) {
+            ctx.log_fmt(format_args!("net-stack: a drain ran past its {} s by the tick counter while the seconds clock moved {} s - ended", secs, gs::task::epoch_secs_monotonic(ctx) - t0));
+            return false;
+        }
         // SERVE AND PACE ONLY WHEN THE WIRE CAME BACK EMPTY.
         //
         // Both of these used to run on EVERY pass, including immediately after a burst arrived, and
@@ -783,6 +793,12 @@ const EMPTY_YIELDS: u32 = 12;
 fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
               mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
+    // A SECOND BOUND, on the tick counter: the seconds above are the wall clock, and a clock that stands
+    // still would hold this loop for as long as it does. Past `secs` plus a second by the counter, it ends and
+    // says what the seconds clock read, so a wedge of this kind is visible and over.
+    let tick0 = gs::driver::wait::ticks(ctx);
+    // None where the counter is uncalibrated: `ticks_ms` floors to one quantum there, which would end every drain.
+    let tick_bound = (gs::driver::wait::ticks_per_10ms(ctx) != 0).then(|| ticks_ms(ctx, secs.max(0) as u64 * 1000 + 1000));
     let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
@@ -801,6 +817,10 @@ fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_st
             }
         }
         if gs::task::epoch_secs_monotonic(ctx) - t0 >= secs { return; }
+        if tick_bound.is_some_and(|b| gs::driver::wait::ticks(ctx).wrapping_sub(tick0) >= b) {
+            ctx.log_fmt(format_args!("net-stack: a drain ran past its {} s by the tick counter while the seconds clock moved {} s - ended", secs, gs::task::epoch_secs_monotonic(ctx) - t0));
+            return;
+        }
         // Serve and pace only on an EMPTY poll - see the twin of this loop in `drain_scan_hit` for
         // why giving a receive window away mid-burst kills a host-polled NIC. On an empty poll,
         // `sleep` parks the task so the core is free for the driver trying to hand us a frame.

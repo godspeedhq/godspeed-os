@@ -130,9 +130,11 @@ pub fn set_wall_clock(_epoch: i64) -> bool { false }   // the CMOS RTC is the au
 /// good value instead. A single kernel-owned clock cache (like MONOTONIC_TICKS or the boot stamp), not
 /// service state. `date` keeps the raw read (an on-demand display tolerates a rare one-off).
 static LAST_NOW_EPOCH: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
-/// Whether a read is being HELD (rejected, so `last` is returned), and since which read: said when it starts and
-/// when it ends. A hold is not harmless: every bounded wait above measures its deadline in these seconds, so
-/// while they stand still no such wait ends. It used to happen in silence.
+/// Whether a BACKWARD read is being held (rejected, so `last` is returned), and since which read: said when it
+/// starts and when it ends. Only a backward hold is said. A read far AHEAD (QEMU's CMOS reads about eleven
+/// years ahead every few seconds, measured 2026-10-18) is rejected and the next good read moves on, so it
+/// stands nothing still. A backward one means an earlier read AHEAD was accepted, and the seconds then stand
+/// still until real time passes it - and every bounded wait measures its deadline in these seconds.
 static HOLDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static HOLD_RAW: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 pub fn now_epoch_monotonic() -> i64 {
@@ -142,7 +144,7 @@ pub fn now_epoch_monotonic() -> i64 {
     // supplies the live RTC read and the high-water-mark store.
     let raw      = epoch_secs(read_datetime());
     let accepted = crate::clock::deglitch_epoch(raw, last);
-    let held     = last != 0 && accepted == last && raw != last;
+    let held     = last != 0 && accepted == last && raw < last;
     if held && !HOLDING.swap(true, Ordering::Relaxed) {
         HOLD_RAW.store(raw, Ordering::Relaxed);
         crate::kprintln!("rtc: a CMOS read of {} is {} s from the last good {} - holding {} until the clock passes it (deadlines measured in these seconds do not move meanwhile)",

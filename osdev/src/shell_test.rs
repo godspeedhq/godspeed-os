@@ -8732,6 +8732,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         // ---- AT BOOT: an installed service starts on its own after a reboot, from the disk. `fs` mounts after
         //      the supervisor is ready, so the supervisor's first read of the installed list can go unanswered;
         //      it is asked again until `fs` answers (`Installed::try_boot`) rather than given up on.
+        // Fetched again: the version tests above removed every fetched copy.
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.7.0\r", 240);
         let bi = run!(b"godspeed install godspeed/hello-service@0.7.0 yes\r", 180);
         check!(bi.contains("installed godspeed/hello-service 0.7.0 started"), "a service is installed before the reboot");
         send(&mut write_half, b"reboot now\r");
