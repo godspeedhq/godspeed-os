@@ -82,6 +82,7 @@ struct Writer<'c> {
     no_length: bool,
     err: Option<gs::Error>,
     t0: i64,
+    t0_ms: u64,
     shown_step: u64,
     shown_secs: i64,
 }
@@ -93,6 +94,7 @@ impl<'c> Writer<'c> {
         if let Err(e) = self.fs.create_sized(self.partial, len) { self.err = Some(e); return false; }
         self.created = true;
         self.t0 = gs::task::uptime_secs(self.ctx);
+        self.t0_ms = gs::driver::wait::counter_ms(self.ctx);
         true
     }
 
@@ -104,9 +106,11 @@ impl<'c> Writer<'c> {
         if step != self.shown_step || secs != self.shown_secs || self.got == self.total {
             self.shown_step = step;
             self.shown_secs = secs;
-            crate::progress(self.ctx, format_args!("  downloading {}  [{}]  {}%  {} / {}  {}{}", self.name,
+            let ms = gs::driver::wait::counter_ms(self.ctx).saturating_sub(self.t0_ms);
+            crate::progress(self.ctx, format_args!("  downloading {}  [{}]  {}%  {} / {}  {}  {}{}", self.name,
                 crate::packages::bar(step as usize, 28).as_str(), self.got * 100 / self.total.max(1),
                 crate::packages::size_text(self.got).as_str(), crate::packages::size_text(self.total).as_str(),
+                crate::packages::rate_text(self.got, ms).as_str(),
                 crate::packages::time_text(secs, self.got, self.total).as_str(),
                 if self.got == self.total { "" } else { "   [q] quit" }));
         }
@@ -172,7 +176,7 @@ pub fn run(ctx: &ServiceContext, r: &mut Rows, typed: &str, dest: &str, setup: &
     let began = gs::driver::wait::counter_ms(ctx);
     let w = RefCell::new(Writer {
         ctx, fs: gs::fs::Fs::new(ctx), partial, name, total: 0, got: 0, written: 0, held: 0,
-        chunk: [0u8; gs::fs::IO_CHUNK], created: false, no_length: false, err: None, t0: 0, shown_step: u64::MAX, shown_secs: -1,
+        chunk: [0u8; gs::fs::IO_CHUNK], created: false, no_length: false, err: None, t0: 0, t0_ms: 0, shown_step: u64::MAX, shown_secs: -1,
     });
     let (head, tls) = loop {
         let (u, tls) = match config::link(link.as_str()) {
@@ -275,8 +279,8 @@ pub fn run(ctx: &ServiceContext, r: &mut Rows, typed: &str, dest: &str, setup: &
         r.row("checked", "NOT checked", "plain http: nothing proves these are the bytes the server sent");
     }
     if began != 0 {
-        r.row("speed", cell(format_args!("{} KiB/s", got * 1000 / 1024 / ms)).as_str(),
-              cell(format_args!("{} bytes in {}.{:03} s, the connection included", got, ms / 1000, ms % 1000)).as_str());
+        r.row("speed", crate::packages::rate_text(got, ms).as_str(),
+              cell(format_args!("{} bytes in {}, the connection included", got, crate::packages::duration_text(ms / 1000).as_str())).as_str());
     }
     r.note(format_args!("{}", if tls { "downloaded and checked" } else { "downloaded over plain http - not checked" }));
 }

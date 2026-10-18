@@ -29,8 +29,9 @@ the same file deletes it first. An existing file is never replaced: delete it, o
 
 ## While it runs
 
-The same progress line as `godspeed fetch`: a bar, the percentage, the size so far and in all, the time taken
-and about how long is left, and `[q] quit`. Nothing ends a download that keeps arriving: the bound is
+The same progress line as `godspeed fetch`: a bar, the percentage, the size so far and in all, the speed so
+far (`KiB/s` or `MiB/s`, the units the sizes use), the time taken and about how long is left (`45 s`, `2 min 5 s`,
+`1 h 3 min`), and `[q] quit`. Nothing ends a download that keeps arriving: the bound is
 `timeout-secs` (`godspeed config`) with NOTHING moving, never a total.
 
 ## Output
@@ -42,7 +43,7 @@ A card when it is done:
 | `saved` | the file | its size |
 | `from` | the link it came from | `as typed`, or how many redirects from the one typed |
 | `checked` | `https`, or `NOT checked` | what that means |
-| `speed` | KiB/s | the bytes and the seconds, the connection included |
+| `speed` | KiB/s or MiB/s | the bytes and the time, the connection included |
 
 ## What it does not do, recorded rather than hidden
 
@@ -52,6 +53,8 @@ A card when it is done:
 - **Certificates must be ECDSA** (P-256 or P-384), which is all this machine's TLS checks. Many sites still use
   RSA certificates, and a download from one is refused, saying so. RSA is a change to the TLS library.
 - **No resume and no retry yet.** A download that breaks starts again from the beginning when it is run again.
+  A connection does not survive the machine's address changing - pulling the cable when the radio is on another
+  network, for one - on any system; resuming is what will make that cheap, and it is the next step.
 - **HTTP and HTTPS only:** no FTP and no other protocol (agreed 2026-10-18).
 - **Not a pipe.** It is an action; its value is the file. `read` the file to pipe it.
 

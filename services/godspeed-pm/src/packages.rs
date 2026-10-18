@@ -940,6 +940,7 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
         let verb = if s.offline() { "unpacking" } else { "downloading" };
         let total = artifact.size;
         let t0 = gs::task::uptime_secs(ctx);
+        let t0_ms = gs::driver::wait::counter_ms(ctx);
         let mut shown_secs = -1i64;
         let head = s.get(path.as_str(), &mut |bytes: &[u8]| {
             if verifier.update(bytes).is_err() { bad_bytes = true; return false; }
@@ -951,9 +952,10 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
             if step != shown || secs != shown_secs || got == total {
                 shown = step;
                 shown_secs = secs;
-                crate::progress(ctx, format_args!("  {} {}  [{}]  {}%  {} / {}  {}{}", verb, what.as_str(), bar(step as usize, 28).as_str(),
-                    got * 100 / total.max(1), size_text(got).as_str(), size_text(total).as_str(), time_text(secs, got, total).as_str(),
-                    if got == total { "" } else { "   [q] quit" }));
+                let ms = gs::driver::wait::counter_ms(ctx).saturating_sub(t0_ms);
+                crate::progress(ctx, format_args!("  {} {}  [{}]  {}%  {} / {}  {}  {}{}", verb, what.as_str(), bar(step as usize, 28).as_str(),
+                    got * 100 / total.max(1), size_text(got).as_str(), size_text(total).as_str(), rate_text(got, ms).as_str(),
+                    time_text(secs, got, total).as_str(), if got == total { "" } else { "   [q] quit" }));
             }
             let mut rest = bytes;
             while !rest.is_empty() {
@@ -1363,10 +1365,29 @@ pub fn cleanup(ctx: &ServiceContext, r: &mut Rows, delete: bool) {
 /// noise. Seconds, because that is the clock a program is given and the unit a download is felt in.
 pub(crate) fn time_text(secs: i64, got: u64, total: u64) -> Cell {
     let secs = secs.max(0) as u64;
-    if got >= total { return cell(format_args!("done in {} s", secs)); }
-    if secs == 0 || got == 0 { return cell(format_args!("{} s", secs)); }
+    if got >= total { return cell(format_args!("done in {}", duration_text(secs).as_str())); }
+    if secs == 0 || got == 0 { return duration_text(secs); }
     let left = secs * (total - got) / got;
-    cell(format_args!("{} s, about {} s left", secs, left.max(1)))
+    cell(format_args!("{}, about {} left", duration_text(secs).as_str(), duration_text(left.max(1)).as_str()))
+}
+
+/// A duration as a person reads one: `45 s`, `2 min 5 s`, `1 h 3 min`. `1162 s` was the operator's example of
+/// what not to show (2026-10-19).
+pub(crate) fn duration_text(secs: u64) -> Cell {
+    if secs < 60 { cell(format_args!("{} s", secs)) }
+    else if secs < 3600 {
+        if secs % 60 == 0 { cell(format_args!("{} min", secs / 60)) } else { cell(format_args!("{} min {} s", secs / 60, secs % 60)) }
+    } else { cell(format_args!("{} h {} min", secs / 3600, secs % 3600 / 60)) }
+}
+
+/// How fast, in the units the sizes beside it use: `830 KiB/s`, `4.2 MiB/s`. `bytes` in `ms` milliseconds; empty
+/// until there is something to divide.
+pub(crate) fn rate_text(bytes: u64, ms: u64) -> Cell {
+    if ms == 0 || bytes == 0 { return Cell::new(); }
+    let per_s = bytes * 1000 / ms;
+    if per_s < 1024 { cell(format_args!("{} B/s", per_s)) }
+    else if per_s < 1024 * 1024 { cell(format_args!("{} KiB/s", per_s / 1024)) }
+    else { cell(format_args!("{}.{} MiB/s", per_s >> 20, (per_s & 0xfffff) * 10 >> 20)) }
 }
 
 /// A bar of `width` cells, `filled` of them `#`.

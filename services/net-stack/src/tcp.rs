@@ -61,6 +61,13 @@ pub const RCV_BIG: usize = 256 * 1024;
 pub const MAX_OOO: usize = 16;
 /// Maximum segment size we announce and honour. 1460 = 1500 MTU - 20 IP - 20 TCP, the Ethernet case.
 pub const MSS: usize = 1460;
+/// In-order data acknowledged at most this far behind (RFC 1122 4.2.3.2 allows a delay; RFC 5681 4.2 asks for
+/// at least every second full segment, which is a SHOULD, and this is past it on purpose). Eight segments, or
+/// sooner when the burst pauses (`Tcp::flush_acks`): every acknowledgement is a frame handed to the driver and
+/// waited on, which is milliseconds on the dwmac and 20 to 60 ms through the AIC8800, so one per two segments
+/// was what paced a download on the VisionFive (2026-10-19). Out of order, a duplicate, the segment that fills
+/// a hole, and a FIN are still answered at once - those acknowledgements carry news the sender acts on.
+pub const ACK_EVERY: u32 = 8 * MSS as u32;
 /// The window-scale option (RFC 7323 2): kind 3, length 3, the shift - sent after a No-Operation so the
 /// option list stays in whole 32-bit words.
 const OPT_WS_LEN: usize = 4;
@@ -284,6 +291,9 @@ pub struct Conn {
     /// Reacting to the peer and making our own progress are now separable, which is what
     /// `docs/tcp-design.md` said the architecture had to be before any of this was written.
     ack_due: bool,
+    /// In-order bytes received since the last acknowledgement went out: owed one at [`ACK_EVERY`], or when the
+    /// burst pauses ([`Tcp::flush_acks`]).
+    ack_owed: u32,
     /// The window most recently ADVERTISED to the peer.
     ///
     /// Without this there is no way to notice that the window has reopened. Reading data out of the
@@ -344,7 +354,7 @@ impl Conn {
             retx_at_ms: 0, retx_count: 0,
             srtt_ms: 0, rttvar_ms: 0, rto_ms: RTO_MIN_MS,
             rtt_timed_seq: 0, rtt_timed_at_ms: 0, rtt_timing: false,
-            state_deadline_ms: 0, close_pending: false, reader_gone: false, used_ms: 0, ack_due: false, last_adv: 0,
+            state_deadline_ms: 0, close_pending: false, reader_gone: false, used_ms: 0, ack_due: false, ack_owed: 0, last_adv: 0,
         }
     }
 
@@ -390,6 +400,8 @@ impl Conn {
     /// (RFC 7323 2.2); after it, it is the free space shifted by ours, rounded DOWN so we never offer room
     /// we do not have.
     fn adv(&mut self, syn: bool) -> u16 {
+        // Every segment that tells the window acknowledges too, so nothing received is owed one any more.
+        self.ack_owed = 0;
         let w = self.window();
         let (field, told) = if syn {
             let f = w.min(0xffff);
@@ -962,6 +974,14 @@ impl Tcp {
         }
     }
 
+    /// The burst has paused (a poll found nothing): every connection owed an acknowledgement for data it has
+    /// taken in is given one now, rather than at the next segment that may not come.
+    pub fn flush_acks(&mut self) {
+        for c in self.conns.iter_mut() {
+            if c.ack_owed > 0 && c.state != State::Closed { c.ack_due = true; }
+        }
+    }
+
     /// The client used connection `i` just now.
     pub fn touch(&mut self, ctx: &ServiceContext, i: usize) {
         let now = self.now_ms(ctx).unwrap_or(0);
@@ -1274,6 +1294,29 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
     check(t.conns[0].reapable(), "and released once its client closes it", &mut pass, &mut fail);
     t.conns[0].rcv_len = 5;
     check(t.conns[0].reapable(), "even if bytes arrived after the client closed it", &mut pass, &mut fail);
+
+    // ---- delayed acknowledgement: in-order data is acknowledged every ACK_EVERY bytes, or when the burst pauses ----
+    {
+        let mut c = Conn::free();
+        c.state = State::Established;
+        c.rcv_nxt = 0;
+        let mut t = Tcp::new(0, 0);
+        t.conns[0] = c;
+        let seg = [7u8; MSS];
+        let mut owed_early = false;
+        let mut seq = 0u32;
+        for _ in 0..3 {
+            deliver(&mut t.conns[0], seq, &seg);
+            seq += MSS as u32;
+            t.conns[0].ack_owed += MSS as u32;
+            owed_early |= t.conns[0].ack_owed >= ACK_EVERY;
+        }
+        check(!owed_early && !t.conns[0].ack_due, "three in-order segments are not yet owed an acknowledgement", &mut pass, &mut fail);
+        t.flush_acks();
+        check(t.conns[0].ack_due, "and are owed one the moment the burst pauses", &mut pass, &mut fail);
+        let _ = t.conns[0].adv(false);
+        check(t.conns[0].ack_owed == 0, "a segment that tells the window acknowledges what was owed", &mut pass, &mut fail);
+    }
 
     // ---- a connection its client abandoned (ended without closing it) is released when the table is full ----
     // A clock of one tick per millisecond, so the counter itself is the time and a connection last used at 0
@@ -1760,14 +1803,26 @@ impl Tcp {
             // ---- data ----
             if !seg.payload.is_empty() && c.state != State::TimeWait {
                 if seg.seq == c.rcv_nxt {
+                    let had_hole = c.ooo_n > 0;
+                    let before = c.rcv_nxt;
                     deliver(c, seg.seq, seg.payload);
-                } else if seq_gt(seg.seq, c.rcv_nxt)
-                    && seq_lt(seg.seq, c.rcv_nxt.wrapping_add(c.window())) {
-                    hold_ooo(c, seg.seq, seg.payload);
+                    // IN ORDER, AND NOTHING WAS MISSING: acknowledged in a while (`ACK_EVERY`). A segment that
+                    // fills a hole, or that the arena had no room for, is news and is answered now.
+                    let took = c.rcv_nxt.wrapping_sub(before);
+                    c.ack_owed = c.ack_owed.saturating_add(took);
+                    if had_hole || took < seg.payload.len() as u32 || c.ack_owed >= ACK_EVERY {
+                        need_ack = true;
+                    }
+                } else {
+                    if seq_gt(seg.seq, c.rcv_nxt)
+                        && seq_lt(seg.seq, c.rcv_nxt.wrapping_add(c.window())) {
+                        hold_ooo(c, seg.seq, seg.payload);
+                    }
+                    // Out of order, or a duplicate below rcv_nxt (dropped, still acknowledged: the peer is
+                    // retransmitting because it did not hear us, and staying silent repeats that). Both at once:
+                    // the duplicate acknowledgements are how the sender learns of a loss.
+                    need_ack = true;
                 }
-                // A duplicate below rcv_nxt is dropped, but still acknowledged: the peer is
-                // retransmitting because it did not hear us, and staying silent repeats that.
-                need_ack = true;
             }
 
             // ---- FIN, only when it is the next thing in sequence ----

@@ -1809,6 +1809,9 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     let mut pos = 1usize;
     let mut any = false;
     let mut out = [0u8; 1600];
+    // THE BURST HAS PAUSED: the driver had nothing. Whatever a connection took in without acknowledging yet
+    // (`tcp::ACK_EVERY`) is acknowledged in this pass, by `poll_one` below.
+    if count == 0 { t.flush_acks(); }
     for _ in 0..count {
         if pos + 2 > p.len() { break; }
         let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
