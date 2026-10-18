@@ -1,6 +1,6 @@
 # TCP for GodspeedOS: the design, and the two facts that shaped it
 
-> **Status: BUILT and shipping** (this header said "design, being built" until 2026-09-26, while the same document's own "HARDWARE VERIFIED" and "Working, and verified on the wire" sections said otherwise). `services/net-stack/src/tcp.rs` is 1,747 lines (2026-10-09); op 22 (listen, `OP_LISTEN` in `gs::net`), the shell's `tcp` and `serve`, `tcp selftest` (53 checks) and `gs::net::Net::tcp` / `Listener::accept` are all live. `docs/networking.md` recorded the commitment on
+> **Status: BUILT and shipping** (this header said "design, being built" until 2026-09-26, while the same document's own "HARDWARE VERIFIED" and "Working, and verified on the wire" sections said otherwise). `services/net-stack/src/tcp.rs` is 1,747 lines (2026-10-09); op 22 (listen, `OP_LISTEN` in `gs::net`), the shell's `tcp` and `serve`, `tcp selftest` (56 checks) and `gs::net::Net::tcp` / `Listener::accept` are all live. `docs/networking.md` recorded the commitment on
 > 2026-07-04 ("TCP/IPv4 is committed from the start, not far-future"); this is how it gets built, and
 > why it is not a port of anyone else's stack.
 
@@ -578,3 +578,16 @@ is unchanged, and still slow to the internet; recorded here rather than changed 
 **What it does not change.** The table is still `MAX_CONNS = 2` and the receive buffer still 2 KiB, and the
 connection's data still moves on the 100 ms poll. That is ample for a registry's index and trust files and
 slow for a large package - roughly 20 KB/s at best - which is recorded here rather than discovered later.
+
+### A finished connection its client closed kept its slot (2026-10-18)
+
+Found on the VisionFive over Ethernet: two `godspeed` commands in a row and every later connect failed with
+"the connection table is full (reached 'closed')". The reaper releases a `Closed` connection only when nothing is
+left unread, so a peer's last bytes are never thrown away from under a client still reading. But `close()` acted
+only on an open connection, and a server that had already finished - its last few bytes, a TLS close_notify,
+waiting unread - left the connection `Closed`, owned and unread forever after the client had closed it. With
+`MAX_CONNS = 2`, two such leftovers filled the table. Over WiFi the same bytes landed before the command ended,
+which is why it had not shown.
+
+A client's close now marks its reader gone in ANY state and drops what is unread, and the reaper releases a
+closed connection whose reader is gone (`Conn::reapable`). The self-test has three checks for it.

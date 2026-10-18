@@ -1850,7 +1850,8 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     // the same mistake the transaction loop's "DRAIN BEFORE LEAVING" comment records.
     for i in 0..tcp::MAX_CONNS {
         let c = &t.conns[i];
-        if c.rid != 0 && c.state == tcp::State::Closed && c.readable() == 0 {
+        // Unread bytes keep a slot only while its client may still read them (`Conn::reapable`).
+        if c.reapable() {
             let rid = c.rid;
             t.forget(rid);
             let _ = gs::resource::revoke(ctx, rid);

@@ -241,6 +241,8 @@ pub struct Conn {
     state_deadline_ms: u64,
     /// Set when the client has asked to close and the send buffer must drain first.
     close_pending: bool,
+    /// The client CLOSED it: it will read nothing more, so what is unread, or arrives after, is no one's.
+    reader_gone: bool,
     /// An acknowledgement is owed to the peer, to be sent by `poll_one` on its next pass.
     ///
     /// `on_frame` USED TO SEND IT ITSELF, and that was the last hardware bug on this branch. Doing so
@@ -313,7 +315,7 @@ impl Conn {
             retx_at_ms: 0, retx_count: 0,
             srtt_ms: 0, rttvar_ms: 0, rto_ms: RTO_MIN_MS,
             rtt_timed_seq: 0, rtt_timed_at_ms: 0, rtt_timing: false,
-            state_deadline_ms: 0, close_pending: false, ack_due: false, last_adv: 0,
+            state_deadline_ms: 0, close_pending: false, reader_gone: false, ack_due: false, last_adv: 0,
         }
     }
 
@@ -326,6 +328,11 @@ impl Conn {
     pub fn unacked(&self) -> usize { self.snd_len }
     /// Bytes received and waiting to be read.
     pub fn readable(&self) -> usize { self.rcv_len }
+    /// Finished and its slot can go back: closed by the protocol, owned, and with nothing left that its client
+    /// will read - nothing unread, or a client that has closed it and so will read nothing more.
+    pub fn reapable(&self) -> bool {
+        self.rid != 0 && self.state == State::Closed && (self.rcv_len == 0 || self.reader_gone)
+    }
     /// Total payload bytes handed to the peer and acknowledged.
     pub fn bytes_acked(&self) -> u32 { self.snd_una.wrapping_sub(self.iss).saturating_sub(1) }
 
@@ -782,6 +789,14 @@ impl Tcp {
     /// already accepted from the client is not discarded by the act of closing.
     pub fn close(&mut self, rid: u64) {
         if let Some(c) = self.by_rid(rid) {
+            // THE CLIENT HAS SAID IT WILL READ NOTHING MORE, whatever state the protocol is in. This used to act
+            // only on an open connection, so one the server had already finished - `Closed`, with its last few
+            // bytes (a TLS close_notify) unread - stayed owned and unread forever, and the reaper, which waits
+            // for unread bytes to be taken, never released its slot. With two slots, two `godspeed` commands in
+            // a row filled the table and every later connect was refused (the VisionFive over Ethernet,
+            // 2026-10-18, where those bytes land before the command ends).
+            c.reader_gone = true;
+            c.rcv_len = 0;
             if c.state == State::Established || c.state == State::CloseWait {
                 c.close_pending = true;
             }
@@ -1059,6 +1074,21 @@ pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
         check(t3.conns[j].snd_wnd == 0, "a zero-window acknowledgement is recorded", &mut pass, &mut fail);
         check(t3.conns[j].dup_acks == 0, "a window change disqualifies an acknowledgement as a duplicate", &mut pass, &mut fail);
     }
+
+    // ---- a finished connection its client has closed goes back, unread bytes or not ----
+    //
+    // The reaper waits for unread bytes to be read, so a peer's last bytes are never thrown away from under a
+    // client still reading. A client that has CLOSED is not reading: its connection must be released, or the
+    // table fills one leftover close_notify at a time.
+    let mut t = Tcp::new(0, 0);
+    t.conns[0].state = State::Closed;
+    t.conns[0].rid = 9;
+    t.conns[0].rcv_len = 37;
+    check(!t.conns[0].reapable(), "a finished connection with unread bytes is kept while its client may read them", &mut pass, &mut fail);
+    t.close(9);
+    check(t.conns[0].reapable(), "and released once its client closes it", &mut pass, &mut fail);
+    t.conns[0].rcv_len = 5;
+    check(t.conns[0].reapable(), "even if bytes arrived after the client closed it", &mut pass, &mut fail);
 
     (pass, fail)
 }
