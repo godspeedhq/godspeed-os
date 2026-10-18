@@ -492,6 +492,8 @@ impl Installed {
         let n = match gs::fs::Fs::new(ctx).read_into(LIST, &mut list) {
             Ok(n) => n,
             Err(gs::Error::NotFound) => { self.boot_pending = false; return; }
+            // `Malformed` only once a read has gone unanswered: it is that read's answer, arriving late and
+            // taken as this one's (seen 2026-10-18, the boot right after a reboot) - stale, not a "no".
             Err(e @ (gs::Error::OutcomeUnknown | gs::Error::Unreachable | gs::Error::Busy | gs::Error::Unavailable))
                 if waited < BOOT_WAIT_SECS => {
                 if !self.boot_said {
@@ -501,6 +503,7 @@ impl Installed {
                 }
                 return;
             }
+            Err(gs::Error::Malformed) if self.boot_said && waited < BOOT_WAIT_SECS => return,
             Err(e) => {
                 self.boot_pending = false;
                 ctx.log_fmt(format_args!("supervisor: {} could not be read ({:?}) after {} s - no installed package started", LIST, e, waited));
