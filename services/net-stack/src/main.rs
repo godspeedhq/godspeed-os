@@ -1689,6 +1689,12 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
 /// 200 ms. Ten wakes a second is also the ceiling on what this costs: each is ONE drain request to
 /// `nic-driver`, and only when nothing else woke us.
 const POLL_MS: u64 = 100;
+/// How old the last poll may be when a client asks to READ a connection before one is run for it. A reader
+/// waiting on a connection is the one time the poll is owed sooner: the data it waits for may already be in
+/// the driver, and the window update that lets the peer send more goes out only from a poll. Waiting for the
+/// scheduled one, a 2 KiB window refilled at most every 100 ms - about 9 KiB/s on the VisionFive over WiFi
+/// AND Ethernet, and 5.5 KiB/s in QEMU (2026-10-18). Ten milliseconds bounds what a busy reader costs.
+const RECV_POLL_MS: u64 = 10;
 /// How long a connect waits for a closing connection's slot when the table is full (`OP_CONNECT`). TIME_WAIT
 /// here is 2 s, and a FIN exchange is a round trip or two, so 4 s covers both; a client asking for a
 /// connection waits 20 s for its answer.
@@ -3459,6 +3465,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // no more: bytes read here leave the connection, so handing over more than the
                     // caller's buffer holds would lose them (`backlog/fixed/80` G3). No length: all of it.
                     COP_RECV if right & RIGHT_READ != 0 => {
+                        // A READER IS WAITING: poll now if the last one is more than RECV_POLL_MS old, so the
+                        // bytes already in the driver are read in and the window the last read freed is told
+                        // to the peer, rather than at the next scheduled poll up to 100 ms away.
+                        if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= ticks_ms(&ctx, RECV_POLL_MS) {
+                            last_poll = gs::driver::wait::ticks(&ctx);
+                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                            let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
+                            poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                        }
                         let max = match body {
                             [lo, hi, ..] => (u16::from_le_bytes([*lo, *hi]) as usize).min(resp.len()),
                             _ => resp.len(),

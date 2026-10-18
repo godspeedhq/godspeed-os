@@ -32,8 +32,11 @@ pub const MAX_CONNS: usize = 2;
 /// cannot be dropped from here until its ACK arrives, because retransmission is reading from it.
 pub const SND_BUF: usize = 2048;
 /// Per-connection receive arena. Its FREE SPACE is what we advertise as the window, so this constant
-/// is the largest amount of un-read data a peer can ever push at this machine.
-pub const RCV_BUF: usize = 2048;
+/// is the largest amount of un-read data a peer can ever push at this machine - and so how much a download
+/// moves per round trip. 8 KiB, not 2: at 2 KiB a package came down at 5.5 KiB/s in QEMU and 9 KiB/s on
+/// the VisionFive over WiFi and Ethernet alike (2026-10-18). It costs 12 KiB more for each of the two
+/// connections, in `service_main`'s frame (about 69 KiB with it, of a 256 KiB stack).
+pub const RCV_BUF: usize = 8192;
 /// Out-of-order segments held while waiting for the gap to fill. Beyond this we DROP and let the peer
 /// retransmit, which is always-legal TCP and is what keeps reassembly bounded. FreeBSD holds far
 /// more; that is a property of their design, not of the protocol.

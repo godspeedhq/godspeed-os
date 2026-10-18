@@ -104,6 +104,24 @@ vCPU thread is, so several of these may be unreachable outside an emulator. That
 the work, not to leave the class unrecorded: a false panic on a busy CI host is still a machine that
 died, and the bar in 22 does not have an "unless the host was busy" clause.
 
+## Seen again: the liveness watchdog, in QEMU, at 1.002x its allowance (2026-10-18)
+
+`osdev test shell`, during `chaos kill-storm supervisor 4`, as the kernel respawned the supervisor a fourth time:
+
+```text
+KERNEL PANIC: panicked at kernel\src\task\scheduler.rs:1871:21:
+LIVENESS WEDGE: core 0 made NO progress for 7783025157 counter ticks (1x the 7769852100 allowed); it was
+running task slot 9 'shell'; since its last stamp it has taken 0 timer interrupts and halted 0 ...
+```
+
+0.17% over the allowance, on x86 QEMU (TCG), on a branch whose only changes since the last clean run were inside
+`net-stack` (feat/packages, the TCP receive window and a read-time poll). The same code then ran the whole suite
+again, 276 passed, no panic. That is this entry's shape exactly - a wedge detector stopping the machine on a core
+that was late by a margin a busy host explains - and the first time the table's "another core making any progress"
+row (`task/scheduler.rs:1616` when the table was written, line 1871 now) has been seen firing outside riscv64
+(`backlog/fixed/16`).
+Recorded, not fixed: the serial log is not kept in the tree.
+
 ## Next step
 
 The operator's call on scope. `backlog/fixed/48`'s instance is the one with a measurement behind it and the
