@@ -743,7 +743,11 @@ pub(crate) fn failure(f: &https::Fail, folder: &str, clock: &str) -> (&'static s
     use https::Fail::*;
     match *f {
         NoRandom => ("tls", cell(format_args!("this machine has no hardware random source, and a key share must not be guessable"))),
-        Resolve => ("address", cell(format_args!("the name did not resolve - is the network up? (`net`)"))),
+        // Which of the ways a name fails, because they are acted on differently: a name nobody has is not
+        // fixed by checking the cable, and a channel that answered out of step is not fixed by either.
+        Resolve(gs::Error::NotFound) => ("address", cell(format_args!("no such name - the DNS server answered, with no address for it"))),
+        Resolve(gs::Error::Unavailable) => ("address", cell(format_args!("no DNS server answered - is the network up? (`net`)"))),
+        Resolve(e) => ("address", cell(format_args!("the name was not resolved: net-stack's answer was {:?} - its log says why", e))),
         Connect => ("connect", cell(format_args!("no TCP connection - net-stack's log says why"))),
         Transport => ("connect", cell(format_args!("the connection broke before the answer was complete"))),
         Timeout => ("connect", cell(format_args!("no answer within timeout-secs"))),

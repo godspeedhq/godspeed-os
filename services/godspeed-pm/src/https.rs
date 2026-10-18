@@ -38,7 +38,8 @@ const IDLE_MS: u64 = 20;
 #[derive(Clone, Copy, Debug)]
 pub enum Fail {
     NoRandom,
-    Resolve,
+    /// The name did not resolve, and how net-stack answered: no server, no such name, or no answer in time.
+    Resolve(gs::Error),
     Connect,
     /// Sending or receiving on the connection failed.
     Transport,
@@ -91,7 +92,7 @@ pub fn session<T>(ctx: &ServiceContext, host: &str, port: u16, roots: &[&[u8]], 
     let mut out = [0u8; OUT_MAX];
     let mut rec = [0u8; RECORD_MAX];
     let mut net = gs::net::Net::new(ctx);
-    let ip = net.resolve(host).map_err(|_| Fail::Resolve)?;
+    let ip = net.resolve(host).map_err(Fail::Resolve)?;
     let mut stream = net.connect(ip, port).map_err(|_| Fail::Connect)?;
     let result = {
         let hello = Hello { server_name: host, random, session_id, x25519_private: private };

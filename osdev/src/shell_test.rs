@@ -8443,7 +8443,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let none = run!(b"godspeed search zzzz\r", 180);
         check!(none.contains("0 packages") && none.contains("verified: root"), "a word nothing matches is an empty list, not a failure, with the chain it was checked by");
         let info = run!(b"godspeed info godspeed/hello\r", 180);
-        check!(info.contains("godspeed/hello 0.2.0") && info.contains("latest; published") && info.contains("bankole"),
+        check!(info.contains("godspeed/hello 0.3.0") && info.contains("latest; published") && info.contains("bankole"),
                "`godspeed info` is a card headed by the release: the latest, when and by whom");
         check!(info.contains("The service template") && info.contains("licence") && info.contains("GPL-2.0-only") && !info.contains("ITEM"),
                "the card gives the manifest's description and licence, and is not a three-column table");
@@ -8455,7 +8455,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(nope.contains("never published on this registry"), "a package the snapshot does not list is said to be unpublished");
 
         let fetched = run!(b"godspeed fetch godspeed/hello\r", 240);
-        check!(fetched.contains("/system/packages/godspeed/hello/0.2.0") && fetched.contains("fetched"),
+        check!(fetched.contains("/system/packages/godspeed/hello/0.3.0") && fetched.contains("fetched"),
                "`godspeed fetch` verifies the package and fetches it to /system/packages/");
         check!(fetched.contains("x86_64") && fetched.contains("its size and digest the manifest's"),
                "it keeps this machine's binary, checked against the manifest");
@@ -8466,16 +8466,16 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
                "`godspeed fetch` draws a progress bar while the binary downloads");
         check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
-        let kept = run!(b"dir /system/packages/godspeed/hello/0.2.0\r", 60);
+        let kept = run!(b"dir /system/packages/godspeed/hello/0.3.0\r", 60);
         check!(kept.contains("x86_64.elf") && kept.contains("manifest.toml") && kept.contains("manifest.sig")
                && kept.contains("contract.toml") && kept.contains("origin") && !kept.contains("aarch64.elf"),
                "the folder holds the binary, the documents that prove it, and where it came from - and no other architecture's");
-        let twice = run!(b"godspeed fetch godspeed/hello@0.2.0\r", 240);
+        let twice = run!(b"godspeed fetch godspeed/hello@0.3.0\r", 240);
         check!(twice.contains("already fetched"), "fetching a fetched version again leaves it as it is");
         let listed = run!(b"godspeed list fetched\r", 60);
         check!(listed.contains("PACKAGE") && listed.contains("VERSION") && listed.contains("FROM") && listed.contains("SIZE"),
                "`godspeed list fetched` is a list with real columns");
-        check!(listed.contains("godspeed/hello") && listed.contains("0.2.0") && listed.contains("default"), "it shows the package, its version and registry");
+        check!(listed.contains("godspeed/hello") && listed.contains("0.3.0") && listed.contains("default"), "it shows the package, its version and registry");
         check!(listed.contains("KiB") && listed.contains("1 package,"), "with its size, and the count and total under the list");
         let verified = run!(b"godspeed verify\r", 120);
         check!(verified.contains("intact") && verified.contains("1 checked, 0 damaged"), "`godspeed verify` checks the fetched copy from the disk: intact");
@@ -8496,17 +8496,17 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let refused = run!(b"godspeed fetch godspeed/hello | count\r", 30);
         check!(refused.contains("are actions, not reports"), "`godspeed fetch` refuses to start a pipe");
         let missing = run!(b"godspeed fetch godspeed/hello@9.9.9\r", 240);
-        check!(missing.contains("not published") && missing.contains("0.2.0"), "a version not published is refused, naming the ones that are");
+        check!(missing.contains("not published") && missing.contains("0.3.0"), "a version not published is refused, naming the ones that are");
 
         // INSTALL: the supervisor checks the fetched copy from the disk again and starts it, under its package name.
         let notfetched = run!(b"godspeed install godspeed/nothing-here yes\r", 60);
         check!(notfetched.contains("not fetched here"), "installing what is not fetched is refused, naming `godspeed fetch`");
         let inst = run!(b"godspeed install godspeed/hello yes\r", 180);
-        check!(inst.contains("godspeed/hello 0.2.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
+        check!(inst.contains("godspeed/hello 0.3.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
                "`godspeed install` asks once, naming everything the package would be given, and `yes` answers it");
         check!(inst.contains("installed") && inst.contains("running, as the task godspeed/hello") && inst.contains("privilege"),
                "the supervisor started it, under its package name, with no privilege");
-        check!(inst.contains("installed godspeed/hello 0.2.0 started") && inst.contains("checked from disk"),
+        check!(inst.contains("installed godspeed/hello 0.3.0 started") && inst.contains("checked from disk"),
                "the supervisor says it checked the copy from the disk before starting it");
         check!(inst.contains("hello: started"), "and the installed program ran");
         let li = run!(b"godspeed list installed\r", 60);
@@ -8672,7 +8672,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fresh.contains("first contact: root 1 matched the pin"), "and the registry is met again from root 1");
 
         // DAMAGE on disk is found without the network.
-        let _ = run!(b"write /system/packages/godspeed/hello/0.2.0/contract.toml name = \"other\"\r", 60);
+        let _ = run!(b"write /system/packages/godspeed/hello/0.3.0/contract.toml name = \"other\"\r", 60);
         let damaged = run!(b"godspeed verify godspeed/hello\r", 120);
         check!(damaged.contains("DAMAGED") && damaged.contains("contract.toml is not the contract the manifest names"),
                "`godspeed verify` finds a fetched file changed on disk, and names it");
