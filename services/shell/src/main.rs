@@ -9949,8 +9949,12 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     };
     let b = bytes.min(1024);                          // matches net-stack's PING_MAX_PAYLOAD
     let bl = (b as u16).to_le_bytes();
-    // No `[q] quit` here: the command's watch offers it once, 2 s in, like every wait in the shell. The
-    // header used to carry one too, so a continuous run printed it twice, once inside its own result.
+    // `[q] quit` FIRST, on its own line, from the command's watch - so it is still the command's one notice, and
+    // none follows. Waited for, the watch offers it 2 s in, which for ping is between two replies: the notice
+    // landed in the middle of the results it is about (seen on the VisionFive, 2026-10-18). A ping prints until
+    // it is stopped, so the way to stop it is said before it starts. The header carries none of its own (it used
+    // to, and then it showed twice).
+    if ctx.cmd_active.get() { gs::call::Watch::notice(ctx); }
     out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
 
     let mut sent = 0u32; let mut recv = 0u32;

@@ -404,6 +404,10 @@ pub fn run(image_path: &Path, smp: u32) {
            && ping_out.contains("Ping statistics for 10.0.2.2")
            && (ping_out.contains("Reply from 10.0.2.2") || ping_out.contains("Request timed out")),
            "ping: continuous ICMP echo (count-limited) prints Windows-style output + stats (ping <gateway>)");
+    // `[q] quit` once, BEFORE the results, never among them (the VisionFive card, 2026-10-18).
+    let q_at = ping_out.find("[q] quit");
+    check!(q_at.is_some_and(|q| ping_out.find("Pinging").is_some_and(|p| q < p)),
+           "ping: `[q] quit` is said before the results start, not in the middle of them");
     check!(!ping_out.contains("bytes of data:  [q] quit") && ping_out.matches("[q] quit").count() <= 1,
            "ping: `[q] quit` is the shell's, at most once, never on the header line");
 
@@ -11951,6 +11955,8 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
                    "with its key trusted, the unpublished file installs as any package, with the same question");
             check!(local.contains("unpacking godspeed/hello-utility 0.9.0") && !local.contains("downloading godspeed/hello-utility 0.9.0"),
                    "and its progress says it is unpacking the file, not downloading");
+            check!(local.contains("100%") && local.contains("done in ") && local.contains("% "),
+                   "the progress line gives the percentage and how long it took");
             let ran_local = run!(b"hello-utility Bo\r", 60);
             check!(ran_local.contains("hello, Bo"), "and it runs");
             let listed_local = run!(b"godspeed list fetched\r", 60);

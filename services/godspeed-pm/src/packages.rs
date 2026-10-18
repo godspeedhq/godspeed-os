@@ -939,15 +939,21 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
         // From a package file nothing is downloaded: it is copied out of the file, and said so.
         let verb = if s.offline() { "unpacking" } else { "downloading" };
         let total = artifact.size;
+        let t0 = gs::task::uptime_secs(ctx);
+        let mut shown_secs = -1i64;
         let head = s.get(path.as_str(), &mut |bytes: &[u8]| {
             if verifier.update(bytes).is_err() { bad_bytes = true; return false; }
             got += bytes.len() as u64;
-            // The bar, redrawn when it moves by a twentieth (and at the end), never per record.
+            // The bar, redrawn when it moves by a twenty-eighth, when a second passes (so a slow link still shows
+            // time going by), and at the end - never per record.
             let step = got * 28 / total.max(1);
-            if step != shown || got == total {
+            let secs = gs::task::uptime_secs(ctx) - t0;
+            if step != shown || secs != shown_secs || got == total {
                 shown = step;
-                crate::progress(ctx, format_args!("  {} {}  [{}]  {} / {}   [q] quit", verb, what.as_str(), bar(step as usize, 28).as_str(),
-                    size_text(got).as_str(), size_text(total).as_str()));
+                shown_secs = secs;
+                crate::progress(ctx, format_args!("  {} {}  [{}]  {}%  {} / {}  {}{}", verb, what.as_str(), bar(step as usize, 28).as_str(),
+                    got * 100 / total.max(1), size_text(got).as_str(), size_text(total).as_str(), time_text(secs, got, total).as_str(),
+                    if got == total { "" } else { "   [q] quit" }));
             }
             let mut rest = bytes;
             while !rest.is_empty() {
@@ -1350,6 +1356,17 @@ pub fn cleanup(ctx: &ServiceContext, r: &mut Rows, delete: bool) {
         if delete { "deleted" } else { "would delete" }, count, if count == 1 { "y" } else { "ies" }, size_text(total).as_str(),
         if leftovers > 0 { cell(format_args!(", and {} leftover(s) of an interrupted fetch", leftovers)) } else { Cell::new() }.as_str(),
         if more { "; more are fetched than one listing shows - run it again after" } else { "" }));
+}
+
+/// How long a transfer has taken, and about how long is left: `3 s, about 4 s left`, then `done in 7 s`. The
+/// estimate is the rate so far, and only once a whole second has passed - a guess from the first chunk would be
+/// noise. Seconds, because that is the clock a program is given and the unit a download is felt in.
+pub(crate) fn time_text(secs: i64, got: u64, total: u64) -> Cell {
+    let secs = secs.max(0) as u64;
+    if got >= total { return cell(format_args!("done in {} s", secs)); }
+    if secs == 0 || got == 0 { return cell(format_args!("{} s", secs)); }
+    let left = secs * (total - got) / got;
+    cell(format_args!("{} s, about {} s left", secs, left.max(1)))
 }
 
 /// A bar of `width` cells, `filled` of them `#`.

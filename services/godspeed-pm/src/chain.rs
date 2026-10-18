@@ -256,6 +256,7 @@ fn fetch_snapshot(ctx: &ServiceContext, s: &mut dyn Source, base: &str, fs: &mut
     let mut chunk = [0u8; gs::fs::IO_CHUNK];
     let (mut held, mut written) = (0usize, 0u64);
     let mut shown = u64::MAX;
+    let t0 = gs::task::uptime_secs(ctx);
     let head = s.get_sized(path.as_str(), &mut |h| {
         match h.length {
             Some(n) if n <= SNAPSHOT_FILE_MAX && n > 0 => {
@@ -284,8 +285,10 @@ fn fetch_snapshot(ctx: &ServiceContext, s: &mut dyn Source, base: &str, fs: &mut
         let step = (written + held as u64) * 20 / total;
         if total > 64 * 1024 && step != shown {
             shown = step;
-            crate::progress(ctx, format_args!("  downloading the snapshot  {} / {} KiB   [q] quit",
-                (written + held as u64) / 1024, total / 1024));
+            let done = written + held as u64;
+            crate::progress(ctx, format_args!("  downloading the snapshot  {}%  {} / {} KiB  {}   [q] quit",
+                done * 100 / total, done / 1024, total / 1024,
+                crate::packages::time_text(gs::task::uptime_secs(ctx) - t0, done, total).as_str()));
         }
         true
     });
