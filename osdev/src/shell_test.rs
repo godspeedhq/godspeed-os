@@ -12110,6 +12110,15 @@ pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
         check!(text.contains("HTTP/1.1 200") && text.contains(&format!("{bytes} bytes")),
                format!("{bytes} bytes arrive, all of them"));
     }
+    // THE REGISTRY'S OWN PATH: 10 MB of random bytes beside the packages, reached through the registry's
+    // certificate and the default root alone - what a package download crosses, and what a board can run as is.
+    let t0 = std::time::Instant::now();
+    let out = run!(b"godspeed check https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin\r", 900);
+    let took = t0.elapsed().as_secs_f64();
+    let speed = out.lines().find(|l| l.contains("speed")).unwrap_or("").trim().to_string();
+    println!("download: the registry's 10 MB: {:.1} s at the host, guest says: {}", took, speed);
+    check!(out.contains("HTTP/1.1 200") && out.contains("10000000 bytes"), "the registry's 10 MB test file arrives, all of it");
+
     // THE DISK'S HALF: a download is written as it arrives, so it is no faster than this.
     let t0 = std::time::Instant::now();
     let copied = run!(b"copy /big.bin /big-copy.bin\r", 600);
