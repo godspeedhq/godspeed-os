@@ -611,7 +611,8 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
             path.push(base).push(bin_rel.as_str());
             let mut got = 0u64;
             let mut shown = u64::MAX;
-            let file = arch.artifact_file();
+            // Said as the PACKAGE, not the file: `x86_64.elf` is how it is stored, not what is being fetched.
+            let what = cell(format_args!("{} {} ({})", name, release.version, arch.as_str()));
             let total = artifact.size;
             let head = s.get(path.as_str(), &mut |bytes: &[u8]| {
                 if verifier.update(bytes).is_err() { bad_bytes = true; return false; }
@@ -620,7 +621,7 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
                 let step = got * 28 / total.max(1);
                 if step != shown || got == total {
                     shown = step;
-                    crate::progress(ctx, format_args!("  downloading {}  [{}]  {} / {}   [q] quit", file, bar(step as usize, 28).as_str(),
+                    crate::progress(ctx, format_args!("  downloading {}  [{}]  {} / {}   [q] quit", what.as_str(), bar(step as usize, 28).as_str(),
                         size_text(got).as_str(), size_text(total).as_str()));
                 }
                 let mut rest = bytes;
@@ -639,7 +640,7 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
             });
             if bad_bytes {
                 let _ = fs.delete_all(staging.as_str());
-                r.fail("binary", arch.artifact_file(), "its bytes are not the ones the manifest names; nothing was kept");
+                r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(), "its bytes are not the ones the manifest names; nothing was kept");
                 return Ok(());
             }
             if let Some(e) = store_err {
@@ -656,7 +657,7 @@ pub fn fetch(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Root
             }
             if verifier.finish().is_err() {
                 let _ = fs.delete_all(staging.as_str());
-                r.fail("binary", arch.artifact_file(), "it is not the size or digest the manifest names; nothing was kept");
+                r.fail("binary", cell(format_args!("for {}", arch.as_str())).as_str(), "it is not the size or digest the manifest names; nothing was kept");
                 return Ok(());
             }
 

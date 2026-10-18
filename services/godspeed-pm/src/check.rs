@@ -269,15 +269,15 @@ pub fn package(ctx: &ServiceContext, publisher: &str, name: &str, version: &str,
     let bin = core::str::from_utf8(&bp[..bn]).unwrap_or("");
     loop {
         let got = fs.read_at(bin, off, &mut chunk).map_err(|e| match e {
-            gs::Error::NotFound => text(format_args!("{} is missing", file)),
-            e => text(format_args!("{} could not be read: {:?}", file, e)),
+            gs::Error::NotFound => text(format_args!("its {} binary is missing", artifact.arch.as_str())),
+            e => text(format_args!("its {} binary could not be read: {:?}", artifact.arch.as_str(), e)),
         })?;
         if got == 0 { break; }
-        verifier.update(&chunk[..got]).map_err(|_| text(format_args!("{} is longer than the manifest says", file)))?;
-        if !image(off, &chunk[..got]) { return Err(text(format_args!("{} is larger than this loader holds", file))); }
+        verifier.update(&chunk[..got]).map_err(|_| text(format_args!("its {} binary is longer than the manifest says", artifact.arch.as_str())))?;
+        if !image(off, &chunk[..got]) { return Err(text(format_args!("its {} binary is larger than this loader holds", artifact.arch.as_str()))); }
         off += got as u64;
     }
-    verifier.finish().map_err(|_| text(format_args!("{} is not the size or digest the manifest names", file)))?;
+    verifier.finish().map_err(|_| text(format_args!("its {} binary is not the size or digest the manifest names", artifact.arch.as_str())))?;
     // ONLY A SERVICE IS REPLACED LIVE. A driver never is: a handover runs two instances side by side for a moment,
     // and two drivers on one device would both program it. A utility runs for one command, and an app is reloaded
     // by its user. Refused here, in the check every start and every `godspeed verify` runs, so a package that
