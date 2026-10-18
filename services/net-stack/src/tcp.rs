@@ -23,10 +23,11 @@ use godspeed_sdk::service_context::ServiceContext;
 
 /// Connections held at once. TWO, not a larger round number, because the transaction model uses
 /// exactly one at a time and a table sized for concurrency that does not exist yet is the
-/// speculative abstraction §26.2 forbids. Each connection costs its two arenas plus its held
-/// out-of-order segments, and this table lives in `service_main`'s frame: on the Pi 2 that stack is
-/// 256 KiB, a debug ARM build has already overflowed one, and four connections put this service's
-/// entry frame at 98 KiB. Raise it when concurrent connections exist to need it.
+/// speculative abstraction §26.2 forbids. Each connection costs its small arenas in `service_main`'s frame
+/// (about 10 KiB) and a 256 KiB region beside it ([`RCV_BIG`]). FOUR was tried on 2026-10-18 and overflowed
+/// that 256 KiB stack at start in QEMU, a crash loop; what it was for - two connections left by programs ended
+/// with `q` filling the table on the VisionFive - is answered by reclaiming an abandoned one
+/// (`Tcp::reclaim_idle`) instead.
 pub const MAX_CONNS: usize = 2;
 /// Per-connection send arena: data handed to us that the peer has not acknowledged yet. A segment
 /// cannot be dropped from here until its ACK arrives, because retransmission is reading from it.
@@ -267,6 +268,9 @@ pub struct Conn {
     close_pending: bool,
     /// The client CLOSED it: it will read nothing more, so what is unread, or arrives after, is no one's.
     reader_gone: bool,
+    /// When its client last used it (any invocation), in this table's milliseconds: what says a connection
+    /// whose program was ended without closing it has been abandoned ([`Tcp::reclaim_idle`]).
+    used_ms: u64,
     /// An acknowledgement is owed to the peer, to be sent by `poll_one` on its next pass.
     ///
     /// `on_frame` USED TO SEND IT ITSELF, and that was the last hardware bug on this branch. Doing so
@@ -340,7 +344,7 @@ impl Conn {
             retx_at_ms: 0, retx_count: 0,
             srtt_ms: 0, rttvar_ms: 0, rto_ms: RTO_MIN_MS,
             rtt_timed_seq: 0, rtt_timed_at_ms: 0, rtt_timing: false,
-            state_deadline_ms: 0, close_pending: false, reader_gone: false, ack_due: false, last_adv: 0,
+            state_deadline_ms: 0, close_pending: false, reader_gone: false, used_ms: 0, ack_due: false, last_adv: 0,
         }
     }
 
@@ -904,6 +908,7 @@ impl Tcp {
         let c = &mut self.conns[i];
         c.reset();
         c.rid = rid;
+        c.used_ms = now;
         c.peer_mac = peer_mac;
         c.state = State::SynSent;
         c.local_port = port;
@@ -955,6 +960,32 @@ impl Tcp {
                 c.close_pending = true;
             }
         }
+    }
+
+    /// The client used connection `i` just now.
+    pub fn touch(&mut self, ctx: &ServiceContext, i: usize) {
+        let now = self.now_ms(ctx).unwrap_or(0);
+        if let Some(c) = self.conns.get_mut(i) { c.used_ms = now; }
+    }
+
+    /// A connection its client has not used for `idle_ms`, released to make room: the longest idle first. Its
+    /// resource id, for the caller to revoke, or `None` when every connection is in use.
+    ///
+    /// **Why a connection can be abandoned at all.** A client that is ENDED - `q` on a download, a killed task -
+    /// never closes what it held, and nothing tells this service: the capability went with the task. Its
+    /// connection stays in the table, owned, until the peer gives up, which can be minutes. Only asked when a
+    /// connect finds the table full, so an idle connection that is still wanted keeps its slot while there is
+    /// room. Nothing is sent to the peer; its next segment finds no connection and it times out on its own.
+    pub fn reclaim_idle(&mut self, ctx: &ServiceContext, idle_ms: u64) -> Option<(u64, u64)> {
+        let now = self.now_ms(ctx)?;
+        let (i, idle) = (0..MAX_CONNS)
+            .filter(|&i| self.conns[i].rid != 0)
+            .map(|i| (i, now.saturating_sub(self.conns[i].used_ms)))
+            .filter(|&(_, idle)| idle >= idle_ms)
+            .max_by_key(|&(_, idle)| idle)?;
+        let rid = self.conns[i].rid;
+        self.conns[i].reset();
+        Some((rid, idle))
     }
 
     /// Release a slot outright: the capability was revoked or the client vanished.
@@ -1243,6 +1274,19 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
     check(t.conns[0].reapable(), "and released once its client closes it", &mut pass, &mut fail);
     t.conns[0].rcv_len = 5;
     check(t.conns[0].reapable(), "even if bytes arrived after the client closed it", &mut pass, &mut fail);
+
+    // ---- a connection its client abandoned (ended without closing it) is released when the table is full ----
+    // A clock of one tick per millisecond, so the counter itself is the time and a connection last used at 0
+    // has been idle as long as the machine has been up.
+    let mut t = Tcp::new(1000, 0);
+    t.conns[0].state = State::Established;
+    t.conns[0].rid = 5;
+    t.touch(ctx, 0);
+    t.conns[1].state = State::Established;
+    t.conns[1].rid = 6;
+    let r = t.reclaim_idle(ctx, 1);
+    check(matches!(r, Some((6, _))) && t.conns[1].rid == 0 && t.conns[0].rid == 5,
+          "the connection nobody has used is released, and the one just used is kept", &mut pass, &mut fail);
 
     // ---- the receive arena is a ring: bytes come out in order across its end ----
     let mut pat = [0u8; 6000];

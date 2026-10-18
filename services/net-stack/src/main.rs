@@ -1707,6 +1707,10 @@ const STREAM_BURST_MS: u64 = 4;
 /// here is 2 s, and a FIN exchange is a round trip or two, so 4 s covers both; a client asking for a
 /// connection waits 20 s for its answer.
 const CONNECT_SLOT_WAIT_MS: u64 = 4_000;
+/// How long a connection's client may leave it untouched before a connect that finds the table full may take
+/// its slot (`Tcp::reclaim_idle`). A client reading a download touches its connection many times a second, and
+/// one between two requests for a few seconds at most; fifteen is far past either.
+const RECLAIM_IDLE_MS: u64 = 15_000;
 
 /// How long ONE frame the poll step sends may wait on the driver.
 ///
@@ -3496,6 +3500,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 tcpst.conns[k].rid == rid && rid != 0 && tcpst.conns[k].state != tcp::State::Closed
             }) {
                 let op = pl.first().copied().unwrap_or(COP_STAT);
+                tcpst.touch(&ctx, i);
                 let body = if pl.len() > 1 { &pl[1..] } else { &[][..] };
                 // A whole message's worth, less the tag byte the reply leads with: what one read can move.
                 let mut resp = [0u8; gs::ipc::MAX_BYTES - 1];
@@ -3830,6 +3835,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let waited = gs::driver::wait::ticks(&ctx).wrapping_sub(start) / ticks_ms(&ctx, 1).max(1);
                     ctx.log_fmt(format_args!("net-stack: connect waited {} ms for a closing connection's slot - {}", waited,
                         if tcpst.has_free_slot() { "freed" } else { "still full" }));
+                }
+                // STILL FULL: a connection whose client has not used it in RECLAIM_IDLE_MS was abandoned - its program
+                // was ended without closing it - and its slot is taken for this one. Said, with how long it sat.
+                if !tcpst.has_free_slot() {
+                    if let Some((rid, idle)) = tcpst.reclaim_idle(&ctx, RECLAIM_IDLE_MS) {
+                        let _ = gs::resource::revoke(&ctx, rid);
+                        ctx.log_fmt(format_args!(
+                            "net-stack: the connection table was full - released one its client had not used for {} s (a program ended without closing it)",
+                            idle / 1000));
+                    }
                 }
                 match gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
                     Ok((crid, cap)) => {
