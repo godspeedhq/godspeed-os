@@ -1195,7 +1195,21 @@ const _: () = assert!(
 /// argument parsing (verified against utilities/*.md + the `cmd_*` parsers). The universal `version`
 /// and `help` subcommands are appended automatically in `complete_keyword` (every utility answers
 /// `<util> version` / `<util> help`), so they are NOT listed here.
+/// `selfcheck`'s first word: its parts, taken from `SELFCHECK_PARTS` - the list that runs them - so a new part
+/// completes the moment it exists and a removed one stops completing; and `save`.
+const SELFCHECK_WORDS: [&str; SELFCHECK_PARTS.len() + 1] = {
+    let mut w = [""; SELFCHECK_PARTS.len() + 1];
+    let mut i = 0;
+    while i < SELFCHECK_PARTS.len() {
+        w[i] = SELFCHECK_PARTS[i].0;
+        i += 1;
+    }
+    w[i] = "save";
+    w
+};
+
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
+    ("selfcheck", &SELFCHECK_WORDS),
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
     ("godspeed", &["search", "info", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "trust", "registry", "config", "check"]),

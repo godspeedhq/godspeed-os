@@ -1897,7 +1897,11 @@ fn handle_alloc_mem(size: u64) -> i64 {
         zero_frame(phys);
         // SAFETY: va is in the task heap range (`TASK_HEAP_VA_START`+); phys is from the
         // allocator; the task's page table is the active CR3 during this syscall.
-        if unsafe { map_in_active_tables(va, phys, flags) }.is_err() {
+        if let Err(e) = unsafe { map_in_active_tables(va, phys, flags) } {
+            // SAID, not just refused: a bare -1 told the caller "no memory" while 8 GiB sat free - the
+            // fault was the mapping, and only this line can say which page and why.
+            crate::kprintln!("alloc_mem: '{}' page {} of {} at {:#x} could not be mapped ({:?})",
+                scheduler::task_name(scheduler::current_task_slot()), i + 1, pages, va, e);
             return -1;
         }
         // Frame ownership passes to the page table (freed when task dies);

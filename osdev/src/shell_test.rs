@@ -813,6 +813,12 @@ pub fn run(image_path: &Path, smp: u32) {
         Some(r) => check!(r.contains("net arp"), "tab: 'net a' completes to 'net arp'"),
         None    => { println!("shell-test: FAIL - tab net-arp completion timed out"); fail += 1; }
     }
+    // selfcheck's parts complete, from the list that runs them: `selfcheck pac<Tab>` -> `selfcheck packages`.
+    send(&mut write_half, b"selfcheck pac\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("selfcheck packages"), "tab: 'selfcheck pac' completes to 'selfcheck packages'"),
+        None    => { println!("shell-test: FAIL - tab selfcheck-part completion timed out"); fail += 1; }
+    }
     // The menu reprints the prompt ("gsh> write "), so collect that frame first…
     send(&mut write_half, b"write \t");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {

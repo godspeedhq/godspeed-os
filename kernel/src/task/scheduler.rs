@@ -601,8 +601,17 @@ static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX
 /// an ISA question standing in for something else: the address width IS the question, asked of the
 /// property that answers it. There is no seam member that would improve it, because the choice is
 /// about the neutral kernel's own address-space layout rather than about any hardware.
+///
+/// **And on 64-bit, 4 GiB was not above everything either** (2026-10-18). RISC-V maps physical RAM at its
+/// own addresses (`hhdm=0x0`) into every address space, and the VisionFive 2 Lite's 8 GiB of RAM runs from 1
+/// GiB to 9 GiB - over 4 GiB. Every `AllocMem` there failed on its first page (`AlreadyMapped`, now said by
+/// `handle_alloc_mem`): the supervisor could not hold a package's image, and `chaos mem-pressure` never
+/// allocated. QEMU's `virt` with 256 MiB at 2 GiB never reached 4 GiB, so nothing saw it; with `-m 4G` it
+/// fails the same way. An 8 GiB Pi 4 would too. 64 GiB is above the RAM of every board this runs on, inside
+/// every 64-bit port's user range (AArch64's 39-bit, 512 GiB; RISC-V Sv39's lower 256 GiB; x86's 128 TiB),
+/// and clear of the fixed `XHCI_MMIO_VA` (4 GiB) and `XHCI_DMA_VA` (8 GiB) windows.
 #[cfg(target_pointer_width = "64")]
-pub const TASK_HEAP_VA_START: u64 = 0x1_0000_0000; // 4 GiB
+pub const TASK_HEAP_VA_START: u64 = 0x10_0000_0000; // 64 GiB
 #[cfg(target_pointer_width = "32")]
 pub const TASK_HEAP_VA_START: u64 = 0x5000_0000;   // 1.25 GiB
 
