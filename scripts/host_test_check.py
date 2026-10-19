@@ -46,6 +46,8 @@ FILES = [
     "services/godspeed-pm/src/http.rs",
     "services/godspeed-pm/src/toml_lines.rs",
     "services/time/src/ntp_file.rs",
+    # A progress line narrowed to the console: the bar gives way first (2026-10-19).
+    "services/shell/src/fit.rs",
 ]
 
 

@@ -934,8 +934,10 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
         path.push(base).push(bin_rel.as_str());
         let mut got = 0u64;
         let mut shown = u64::MAX;
-        // Said as the PACKAGE, not the file: `x86_64.elf` is how it is stored, not what is being fetched.
-        let what = cell(format_args!("{} {} ({})", name, version, arch.as_str()));
+        // Said as the PACKAGE, not the file: `x86_64.elf` is how it is stored, not what is being fetched. And not
+        // its arch: a machine fetches only its own, the card after says which, and the line has to fit a screen
+        // (the shell narrows the bar first, `fit_progress`; at 100 columns this name was what was left over).
+        let what = cell(format_args!("{} {}", name, version));
         // From a package file nothing is downloaded: it is copied out of the file, and said so.
         let verb = if s.offline() { "unpacking" } else { "downloading" };
         let total = artifact.size;

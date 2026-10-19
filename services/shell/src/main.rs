@@ -73,6 +73,7 @@ impl Utf8In {
 #[allow(dead_code)]
 #[path = "../../ask/src/know.rs"]
 mod ask_know;
+mod fit;
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
@@ -16000,6 +16001,11 @@ fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
     // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
     // the line does not offer it a second time.
     let noticed_first = core::cell::Cell::new(None::<bool>);
+    // CLIPPED TO THE SCREEN, as the pager clips (`help_browser`). `\r` and clear-line reach only the row the
+    // cursor is on, so a line wider than the console wraps and every redraw adds rows: the Wyse's console
+    // drew the bar down the screen where the Pis' wider ones held it on one line (2026-10-19). Asked once
+    // per command; 0 means no console answered, and serial keeps the whole line.
+    let clip = match ctx.console_dims() { (_, 0) => usize::MAX, (_, c) => (c as usize).saturating_sub(1) };
     let show = |line: &[u8]| {
         let already = match noticed_first.get() {
             Some(a) => a,
@@ -16007,11 +16013,14 @@ fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
         };
         let text = core::str::from_utf8(line).unwrap_or("");
         let text = if already { text.trim_end().trim_end_matches("[q] quit").trim_end() } else { text };
+        let mut fit = [0u8; 192];
+        let text = fit::fit_progress(text, clip, &mut fit);
         gs::io::print(ctx, "\r\x1b[2K");
         gs::io::print(ctx, text);
         drawn.set(true);
-        // The line offers `q` itself, so the watch does not print a second notice under it.
-        if !already && line.windows(8).any(|w| w == b"[q] quit") { ctx.quit_shown(); }
+        // The line offers `q` itself, so the watch does not print a second notice under it - unless the clip
+        // cut the offer off, when the watch's own notice is what tells the reader.
+        if !already && text.contains("[q] quit") { ctx.quit_shown(); }
     };
     let built = build_godspeed_table(ctx, line, Some(&show));
     if drawn.get() { gs::io::print(ctx, "\r\x1b[2K"); }

@@ -8474,7 +8474,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fetched.contains("log_write"), "it says what the contract requests");
         check!(fetched.contains("installed") && fetched.contains("not installed") && fetched.contains("`godspeed install` starts it"),
                "and that it is fetched, not installed, and how to install it");
-        check!(fetched.contains("downloading godspeed/hello 0.3.0 (x86_64)") && !fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
+        check!(fetched.contains("downloading godspeed/hello 0.3.0  [") && !fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
                "`godspeed fetch` draws a progress bar naming the package, not the file, while it downloads");
         check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
         let kept = run!(b"dir /system/packages/godspeed/hello/0.3.0\r", 60);
