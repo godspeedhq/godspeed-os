@@ -287,8 +287,8 @@ replace `dir`.
 
 ## 4d. Package files: installing with no network
 
-A package travels as one file, `<name>-<version>.gsp`, made where there is a network and installed where there
-is not (`docs/developer-services-design.md` 15):
+A package travels as one file, `<name>-<version>.gsp` (`.gsp` for GodspeedOS Package), made where there is a
+network and installed where there is not (`docs/developer-services-design.md` 15):
 
 ```
 gsh> godspeed fetch godspeed/hello offline          on a machine that can reach the registry
