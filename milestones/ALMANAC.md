@@ -61,6 +61,7 @@
 - [2026-09-27 to 2026-09-28 - The day the radio scanned the room](#2026-09-27-to-2026-09-28---the-day-the-radio-scanned-the-room)
 - [2026-09-29 to 2026-09-30 - The day the radio joined, and the cable learned to step aside](#2026-09-29-to-2026-09-30---the-day-the-radio-joined-and-the-cable-learned-to-step-aside)
 - [2026-09-30 to 2026-10-02 - The day the warm chip turned out to be a slow host](#2026-09-30-to-2026-10-02---the-day-the-warm-chip-turned-out-to-be-a-slow-host)
+- [2026-10-15 to 2026-10-19 - The day the machine learned to trust what it fetched](#2026-10-15-to-2026-10-19---the-day-the-machine-learned-to-trust-what-it-fetched)
 - [The Days I Was Wrong](#the-days-i-was-wrong)
   - [~2026-06-21 - The day the constitution rejected its author](#2026-06-21---the-day-the-constitution-rejected-its-author)
   - [~2026-06-27 - The day I reached for a heap](#2026-06-27---the-day-i-reached-for-a-heap)
@@ -1837,3 +1838,131 @@ RECORDS in a pipe, so `wifi list | sort reverse dbm` puts the strongest network 
 number the record model did not have: signal is measured in dBm, always below zero, and every number in a
 table had been unsigned. Writing the magnitude would be a different fact, and text sorts `-9` after `-80`.
 So the record model gained a signed number, pulled into existence by the one column that needed it.
+
+## 2026-10-15 to 2026-10-19 - The day the machine learned to trust what it fetched
+
+Until this week a Godspeed machine ran exactly the software it was built with. Five days later it could reach
+the internet over TLS, fetch a package someone else had published, and prove who signed it and that no byte
+had changed. It could then start it, upgrade it while it ran, and put the old version back if the new one
+would not start, on all five boards. It took three repositories, not one: the OS; `godspeed-cli` on the
+developer's workstation; and `godspeed-registry`, a Cloudflare Worker over R2. Released as v0.29.0, "Signed,
+Sealed, Delivered".
+
+### No library fit, so the protocol was written and the arithmetic was not
+
+The registry had to be reached over HTTPS; software fetched over a channel anyone can alter is software
+anyone can replace. No TLS library fit this tree as it stood. The one that keeps to the no-heap rule is
+Apache-2.0 only, which GPL-2.0-only cannot include, and the rest need a heap or are C. So `sdk/tls` is a TLS
+1.3 client written from RFC 8446: the key schedule, the record layer, the handshake, and the verifier that
+says why a chain was refused. The parts that are easy to get subtly wrong were taken, on purpose, from
+libraries built for them: RustCrypto's hashes and AES-GCM, dalek's X25519, `p256` and `p384`, and
+`rustls-webpki` for the chain. It is section 26.14 drawn at a new line: borrow what is a fact about
+mathematics; write what is a decision about this system.
+
+It is deliberately narrow: a client, TLS 1.3, one cipher suite, one key exchange, ECDSA certificates, and
+every buffer the caller's. RFC 8448 prints a whole handshake byte for byte, and the tests reproduce every value
+in it. The narrowness was paid for once, honestly: a server with only an RSA certificate cannot be checked,
+and `godspeed` says so in a sentence rather than as `alert 40`.
+
+### One contract, checked in three places
+
+The CLI that publishes, the Worker that accepts, and the machine that installs each verify a package with the
+same crate, `godspeed-package`. The Worker checks a manifest when it is reserved, each file as it is uploaded,
+and all of them again at finalisation; the machine then checks it once more, from scratch. The trust chain is
+the same everywhere:
+
+- a root pinned at first contact;
+- a timestamp and a snapshot that make a stale registry look stale;
+- namespaces that say which keys may publish under which name;
+- a manifest signed by one of those keys.
+
+The Worker signs only the two documents that must change without a person: the snapshot after each publish,
+and the timestamp every six hours. Which keys may sign for whom is signed offline, and the Worker
+cannot change it. A compromised server can stop answering, but it cannot lie about who published what.
+
+### Fetched is not installed, and the supervisor believes nothing it checked yesterday
+
+A fetch keeps a package and grants it nothing. An install is the supervisor reading the package back from the
+disk, checking the signature, the key's standing, the contract and the binary against the manifest, and
+handing the kernel the very bytes it hashed. It does that at install, at every boot and at every restart, with
+nothing cached between. A check whose result is remembered is a check of the past.
+
+An installed package gets no privilege. It gets the peers its signed contract asks for, and only the ones the
+operator approved. It runs under a `publisher/name` no built-in service can hold, so it can never answer for
+one when a client reacquires a name.
+
+### Kinds are decided by who governs the life
+
+Four kinds of program arrived: service, utility, app and driver. The question that settled them was not how
+long each runs. It was who decides when it ends:
+
+- the system restarts a service;
+- a utility ends itself with a status;
+- an app lasts as long as the operator keeps it open;
+- a driver lives with its device.
+
+A word processor is an app even if it runs all day.
+
+The utility needed the kernel to learn one thing, `Exit`, and it takes no capability. The rule that every
+syscall checks a capability exists so that nothing reaches authority without one, and the only task `Exit` can
+end is the caller. A rule is read by what it protects.
+
+### Erlang's upgrade, without changing running code
+
+The operator asked for Erlang's upgrade in place. What the constitution had rejected, new code loaded into a
+running program, stays rejected. What was built is the half of Erlang anyone can observe: the new version
+starts beside the old one under the same name, the old one hands its state over in one message and ends, and
+the name moves. The bytes that run are still the bytes the supervisor checked.
+
+The offer carries a key from the hardware random source, and a board without one does no handover at all
+rather than one keyed by the clock. A version that cannot take over is stopped and started instead: its checks
+run before the stop, and a failed start puts the old one back.
+
+### The download was paced by a clock, and the bugs were habits
+
+A 10 MB file came in at 113 KiB/s in QEMU, and the number that explained it was 100. net-stack looked at the
+wire once per 100 ms tick, so a download moved one window per tick however fast the link was. Four changes
+took it to 872 KiB/s, and the T630's cable to 629 KiB/s:
+
+- burst polling;
+- a 256 KiB window;
+- out-of-order data kept in the ring;
+- delayed ACKs.
+
+Then the boards found what QEMU could not:
+
+- **The RTL8168 driver emptied its receive ring before every frame it sent.** It had done so since July, to
+  recover a ring that filled while nobody read it, and that was harmless while each request had one reply.
+  With a sender running ahead, every ACK threw a ring of data away. The e1000 driver had dropped the same
+  habit long before, and QEMU emulates only the e1000. The fix kept the recovery, but moved it to where the
+  chip reports the stall.
+- **With the reset gone, the Wyse took exactly 24 frames and fell silent without saying it had stopped.**
+  That is one ring, the same "one ring's worth" the T630 showed in July, hidden ever since by the reset. A
+  receiver that gives nothing for a second is now restarted whether it says so or not. Every restart is logged
+  with the bits the chip set, so the next board says which case it is in.
+- **The Pi 4's radio lost a large window's bursts.** It hands them over as superframes bigger than its
+  driver's buffer, and it lost them until the radio died. A connection over a radio keeps the small window
+  until the driver can take them.
+- **"Connections stay open after a program ends" turned out not to be the program.** The client had closed;
+  the server simply had not sent its FIN, and fin-wait-2 waited for it with no limit, with only two slots in
+  the table. An orphan is now let go after two seconds, as Linux does.
+
+None of these could be seen in the emulator, and each was found by a card read line by line.
+
+### What is not done, said plainly
+
+Downloads are not yet at the speed of the link (`backlog/93`):
+
+- the RTL8168's ring still overflows;
+- the Pi 4's radio still runs on the small window;
+- the VisionFive's radio sends slowly;
+- every connect waits on an ARP it does not need.
+
+And on the last day the operator asked whether this was v1. The answer was not yet, and measured:
+
+- drivers still reach past the standard library;
+- the public surface has no gate that fails on a change;
+- no compatibility policy is written;
+- the surface changed that very day.
+
+v1 is a promise to contributors, and a promise that is not gated is a preference (`backlog/71`).
