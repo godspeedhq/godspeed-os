@@ -37,6 +37,15 @@
 //! The kernel. Nothing here is a new kernel responsibility or a new syscall; these are the mechanisms
 //! the kernel already offers, put in the one shape a driver should reach for.
 
+pub mod arena;
 pub mod delay;
 pub mod irq;
+pub mod registers;
 pub mod wait;
+
+// The two grants a driver names and relies on (step 3, 2026-10-19): its device's registers and its DMA
+// arena, taken at the top of every driver, so they are here rather than a module down.
+#[cfg(not(test))]
+pub use arena::{arena, Arena, Layout, Part};
+#[cfg(not(test))]
+pub use registers::{registers, Registers};
