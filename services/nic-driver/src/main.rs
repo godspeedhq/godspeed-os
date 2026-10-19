@@ -255,10 +255,10 @@ const RTL_MTPS_VALUE: u8 = 0x3B;
 /// How long to let the chip settle after Rx/Tx are switched off, before asking it to reset. Gives an
 /// in-flight DMA burst time to retire instead of being reset underneath itself.
 const RTL_QUIESCE_MS: u64 = 10;
-/// How long nobody has collected a frame before a receiver the chip STOPPED (RDU/FOVW) is restarted with
-/// its ring emptied. Frames that waited this long were waited for by nobody: the ring filled with
-/// broadcasts while `net-stack` was idle. A ring that filled DURING a download is collected within
-/// milliseconds, so its frames are kept and the receiver restarts once they have been taken.
+/// How long nobody has collected a frame before the receiver is restarted with its ring emptied, whether
+/// or not the chip said it stopped. Frames that waited this long were waited for by nobody: the ring
+/// filled with broadcasts while `net-stack` was idle. A ring that filled DURING a download is collected
+/// within milliseconds, so its frames are kept and the receiver restarts once they have been taken.
 const RTL_STALE_RX_MS: u64 = 1000;
 
 /// Wait, up to `TX_CONFIRM_MS`, for the NIC to say a transmit is done, yielding between looks: a send
@@ -478,6 +478,9 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // when a frame was last collected. Together they decide when the ring may be emptied (`RTL_STALE_RX_MS`).
     let mut rx_stopped = false;
     let mut collected_at = wait::Since::now(ctx);
+    // For the restart's line: how many there have been, and the ISR bits latched since the last.
+    let mut rx_restarts = 0u32;
+    let mut isr_seen = 0u16;
 
     // THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi-usb.md` 39): the USB WiFi dongle's service,
     // `wifi-usb`, reached over the same frame ops as on the Pi 2, Pi 4 and VisionFive, with the same rule
@@ -517,18 +520,41 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         // silent until the timeout. So the frames are kept: the ring is emptied only when net-stack has
         // taken everything in it (the descriptor at `rx_idx` is the chip's again), or when nobody has
         // collected a frame for `RTL_STALE_RX_MS` - the broadcasts the restart was written for.
+        //
+        // **And a receiver that stops WITHOUT saying so** (2026-10-19, the Wyse): with the per-send restart
+        // gone, the chip took exactly one ring's worth, 24 frames, and then nothing - the same "one ring's
+        // worth" the T630 showed in July - and this RDU test never fired. Either the chip stops at the end
+        // of the ring without latching RDU, or it does not wrap there. The restart used to hide which. So a
+        // receiver that has given nothing for `RTL_STALE_RX_MS` is restarted whether or not the chip said
+        // it stopped (an empty ring loses nothing; a full one held what nobody waited for), and each
+        // restart is said, with the status bits seen since the last, until the card says which it is.
         let isr = mmio.read16(RTL_ISR);
         mmio.write16(RTL_ISR, 0xFFFF);
+        isr_seen |= isr;
         if isr & (RTL_ISR_RDU | RTL_ISR_FOVW) != 0 {
             rx_stopped = true;
         }
-        if rx_stopped {
-            let taken = arena.read32(RX_RING_OFF + rx_idx * 16) & RTL_DESC_OWN != 0;
-            if taken || collected_at.passed(ctx, Budget::ms(RTL_STALE_RX_MS)) {
-                rtl_restart_rx(mmio, arena);
-                rx_idx = 0;
-                rx_stopped = false;
+        let taken = arena.read32(RX_RING_OFF + rx_idx * 16) & RTL_DESC_OWN != 0;
+        let why = if rx_stopped && taken {
+            Some("the chip stopped it and every frame was taken")
+        } else if collected_at.passed(ctx, Budget::ms(RTL_STALE_RX_MS)) {
+            Some(if rx_stopped { "the chip stopped it and nothing was collected for 1 s" }
+                 else { "nothing was collected for 1 s and the chip did not say it stopped" })
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            rtl_restart_rx(mmio, arena);
+            rx_restarts = rx_restarts.saturating_add(1);
+            if rx_restarts <= 8 || rx_restarts % 64 == 0 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: RTL8168 receiver restarted (#{}) - {}; ISR since the last 0x{:04x}, rx_idx was {}, {} frames taken",
+                    rx_restarts, why, isr_seen, rx_idx, rx_count));
             }
+            rx_idx = 0;
+            rx_stopped = false;
+            isr_seen = 0;
+            collected_at = wait::Since::now(ctx);
         }
         // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
