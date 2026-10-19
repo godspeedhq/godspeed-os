@@ -22,7 +22,7 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
 ## What is left
 
 1. **The RTL8168's ring overflows during a download.** It is 24 descriptors, all a 64 KiB DMA arena holds
-   (`services/nic-driver/src/main.rs`, `RX_RING_COUNT`, `TALLY_OFF`). The chip fills it, latches RDU, and
+   (`services/nic-driver/src/main.rs`, `RX_RING_COUNT`, the `tally` part). The chip fills it, latches RDU, and
    drops what arrives until the driver restarts it once every frame is taken: about 130 restarts in a 10 MB
    download on the Wyse, about 64 per 12,000 frames on the T630. Each stop is a loss the sender recovers
    from. A larger arena and ring is the obvious step. **Why the Wyse is 3.6 times slower than the T630 on the
