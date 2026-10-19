@@ -1,7 +1,8 @@
 # The driver library: `gs::driver`
 
-**Status: adopted 2026-10-02, from the operator's design guidance. Three mechanisms built (`wait`,
-`delay`, `irq`); nine drivers converted across all four ports. "Current state" below says what exists; the
+**Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
+`delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
+converted to the first three across all four ports, and AHCI the first on the grants (step 3). "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -80,6 +81,15 @@ and why; read them for the reasoning, not to find out what the library contains.
   unmask without a driver naming a vector. `xhci` reads its MSI vector through `Irq::vector`. Their WAIT
   loops are still hand-written - moving those onto `Irq::wait` changes a driver's structure and is owed
   its own hardware card on each board.
+
+- **`registers` and `arena`** (step 3, 2026-10-19) - the two grants a driver names and relies on.
+  `registers(ctx)` is the device's register window (`Registers`: `read8`..`read64`, `write8`..`write64`,
+  `len`); `arena(ctx)` is its DMA arena (`Arena`: the same accesses, `phys_at`, `zero`, `len`). Both answer
+  `None` when the spawn granted none. `Arena::layout` TAKES the arena and hands out named `Part`s
+  (`Layout::take(name, len, align)`), each aligned on its PHYSICAL address, never overlapping, every access
+  bounded to the part and a part that does not fit refused with its name (`NoRoom`). The placement is a
+  pure function pinned by host tests (`cargo test --lib` in `stdlib/rust`). Both wrap the SDK's audited
+  `Mmio` and `Dma`, so no `unsafe` moved.
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
 (1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
@@ -632,3 +642,46 @@ short of the tone, and that is a hypothesis until the position at each interrupt
 **Not done: `xhci`, `ehci` and `dwc2` are still hand-written.** Converting them is the step that proves
 the library replaced its sources rather than joined them, and each needs its own hardware (the T630
 and the Pi 2), so it is its own work, one driver per step.
+
+## Step 3: the grants - `registers`, `arena` and its layout (2026-10-19)
+
+**Why now.** `backlog/71` put `gs::driver` inside the v1 promise, grow-only, and named the end of step 2:
+no driver reaching past the standard library for its grants. Eleven drivers still took them with the
+SDK's `ctx.mmio()` and `ctx.dma_region()`, 22 call sites, and the CLI's `driver` template did too.
+
+**What was repeated, measured.** Across those drivers: about 640 arena accesses, 107 `phys_at` calls
+turning an offset into the address a device is given, 33 hand-kept offset constants and TWO asserts
+between them checking that nothing overlapped. The day this was built, the RTL8168's 24 receive buffers
+filled its arena to the last 4 KiB and one of those two asserts was all that kept its counters out of a
+buffer. That is a mechanism written out by hand seven times, which is this library's test for membership.
+
+**Decided by the operator, 2026-10-19.**
+
+- **The names are what the grants are to a driver author: `Registers` and `Arena`.** Not `Window` (the
+  kernel's word for how a grant is made) and not `Mmio` / `Dma` (the SDK's, which would make the
+  mechanism's name the promise).
+- **The arena comes with its layout, on this branch,** rather than after every driver had its grants.
+
+**The decisions inside it, and why.**
+
+- **Alignment is of the PHYSICAL address**, because that is what the device checks. On a page-aligned
+  arena the two agree up to 4 KiB; past that, or on an arena that is not page-aligned, only the physical
+  one is right. A host test pins an arena whose base is only 64-aligned.
+- **`layout` takes the arena.** Once laid out, it is reached only through its parts, so the parts are the
+  only description of where things are. `Arena` is not `Copy` for the same reason; a `Part` is, because
+  copies of a part are views of the same bytes.
+- **Every part access is bounded to the part,** and an access past it ends the driver naming the part -
+  as an access past the arena always did (SEC-4), one boundary earlier. A ring index running off its
+  ring is caught at the ring.
+- **A refusal is a sentence the driver can log as it stands**: ``the arena (64 KiB) has no room for
+  `tally` (64 bytes, aligned to 64, after 64 KiB)``. What to do then stays the driver's.
+- **A physical end that would wrap the address space is refused.** No real grant looks like that; the
+  host test that found the gap is why the check exists.
+
+**AHCI first** (x86; GENET on the Pi 4 is the second, unlike, driver). Its four parts - the command list,
+the received FIS, the command table and the data - are taken with AHCI's alignments and land exactly
+where its hand-placed offsets were: `command list at 0x0, received FIS at 0x400, command table at 0x500,
+data at 0x1000 (36864 of 65536 bytes)`, logged once at start. One check was added while converting it:
+a command's byte count is now checked against the data part before the PRDT tells the device to move
+that many, because nothing on the CPU side can stop the device once it is told. QEMU: `osdev test files`
+270/0, `fs-restart` 11/0, `fs-ioretry` 5/0, `fs-journal` 11/0. Owed: a card on the T630 and the Wyse.

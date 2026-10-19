@@ -251,7 +251,7 @@ const STATUS_UNREACHABLE: u8 = 2;
 
 /// Drive the AHCI controller directly, through the BAR the kernel granted this service.
 #[cfg(not(storage_is_usb))]
-fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ctx, m) }
+fn backend_run(ctx: &ServiceContext, m: &godspeed::driver::Registers) -> ! { ahci::run(ctx, m) }
 /// On a board whose only card slot is its boot medium, storage is the USB stick and ONLY the USB
 /// stick. Never the SD/EMMC card.
 ///
@@ -326,7 +326,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "block-driver");
     // A USB board's backend needs NO MMIO: the disk is reached by IPC to the service that owns the
     // host controller (`STORAGE_HOST`), so this service is granted no window and asks for none. Going
-    // through the `ctx.mmio()` gate would refuse a perfectly good USB stick on any board that does not
+    // through the register gate (`gs::driver::registers`) would refuse a perfectly good USB stick on any board that does not
     // also hand this service a peripheral window it never reads - which is the Pi 4 exactly.
     //
     // (This used to say the USB stack was in the kernel and the disk reached through syscalls. That
@@ -336,7 +336,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(storage_is_usb)]
     backend_run(&ctx);
     #[cfg(not(storage_is_usb))]
-    match ctx.mmio() {
+    match godspeed::driver::registers(&ctx) {
         Some(m) => backend_run(&ctx, &m),
         None => {
             ctx.log("block-driver: no AHCI controller found (no SATA disk?)");

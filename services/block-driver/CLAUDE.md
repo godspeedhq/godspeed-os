@@ -23,8 +23,10 @@ reacquires it by name and retries (§14.3).
 The driver talks to a SATA disk through an AHCI HBA: the kernel maps the HBA's ABAR
 (MMIO) and grants a physically-contiguous DMA arena at spawn - the same path the USB
 drivers use. It brings up port 0, IDENTIFYs the disk, runs a boot read self-test, then
-serves block read/write to `fs` over IPC. It uses the SDK's safe `Mmio`/`Dma` wrappers,
-so the driver itself is `unsafe`-free (§18.1).
+serves block read/write to `fs` over IPC. It takes both grants through the standard library,
+`gs::driver::registers` and `gs::driver::arena`, and lays the arena out in named parts (the command
+list, the received FIS, the command table and the data), so the driver itself is `unsafe`-free (§18.1)
+and an offset past a part ends it naming the part (`docs/driver-library.md` step 3).
 
 Command shape: a command list (32 headers) + received-FIS area + a command table per
 slot (H2D Register FIS type 0x27 + PRDT). ATA commands: IDENTIFY `0xEC`, READ DMA EXT
