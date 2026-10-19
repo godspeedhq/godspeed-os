@@ -10,7 +10,7 @@
 //! connected port and binds up to `MAX_HID` boot-protocol HID devices (a
 //! keyboard AND a mouse) on the SAME controller at once, then polls all of them
 //! from one loop, demultiplexing transfer events by slot id. All hardware access
-//! is via the SDK's audited Mmio / Dma wrappers (§18); no `unsafe` here.
+//! is through `gs::driver`'s `Registers` and `Arena` (§18); no `unsafe` here.
 
 #![no_std]
 #![no_main]
@@ -18,7 +18,8 @@
 use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::ServiceContext;
 
 /// USB mass storage (Bulk-Only Transport + SCSI). Split out because it is a self-contained protocol
 /// on top of the bulk endpoints this file configures - and because it is the capability whose absence
@@ -270,7 +271,7 @@ pub(crate) fn ep0_tr_off(i: usize) -> usize {
 /// A caller that gets `None` should fall back to its recorded offset, because a plausible cursor beats
 /// a fabricated one: the whole bug was a number nobody checked against the hardware.
 pub(crate) fn ep0_hw_dequeue(
-    dma: &Dma,
+    dma: &Arena,
     dev: usize,
     ctx_size: usize,
     ring_bytes: usize,
@@ -336,8 +337,8 @@ impl SliceAlloc {
 #[allow(clippy::too_many_arguments)]
 fn disable_slot(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     slot: u32,
@@ -389,7 +390,7 @@ fn disable_slot(
 #[allow(clippy::too_many_arguments)]
 fn deliver_hid_report(
     ctx: &ServiceContext,
-    dma: &Dma,
+    dma: &Arena,
     d: usize,
     devs: &[Hid; MAX_HID],
     kb_last: &mut [[u8; 6]; MAX_HID],
@@ -443,8 +444,8 @@ fn deliver_hid_report(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reset_endpoint(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     slot: u32,
@@ -546,7 +547,7 @@ pub(crate) fn reset_endpoint(
 /// context, which no endpoint fetches TRBs from. The slot context is built as `bind_msc` builds it.
 #[allow(clippy::too_many_arguments)]
 fn configure_radio_bulk(
-    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
+    ctx: &ServiceContext, dma: &Arena, mmio: &Registers, dboff: usize, ir0: usize, ctx_size: usize,
     slot: u32, dev_idx: usize, speed: u32, route: u32, root_port: u32, in_dci: u32, mps: u16,
     out_dci: &[u32], out_mps: u16,
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
@@ -897,7 +898,7 @@ const IDLE_WAIT_MS: u64 = 5;
 /// that was NOT connected becomes connected - otherwise an always-present non-HID
 /// device would make the hot-plug loop spin (re-scan → not a keyboard → wait →
 /// still connected → re-scan …).
-fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
+fn wait_for_port(ctx: &ServiceContext, mmio: &Registers, op: usize, max_ports: u32) {
     let connected =
         |p: u32| mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
     let mut base = 0u32;
@@ -959,7 +960,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
 /// `kill xhci`.
 #[allow(clippy::too_many_arguments)]
 fn contain_radio(
-    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, op: usize, dboff: usize, ir0: usize,
+    ctx: &ServiceContext, dma: &Arena, mmio: &Registers, op: usize, dboff: usize, ir0: usize,
     radio: &mut Option<radio::Radio>, hub_tried: &mut u64,
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
 ) {
@@ -1043,8 +1044,8 @@ fn idle(ctx: &ServiceContext) -> ! {
 /// read, a MISATTRIBUTED one - which is also why the two-consecutive-reads guard never caught it. Two
 /// stale answers are as easy to get as one.
 pub(crate) fn next_event_at(
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     ir0: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
@@ -1093,8 +1094,8 @@ pub(crate) fn next_event_at(
 /// The three fields every other caller wants. Delegates, so there is ONE event-ring walk: two copies
 /// of a ring dequeue that must advance exactly once is a bug waiting for the second one to drift.
 pub(crate) fn next_event(
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     ir0: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
@@ -1108,8 +1109,8 @@ pub(crate) fn next_event(
 #[allow(clippy::too_many_arguments)]
 fn run_command(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     cmd_trb_off: usize,
@@ -1179,7 +1180,7 @@ fn run_command(
 /// addressed AFTER the stick and the hub, so it is the one that inherits the most debris.
 ///
 /// One Input Control Context + 32 endpoint contexts is the most any command here uses.
-fn clear_input_ctx(dma: &Dma, ctx_size: usize) {
+fn clear_input_ctx(dma: &Arena, ctx_size: usize) {
     for off in (0..(33 * ctx_size)).step_by(4) {
         dma.write32(INPUT_CTX_OFF + off, 0);
     }
@@ -1222,8 +1223,8 @@ fn ep0_max_packet(speed: u32) -> u32 {
 /// Returns true on success/short-packet completion.
 #[allow(clippy::too_many_arguments)]
 fn control(
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     slot: u32,
@@ -1286,8 +1287,8 @@ fn control(
 #[allow(clippy::too_many_arguments)]
 fn hub_port_status(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     hub_slot: u32,
@@ -1557,8 +1558,8 @@ fn hub_port_status(
 #[allow(clippy::too_many_arguments)]
 fn configure_as_hub(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -1630,8 +1631,8 @@ fn configure_as_hub(
 #[allow(clippy::too_many_arguments)]
 fn address_downstream(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -1837,8 +1838,8 @@ fn address_downstream(
 #[allow(clippy::too_many_arguments)]
 fn read_config_and_bind(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -2240,8 +2241,8 @@ fn read_config_and_bind(
 #[allow(clippy::too_many_arguments)]
 fn serve_if_block(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     disk: &mut Option<msc::Disk>,
@@ -2398,8 +2399,8 @@ fn serve_if_block(
 #[allow(clippy::too_many_arguments)]
 fn bind_msc(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -2593,7 +2594,7 @@ fn bind_msc(
 #[allow(clippy::too_many_arguments)]
 /// Write a 64-bit xHCI register as TWO 32-BIT WRITES, low half first.
 ///
-/// The SDK's `Mmio::write64` emits a single 64-bit store. The in-kernel driver this replaced (deleted 2026-08-09; read it in git history) - the one that had
+/// `Registers::write64` (the SDK's `Mmio::write64` beneath it) emits a single 64-bit store. The in-kernel driver this replaced (deleted 2026-08-09; read it in git history) - the one that had
 /// always driven this exact VL805 on the Pi 4 - has never done that: its `wr64` is two 32-bit writes,
 /// and the difference had never been tested because QEMU accepts either.
 ///
@@ -2604,7 +2605,7 @@ fn bind_msc(
 ///
 /// Low half first is required, not stylistic: several of these registers (CRCR especially) latch on
 /// the write of the HIGH half, so writing high-then-low latches a half-updated pointer.
-fn wr64(mmio: &Mmio, off: usize, val: u64) {
+fn wr64(mmio: &Registers, off: usize, val: u64) {
     mmio.write32(off, val as u32);
     mmio.write32(off + 4, (val >> 32) as u32);
 }
@@ -2629,7 +2630,7 @@ const DIAG_HINT: &str = "command diagnosis - CRR=0 means the controller never st
 /// choose between the three. Measure, do not guess.
 #[allow(clippy::too_many_arguments)]
 fn dump_ring_state(
-    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, op: usize, ir0: usize,
+    ctx: &ServiceContext, dma: &Arena, mmio: &Registers, op: usize, ir0: usize,
     cmd_off: usize, ev_idx: usize, ev_cycle: u32,
 ) {
     let crcr_lo = mmio.read32(op + OP_CRCR);
@@ -2659,7 +2660,7 @@ fn dump_ring_state(
 /// caller must poison the offending port and re-initialise the controller rather than issue more doomed
 /// commands. Pure diagnosis when it returns false (e.g. a device-level Transaction Error with the HC
 /// still running); the log is the breadcrumb that tells us, on the Wyse, which case a port hit.
-fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize, hint_said: &mut bool) -> bool {
+fn hc_wedged_now(ctx: &ServiceContext, mmio: &Registers, op: usize, hint_said: &mut bool) -> bool {
     let sts = mmio.read32(op + OP_USBSTS);
     let wedged = sts & STS_WEDGED != 0;
     // ONCE. This is 200 characters of FIXED explanatory text - it says what the numbers below mean,
@@ -2700,7 +2701,7 @@ fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize, hint_said: &mut b
 /// enumerate loop's `1..=max_ports`). Bounded walk: a malformed Next-pointer chain can neither loop
 /// forever nor read far outside the cap region (§26.6). Returns 0 if there is no xECP list (all ports
 /// enumerated as before).
-fn usb3_port_mask(mmio: &Mmio, hcc1: u32, max_ports: u32) -> u64 {
+fn usb3_port_mask(mmio: &Registers, hcc1: u32, max_ports: u32) -> u64 {
     let mut mask = 0u64;
     let mut ptr = ((hcc1 >> 16) & 0xFFFF) as usize; // xECP, in dwords from the MMIO base (0 = none)
     let mut guard = 0u32;
@@ -2744,8 +2745,8 @@ fn usb3_port_mask(mmio: &Mmio, hcc1: u32, max_ports: u32) -> u64 {
 /// rings via the mutable bookkeeping refs.
 fn enumerate_one(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     op: usize,
@@ -3733,14 +3734,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "xhci");
     ctx.log("xhci: driver starting");
 
-    let mmio = match ctx.xhci_mmio() {
+    // Both grants through `gs::driver` (`docs/driver-library.md` step 3). The arena is reached at the
+    // offsets below, as before: a layout by name is the step after this one.
+    let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
         None => {
             ctx.log("xhci: no controller MMIO granted - idling");
             idle(&ctx);
         }
     };
-    let dma = match ctx.dma_region() {
+    let dma = match godspeed::driver::arena(&ctx) {
         Some(d) => d,
         None => {
             ctx.log("xhci: no DMA arena granted - idling");

@@ -27,7 +27,8 @@
 //! path files it, so the caller re-arms that endpoint.
 
 use godspeed as gs;
-use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::{Message, ServiceContext};
 use godspeed_sdk::service_context::usbdev;
 use godspeed_wifi::usbfn;
 use gs::driver::wait::{self, Budget};
@@ -78,7 +79,7 @@ pub struct Eps {
 
 /// Walk a configuration descriptor at `off` (`len` bytes) for its bulk endpoints. Every length is from
 /// the device and distrusted: a zero length ends the walk, and nothing is read past `len`.
-pub fn parse_eps(dma: &Dma, off: usize, len: usize) -> Eps {
+pub fn parse_eps(dma: &Arena, off: usize, len: usize) -> Eps {
     let mut e = Eps { in_addr: 0, in_mps: 0, outs: [0; 3], n_out: 0, out_mps: 0 };
     let mut i = 0usize;
     while i + 2 <= len {
@@ -232,8 +233,8 @@ const MAX_REPAIRS: u32 = 8;
 
 /// The controller state a radio request needs, gathered so the calls stay readable.
 pub struct Hc<'a> {
-    pub dma: &'a Dma,
-    pub mmio: &'a Mmio,
+    pub dma: &'a Arena,
+    pub mmio: &'a Registers,
     pub dboff: usize,
     pub ir0: usize,
     pub ctx_size: usize,

@@ -43,7 +43,8 @@
 //!   CBW/CSW page here is the disk's alone - see `DISK_BASE`.
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::ServiceContext;
 
 use crate::{EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
 
@@ -130,7 +131,7 @@ impl Ring {
     /// Post one Normal TRB pointing at `buf_phys` for `len` bytes, with Interrupt On Completion.
     /// Returns the TRB's physical address: the pointer its transfer event will carry, which is how
     /// the wait knows the completion is this TD's (`await_on_slot`).
-    fn push(&mut self, dma: &Dma, buf_phys: u64, len: u32) -> u64 {
+    fn push(&mut self, dma: &Arena, buf_phys: u64, len: u32) -> u64 {
         // Wrap if this TRB plus the Link that would follow it do not both fit. The Link is written
         // AT the cursor (where the controller's dequeue pointer sits), so there is no stale gap in
         // front of it for the controller to stop on.
@@ -223,10 +224,10 @@ impl Disk {
     }
 
     /// Physical address of the bulk-OUT ring, for the Configure Endpoint input context.
-    pub fn out_ring_phys(&self, dma: &Dma) -> u64 {
+    pub fn out_ring_phys(&self, dma: &Arena) -> u64 {
         dma.phys_at(OUT_RING)
     }
-    pub fn in_ring_phys(&self, dma: &Dma) -> u64 {
+    pub fn in_ring_phys(&self, dma: &Arena) -> u64 {
         dma.phys_at(IN_RING)
     }
     pub fn out_dci(&self) -> u32 {
@@ -261,8 +262,8 @@ impl Disk {
 #[allow(clippy::too_many_arguments)]
 fn await_on_slot(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     ir0: usize,
     slot: u32,
     want: u64,
@@ -338,8 +339,8 @@ fn await_on_slot(
 #[allow(clippy::too_many_arguments)]
 pub fn bot(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     d: &mut Disk,
@@ -411,8 +412,8 @@ pub fn bot(
 #[allow(clippy::too_many_arguments)]
 pub fn test_unit_ready(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     d: &mut Disk,
@@ -435,8 +436,8 @@ pub fn test_unit_ready(
 #[allow(clippy::too_many_arguments)]
 pub fn read_capacity(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     d: &mut Disk,
@@ -465,8 +466,8 @@ pub fn read_capacity(
 #[allow(clippy::too_many_arguments)]
 pub fn read10(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     d: &mut Disk,
@@ -516,8 +517,8 @@ pub fn read10(
 #[allow(clippy::too_many_arguments)]
 pub fn write10(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     d: &mut Disk,
@@ -573,8 +574,8 @@ pub fn write10(
 #[allow(clippy::too_many_arguments)]
 pub fn sync_cache(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     d: &mut Disk,
@@ -590,12 +591,12 @@ pub fn sync_cache(
 }
 
 /// Read one byte out of the data buffer (after a `read10`).
-pub fn data_read8(dma: &Dma, off: usize) -> u8 {
+pub fn data_read8(dma: &Arena, off: usize) -> u8 {
     dma.read8(DATA_BUF + off)
 }
 
 /// Write one byte into the data buffer (before a `write10`).
-pub fn data_write8(dma: &Dma, off: usize, val: u8) {
+pub fn data_write8(dma: &Arena, off: usize, val: u8) {
     dma.write8(DATA_BUF + off, val);
 }
 
@@ -625,7 +626,7 @@ fn ep_num_ok(addr: u8) -> bool {
 /// combination this driver speaks. A UAS-only device or a CBI device is left alone rather than
 /// half-driven: storage driven by a protocol it does not implement returns plausible garbage exactly
 /// where a filesystem expects blocks.
-pub fn parse_msc(dma: &Dma, buf_off: usize, buf_len: usize) -> Option<MscInfo> {
+pub fn parse_msc(dma: &Arena, buf_off: usize, buf_len: usize) -> Option<MscInfo> {
     let total = (dma.read16(buf_off + 2) as usize).min(buf_len);
     let cfg_value = dma.read8(buf_off + 5);
 
@@ -718,8 +719,8 @@ pub const STATUS_NO_DISK: u8 = 2;
 #[allow(clippy::too_many_arguments)]
 pub fn serve_block(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Arena,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     disk: &mut Option<Disk>,

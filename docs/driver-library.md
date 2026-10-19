@@ -2,7 +2,7 @@
 
 **Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
-converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants (step 3). "Current state" below says what exists; the
+converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants and their layout, and `xhci` on the grants (step 3). "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -704,3 +704,11 @@ and the Wyse.
 at 0x400, buffer descriptors at 0xc00, sound at 0x1000 (69632 of 98304 bytes)`. Its own size check
 (`ARENA_NEEDED`) is the layout's refusal now, so an arena too small says which part did not fit. QEMU: `osdev
 test audio` 69/0, the WAV read back. Owed: a card on the Wyse and the T630.
+
+**`xhci` fifth, its grants only.** Its register window and arena come through `gs::driver` (`Registers`,
+`Arena`) on every port, and the arena is still reached at its offset constants: its layout - shared controller
+structures, six per-device slices, the scratchpad and the disk's region, with the hub probe deliberately
+inside the ERST page - is the next step, and the largest of any driver. QEMU: `osdev test iommu` 1/1 (the
+keyboard bound through the confined domain) and, on RISC-V `virt` with a USB disk behind `qemu-xhci`, `drives
+flash data`, a write read back and `drives check` with 0 bad. Built for the Pi 4 and the VisionFive. Owed:
+a card on any board with a USB keyboard - every board but the Pi 2 has one behind `xhci`.
