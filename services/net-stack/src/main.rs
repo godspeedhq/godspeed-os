@@ -186,6 +186,16 @@ const PING_MAX_PAYLOAD: usize = 1024;
 /// discard, so it is discarded. A CLIENT REQUEST is dropped with its cap reclaimed and counted, which
 /// is `docs/net-tags-design.md` phase-2 behaviour: it times out and retries, which is defined and
 /// recoverable, where consuming it corrupts both sides silently.
+/// Whether the radio carries the link now: `nic-driver`'s status ([3]) answers nine bytes where it has a radio
+/// bridge, the last saying which link carries the frames - 2 is the radio (`Carrier` in its `radio.rs`). No
+/// answer, or another shape, is the cable's answer: the large window is what every wired board was given.
+fn over_radio(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
+    match nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS) {
+        Some(r) => { let p = r.payload_bytes(); p.len() == 9 && p[8] == 2 }
+        None => false,
+    }
+}
+
 fn nic_status_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
     while let Some(m) = gs::ipc::try_recv(ctx) {
         // Read the badge for EVERY message, not only the ones with a reply cap. It reads and CLEARS,
@@ -1615,6 +1625,11 @@ fn tcp_open(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net
     }
     let deadline = t.now_ms(ctx).unwrap_or(0) + budget_ms;
     let i = match t.connect(ctx, rid, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
+    // OVER A RADIO, THE SMALL WINDOW (`Conn::small_window` says why), decided now, before the SYN settles it.
+    if over_radio(ctx, pending) {
+        t.conns[i].small_window();
+        ctx.log("net-stack: connect - the radio carries the link, so this connection offers the small window");
+    }
     let n = t.syn_frame(ctx, net, i, &mut frame);
     if n > 0 {
         let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);

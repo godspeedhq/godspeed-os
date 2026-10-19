@@ -250,6 +250,8 @@ pub struct Conn {
     snd_shift: u8,
     /// The shift the peer's SYN offered, kept until our SYN-ACK settles whether scaling is on.
     peer_ws: Option<u8>,
+    /// The most of the arena this connection may offer the peer, set before its SYN ([`Conn::small_window`]).
+    rcv_limit: usize,
 
     /// Out-of-order ranges already in the arena, `[start, end)` in sequence numbers, beyond `rcv_nxt`.
     ooo: [(u32, u32); MAX_OOO],
@@ -345,7 +347,7 @@ impl Conn {
             snd_una: 0, snd_nxt: 0, snd_wnd: 0, iss: 0, rcv_nxt: 0,
             snd_buf: [0u8; SND_BUF], snd_len: 0,
             rcv_small: [0u8; RCV_SMALL], rcv_big: None, rcv_head: 0, rcv_len: 0,
-            rcv_shift: 0, snd_shift: 0, peer_ws: None,
+            rcv_shift: 0, snd_shift: 0, peer_ws: None, rcv_limit: RCV_BIG,
             ooo: [(0, 0); MAX_OOO], ooo_n: 0,
             snd_mss: MSS_DEFAULT,
             cwnd: 0, ssthresh: u32::MAX / 2,
@@ -369,9 +371,23 @@ impl Conn {
 
     pub fn in_use(&self) -> bool { self.state != State::Closed || self.rid != 0 }
 
-    /// The receive arena's size.
+    /// The receive arena's size: the region, or the small arena, and no more than this connection may offer.
     fn rcv_cap(&self) -> usize {
-        match &self.rcv_big { Some(r) => r.len().min(RCV_BIG), None => RCV_SMALL }
+        let have = match &self.rcv_big { Some(r) => r.len().min(RCV_BIG), None => RCV_SMALL };
+        have.min(self.rcv_limit)
+    }
+
+    /// Offer the peer no more than the small window ([`RCV_SMALL`]), for a connection whose link cannot take a
+    /// large one's bursts. Before the SYN: the window and its scale are settled by the handshake.
+    ///
+    /// **Why a link would not.** Over a radio both drivers here read the chip into fixed buffers, and a large
+    /// window lets the access point send bursts the chip hands over as one transfer: 26 KiB through the
+    /// VisionFive's AIC8800 (which now reads its whole queue) and superframes of 4.7 to 14 KB through the Pi 4's
+    /// CYW43455, whose driver reads at most 4 KiB - so the rest stayed unread, the radio stopped, and after a
+    /// `godspeed fetch` even `ping` failed (2026-10-19). Until the radio drivers can take a large window's
+    /// bursts, a connection over a radio keeps the window it had before, which worked.
+    pub fn small_window(&mut self) {
+        self.rcv_limit = RCV_SMALL;
     }
 
     fn rcv_ring(&mut self) -> &mut [u8] {
@@ -1392,6 +1408,13 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
         c.rcv_shift = c.our_ws();
         let _ = c.adv(false);
         check(c.last_adv as usize == RCV_BIG, "a scaled peer is told the whole arena", &mut pass, &mut fail);
+    }
+    if c.rcv_big.is_some() {
+        // Over a radio the large arena offers only the small window, and its SYN asks no scale.
+        c.reset();
+        c.small_window();
+        check(c.window() as usize == RCV_SMALL && c.our_ws() == 0,
+              "a connection over a radio offers the small window, unscaled, from the large arena", &mut pass, &mut fail);
     }
     *spare = c.rcv_big.take();
 
