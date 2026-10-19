@@ -14,7 +14,7 @@
 //! as the xHCI driver: a **userspace** service holding the controller's MMIO and
 //! DMA capabilities, with the kernel only discovering the controller and
 //! granting access. The kernel stays small (§4.4); all USB 2.0 protocol lives
-//! here, `unsafe`-free behind the SDK's audited `Mmio`/`Dma` wrappers (§18.1).
+//! here, `unsafe`-free behind `gs::driver`'s `Registers` and `Arena` (§18.1).
 //!
 //! Staged build (mirrors how xHCI was grown; every stage below is built, and E6 adds the
 //! hot-plug loop):
@@ -62,7 +62,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "ehci");
     ctx.log("ehci: driver starting");
 
-    let mmio = match ctx.ehci_mmio() {
+    let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
         None => {
             ctx.log("ehci: no controller MMIO granted - idling");
@@ -259,7 +259,7 @@ const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 /// error/timeout (with the qTD tokens logged). The async schedule stays enabled
 /// across calls; the single QH is idle between them.
 fn control(
-    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
     op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
     dma.zero();
@@ -394,8 +394,8 @@ fn control(
 /// descriptor (downstream port count), then run the E6 hot-plug loop over its ports
 /// for the rest of the driver's life. Returns only when a step of the hub's own
 /// bring-up fails.
-fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
-    let dma = match ctx.dma_region() {
+fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize) {
+    let dma = match godspeed::driver::arena(&ctx) {
         Some(d) => d,
         None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); return; }
     };
@@ -514,7 +514,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, op: usize) {
 /// loop - addressing each device (Set_Address moves it off the default address 0)
 /// before resetting the next port is what lets two devices coexist.
 fn scan_devices(
-    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
     op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
 ) -> ([HidDev; MAX_HID], usize, bool) {
     // Power every downstream port (the hub does individual power switching), let
@@ -699,7 +699,7 @@ fn scan_devices(
 /// connected → re-scan …). The async schedule is free for these hub control
 /// transfers while nothing usable is attached.
 fn wait_for_connection(
-    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
     op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
 ) {
     // Returns Some(true/false) on a successful status read, None if the read
@@ -754,7 +754,7 @@ fn wait_for_connection(
 /// short settle between) reliably gets it through. Used for the configuration
 /// transfers, which must all succeed before the keyboard is usable.
 fn control_retry(
-    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
     op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool, tries: u32,
 ) -> Option<usize> {
     for _ in 0..tries {
@@ -772,7 +772,7 @@ fn control_retry(
 /// because this hub's split control endpoint is intermittently flaky - one failed
 /// SETUP must not abandon the device.
 fn setup_hid(
-    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
     op: usize, said: &Cell<bool>, port: u8, addr: u8, cfg_val: u8, iface: u8, is_mouse: bool,
 ) -> bool {
     let what = if is_mouse { "mouse" } else { "keyboard" };
@@ -799,7 +799,7 @@ fn setup_hid(
 /// Arm an interrupt IN qTD (8-byte report, IOC, given data toggle) for the QH at
 /// DMA offset `qh`, and point the QH overlay at it so the controller re-fetches.
 /// The qTD lives at `qh + 0x40`, its report buffer at `qh + 0x80`.
-fn arm_int(dma: &godspeed_sdk::Dma, qh: usize, toggle: u32) {
+fn arm_int(dma: &godspeed::driver::Arena, qh: usize, toggle: u32) {
     let qtd = qh + 0x40;
     let qtd_phys = dma.phys_at(qtd) as u32;
     let buf_phys = dma.phys_at(qh + 0x80) as u32;
@@ -829,7 +829,7 @@ fn arm_int(dma: &godspeed_sdk::Dma, qh: usize, toggle: u32) {
 /// (the device NAKs between events) until a report arrives, then the qTD retires,
 /// we act on it, and re-arm with the data toggle flipped.
 fn poll_devices(
-    ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, dma: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
     op: usize, devs: &[HidDev],
 ) -> usize {
     let n = devs.len();
@@ -1181,7 +1181,7 @@ const PORTSC_W1C:    u32 = (1 << 1) | (1 << 3) | (1 << 5);
 /// while every other service waits. The 10 ms quantum still preempts it, so this is not a hang - but
 /// "the scheduler will eventually take it away" is not a substitute for a driver that hands the core
 /// back when it has nothing to do.
-fn wait(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio, off: usize, mask: u32, want_set: bool) -> bool {
+fn wait(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, off: usize, mask: u32, want_set: bool) -> bool {
     // Generous, because a controller coming out of BIOS ownership can be slow, and a timeout that
     // fires early turns a working controller into a reported fault.
     const TIMEOUT_MS: u64 = 250;

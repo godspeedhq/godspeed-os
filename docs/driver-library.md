@@ -2,7 +2,7 @@
 
 **Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
-converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants and their layout, and `xhci` and `dwc2` on the grants (step 3). "Current state" below says what exists; the
+converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants and their layout, and `xhci`, `dwc2` and `ehci` on the grants (step 3). "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -721,3 +721,10 @@ applies it, and it matched three fixed bytes - one register allocation, `orr r2,
 the instruction by its fields, any registers and condition; a `--qemu` build still verifies as having none.
 QEMU (`raspi2b`, `arm_run.py --usb --usbdisk`): the keyboard connected, `drives flash data`, a write read back,
 `drives check` 0 bad. Owed: a card on the Pi 2.
+
+**`ehci` seventh, its grants only** (x86; the T630's keyboard sits behind its hub). No suite attaches an EHCI
+controller, so it was booted by hand on q35 with QEMU's `usb-ehci` and a `usb-kbd`: the reset, the port reset
+and the control transfers through the arena (the device descriptor, the address, the configuration) ran, and
+the log matched the code before the change line for line, both stopping at `Get_Hub_Descriptor failed`
+because the driver takes the high-speed device for the hub the T630 has. QEMU cannot model that hub: its
+`usb-hub` is full speed and will not attach to EHCI. Owed: a card on the T630, with step 1l's.
