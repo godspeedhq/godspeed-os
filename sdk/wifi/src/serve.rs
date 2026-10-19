@@ -100,6 +100,19 @@ pub struct NoHost;
 impl Host for NoHost {}
 
 /// One line, opened with the service's name.
+/// Say how many received frames the queue has turned away for want of a slot (`RxQueue::full`), at the
+/// first and then each time the count doubles: often enough to tell a lossy link from a slow one, and
+/// bounded however busy the link is. Those frames were already off the chip, so they are lost; TCP resends.
+fn note_full(rxq: &RxQueue, said: &mut u32, who: &str, ctx: &ServiceContext) {
+    if rxq.full > *said && (*said == 0 || rxq.full >= said.saturating_mul(2)) {
+        *said = rxq.full;
+        say_fmt(ctx, who, format_args!(
+            "{} received frame(s) turned away so far - the receive queue's {} slots were full (frames handed up: {})",
+            rxq.full, crate::rxq::RX_SLOTS, rxq.handed
+        ));
+    }
+}
+
 fn say(ctx: &ServiceContext, who: &str, line: &str) {
     ctx.log_fmt(format_args!("{}: {}", who, line));
 }
@@ -271,6 +284,8 @@ pub fn serve<'s>(
     // the cable is out. The queue is bounded and on this stack; the address is asked of the chip once; the
     // rekey count is for the log.
     let mut rxq = RxQueue::new();
+    // How many of the queue's turned-away frames have been said (`note_full`).
+    let mut full_said = 0u32;
     let mut link_mac: Option<[u8; 6]> = None;
     // The access point of the current join, for INFO: asked of the firmware once per join, keyed by
     // `joined_at_secs`. A join takes seconds, so two joins cannot share one. Zeros mean "not known",
@@ -679,6 +694,7 @@ pub fn serve<'s>(
                     if last_frame_op.passed(ctx, Budget::ms(IDLE_PULL_MS)) {
                         rxq.clear();
                         let p = session.pull(&mut rxq, ctx);
+                        note_full(&rxq, &mut full_said, who, ctx);
                         if note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx) {
                             auto_join = rejoin_after_drop(ctx, who, joined_at_secs, last_joined);
                             auto_join_why = "after the access point dropped it";
@@ -1509,6 +1525,7 @@ pub fn serve<'s>(
                     if !session.tx_ok() {
                         // Credit comes back on received frames; a stack that only sends runs dry.
                         let p = session.pull(&mut rxq, ctx);
+                        note_full(&rxq, &mut full_said, who, ctx);
                         if note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx) {
                             auto_join = rejoin_after_drop(ctx, who, joined_at_secs, last_joined);
                             auto_join_why = "after the access point dropped it";
@@ -1528,6 +1545,7 @@ pub fn serve<'s>(
                 out[0] = wire::OP_NET_RX;
                 if rxq.is_empty() && radio_on && joined.is_some() && sweep.is_none() {
                     let p = session.pull(&mut rxq, ctx);
+                    note_full(&rxq, &mut full_said, who, ctx);
                     if note_pull(session, &p, &mut joined, &mut rekey_seen, who, ctx) {
                         auto_join = rejoin_after_drop(ctx, who, joined_at_secs, last_joined);
                         auto_join_why = "after the access point dropped it";

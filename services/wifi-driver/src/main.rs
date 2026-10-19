@@ -847,6 +847,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         { clock_release(&ctx, lease); serve_unavailable(&ctx, Some(&h)) }
     }
     let mut window = backplane::Window::new();
+    // THE RECEIVE REGION (`ctrl::RX_REGION`), asked for once, here, before anything is read: the boot scan
+    // reads into it and the station then owns it. A region is never given back, so one serves both. Without
+    // it a superframe over 4 KiB is lost, and with a large window the link with it, so no radio is served.
+    let Ok(mut rx) = godspeed::memory::Region::alloc(&ctx, ctrl::RX_REGION) else {
+        ctx.log("wifi-driver: the 64 KiB receive region could not be had, so the radio is not served");
+        clock_release(&ctx, lease);
+        serve_unavailable(&ctx, Some(&h))
+    };
     // The radio's session, if boot brings it up. The serving loop scans on it when the shell asks; `None`
     // means every such request is answered "radio down" - loudly, and without pretending (§26.7).
     let mut radio: Option<ctrl::Session> = None;
@@ -928,7 +936,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Some(sdiod) => {
                         if bus::bring_up(&h, &mut window, sdiod.base, &ctx) && ctrl::report_mac(&h, &mut window, &ctx) {
                             ctx.log("wifi-driver: ADOPTED - the firmware the earlier instance loaded answers; this instance carries on with it");
-                            radio = scan::run(&h, &mut window, true, &ctx);
+                            radio = scan::run(&h, &mut window, true, &mut rx, &ctx);
                         } else if power_cycle_device(&ctx, &h) {
                             // THE FIRMWARE IS DEAD AND THE CHIP IS NOW COLD. Everything the warm path did
                             // on the SDIO side has to be done again on the fresh card - identification,
@@ -1080,7 +1088,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                     // against a channel that has never
                                                     // replied would confuse "the scan is
                                                     // wrong" with "nothing works yet".
-                                                    radio = scan::run(&h, &mut window, false, &ctx);
+                                                    radio = scan::run(&h, &mut window, false, &mut rx, &ctx);
                                                 }
                                             }
                                         }
@@ -1140,6 +1148,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     );
     let down_reason = if trapped { scan::reply::DOWN_TRAPPED } else { scan::reply::DOWN_BRINGUP };
     clock_release(&ctx, lease);
-    let mut bcm = radio.map(|s| bcm::Bcm::new(&h, &mut window, s));
+    let mut bcm = radio.map(|s| bcm::Bcm::new(&h, &mut window, s, rx));
     serve_radio(&ctx, &h, bcm.as_mut().map(|b| b as &mut dyn Station), down_reason, "CYW43455")
 }

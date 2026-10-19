@@ -20,11 +20,15 @@ pub struct RxQueue {
     pub handed: u32,
     /// Frames dropped because the buffer they were asked into could not hold them.
     pub too_big: u32,
+    /// Frames turned away because every slot was taken. A radio that reads a burst at once - a Broadcom
+    /// superframe, the AIC8800's whole queue - can hold more than this queue does, and those frames are
+    /// gone; the serve loop says how many (`serve.rs`), so a slow link can be told from a lossy one.
+    pub full: u32,
 }
 
 impl RxQueue {
     pub fn new() -> Self {
-        RxQueue { slots: [[0; FRAME_MAX]; RX_SLOTS], lens: [0; RX_SLOTS], head: 0, count: 0, queued: 0, handed: 0, too_big: 0 }
+        RxQueue { slots: [[0; FRAME_MAX]; RX_SLOTS], lens: [0; RX_SLOTS], head: 0, count: 0, queued: 0, handed: 0, too_big: 0, full: 0 }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -43,7 +47,11 @@ impl RxQueue {
     }
 
     pub fn push(&mut self, frame: &[u8]) -> bool {
-        if !self.has_room() || frame.len() > FRAME_MAX {
+        if !self.has_room() {
+            self.full = self.full.wrapping_add(1);
+            return false;
+        }
+        if frame.len() > FRAME_MAX {
             return false;
         }
         let i = (self.head + self.count) % RX_SLOTS;

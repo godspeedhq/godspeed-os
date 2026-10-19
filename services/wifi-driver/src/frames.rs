@@ -57,17 +57,18 @@ pub fn pull(
     w: &mut Window,
     s: &mut Session,
     q: &mut RxQueue,
-    frame: &mut [u8; ctrl::FRAME],
+    rx: &mut godspeed::memory::Region,
     mut keys: Option<&mut Keys>,
     ctx: &ServiceContext,
 ) -> Pulled {
     let mut got = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None };
     let mut reads = 0u32;
     while reads < PULL_MAX_READS && q.has_room() {
-        let f = match ctrl::read_frame(h, w, frame, ctx) {
+        let f = match ctrl::read_frame_region(h, w, rx, ctx) {
             Some(f) => f,
             None => break,
         };
+        let frame = rx.bytes();
         reads += 1;
         s.note_frame(ctx, &f, &frame[..], false);
         let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
@@ -125,7 +126,7 @@ pub fn pull(
                     // The access point restarted the four-way handshake. It is run here to completion,
                     // reading the frames that follow; data frames that arrive meanwhile are queued as
                     // they would be by any pull.
-                    if pairwise_rekey(h, w, s, q, frame, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
+                    if pairwise_rekey(h, w, s, q, rx, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
                         got.pairwise_rekeyed += 1;
                     } else {
                         got.pairwise_failed += 1;
@@ -155,7 +156,7 @@ fn pairwise_rekey(
     w: &mut Window,
     s: &mut Session,
     q: &mut RxQueue,
-    frame: &mut [u8; ctrl::FRAME],
+    rx: &mut godspeed::memory::Region,
     first: &[u8],
     keys: Option<&mut Keys>,
     ctx: &ServiceContext,
@@ -176,7 +177,7 @@ fn pairwise_rekey(
     }
     let mut empty = 0u32;
     while empty < REKEY_EMPTY_POLLS {
-        let f = match ctrl::read_frame(h, w, frame, ctx) {
+        let f = match ctrl::read_frame_region(h, w, rx, ctx) {
             Some(f) => f,
             None => {
                 empty += 1;
@@ -184,9 +185,10 @@ fn pairwise_rekey(
                 continue;
             }
         };
-        s.note_frame(ctx, &f, &frame[..], false);
+        let frame = rx.bytes();
+        s.note_frame(ctx, &f, frame, false);
         let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
-        let nsubs = ctrl::subframes(&f, &frame[..], s.glom_descriptor(), &mut subs, ctx);
+        let nsubs = ctrl::subframes(&f, frame, s.glom_descriptor(), &mut subs, ctx);
         for sub in subs.iter().take(nsubs) {
             let channel = sub.chanflag & CHANNEL_MASK;
             let body = &frame[sub.off..sub.off + sub.len];
@@ -201,6 +203,8 @@ fn pairwise_rekey(
                 }
                 let ethertype = u16::from_be_bytes([eth_frame[ev::ETHERTYPE], eth_frame[ev::ETHERTYPE + 1]]);
                 if ethertype != eapol::ETHERTYPE_EAPOL {
+                    // A frame the queue has no room for is counted there (`RxQueue::full`), and the serve
+                    // loop says so; nothing here can keep it.
                     let _ = q.push(eth_frame);
                     continue;
                 }

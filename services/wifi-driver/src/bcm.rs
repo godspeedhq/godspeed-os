@@ -18,13 +18,14 @@ pub struct Bcm<'a> {
     /// The keys a WPA2 join keeps for the rekeys to come; `None` on an open network and after any end of
     /// the association.
     keys: Option<join::Keys>,
-    /// The frame buffer the sweep and the pulls read into - here, so the loop does not carry it.
-    frame: [u8; ctrl::FRAME],
+    /// The region the sweep and the pulls read into (`ctrl::RX_REGION`), asked for once at start: a
+    /// superframe may be as large as its 16-bit length allows, more than the stack holds (`backlog/93`).
+    rx: godspeed::memory::Region,
 }
 
 impl<'a> Bcm<'a> {
-    pub fn new(h: &'a dyn SdioHost, w: &'a mut backplane::Window, s: ctrl::Session) -> Self {
-        Bcm { h, w, s, keys: None, frame: [0u8; ctrl::FRAME] }
+    pub fn new(h: &'a dyn SdioHost, w: &'a mut backplane::Window, s: ctrl::Session, rx: godspeed::memory::Region) -> Self {
+        Bcm { h, w, s, keys: None, rx }
     }
 }
 
@@ -33,7 +34,7 @@ impl Station for Bcm<'_> {
         scan::start(self.h, &mut *self.w, &mut self.s, ctx)
     }
     fn scan_step(&mut self, sc: &mut Scan, ctx: &ServiceContext) -> ScanStep {
-        scan::step(self.h, &mut *self.w, &mut self.s, sc, &mut self.frame, ctx)
+        scan::step(self.h, &mut *self.w, &mut self.s, sc, &mut self.rx, ctx)
     }
     fn scan_abort(&mut self, ctx: &ServiceContext) -> bool {
         scan::abort(self.h, &mut *self.w, &mut self.s, ctx)
@@ -76,7 +77,7 @@ impl Station for Bcm<'_> {
         ctrl::send_data(self.h, &mut *self.w, &mut self.s, eth, ctx)
     }
     fn pull(&mut self, rxq: &mut RxQueue, ctx: &ServiceContext) -> Pulled {
-        frames::pull(self.h, &mut *self.w, &mut self.s, rxq, &mut self.frame, self.keys.as_mut(), ctx)
+        frames::pull(self.h, &mut *self.w, &mut self.s, rxq, &mut self.rx, self.keys.as_mut(), ctx)
     }
     fn event_name(&self, code: u32) -> &'static str {
         scan::code::name(code)

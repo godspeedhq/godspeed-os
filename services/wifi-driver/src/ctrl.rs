@@ -257,6 +257,8 @@ pub struct Stats {
     pub rx_event: u32,
     pub rx_data: u32,
     pub rx_glom: u32,
+    /// The largest superframe read, in bytes, for the size line `note_frame` says as it grows.
+    pub largest_glom: u16,
     /// Sub-frames delivered out of superframes - the events and data that used to be dropped with them.
     pub rx_glom_sub: u32,
     pub rx_header_only: u32,
@@ -451,6 +453,19 @@ impl Session {
                 self.glom_count = n;
                 (trace_kind::RX_GLOMDESC, n as u32, 0)
             } else {
+                // HOW LARGE THE BURSTS ARE, said once as each power of two from 4 KiB is passed: the region
+                // reads them whole now (`read_frame_region`), and the window a radio may offer depends on
+                // the size they reach (`backlog/93`).
+                let before = self.stats.largest_glom as u32;
+                if f.frmlen as u32 > before {
+                    self.stats.largest_glom = f.frmlen;
+                    let step = |n: u32| if n < 4096 { 0 } else { 32 - n.leading_zeros() };
+                    if step(f.frmlen as u32) > step(before) {
+                        ctx.log_fmt(format_args!(
+                            "wifi-driver: read a {} byte superframe, the largest so far ({} descriptor entries)",
+                            f.frmlen, self.glom_count));
+                    }
+                }
                 // The superframe itself is one trace line, then one per sub-frame inside it, so the trace
                 // shows what a glom carried rather than only that one arrived.
                 self.trace.push(TraceEntry {
@@ -553,9 +568,16 @@ pub struct Sub {
     pub glommed: bool,
 }
 
-/// The most sub-frames one superframe is walked for. The descriptors seen on hardware list 2 to 5; a
-/// 4 KiB superframe of minimal frames could hold more, and past this the rest are counted as dropped.
-pub const MAX_SUBS: usize = 16;
+/// The most sub-frames one superframe is walked for, and the most entries a glom descriptor is read for.
+/// The descriptors seen on hardware listed 2 to 5 while frames over 4 KiB could not be read; a superframe
+/// as large as [`RX_REGION`] carries about 44 full-size frames. A descriptor cut short at this bound no
+/// longer sums to its superframe's length, so `subframes` refuses the WHOLE superframe rather than read
+/// part of it - which is why this rose with the region (2026-10-19) and not after it.
+pub const MAX_SUBS: usize = 64;
+
+/// The station's receive region (`read_frame_region`): the largest frame the hardware header's 16-bit
+/// length can describe, rounded to a whole number of SDIO blocks.
+pub const RX_REGION: usize = 64 * 1024;
 
 /// The frames inside `f`, written into `out`; returns how many.
 ///
@@ -1057,6 +1079,49 @@ pub fn read_frame(
     buf: &mut [u8; FRAME],
     ctx: &ServiceContext,
 ) -> Option<Frame> {
+    let mut rbuf = [0u32; FRAME / 4];
+    let f = read_frame_words(h, w, &mut rbuf, ctx)?;
+    for (i, word) in rbuf.iter().enumerate().take(f.body.div_ceil(4)) {
+        let b = word.to_le_bytes();
+        let n = (f.body - i * 4).min(4);
+        buf[i * 4..i * 4 + n].copy_from_slice(&b[..n]);
+    }
+    Some(f)
+}
+
+/// [`read_frame`] into the station's receive REGION, for the data path: a frame as large as the region,
+/// where the array version stops at [`FRAME`]. The frame's bytes are `rx.bytes()[..body]`, in place - no copy.
+///
+/// **Why a region.** A large TCP window makes the access point send in bursts, and the chip hands a burst over
+/// as one glommed superframe. Over 4 KiB they were dropped, the events and data inside them lost, and
+/// under a 256 KiB window the radio died (2026-10-19, `backlog/93`); even on the small window that kept it
+/// alive, superframes of 4.2 to 8 KB arrived and were lost. The frame length in the hardware header is
+/// 16 bits, so [`RX_REGION`] holds the largest one that can be described.
+pub fn read_frame_region(
+    h: &dyn SdioHost,
+    w: &mut Window,
+    rx: &mut godspeed::memory::Region,
+    ctx: &ServiceContext,
+) -> Option<Frame> {
+    let words = rx.words_mut();
+    let f = read_frame_words(h, w, words, ctx)?;
+    // The FIFO's words are little-endian on the wire; in place they are the machine's order. A no-op on every
+    // port this radio is on (`aic::receive_region` does the same), and correct on one that is not little-endian.
+    for word in words[..f.body.div_ceil(4)].iter_mut() {
+        *word = u32::from_ne_bytes(word.to_le_bytes());
+    }
+    Some(f)
+}
+
+/// The read itself, into `words`: the header, then the body straight into them. Its capacity is theirs,
+/// `words.len() * 4` bytes; a frame larger is reported and left, as [`read_frame`] always did at [`FRAME`].
+fn read_frame_words(
+    h: &dyn SdioHost,
+    w: &mut Window,
+    words_out: &mut [u32],
+    ctx: &ServiceContext,
+) -> Option<Frame> {
+    let cap = words_out.len() * 4;
     let mut hdr = [0u32; (HWHDR + SWHDR) / 4];
     if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
         return None;
@@ -1083,22 +1148,22 @@ pub fn read_frame(
     let frmlen = frmlen as usize;
     let chanflag = b1[1];
     let dataoff = b1[3] as usize;
-    if frmlen > FRAME || dataoff < HWHDR + SWHDR || dataoff > frmlen {
+    if frmlen > HWHDR + SWHDR + cap || dataoff < HWHDR + SWHDR || dataoff > frmlen {
         // SAY WHICH. A glommed frame (channel 3) over the buffer is a legitimate frame this driver chooses
         // not to read - the reference drops them too - and calling it "impossible" was a lie the log told on
         // every scan. Anything else over the buffer, or with a dataoff outside the frame, really is a shape
         // this driver cannot account for.
-        if chanflag & 0x0F == 3 && frmlen > FRAME {
+        if chanflag & 0x0F == 3 && frmlen > HWHDR + SWHDR + cap {
             ctx.log_fmt(format_args!(
                 "wifi-driver: a {} byte superframe (channel 3) exceeds this driver's {} byte buffer and is not \
                  read - the events or data inside it are LOST; if this recurs the bound is what to raise",
-                frmlen, FRAME
+                frmlen, cap
             ));
         } else {
             ctx.log_fmt(format_args!(
                 "wifi-driver: a frame validated its checksum but describes an impossible shape - frmlen {}, \
                  dataoff {}, channel {:#04x} (headers are {}, buffer is {})",
-                frmlen, dataoff, chanflag, HWHDR + SWHDR, FRAME
+                frmlen, dataoff, chanflag, HWHDR + SWHDR, cap
             ));
         }
         return None;
@@ -1124,14 +1189,13 @@ pub fn read_frame(
     // count field and the controller errored without ever starting a data phase.
     let (blk, blocks, moved) = transfer_mode(rest);
     let words = moved / 4;
-    if words > FRAME / 4 {
+    if words > words_out.len() {
         ctx.log_fmt(format_args!(
             "wifi-driver: a {} byte frame body rounds to {} bytes, over this driver's {} byte buffer",
-            rest, moved, FRAME
+            rest, moved, cap
         ));
         return None;
     }
-    let mut rbuf = [0u32; FRAME / 4];
     if !w.set_for(h, CHIPCOMMON_BASE, ctx) {
         return None;
     }
@@ -1139,16 +1203,12 @@ pub fn read_frame(
         h,
         DATA_FUNC,
         frame_offset(),
-        &mut rbuf[..words],
+        &mut words_out[..words],
         blk,
         blocks,
         ctx,
     ) {
         return None;
-    }
-    let mut body = [0u8; FRAME];
-    for i in 0..words {
-        body[i * 4..i * 4 + 4].copy_from_slice(&rbuf[i].to_le_bytes());
     }
     // Everything past `rest` is over-read from rounding to a whole block and is not part of this frame.
     // THE WHOLE BODY GOES IN `buf`, and the Frame says where the payload is inside it. The reader used to
@@ -1158,7 +1218,6 @@ pub fn read_frame(
     // `flen = hwhdr->frmlen - (sizeof(*hwhdr) + sizeof(*swhdr))` and
     // `off = swhdr->dataoff - (sizeof(*hwhdr) + sizeof(*swhdr))`, both quoted from the reference.
     let off = dataoff - (HWHDR + SWHDR);
-    buf[..rest].copy_from_slice(&body[..rest]);
     Some(Frame {
         chanflag,
         seq: b1[0],
