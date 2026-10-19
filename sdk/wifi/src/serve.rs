@@ -99,7 +99,6 @@ pub trait Host {
 pub struct NoHost;
 impl Host for NoHost {}
 
-/// One line, opened with the service's name.
 /// Say how many received frames the queue has turned away for want of a slot (`RxQueue::full`), at the
 /// first and then each time the count doubles: often enough to tell a lossy link from a slow one, and
 /// bounded however busy the link is. Those frames were already off the chip, so they are lost; TCP resends.
@@ -113,6 +112,7 @@ fn note_full(rxq: &RxQueue, said: &mut u32, who: &str, ctx: &ServiceContext) {
     }
 }
 
+/// One line, opened with the service's name.
 fn say(ctx: &ServiceContext, who: &str, line: &str) {
     ctx.log_fmt(format_args!("{}: {}", who, line));
 }

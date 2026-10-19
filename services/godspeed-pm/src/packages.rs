@@ -1420,8 +1420,9 @@ pub fn cleanup(ctx: &ServiceContext, r: &mut Rows, delete: bool) {
 /// How long a transfer has taken, or about how long is left: `1 s`, then `about 4 s left`, then `done in 7 s`.
 /// The estimate is the rate so far, and only once a whole second has passed - a guess from the first chunk would
 /// be noise. Seconds, because that is the clock a program is given and the unit a download is felt in. While it
-/// runs only the time LEFT is said: the line has to fit a 102-column console with its bar, and with both times
-/// the bar had no room on the T630 at all (2026-10-19); the time taken is said once, at the end.
+/// runs only the time LEFT is said, so the words stay short on a narrow console - with both times the bar had no
+/// room on the T630's 102 columns (2026-10-19), and the shell has drawn it on its own line since; the time taken
+/// is said once, at the end.
 pub(crate) fn time_text(secs: i64, got: u64, total: u64) -> Cell {
     let secs = secs.max(0) as u64;
     if got >= total { return cell(format_args!("done in {}", duration_text(secs).as_str())); }

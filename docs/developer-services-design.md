@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # Developer services: building a service from outside the tree into an image
 
-**Status: PROPOSAL, 2026-10-15. Nothing here is built and nothing here is approved.** Written for the
+**Status: PROPOSAL, 2026-10-15, for sections 1-8: nothing in them is built and nothing in them is approved. The
+later sections are dated, and 11, 12, 14, 15 and 16 have since been built (each says so).** Written for the
 `godspeed` developer CLI (the separate `godspeed-cli` repository), whose contract says its first half -
 create, build, test, run in QEMU - "can be built now". Measured against this tree it cannot, without
 the CLI editing supervisor source, and that is the boundary the CLI's own contract forbids. This
@@ -1435,7 +1436,7 @@ record (12); the residual there is unchanged.
 `godspeed inspect` reads an unpublished file too, on the machine and in the CLI, and says that no registry vouches
 for it.
 
-## 16. Dependencies: a package that needs another (approved 2026-10-19; built on `feat/gs-driver`, QEMU-verified: `osdev test deps` 18/0)
+## 16. Dependencies: a package that needs another (approved 2026-10-19; built on `feat/gs-driver` except 16.7, QEMU-verified: `osdev test deps` 18/0)
 
 The operator asked for this: a service that needs a driver, an app that needs a service, and the package manager
 and the CLI both knowing it. Until now a contract named the PEERS a package talks to, and the operator approved
@@ -1462,7 +1463,7 @@ format = 2
 
 [[requires]]
 name = "alice/notes-store"
-version = "^1.2"
+version = "^1.2.0"
 ```
 
 - **`format = 2` exactly when there is a requirement.** A manifest with none stays format 1. So every package
@@ -1474,7 +1475,7 @@ version = "^1.2"
   with the whole version - `^1.2.0`, never `^1.2` - because before 1.0 a shortened caret is ambiguous (`^0` and
   `^0.0.0` accept different versions):
   - `^1.2.0`: the same major version, and at least this one. For a `0.x`
-    version, the same minor (`^0.3` is `>= 0.3.0, < 0.4.0`); for `0.0.z`, exactly that version. That is the usual
+    version, the same minor (`^0.3.0` is `>= 0.3.0, < 0.4.0`); for `0.0.z`, exactly that version. That is the usual
     reading, because before 1.0 a minor change is allowed to break.
   - `=1.2.3`: exactly this version.
   - `>=1.2.0`: this version or any later one, later majors included.
@@ -1497,12 +1498,12 @@ snapshot:
 - an INSTALLED version that satisfies it is kept, and not fetched again;
 - an installed version that does not satisfy it is refused, naming both. A plan never upgrades something the
   operator did not ask to upgrade;
-- the requirements of each package in turn, to a depth of 4 and at most 8 packages in one plan. A cycle is
-  refused, naming it;
+- the requirements of each package in turn, in a chain of at most 4 packages (the one asked for included) and at
+  most 8 packages besides the one asked for. A cycle is refused, naming it;
 - one version of each package on a machine, so two requirements that no single version satisfies are refused,
-  naming both ranges.
+  naming the range and the version the plan already takes.
 
-Every refusal is a sentence that names the package and the range. Nothing is fetched or installed when the plan
+Every refusal is a sentence that names the package, and the range where a range is what failed. Nothing is fetched or installed when the plan
 cannot be made.
 
 ### 16.4 One question
@@ -1512,9 +1513,9 @@ The operator is asked once, for the whole plan, dependencies first:
 ```text
 gsh> godspeed install alice/notes
 alice/notes 1.0.0 needs 1 more package:
-  alice/notes-store 1.2.4   a service, starts at every boot   asks for: fs        (needed by alice/notes)
-  alice/notes 1.0.0         an app                            asks for: console, alice/notes-store
-Install all 2 and grant them? [y/N]:
+  alice/notes-store            1.2.4     a service  asks for: fs   (needed by alice/notes)
+  alice/notes                  1.0.0     an app     asks for: console, alice/notes-store
+Install all 2 and grant them? (no privilege) [y/N]:
 ```
 
 `yes` on the command line answers it, as it does for one package. No installs nothing.
@@ -1546,7 +1547,8 @@ is checked as a fetched one is.
 and the OS's `unpack`, which reads "one index and one release" today. A file can only carry a requirement the
 registry has, and the registry has no package with requirements until it is redeployed with this format (16.9), so
 the closure cannot be tested end to end yet. Until then a package's requirements install from their own files
-first, which works: `osdev test deps` installs `dep-store`'s file and then `dep-user`'s.
+first, which works: `osdev test deps` installs `dep-store`'s file, uninstalls it (its fetched copy stays), then
+installs `dep-user`'s file, whose plan takes that fetched copy.
 
 ### 16.8 The CLI
 

@@ -306,8 +306,9 @@ impl Rows {
 }
 
 /// A progress frame for the shell, sent BEFORE the answer: `PROGRESS` and one line of text, which the shell
-/// draws in place on one line until the answer arrives. The shell reads frames only until the first byte of
-/// the answer, so nothing in an answer can be taken for one.
+/// draws in place until the answer arrives - the words on one line and, when the frame has a bar, the bar on
+/// the line under them. The shell reads frames only until the first byte of the answer, and sets aside anything
+/// else that comes before it, so nothing in an answer can be taken for one.
 pub(crate) const PROGRESS: &[u8; 8] = b"\x01GSPROG1";
 
 /// Send one progress line to the shell. A frame that cannot be sent changes nothing: progress is a courtesy,

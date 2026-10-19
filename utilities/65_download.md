@@ -29,9 +29,10 @@ the same file deletes it first. An existing file is never replaced: delete it, o
 
 ## While it runs
 
-The same progress line as `godspeed fetch`: a bar, the percentage, the size so far and in all, the speed so
-far (`KiB/s` or `MiB/s`, the units the sizes use), the time taken and about how long is left (`45 s`, `2 min 5 s`,
-`1 h 3 min`), and `[q] quit`. Nothing ends a download that keeps arriving: the bound is
+The same progress as `godspeed fetch`: one line of words - the percentage, the size so far of the whole
+(`2.0 / 9.5 MiB`), the speed so far (`KiB/s` or `MiB/s`, the units the sizes use), about how long is left
+(`about 45 s left`, `2 min 5 s`, `1 h 3 min`; `done in ...` at the end) and `[q] quit` - and the bar on its own
+line under them, as wide as the console. Nothing ends a download that keeps arriving: the bound is
 `timeout-secs` (`godspeed config`) with NOTHING moving, never a total.
 
 ## Output

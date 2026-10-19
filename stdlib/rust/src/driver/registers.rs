@@ -4,9 +4,9 @@
 //! # Why this exists
 //!
 //! A driver must name its register window and rely on it, so the window is part of how a Godspeed
-//! driver is written, and comes through `gs` (`docs/driver-library.md`, step 3). Until 2026-10-19 every
-//! driver reached past the standard library for it, with the SDK's `ctx.mmio()`; this is the same grant,
-//! in the shape the promise covers.
+//! driver is written, and comes through `gs` (`docs/driver-library.md`, step 3). Every driver reached past
+//! the standard library for it, with the SDK's `ctx.mmio()`; this is the same grant, in the shape the promise
+//! covers. AHCI and GENET were the first to take it here (2026-10-19); the rest still use the SDK's.
 //!
 //! # What it is, and is not
 //!

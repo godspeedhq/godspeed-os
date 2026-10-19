@@ -564,7 +564,8 @@ fn parse_results(payload: &[u8], scan: &mut Scan, ctx: &ServiceContext) {
 /// Advance a running sweep by ONE frame. This is the body `collect` used to loop over, split out so the
 /// serve loop can do the same one frame at a time and still answer requests between frames - which is what
 /// lets `wifi list`, `wifi status` and an abort be heard mid-sweep (rule 11), and a background sweep exist
-/// at all. `frame` is the caller's buffer, so the serve loop does not put 2 KiB on its stack per turn.
+/// at all. `rx` is the station's receive region (`ctrl::RX_REGION`), owned by the caller, so the serve loop puts
+/// no frame buffer on its stack per turn.
 pub fn step(
     h: &dyn SdioHost,
     w: &mut Window,

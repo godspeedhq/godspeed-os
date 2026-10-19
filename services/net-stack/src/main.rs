@@ -2586,7 +2586,7 @@ struct NetState {
 /// **Why a mask now, when op 21's comment once refused one.** It refused to ASSUME /24, which would be a
 /// guess. This is the mask the DHCP server gave with the address (option 1), which is the network saying
 /// where its edge is. Every address off it was ARPed anyway, waited out, and sent to the gateway: about 1.8 s
-/// on every connection to the internet (backlog/93).
+/// on every connect through op 23 (one ARP try) and 12 to 18 s on every op 21 transaction (backlog/93).
 fn on_link_by_mask(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4]) -> Option<bool> {
     if *mask == [0; 4] {
         return None;
@@ -3748,9 +3748,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // AN ARP REPLY IS THE TEST on the subnet, and it needs no prefix: a host that answers is
                 // on-link by definition. OFF the subnet - by the mask the DHCP server gave with the
                 // address, never an assumed /24 - nothing is asked: the gateway is the answer
-                // (`on_link_by_mask`). No answer means it is not a neighbour, so the gateway is right and
-                // we fall back to it.
-                // Off the subnet by the lease's mask: the gateway, with no ARP to wait on (as op 23).
+                // (`on_link_by_mask`), as op 23 does. With no mask, ARP decides: no answer means it is not a
+                // neighbour, so the gateway is right and we fall back to it.
                 let peer_mac = match if on_link_by_mask(&our_ip, &netmask, &dip) == Some(false) { None }
                                      else { arp_resolve(&ctx, pending, &our_ip, &our_mac, &dip, None) } {
                     Some(mac) => {

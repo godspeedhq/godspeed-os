@@ -2,7 +2,7 @@
 
 **Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
-converted to the first three across all four ports, and AHCI the first on the grants (step 3). "Current state" below says what exists; the
+converted to the first three across all four ports, and AHCI and GENET the first two on the grants (step 3). "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -684,4 +684,10 @@ where its hand-placed offsets were: `command list at 0x0, received FIS at 0x400,
 data at 0x1000 (36864 of 65536 bytes)`, logged once at start. One check was added while converting it:
 a command's byte count is now checked against the data part before the PRDT tells the device to move
 that many, because nothing on the CPU side can stop the device once it is told. QEMU: `osdev test files`
-270/0, `fs-restart` 11/0, `fs-ioretry` 5/0, `fs-journal` 11/0. Owed: a card on the T630 and the Wyse.
+270/0, `fs-restart` 11/0, `fs-ioretry` 5/0, `fs-journal` 11/0. Seen on the T630 at `27201c83` (the layout line
+above, the disk mounted and a `godspeed fetch` written to it); owed: a card on the Wyse.
+
+**GENET second** (the Pi 4, `4e0c733d`). Its arena is two page-aligned parts, the receive buffers at 0x0 and
+the transmit buffers at 0xC000 of its 64 KiB, where the hand-placed offsets put them; the layout's refusal
+replaces the const assert that checked they fit, and an arena that does not fit is said with the part's name
+and served as no arena at all. Owed: a card on the Pi 4.

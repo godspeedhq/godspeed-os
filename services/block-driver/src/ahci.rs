@@ -261,7 +261,8 @@ impl<'a> Ahci<'a> {
     }
 
     /// Issue a single-PRDT command (slot 0) transferring `data_bytes` to/from the
-    /// arena's data buffer. Builds the command header, command table FIS, and PRDT.
+    /// arena's `data` part (refused when larger than it). Builds the command header, command table FIS,
+    /// and PRDT.
     fn issue(
         &self,
         ctx: &ServiceContext,
@@ -524,7 +525,7 @@ impl<'a> Ahci<'a> {
     }
 
     /// Write `count` zeroed sectors from `lba`, batched into multi-sector WRITE DMA EXT
-    /// commands (up to MAX_PER sectors each - bounded by the DMA arena's data area). One
+    /// commands (up to MAX_PER sectors each - bounded by the arena's `data` part, `DATA_LEN`). One
     /// IPC call zeros a whole run, so `fs` can clear a big bitmap without per-block traffic.
     fn write_zeros(&self, ctx: &ServiceContext, lba: u64, count: u64) -> Result<(), &'static str> {
         if count == 0 {

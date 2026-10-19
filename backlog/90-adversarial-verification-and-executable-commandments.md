@@ -262,7 +262,7 @@ kernel service, never a runtime dependency, nothing added to an image to check i
   harness documents the property, the PRODUCTION functions it exercises, the input and state bounds, the
   assumptions, what it does not support, and the result. **A bounded proof is never described as unrestricted, and
   a simplified model is never presented as the implementation.**
-- **D. Runtime chaos with invariant assertions.** The 22 suites (property, fuzz, stress, adversarial, chaos) and
+- **D. Runtime chaos with invariant assertions.** The section 22 suites (property, fuzz, stress, adversarial, chaos) and
   `chaos max-carnage`. What changes: each run checks EXPLICIT invariants, not that the machine stayed up. **A
   surviving kernel is not necessarily a correct kernel.** Termination and recreation, IPC floods, memory
   exhaustion, revocation mid-operation, service death and recovery, rapid scheduling, interrupt pressure, and
@@ -329,7 +329,9 @@ Every result is one of: **PROVED WITHIN STATED BOUNDS**, **TESTED - NO VIOLATION
 FOUND**, **PROOF GAP**, **NOT EXAMINED**. Never conflated: passing tests with proof, a model with the
 implementation, a bounded proof with unrestricted correctness, the emulator with the hardware, simplicity with the
 absence of vulnerabilities. No percentage of correctness without a measurement model that defends it. (The audit's
-four labels - property test, model check, architectural check, review - map onto these.)
+check grades - architectural check, property test, model check, implementation verification, machine-checked proof,
+unverified - and its reasoning results - counterexample found, argument supported, proof gap, not examined - map
+onto these.)
 
 ### Layout
 

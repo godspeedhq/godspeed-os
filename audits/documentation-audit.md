@@ -1509,3 +1509,92 @@ spec lists and the program leaves to the shell, as every utility does.
 
 **Gates:** every documentation checker green (dash, doc refs, doc and comment symbols, line refs, facts,
 site, unsafe). `osdev test shell` 273 passed, 0 failed, 2 skipped, on `551f0c2d`.
+
+## Audit 17 - documents and code comments, `feat/gs-driver` since it left `main` (2026-10-19)
+
+Scope: the branch that put a driver's two grants into `gs::driver` (`registers`, `arena` and its layout) and
+converted AHCI and GENET, sent off-subnet traffic straight to the gateway, read the CYW43455 into a 64 KiB
+region, added package dependencies (`docs/developer-services-design.md` 16), and moved a download's bar onto
+its own line - 43 files at `1e282e7b`. Three read-only reviewers, one for the documents and two for the
+comments; every finding below was then re-read against the code by the session that made the change, which
+also wrote the code, so this is closer to a self-audit than an independent one. Dated evidence is left as written.
+
+**Result.** 47 corrections: 22 in code comments and 25 in documents, the ratchet included. Nine defects are
+in code, recorded and not changed.
+
+**Overtaken by the branch's own later commits:**
+- `godspeed-pm`'s `PROGRESS` doc said the shell draws a frame "on one line"; since `1e282e7b` the bar is on the
+  line under the words. `time_text` still gave the reason as the bar sharing the line.
+  `utilities/65_download.md` described the old line (a bar first, both times), not the words and the bar under them.
+- `docs/ahci.md` said the driver takes its grants with `ctx.mmio()` and `ctx.dma_region()`.
+- `docs/driver-library.md`, `docs/CLAUDE.md` and `backlog/71` named AHCI as the only driver on the grants; GENET
+  was converted in `4e0c733d`. Step 3 gains a GENET paragraph.
+- `backlog/93` still listed the off-link ARP wait (item 4, fixed in `3ec99a27`) and the Pi 4 superframes (item
+  2, the region read built in `1bcfb9cb`) as untouched, and its README row named the ARP wait as the next step.
+- The design doc's status line ("Nothing here is built and nothing here is approved") and its `docs/CLAUDE.md`
+  row ("not built, not approved") read as covering sections 11 to 16, which are built.
+
+**Seen on hardware, recorded:** the T630 log at `27201c83` (`build/serial_output.log`, 2026-10-19) shows AHCI's
+layout line, the disk mounted, and `connect 188.114.96.1:443 - off the subnet, via the gateway`. So
+`driver-library.md` step 3 and `backlog/93` item 4 now say the T630 has seen them, and the other boards owe a card.
+
+**Documents that disagreed with the code:**
+- 16.2's example range was `^1.2`, which the parser refuses; the section itself says never to write it.
+  It is `^1.2.0` now, and `^0.3` is now `^0.3.0`.
+- 16.3 and `utilities/61_godspeed.md` gave "at most 8 packages in one plan" and "a depth of 4". `PLAN_MAX` counts
+  the packages besides the one asked for, and `PLAN_DEPTH` counts a chain with it included. Both are stated that way now.
+- 16.3 said every refusal names "both ranges". A conflict names one range and the version already planned.
+- 16.4's sample question, marked built, was not what the shell prints. It is re-rendered from `install_plan`.
+- 16.7 left out the uninstall in the middle of `osdev test deps`.
+- 61's `plan` gave `state` as plain `install` or `fetch`; the rows say `..., needed by <pkg>`. Its section 4f
+  sat between 4b and 4c and is moved after 4e.
+- `backlog/90` quoted the verification audit's grades as four labels including "review". The audit has six check
+  grades and four reasoning results.
+
+**Comments that disagreed with the code:**
+- `gs::driver`: `arena.rs` and `registers.rs` said every driver took its grants from the SDK "until 2026-10-19",
+  which reads as none do now (only AHCI and GENET moved). `mod.rs` listed only `wait`, `delay` and `irq`.
+  `Layout::take` left out two refusals: a part of no bytes, and an alignment that is not a power of two.
+- AHCI: `issue` and `write_zeros` still named "the data buffer" / "data area" and not the `data` part, or its
+  new refusal. GENET's refusal comment said "other than 64 KiB" where only less fails.
+- `net-stack`: `on_link_by_mask` gave 1.8 s as the cost everywhere; that was op 23's, and op 21's was 12 to 18 s.
+  Op 21 had a second comment repeating the paragraph above it.
+- The wifi SDK: two doc-comment placement errors, then three wrong comments.
+  - Placement: `note_full` was inserted under `say`'s doc line, so it opened `note_full`'s doc and `say` had none.
+  - `rxq.rs` said nothing reports `handed`, which `note_full` now does.
+  - `RX_SLOTS` said everything that does not fit stays in the chip; a burst already read is turned away.
+  - `scan::step` described a 2 KiB `frame` parameter that is now the 64 KiB `rx` region.
+  - `read_frame_words` said the body goes into a `buf` it does not have.
+- `godspeed-pm`'s `install.rs` had three comments that said less than the code does.
+  - `Plan::resolve` left out the out-of-range refusal and four others.
+  - `plan` gave the wrong state strings.
+  - `asks_of` said "peers", but `console` and `device` come first.
+- The supervisor's start loop gave a cycle as the reason it ends. It ends because each pass starts one package
+  or stops.
+- The shell: `build_godspeed_table`'s doc sat above `PROGRESS_FRAME`, so the const had two docs and the function none.
+- `scripts/DOC-SYMBOLS.baseline.txt`: `left_secs` no longer needed (the ratchet tightened).
+
+**Code, recorded and not changed** (an audit changes documents only):
+- Folded into `backlog/93` item 10, which is open and covers this work:
+  - op 21 logs `did not answer ARP` where no ARP was sent;
+  - `RxQueue::push` drops an oversize frame uncounted, and the AIC8800 pull counts a full queue twice;
+  - the CYW43455's join and control waits still read 4 KiB;
+  - a log line names the region's size by hand.
+- **Not in any backlog yet, for the operator** (a new entry needs asking; the dependencies work has no open one):
+  - `meta.rs` reports a format 2 manifest with no requirements as "a format this machine does not read", where
+    the format is read and the requirements are missing.
+  - `Plan::resolve` keeps an INSTALLED requirement in range without checking its kind, so an installed app could
+    satisfy a requirement that a fetched one could not.
+  - The `PLAN_MAX` refusal says "more than 8 packages installed at once" where 9 can be.
+  - `godspeed plan` and `resolve` are reports, but refuse a pipe and are missing from `SUBCMD_FIRST`.
+  - `installed_requiring` refuses every install-over and uninstall when any one installed manifest cannot be
+    read. That may be deliberate: what cannot be read cannot be shown not to need the package.
+
+**Uncertain, not changed:**
+- `arena.rs` counts "two asserts" between the hand-kept offsets, but `dwc2` alone has eight const layout
+  asserts. The count likely covers the arena drivers only.
+- The bar is "as wide as the console" in two comments, but it stops one column short (the shell's
+  `clip = cols - 1`), deliberately.
+
+**Gates:** every documentation checker green (dash, doc refs, docs index, facts, foreign words, line refs,
+site, backlog, doc commands, doc and comment symbols).

@@ -6,7 +6,8 @@
 /// buffer and a 4 KiB message.
 pub const FRAME_MAX: usize = 1600;
 /// Frames the queue holds. Eight is one `nic-driver` batch drain; `net-stack` drains every hundred
-/// milliseconds when it has a link, and what does not fit stays in the chip for the next pull.
+/// milliseconds when it has a link. What does not fit before a read stays in the chip for the next pull; what
+/// does not fit from a burst already read (a superframe's sub-frames) is turned away and counted in `full`.
 pub const RX_SLOTS: usize = 8;
 /// A bounded ring of received ethernet frames, oldest first. About 13 KiB on the serve loop's stack.
 pub struct RxQueue {
@@ -14,8 +15,8 @@ pub struct RxQueue {
     lens: [u16; RX_SLOTS],
     head: usize,
     count: usize,
-    /// Frames queued and handed up over the driver's life. Kept for diagnostics; nothing reports them yet
-    /// (`wifi debug stats` does not read them).
+    /// Frames queued and handed up over the driver's life. Kept for diagnostics: `handed` is said beside `full`
+    /// by the serve loop (`note_full`); `queued` is reported nowhere yet, and `wifi debug stats` reads neither.
     pub queued: u32,
     pub handed: u32,
     /// Frames dropped because the buffer they were asked into could not hold them.

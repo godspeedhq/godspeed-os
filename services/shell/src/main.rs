@@ -15439,12 +15439,12 @@ fn cmd_ask(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 /// `timeout-secs`, at most 100 (`services/godspeed-pm`), and this leaves it room to say why one ended.
 const GODSPEED_WAIT_SECS: i64 = 120;
 
-/// `godspeed <command>` as a record table (`item`, `value`, `note`) whose last row is `status`. Like `ask`, a
-/// FOREGROUND PROGRAM: started for one command, its answer read, then ended. Its peers are its supervisor
-/// row's (`fs`, `net-stack`, `time`, and this shell), never passed from here.
 /// The marker that begins a progress frame from `godspeed-pm` (`services/godspeed-pm/src/main.rs`, `PROGRESS`).
 const PROGRESS_FRAME: &[u8] = b"\x01GSPROG1";
 
+/// `godspeed <command>` as a record table (`item`, `value`, `note`) whose last row is `status`. Like `ask`, a
+/// FOREGROUND PROGRAM: started for one command, its answer read, then ended. Its peers are its supervisor
+/// row's (`fs`, `net-stack`, `time`, and this shell), never passed from here.
 fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>) -> Option<Table> {
     let line = arg.trim();
     let mut cap = Cap::new();

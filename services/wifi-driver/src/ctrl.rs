@@ -1211,7 +1211,8 @@ fn read_frame_words(
         return None;
     }
     // Everything past `rest` is over-read from rounding to a whole block and is not part of this frame.
-    // THE WHOLE BODY GOES IN `buf`, and the Frame says where the payload is inside it. The reader used to
+    // THE WHOLE BODY GOES IN `words_out` (and from there into `read_frame`'s `buf`, or it stays in the region),
+    // and the Frame says where the payload is inside it. The reader used to
     // slice here and hand back only the payload, discarding the bytes before `dataoff` - which are exactly
     // the ones needed to explain a frame that does not parse.
     //

@@ -519,7 +519,8 @@ impl Installed {
         // IN DEPENDENCY ORDER (`docs/developer-services-design.md` 16.5): the list's order is the order things were
         // installed, and an upgrade moves a package to the end - after what needs it. So each pass starts every
         // package whose requirements are running, until a pass starts nothing; what is left waits on something
-        // that is not running, and says which. A cycle cannot be installed, so this ends within the list's length.
+        // that is not running, and says which. Each pass starts at least one or ends the loop, so there are at most
+        // as many passes as lines; and a cycle cannot be installed, so nothing is left waiting on one.
         let text = core::str::from_utf8(&list[..n]).unwrap_or("");
         let mut done = [false; BOOT_MAX];
         let entries = || text.lines().filter_map(|l| { let mut it = l.split_whitespace(); Some((it.next()?, it.next()?)) }).take(BOOT_MAX);

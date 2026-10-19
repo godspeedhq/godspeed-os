@@ -27,7 +27,9 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    download on the Wyse, about 64 per 12,000 frames on the T630. Each stop is a loss the sender recovers
    from. A larger arena and ring is the obvious step. **Why the Wyse is 3.6 times slower than the T630 on the
    same chip and image is not measured.**
-2. **The Pi 4's radio loses superframes over 4 KiB.** `wifi-driver` reads the CYW43455 into a 4096-byte
+2. **The Pi 4's radio loses superframes over 4 KiB.** *(The region read is built on `feat/gs-driver`,
+   `1bcfb9cb`: the CYW43455's data and scan paths read into a 64 KiB region. A Pi 4 card is owed, and
+   `small_window` is not yet lifted. Item 10 names the paths that still read 4 KiB.)* `wifi-driver` reads the CYW43455 into a 4096-byte
    buffer, and a large window's bursts arrive as superframes of 4.2 to 8 KB, which are dropped and logged
    (`exceeds this driver's 4096 byte buffer`). Until the 2026-10-19 fix that also killed the radio; now a
    connection over a radio offers the old 8 KiB window (`Conn::small_window`, `a496e4de`), which survives
@@ -35,7 +37,10 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    region (as the AIC8800 now reads its queue, `receive_region`), then lift `small_window`.
 3. **The VisionFive's radio is slow on transmit.** About 8 KiB/s; the latency is in sending over the AIC8800,
    not in receiving. Not investigated further.
-4. **Every connect waits about 1.8 s on an ARP for an address that is not on the link.** Before going via the
+4. **Every connect waits about 1.8 s on an ARP for an address that is not on the link.** *(Fixed on
+   `feat/gs-driver`, `3ec99a27`: net-stack keeps the DHCP server's mask and sends an address off it to the
+   gateway with no ARP. Seen on the T630 at `27201c83`: `connect 188.114.96.1:443 - off the subnet, via the
+   gateway`. The other boards owe a card.)* Before going via the
    gateway, net-stack asks ARP for the remote server's address and waits for an answer that cannot come
    (`ARP for 104.21.38.128 found nothing`, then `connect ... - via the gateway`; on the Pi 4 the request
    reached dispatch at 09:08:04.334 and connected at 09:08:06.122). It is about 2 s on every `godspeed`
@@ -51,8 +56,24 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
 8. **Two connections at most** (`MAX_CONNS`). Four overflowed net-stack's stack; raising it needs the frames
    measured first.
 9. **The Pis and the VisionFive have not run `d4ed712c`.** Two of the last changes run on every board and
-   were proved only on the two PCs: the progress line fitted to the console (`6e50b1f5`) and the fin-wait-2
+   were proved only on the two PCs: the progress line fitted to the console (`6e50b1f5`, since replaced by the
+   bar on its own line, `1e282e7b`) and the fin-wait-2
    bound (`d4ed712c`). Their last cards passed on `a496e4de`.
+
+10. **Found by the docs and comments audit of 2026-10-19, in code, not fixed** (an audit changes documents
+   only):
+   - `net-stack` op 21 logs `tcp X did not answer ARP - routing via the gateway` for an address off the
+     subnet, where since `3ec99a27` no ARP is sent. Op 23 says `off the subnet, via the gateway`; op 21
+     should tell the two cases apart the same way.
+   - `RxQueue::push` (`sdk/wifi/src/rxq.rs`) turns away a frame over `FRAME_MAX` without counting it
+     (`too_big` counts only what `pop` drops), and the AIC8800's pull (`aic_station.rs`) counts every
+     refused push as `no_room`, so a full queue is counted twice, in `full` and there, and an oversize frame
+     is called no room.
+   - The CYW43455's join and control waits (`join.rs`, `ctrl.rs`) still read through the 4 KiB
+     `read_frame`, so a superframe over 4 KiB that arrives then is still lost; only the data and scan paths
+     read into the 64 KiB region.
+   - `wifi-driver`'s `the 64 KiB receive region could not be had` names the size by hand; it should come
+     from `ctrl::RX_REGION`.
 
 ## Where to start
 

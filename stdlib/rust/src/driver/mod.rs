@@ -9,7 +9,9 @@
 //! or a reusable Godspeed mechanism?** A register sequence, a command set, a firmware's quirks and a
 //! chip's recovery dance describe the device and stay in its driver. How long to wait for a register,
 //! how to say the wait gave up, how long to hold still when no register can say, and how to wait for an
-//! interrupt without losing a request, describe neither - so they are here (`wait`, `delay`, `irq`).
+//! interrupt without losing a request, describe neither - so they are here (`wait`, `delay`, `irq`). So are
+//! the two grants a driver names: its register window (`registers`) and its DMA arena, laid out by name
+//! (`arena`).
 //!
 //! **There are no device CLASSES here, and there will not be.** No driver::wifi, driver::audio or
 //! driver::usb: a class API is a guess about what every device of that kind will need, made before
@@ -44,7 +46,7 @@ pub mod registers;
 pub mod wait;
 
 // The two grants a driver names and relies on (step 3, 2026-10-19): its device's registers and its DMA
-// arena, taken at the top of every driver, so they are here rather than a module down.
+// arena, taken at the top of a driver, so they are here rather than a module down.
 #[cfg(not(test))]
 pub use arena::{arena, Arena, Layout, Part};
 #[cfg(not(test))]

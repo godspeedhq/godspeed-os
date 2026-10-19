@@ -4,9 +4,10 @@
 //! # Why this exists
 //!
 //! A device that does DMA is given an arena: physically contiguous memory the kernel mapped into the
-//! driver, whose physical addresses the driver programs into the device (CLAUDE.md 12.3, 6.4). Until
-//! 2026-10-19 every driver reached past the standard library for it, with the SDK's `ctx.dma_region()`,
-//! and then laid it out by hand: seven drivers placed their rings, buffers and tables at offset constants
+//! driver, whose physical addresses the driver programs into the device (CLAUDE.md 12.3, 6.4). Every
+//! driver reached past the standard library for it, with the SDK's `ctx.dma_region()`, and then laid it out
+//! by hand (AHCI and GENET were the first to come through `gs`, 2026-10-19; the rest still do,
+//! `docs/driver-library.md` step 3): seven drivers placed their rings, buffers and tables at offset constants
 //! of their own, 33 of them, and two asserts between them checked that nothing overlapped. The day this
 //! was written, the RTL8168's 24 receive buffers filled its arena to the last 4 KiB, and one hand-written
 //! assert was all that kept its counters from landing inside a buffer.
@@ -207,7 +208,8 @@ mod granted {
 
     impl Layout {
         /// Take the next part: `len` bytes, its PHYSICAL address a multiple of `align` (a power of two).
-        /// Refused, with the reason, when it does not fit in what is left.
+        /// Refused, with the reason, when it does not fit in what is left, asks for no bytes, or names an
+        /// alignment that is not a power of two.
         pub fn take(&mut self, name: &'static str, len: usize, align: usize) -> Result<Part, NoRoom> {
             let off = place(self.dma.phys_base(), self.dma.len(), self.used, name, len, align)?;
             self.used = off + len;

@@ -1216,7 +1216,7 @@ pub fn genet_main(ctx: ServiceContext) -> ! {
     };
     // The arena in its two parts, page-aligned, so they sit at 0x0 and 0xC000 as they always have. One
     // that does not fit is said with its name and treated as no arena at all - which, unlike a MAC that
-    // will not come up, also leaves the radio unserved; it can only happen if the spawn grants other than
+    // will not come up, also leaves the radio unserved; it can only happen if the spawn grants less than
     // 64 KiB, and that is a kernel change, not a board state.
     let mut parts = a.layout();
     let (rx, tx) = match (parts.take("rx buffers", RX_BUFS_LEN, 4096), parts.take("tx buffers", TX_BUFS_LEN, 4096)) {

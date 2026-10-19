@@ -172,7 +172,8 @@ struct Plan {
     kept: u32,
 }
 
-/// The peers a checked release asks for, as the question shows them.
+/// What a checked release asks for, as the question shows it: `console` for an app, `device` for a driver, then
+/// its contract's send peers; `nothing` when there are none.
 fn asks_of(c: &check::Checked) -> Cell {
     let mut a = Cell::new();
     let mut first = true;
@@ -189,8 +190,10 @@ impl Plan {
         self.steps[..self.n].iter().flatten().find(|s| s.pkg.as_str() == pkg)
     }
 
-    /// Resolve `req`, needed by `by`: kept if installed in range, planned if fetched in range, to be fetched if
-    /// neither. Its own requirements first, so the plan's order is the order to install in.
+    /// Resolve `req`, needed by `by`: kept if installed in range, refused if installed out of range, planned if
+    /// fetched in range, to be fetched if not here at all. Refused too for a cycle, nesting past `PLAN_DEPTH`, more
+    /// than `PLAN_MAX` packages, or a requirement that is not a service or a driver. Its own requirements first, so
+    /// the plan's order is the order to install in.
     fn resolve(&mut self, ctx: &ServiceContext, req: &Requirement, by: &str) -> Result<(), Cell> {
         let name = cell(format_args!("{}", req.name()));
         if let Some(s) = self.has(name.as_str()) {
