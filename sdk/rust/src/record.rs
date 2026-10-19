@@ -47,7 +47,7 @@ pub const REC_COL_NAME: usize = 24;
 
 /// Magic prefix of the binary wire encoding (`Table::encode`/`decode`). Lets a decoder reject a
 /// non-record byte stream loudly instead of misparsing it.
-const REC_WIRE_MAGIC: &[u8; 4] = b"GSR1";
+pub const REC_WIRE_MAGIC: &[u8; 4] = b"GSR1";
 
 /// A typed cell. `Str` points into the owning [`Table`]'s arena (no lifetimes, no heap).
 #[derive(Clone, Copy)]

@@ -16130,6 +16130,8 @@ fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
 fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
     // PROGRESS, drawn in place on one line until the answer comes, then cleared.
     let drawn = core::cell::Cell::new(false);
+    // The bar's width so far, so every frame draws it at one size (`fit::fit_progress`).
+    let bar = core::cell::Cell::new(usize::MAX);
     // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
     // the line does not offer it a second time.
     let noticed_first = core::cell::Cell::new(None::<bool>);
@@ -16146,7 +16148,9 @@ fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
         let text = core::str::from_utf8(line).unwrap_or("");
         let text = if already { text.trim_end().trim_end_matches("[q] quit").trim_end() } else { text };
         let mut fit = [0u8; 192];
-        let text = fit::fit_progress(text, clip, &mut fit);
+        let mut held = bar.get();
+        let text = fit::fit_progress(text, clip, &mut held, &mut fit);
+        bar.set(held);
         gs::io::print(ctx, "\r\x1b[2K");
         gs::io::print(ctx, text);
         drawn.set(true);
@@ -19107,6 +19111,11 @@ fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, 
     // line, handed to `progress`. They are read only until the answer's first byte, so nothing in an answer
     // can be taken for one.
     let mut answering = progress.is_none();
+    // A STAGE WITH PROGRESS ANSWERS A RECORD TABLE, so before the answer begins a message that is neither a
+    // frame nor the start of one is not from it: a reply that came late to the shell's endpoint for an
+    // earlier command (`ping`'s, on the T630) was taken for `godspeed fetch`'s answer and refused as bad
+    // magic (2026-10-19). Set aside and counted, never shown as the answer.
+    let mut stray = 0u32;
     for _ in 0..512 {
         let got = recv_quittable(ctx, wait_secs, &noticed, keep.unwrap_or(&|_| {}));
         match got {
@@ -19118,6 +19127,7 @@ fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, 
                         show(line);
                         continue;
                     }
+                    if !p.starts_with(gs::record::REC_WIRE_MAGIC) { stray += 1; continue; }
                     answering = true;
                 }
                 out.push(p);
@@ -19131,6 +19141,9 @@ fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, 
                 break;
             }
         }
+    }
+    if stray > 0 {
+        ctx.log_fmt(format_args!("shell: set aside {} message(s) that came before '{}' answered and were not from it", stray, svc));
     }
     if grace_ms > 0 && matches!(how, Drained::Eot) {
         // Bounded by grace_ms, a second at most, and only after the program has sent its end byte.

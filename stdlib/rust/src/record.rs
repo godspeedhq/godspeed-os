@@ -40,5 +40,5 @@
 
 pub use godspeed_sdk::record::{
     parse_predicate, AggErr, AggOp, RecordSink, Table, Value, REC_ARENA, REC_COL_NAME, REC_MAX_COLS,
-    REC_MAX_ROWS,
+    REC_MAX_ROWS, REC_WIRE_MAGIC,
 };
