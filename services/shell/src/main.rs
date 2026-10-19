@@ -6171,6 +6171,9 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("godspeed install <file>.gsp [yes] [accept-old]", "a package file, with no network: checked through its chain as of the day it was made (or, unpublished, by a key `godspeed trust add` trusts), then asked about as any package; a file older than offline-max-age-days is asked about first, and only `accept-old` answers that", "godspeed install hello.gsp"),
             ("godspeed install <publisher/name> grant <peer>,... | grant none", "give only some of the peers its contract requests, without the question", "godspeed install godspeed/hello grant none"),
             ("what it is given", "the send peers its contract requests and you approve, never `supervisor`, and no privilege", ""),
+            ("what it needs", "a package that requires others is planned first: they are fetched, listed in one question, and installed first", "godspeed plan godspeed/hello"),
+            ("godspeed plan <publisher/name>[@version]", "what installing it takes - what it requires, in the order to install - without installing", "godspeed plan godspeed/hello"),
+            ("godspeed resolve <publisher/name> <range>", "the newest release on the registry in a range, such as ^1.2.0", "godspeed resolve godspeed/hello ^0.3.0"),
             ("what is checked", "the copy on disk, again, by the supervisor, before every start: signature, key, contract, binary", ""),
             ("if it dies", "restarted from the disk, up to 5 times a boot, then left down and said so", ""),
         ], false),
@@ -15915,6 +15918,9 @@ fn install_asks(ctx: &ShellCtx, spec: &str, q: &mut [u8; 512]) -> Option<([u8; 5
 }
 
 fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> bool {
+    // A PACKAGE THAT NEEDS OTHERS is planned first and asked about once, for all of them
+    // (`docs/developer-services-design.md` 16.4). One that needs nothing goes on below, as it always has.
+    if let Some(done) = install_plan(ctx, spec, from, yes, q) { return done; }
     let Some((note_b, nl, peers_b, pn)) = install_asks(ctx, spec, q) else {
         // Not fetched, or the copy did not check out: the answer says which.
         let _ = godspeed_show(ctx, fmt_into(q, format_args!("install {}", spec)));
@@ -15956,6 +15962,132 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
     let mut line = [0u8; 512];
     let cmd = fmt_into(&mut line, format_args!("install {} grant {}", spec, grant));
     godspeed_show(ctx, cmd).is_ok()
+}
+
+/// The most packages one plan installs, its own included (the package manager's `PLAN_MAX` and the package).
+const PLAN_ROWS: usize = 9;
+
+/// One row of a plan, copied out of the package manager's table.
+#[derive(Clone, Copy)]
+struct PlanRow { pkg: [u8; 128], pl: usize, ver: [u8; 24], vl: usize, kind: [u8; 16], kl: usize, asks: [u8; 192], al: usize, by: [u8; 128], bl: usize, fetch: bool }
+
+impl PlanRow {
+    const EMPTY: PlanRow = PlanRow { pkg: [0; 128], pl: 0, ver: [0; 24], vl: 0, kind: [0; 16], kl: 0, asks: [0; 192], al: 0, by: [0; 128], bl: 0, fetch: false };
+    fn pkg(&self) -> &str { core::str::from_utf8(&self.pkg[..self.pl]).unwrap_or("") }
+    fn ver(&self) -> &str { core::str::from_utf8(&self.ver[..self.vl]).unwrap_or("") }
+    fn kind(&self) -> &str { core::str::from_utf8(&self.kind[..self.kl]).unwrap_or("") }
+    fn asks(&self) -> &str { core::str::from_utf8(&self.asks[..self.al]).unwrap_or("") }
+    fn by(&self) -> &str { core::str::from_utf8(&self.by[..self.bl]).unwrap_or("") }
+}
+
+fn copy_cell(dst: &mut [u8], src: &[u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+/// The plan for `spec`, read into `rows`: how many there are, or `None` when the package manager refused it - its
+/// answer already shown.
+#[inline(never)]
+fn read_plan(ctx: &ShellCtx, spec: &str, rows: &mut [PlanRow; PLAN_ROWS], q: &mut [u8; 512]) -> Option<usize> {
+    let t = build_godspeed_table(ctx, fmt_into(q, format_args!("plan {}", spec)), None)?;
+    let status = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status");
+    if status.is_some_and(|s| t.cell_bytes(s, 1) == b"failed") {
+        let _ = godspeed_present(ctx, t);
+        return None;
+    }
+    let mut n = 0usize;
+    for r in 0..t.nrows() {
+        if Some(r) == status || n == rows.len() { continue; }
+        let row = &mut rows[n];
+        *row = PlanRow::EMPTY;
+        row.pl = copy_cell(&mut row.pkg, t.cell_bytes(r, 0));
+        row.vl = copy_cell(&mut row.ver, t.cell_bytes(r, 1));
+        row.kl = copy_cell(&mut row.kind, t.cell_bytes(r, 2));
+        row.al = copy_cell(&mut row.asks, t.cell_bytes(r, 3));
+        let state = t.cell_bytes(r, 4);
+        row.fetch = state.starts_with(b"fetch");
+        if let Some(at) = state.windows(10).position(|w| w == b"needed by ") { row.bl = copy_cell(&mut row.by, &state[at + 10..]); }
+        n += 1;
+    }
+    Some(n)
+}
+
+/// The newest release of `pkg` in `range` on the registry, fetched: true when it is now here.
+#[inline(never)]
+fn fetch_in_range(ctx: &ShellCtx, pkg: &str, range: &str, q: &mut [u8; 512]) -> bool {
+    let Some(t) = build_godspeed_table(ctx, fmt_into(q, format_args!("resolve {} {}", pkg, range)), None) else {
+        gs::io::println(ctx, "godspeed: the package manager did not answer");
+        return false;
+    };
+    let Some(row) = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"version") else {
+        let _ = godspeed_present(ctx, t);
+        return false;
+    };
+    let mut ver = [0u8; 24];
+    let vl = copy_cell(&mut ver, t.cell_bytes(row, 1));
+    let v = core::str::from_utf8(&ver[..vl]).unwrap_or("");
+    gs::io::println_fmt(ctx, format_args!("  {} {} is needed - fetching {} {}", pkg, range, pkg, v));
+    godspeed_show(ctx, fmt_into(q, format_args!("fetch {}@{}", pkg, v))).is_ok()
+}
+
+/// What installing `spec` takes, when that is more than `spec` alone: requirements not fetched are fetched (the newest
+/// in range), the plan made again, one question asked for all of it and each installed in order, dependencies
+/// first. `None` when `spec` needs nothing besides itself, so the one-package question below asks as before.
+#[inline(never)]
+fn install_plan(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> Option<bool> {
+    let mut rows = [PlanRow::EMPTY; PLAN_ROWS];
+    let mut n = 0usize;
+    // A fetched requirement can need another, so this goes round until nothing is left to fetch - a bounded number
+    // of times, the depth requirements may nest to.
+    for _ in 0..5 {
+        n = match read_plan(ctx, spec, &mut rows, q) { Some(n) => n, None => return Some(false) };
+        let mut fetched_any = false;
+        for i in 0..n {
+            if !rows[i].fetch { continue; }
+            let row = rows[i];
+            if !fetch_in_range(ctx, row.pkg(), row.ver(), q) { return Some(false); }
+            fetched_any = true;
+        }
+        if !fetched_any { break; }
+    }
+    if rows[..n].iter().any(|r| r.fetch) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} needs more than could be fetched - nothing was installed", spec));
+        return Some(false);
+    }
+    if n <= 1 { return None; }
+    let me = rows[n - 1];
+    gs::io::println_fmt(ctx, format_args!("{} {}{} needs {} more package{}:", me.pkg(), me.ver(),
+        match from { Some(h) => fmt_into(q, format_args!(" (upgrade from {})", h)), None => "" },
+        n - 1, if n == 2 { "" } else { "s" }));
+    for r in &rows[..n] {
+        gs::io::print_fmt(ctx, format_args!("  {:<28} {:<9} {:<10} asks for: {}", r.pkg(), r.ver(), r.kind(), r.asks()));
+        if r.bl > 0 { gs::io::println_fmt(ctx, format_args!("   (needed by {})", r.by())); } else { gs::io::println(ctx, ""); }
+    }
+    gs::io::print_fmt(ctx, format_args!("Install all {} and grant them? (no privilege) [y/N]: ", n));
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+    else if !read_confirm(ctx) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed, nor what it needs", spec));
+        return Some(true);
+    }
+    for r in &rows[..n] {
+        let mut grant = [0u8; 192];
+        let mut gl = 0usize;
+        if r.asks() != "nothing" {
+            for p in r.asks().split(", ") {
+                if gl > 0 && gl < grant.len() { grant[gl] = b','; gl += 1; }
+                gl += copy_cell(&mut grant[gl..], p.as_bytes());
+            }
+        }
+        let g = if gl == 0 { "none" } else { core::str::from_utf8(&grant[..gl]).unwrap_or("none") };
+        let mut line = [0u8; 512];
+        let cmd = fmt_into(&mut line, format_args!("install {}@{} grant {}", r.pkg(), r.ver(), g));
+        if godspeed_show(ctx, cmd).is_err() {
+            gs::io::println_fmt(ctx, format_args!("godspeed: stopped at {} - what was installed before it stays installed, and the rest was not", r.pkg()));
+            return Some(false);
+        }
+    }
+    Some(true)
 }
 
 /// `a,b,c` shown as `a, b, c`.

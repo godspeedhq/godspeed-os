@@ -817,7 +817,7 @@ dependencies = [
 [[package]]
 name = "godspeed-package"
 version = "0.1.0"
-source = "git+https://github.com/godspeedhq/godspeed-cli?rev=9c3d4502beb024ce7599dca0d482b73735f029ec#9c3d4502beb024ce7599dca0d482b73735f029ec"
+source = "git+https://github.com/godspeedhq/godspeed-cli?rev=6bc893aca94335f98e908476ab98aabfaac8638b#6bc893aca94335f98e908476ab98aabfaac8638b"
 dependencies = [
  "ed25519-dalek",
  "sha2",

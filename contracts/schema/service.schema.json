@@ -39,8 +39,8 @@
       "properties": {
         "ipc_send": {
           "type": "array",
-          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
-          "description": "Services this service may send IPC messages to. The send caps are minted from the spawn request's send peers; `scripts/contract_check.py` fails a service contract whose list differs from them."
+          "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*(/[a-z][a-z0-9-]*)?$" },
+          "description": "Services this service may send IPC messages to: a built-in by its name, or an installed package by its publisher/name, which the package must also require (docs/developer-services-design.md 16.2). The send caps are minted from the spawn request's send peers; `scripts/contract_check.py` fails a service contract whose list differs from them."
         },
         "ipc_receive": {
           "type": "array",

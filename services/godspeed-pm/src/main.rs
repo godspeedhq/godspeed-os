@@ -162,6 +162,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             _ => r.fail("usage", "godspeed install <file>.gsp [yes] [accept-old]", "a package file, as the CLI writes one"),
         },
         (Some("install"), None) => r.fail("usage", "godspeed install <publisher/name>[@version]", "a fetched package to install"),
+        // What installing a package takes: its requirements, resolved, in the order to install them (`install.rs`).
+        (Some("plan"), Some(name)) if words.clone().next().is_none() => install::plan(&ctx, &mut r, name),
+        (Some("resolve"), Some(name)) => match (words.next(), words.next()) {
+            (Some(range), None) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::resolve(&ctx, r, ready, roots, name, range)),
+            _ => r.fail("usage", "godspeed resolve <publisher/name> <range>", "a package and the versions that will do"),
+        },
         // What the package manager keeps that nothing uses: listed, and deleted only once the shell has asked.
         (Some("cleanup"), None) => packages::cleanup(&ctx, &mut r, false),
         (Some("cleanup"), Some("delete")) if words.clone().next().is_none() => packages::cleanup(&ctx, &mut r, true),
@@ -327,6 +333,7 @@ impl RecordSink for BufSink {
 }
 
 /// A short formatted string, for a table cell.
+#[derive(Clone, Copy)]
 pub(crate) struct Cell { b: [u8; 160], pub(crate) n: usize }
 impl Cell {
     pub(crate) fn new() -> Cell { Cell { b: [0; 160], n: 0 } }

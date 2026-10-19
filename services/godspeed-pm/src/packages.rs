@@ -447,6 +447,52 @@ pub fn versions(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &R
     });
 }
 
+/// `godspeed resolve <publisher/name> <range>`: the newest release on the registry in `range`, from its verified
+/// index - what a plan fetches for a requirement nothing here satisfies (`docs/developer-services-design.md` 16.3).
+/// Columns `key value note`, the version in the `version` row; a range nothing published satisfies fails, naming
+/// the newest there is.
+#[inline(never)]
+pub fn resolve(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str, range: &str) {
+    let name = match spec(which) {
+        Ok((n, None)) => n,
+        Ok((_, Some(_))) => return r.fail("usage", which, "a package and a range, not one version"),
+        Err(why) => return r.fail("usage", which, why),
+    };
+    let Ok(want) = range.parse::<godspeed_package::VersionReq>() else {
+        return r.fail("usage", range, "a version range is ^, = or >= and a whole version: ^1.2.0");
+    };
+    let mut docs = Docs::new();
+    let base = ready.url.base;
+    on_registry(ctx, r, ready, roots, |s, r| {
+        let mut iso = [0u8; 20];
+        let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
+        let mut ibuf = [0u8; INDEX_MAX];
+        let Some(text) = index_text(ctx, s, base, &v, &name, &mut ibuf)? else {
+            r.fail("package", which, "never published on this registry");
+            return Ok(());
+        };
+        let mut rel = Releases::new();
+        let idx = match meta::index(text, &mut rel) {
+            Ok(i) => i,
+            Err(b) => { r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(()); }
+        };
+        let best = idx.releases.iter().map(|rel| rel.version).filter(|v| want.matches(v)).max();
+        let newest = idx.releases.iter().map(|rel| rel.version).max();
+        match best {
+            Some(b) => {
+                r.columns(&["key", "value", "note"]);
+                r.row("version", cell(format_args!("{}", b)).as_str(), cell(format_args!("the newest of {} in {}", which, want)).as_str());
+                chain_note(r, &v, "");
+            }
+            None => {
+                let n = newest.map(|n| cell(format_args!("the newest is {}", n))).unwrap_or_else(|| cell(format_args!("it has no releases")));
+                r.fail("requires", which, cell(format_args!("no release is in {} - {}", want, n.as_str())).as_str());
+            }
+        }
+        Ok(())
+    });
+}
+
 /// it was built for, what it ships, what its contract requests, who signed it, and every version published -
 /// each checked as `fetch` checks it. Columns `key value note`; the shell shows it as a card.
 #[inline(never)]

@@ -15,6 +15,8 @@
 use godspeed::{self as gs, ipc::Message, ServiceContext};
 use godspeed_sdk::service_context::supcmd;
 
+use godspeed_package::{Kind, Requirement, Version, VersionReq, MAX_REQUIRES};
+
 use crate::check::{self, MAX_PEERS};
 use crate::packages::{self, Fetched, MAX_FETCHED};
 use crate::{cell, Cell, Rows, C};
@@ -88,6 +90,197 @@ pub fn installed_version(ctx: &ServiceContext, pkg: &str, out: &mut [u8; 24]) ->
     Some(n)
 }
 
+// ---- Dependencies (`docs/developer-services-design.md` 16) ------------------------------------------------------
+
+/// How deep requirements may nest in one plan, and how many packages one plan may install.
+const PLAN_DEPTH: usize = 4;
+const PLAN_MAX: usize = 8;
+
+/// What an installed or fetched release requires, and its kind, from the manifest beside it. Read, not verified: it
+/// was verified when it was fetched, and the supervisor verifies it again before anything of it runs.
+#[inline(never)]
+fn manifest_of(ctx: &ServiceContext, pkg: &str, version: &str) -> Result<([Requirement; MAX_REQUIRES], usize, Kind), Cell> {
+    let path = cell(format_args!("{}{}/{}/manifest.toml", check::DIR, pkg, version));
+    let mut buf = [0u8; check::MANIFEST_MAX];
+    let n = gs::fs::Fs::new(ctx).read_into(path.as_str(), &mut buf)
+        .map_err(|e| cell(format_args!("{} could not be read: {:?}", path.as_str(), e)))?;
+    let text = core::str::from_utf8(&buf[..n]).map_err(|_| cell(format_args!("{} is not text", path.as_str())))?;
+    let mut arts = crate::meta::Artifacts::new();
+    let m = crate::meta::manifest(text, &mut arts).map_err(|b| cell(format_args!("{} line {}: {}", path.as_str(), b.line, b.why)))?.manifest;
+    let mut reqs = [Requirement::default(); MAX_REQUIRES];
+    let n = m.requires.len().min(MAX_REQUIRES);
+    reqs[..n].copy_from_slice(&m.requires[..n]);
+    Ok((reqs, n, m.kind))
+}
+
+/// The installed version of `pkg`, read as a version.
+fn installed(ctx: &ServiceContext, pkg: &str) -> Option<Version> {
+    let mut v = [0u8; 24];
+    let l = installed_version(ctx, pkg, &mut v)?;
+    core::str::from_utf8(&v[..l]).ok()?.parse().ok()
+}
+
+/// Every installed package other than `pkg` that requires `pkg`, handed to `each` with its version and the range it
+/// requires; `each` returns true to stop.
+#[inline(never)]
+fn installed_requiring(ctx: &ServiceContext, pkg: &str, each: &mut dyn FnMut(&str, &str, VersionReq) -> bool) -> Result<(), Cell> {
+    let mut buf = [0u8; 1024];
+    let list = read_list(ctx, &mut buf)?;
+    for l in list.lines() {
+        let mut it = l.split_whitespace();
+        let (Some(p), Some(v)) = (it.next(), it.next()) else { continue };
+        if p == pkg { continue; }
+        let (reqs, n, _) = manifest_of(ctx, p, v)?;
+        for r in &reqs[..n] {
+            if cell(format_args!("{}", r.name())).as_str() == pkg && each(p, v, r.range) { return Ok(()); }
+        }
+    }
+    Ok(())
+}
+
+/// The newest FETCHED version of `pkg` in `range`.
+#[inline(never)]
+fn fetched_in(ctx: &ServiceContext, pkg: &str, range: VersionReq) -> Option<Version> {
+    let mut all = [Fetched::EMPTY_PUB; MAX_FETCHED];
+    let mut more = false;
+    let n = packages::fetched(ctx, &mut all, &mut more).ok()?;
+    all.iter().take(n)
+        .filter(|f| cell(format_args!("{}/{}", f.publisher(), f.name())).as_str() == pkg)
+        .filter_map(|f| f.version().parse::<Version>().ok())
+        .filter(|v| range.matches(v))
+        .max()
+}
+
+/// One package a plan installs, or fetches first.
+#[derive(Clone, Copy)]
+struct Step {
+    pkg: Cell,
+    version: Option<Version>,
+    range: Option<VersionReq>,
+    kind: Kind,
+    asks: Cell,
+    by: Cell,
+}
+
+/// A plan: the packages to install, dependencies first, and those that must be fetched before it can be made.
+struct Plan {
+    steps: [Option<Step>; PLAN_MAX],
+    n: usize,
+    /// Names being resolved, deepest last: one met again is a cycle.
+    path: [Cell; PLAN_DEPTH + 1],
+    depth: usize,
+    kept: u32,
+}
+
+/// The peers a checked release asks for, as the question shows them.
+fn asks_of(c: &check::Checked) -> Cell {
+    let mut a = Cell::new();
+    let mut first = true;
+    let mut add = |s: &str| { let _ = core::fmt::Write::write_fmt(&mut a, format_args!("{}{}", if first { "" } else { ", " }, s)); first = false; };
+    if c.kind == Kind::App { add("console"); }
+    if c.kind == Kind::Driver { add("device"); }
+    for p in c.contract.peers() { add(p); }
+    if first { a = cell(format_args!("nothing")); }
+    a
+}
+
+impl Plan {
+    fn has(&self, pkg: &str) -> Option<&Step> {
+        self.steps[..self.n].iter().flatten().find(|s| s.pkg.as_str() == pkg)
+    }
+
+    /// Resolve `req`, needed by `by`: kept if installed in range, planned if fetched in range, to be fetched if
+    /// neither. Its own requirements first, so the plan's order is the order to install in.
+    fn resolve(&mut self, ctx: &ServiceContext, req: &Requirement, by: &str) -> Result<(), Cell> {
+        let name = cell(format_args!("{}", req.name()));
+        if let Some(s) = self.has(name.as_str()) {
+            return match s.version {
+                Some(v) if req.range.matches(&v) => Ok(()),
+                Some(v) => Err(cell(format_args!("{} needs {} {}, and this plan already takes {} {} for another package - no one version will do",
+                    by, name.as_str(), req.range, name.as_str(), v))),
+                None => Ok(()),
+            };
+        }
+        if self.path[..self.depth].iter().any(|p| p.as_str() == name.as_str()) {
+            return Err(cell(format_args!("{} and {} require each other, which cannot be installed in any order", by, name.as_str())));
+        }
+        if let Some(v) = installed(ctx, name.as_str()) {
+            if req.range.matches(&v) { self.kept += 1; return Ok(()); }
+            return Err(cell(format_args!("{} needs {} {}, and {} is installed - `godspeed upgrade {}` first, or install a {} that needs that version",
+                by, name.as_str(), req.range, v, name.as_str(), by)));
+        }
+        if self.depth == PLAN_DEPTH {
+            return Err(cell(format_args!("requirements nest deeper than {} packages at {}", PLAN_DEPTH, name.as_str())));
+        }
+        if self.n == PLAN_MAX {
+            return Err(cell(format_args!("this needs more than {} packages installed at once", PLAN_MAX)));
+        }
+        let Some(v) = fetched_in(ctx, name.as_str(), req.range) else {
+            // Fetched first, then planned again: the shell fetches the newest release in range.
+            self.steps[self.n] = Some(Step { pkg: name, version: None, range: Some(req.range), kind: Kind::Service,
+                                             asks: Cell::new(), by: cell(format_args!("{}", by)) });
+            self.n += 1;
+            return Ok(());
+        };
+        let vt = cell(format_args!("{}", v));
+        let (publisher, short) = (req.name().publisher(), req.name().name());
+        let c = check::package(ctx, publisher, short, vt.as_str(), packages::this_arch().map(|a| a.as_str()), &mut |_, _| true)
+            .map_err(|why| cell(format_args!("{} {}, needed by {}: {}", name.as_str(), vt.as_str(), by, why.as_str())))?;
+        if c.kind != Kind::Service && c.kind != Kind::Driver {
+            return Err(cell(format_args!("{} needs {}, which is {} - only a service or a driver runs to be needed",
+                by, name.as_str(), if c.kind == Kind::App { "an app" } else { "a utility" })));
+        }
+        self.path[self.depth] = name;
+        self.depth += 1;
+        for r in c.requires() { self.resolve(ctx, r, name.as_str())?; }
+        self.depth -= 1;
+        if self.n == PLAN_MAX {
+            return Err(cell(format_args!("this needs more than {} packages installed at once", PLAN_MAX)));
+        }
+        self.steps[self.n] = Some(Step { pkg: name, version: Some(v), range: Some(req.range), kind: c.kind,
+                                         asks: asks_of(&c), by: cell(format_args!("{}", by)) });
+        self.n += 1;
+        Ok(())
+    }
+}
+
+/// `godspeed plan <pkg>[@ver]`: what installing it takes, for the shell's one question. One row per package, in the
+/// order to install them - its requirements first and itself last; columns `package version kind asks state`, state
+/// `install` (fetched, checked) or `fetch` (to be fetched first: version is the range). Installed packages that
+/// already satisfy a range are kept, and counted in the note. A plan that cannot be made fails, saying why.
+#[inline(never)]
+pub fn plan(ctx: &ServiceContext, r: &mut Rows, which: &str) {
+    let f = match pick(ctx, which) { Ok(f) => f, Err(why) => return r.fail("fetched", which, why.as_str()) };
+    let pkg = cell(format_args!("{}/{}", f.publisher(), f.name()));
+    let root = match check::package(ctx, f.publisher(), f.name(), f.version(), packages::this_arch().map(|a| a.as_str()), &mut |_, _| true) {
+        Ok(c) => c,
+        Err(why) => return r.fail("check", cell(format_args!("{} {}", pkg.as_str(), f.version())).as_str(), why.as_str()),
+    };
+    let mut p = Plan { steps: [None; PLAN_MAX], n: 0, path: [Cell::new(); PLAN_DEPTH + 1], depth: 1, kept: 0 };
+    p.path[0] = pkg;
+    for req in root.requires() {
+        if let Err(why) = p.resolve(ctx, req, pkg.as_str()) { return r.fail("requires", pkg.as_str(), why.as_str()); }
+    }
+    r.columns(&["package", "version", "kind", "asks", "state"]);
+    let kind = |k: Kind| match k { Kind::Utility => "a utility", Kind::App => "an app", Kind::Driver => "a driver", _ => "a service" };
+    let mut fetch = 0u32;
+    for s in p.steps[..p.n].iter().flatten() {
+        match s.version {
+            Some(v) => r.entry(&[C::S(s.pkg.as_str()), C::S(cell(format_args!("{}", v)).as_str()), C::S(kind(s.kind)), C::S(s.asks.as_str()),
+                                 C::S(cell(format_args!("install, needed by {}", s.by.as_str())).as_str())]),
+            None => {
+                fetch += 1;
+                let range = s.range.map(|r| cell(format_args!("{}", r))).unwrap_or_else(Cell::new);
+                r.entry(&[C::S(s.pkg.as_str()), C::S(range.as_str()), C::S("-"), C::S("-"),
+                          C::S(cell(format_args!("fetch, needed by {}", s.by.as_str())).as_str())])
+            }
+        }
+    }
+    r.entry(&[C::S(pkg.as_str()), C::S(f.version()), C::S(kind(root.kind)), C::S(asks_of(&root).as_str()), C::S("install")]);
+    r.note(format_args!("{} {}: {} to install, {} to fetch first, {} already installed and kept",
+        pkg.as_str(), f.version(), p.n as u32 + 1 - fetch, fetch, p.kept));
+}
+
 /// `godspeed install <pkg>[@ver]` with no answer yet: what the contract requests, for the shell to ask about. Columns
 /// `peer gives note`, one row per send peer, and the release in the status note; none is no rows. Three columns, so
 /// the status row has a note to carry the release in.
@@ -135,6 +328,27 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
         Ok(c) => c,
         Err(why) => return r.fail("check", cell(format_args!("{} {}", pkg.as_str(), f.version())).as_str(), why.as_str()),
     };
+    // ITS REQUIREMENTS ARE INSTALLED, in range, before it is - the shell's plan installs them first, and this holds
+    // for any other way of asking too (`docs/developer-services-design.md` 16.5).
+    for req in checked.requires() {
+        let name = cell(format_args!("{}", req.name()));
+        match installed(ctx, name.as_str()) {
+            Some(v) if req.range.matches(&v) => {}
+            Some(v) => return r.fail("requires", name.as_str(), cell(format_args!("{} needs {} {}, and {} is installed", pkg.as_str(), name.as_str(), req.range, v)).as_str()),
+            None => return r.fail("requires", name.as_str(), cell(format_args!("{} needs {} {}, which is not installed - `godspeed install {}` installs both", pkg.as_str(), name.as_str(), req.range, pkg.as_str())).as_str()),
+        }
+    }
+    // NO INSTALLED PACKAGE IS LEFT WITHOUT A VERSION IT NEEDS (16.6): an upgrade, a downgrade or a replacement of this
+    // one is refused if an installed dependent's range does not take the new version.
+    let new_v: Option<Version> = f.version().parse().ok();
+    let mut broken: Option<Cell> = None;
+    if let Err(why) = installed_requiring(ctx, pkg.as_str(), &mut |dep, dv, range| {
+        if new_v.is_some_and(|v| !range.matches(&v)) {
+            broken = Some(cell(format_args!("{} {} needs {} {}, and this is {} - upgrade or uninstall {} first", dep, dv, pkg.as_str(), range, f.version(), dep)));
+            true
+        } else { false }
+    }) { return r.fail("requires", LIST, why.as_str()); }
+    if let Some(why) = broken { return r.fail("requires", pkg.as_str(), why.as_str()); }
     // The answer, each peer one the contract requests, and never the supervisor.
     let mut granted: [&str; MAX_PEERS] = [""; MAX_PEERS];
     let mut ng = 0usize;
@@ -238,6 +452,13 @@ pub fn uninstall(ctx: &ServiceContext, r: &mut Rows, pkg: &str, purge: bool) {
         return r.fail("installed", pkg, "not installed here: `godspeed list installed` says what is");
     };
     let version = core::str::from_utf8(&v[..vl]).unwrap_or("?");
+    // NOT WHILE SOMETHING INSTALLED NEEDS IT (16.6): the dependent first.
+    let mut needed: Option<Cell> = None;
+    if let Err(why) = installed_requiring(ctx, pkg, &mut |dep, dv, range| {
+        needed = Some(cell(format_args!("{} {} requires it ({}) - uninstall {} first", dep, dv, range, dep)));
+        true
+    }) { return r.fail("installed", LIST, why.as_str()); }
+    if let Some(why) = needed { return r.fail("requires", pkg, why.as_str()); }
     if let Err(why) = write_list(ctx, pkg, "") { return r.fail("installed", LIST, why.as_str()); }
     let stopped = supervisor(ctx, supcmd::UNINSTALL, pkg.as_bytes(), 10);
     r.columns(&["key", "value", "note"]);

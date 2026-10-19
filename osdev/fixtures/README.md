@@ -25,6 +25,29 @@ GODSPEED_SIGNING_KEY=<the seed> GODSPEED_OS=<this checkout> godspeed package --a
 Remake it when the OS's program layout changes (the shared check refuses a package built before
 `LAYOUT_RELEASE`); the suite will say so if it is stale.
 
+## `dep-store-0.1.0.gsp` and `dep-user-0.1.0.gsp`
+
+Two UNPUBLISHED package files for `osdev test deps` (`docs/developer-services-design.md` 16), signed by the same
+throwaway test key as `hello-utility-0.9.0.gsp`, for `x86_64` only. `godspeed/dep-store` is a service that says it
+started and then says each line a dependent sends it; `godspeed/dep-user` is a service whose manifest REQUIRES
+`godspeed/dep-store ^0.1.0` (format 2) and whose contract names it as its one send peer: at start it sends it
+`hello from dep-user`. So the suite's log shows the dependency both started first and reached.
+
+Their projects (`godspeed.toml`, the contract and `src/main.rs`) are kept beside the CLI's examples, outside this
+tree; each is the `hello-service` template with that behaviour. `dep-user`'s `godspeed.toml` carries
+
+```toml
+[requires]
+"godspeed/dep-store" = "^0.1.0"
+```
+
+and its contract `ipc_send = ["godspeed/dep-store"]`. Made with the CLI that reads `[requires]` (godspeed-cli
+`feat/dependencies`), as the file above:
+
+```text
+GODSPEED_SIGNING_KEY=<the seed> GODSPEED_OS=<this checkout> godspeed package --arch x86_64 --local
+```
+
 ## `gts-root-r4.der`
 
 Google Trust Services' **GTS Root R4**, the ECDSA P-384 root that `speed.cloudflare.com`'s chain reaches, for

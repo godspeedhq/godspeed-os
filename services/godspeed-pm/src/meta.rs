@@ -7,7 +7,7 @@
 //! against the index's digest - so a parse failure is a registry fault, never an attacker's input reaching
 //! further than this reader.
 
-use godspeed_package::{Arch, Artifact, Kind, Manifest, PackageIndex, PackageName, Release, Sha256Digest, Version};
+use godspeed_package::{Arch, Artifact, Kind, Manifest, PackageIndex, PackageName, Release, Requirement, Sha256Digest, Version, VersionReq, MAX_REQUIRES};
 
 use crate::toml_lines::{lines, Line, Val};
 
@@ -137,12 +137,16 @@ pub fn index<'a>(text: &'a str, rel: &'a mut Releases<'a>) -> Result<PackageInde
 pub struct Artifacts {
     pub items: [Artifact; 4],
     pub len: usize,
+    /// The manifest's requirements (`[[requires]]`, `docs/developer-services-design.md` 16), read into here as
+    /// the artifacts are: the manifest's slice points at the filled part.
+    pub reqs: [Requirement; MAX_REQUIRES],
+    pub nreq: usize,
 }
 
 impl Artifacts {
     pub fn new() -> Artifacts {
         let a = Artifact { arch: Arch::X86_64, size: 0, digest: Sha256Digest([0; 32]) };
-        Artifacts { items: [a; 4], len: 0 }
+        Artifacts { items: [a; 4], len: 0, reqs: [Requirement::default(); MAX_REQUIRES], nreq: 0 }
     }
 }
 
@@ -154,11 +158,27 @@ pub struct Read<'a> {
 /// Read a manifest. The crate's `validate` runs on the result; a problem it reports is refused here.
 pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, Bad> {
     #[derive(PartialEq)]
-    enum In { Top, Package, Os, Contract, Artifact }
+    enum In { Top, Package, Os, Contract, Artifact, Requires }
     let mut at = In::Top;
     let (mut format, mut name, mut ver, mut kind, mut desc, mut lic, mut os, mut contract) =
         (None, None, None, None, None, None, None, None);
     let mut cur: Option<(usize, Option<Arch>, Option<u64>, Option<Sha256Digest>)> = None;
+    // A `[[requires]]` being read: its line, and its name and range as they arrive.
+    let mut req: Option<(usize, Option<&'a str>, Option<VersionReq>)> = None;
+    let end_req = |req: &mut Option<(usize, Option<&'a str>, Option<VersionReq>)>, arts: &mut Artifacts| -> Result<(), Bad> {
+        if let Some((n, name, range)) = req.take() {
+            let (Some(name), Some(range)) = (name, range) else {
+                return Err(bad(n, "a requirement lacks its name or its version range"));
+            };
+            let name = PackageName::parse(name).map_err(|_| bad(n, "a requirement names no publisher/name package"))?;
+            if arts.nreq == arts.reqs.len() {
+                return Err(bad(n, "more requirements than a manifest may have"));
+            }
+            arts.reqs[arts.nreq] = Requirement::new(name, range);
+            arts.nreq += 1;
+        }
+        Ok(())
+    };
     let finish = |cur: &mut Option<(usize, Option<Arch>, Option<u64>, Option<Sha256Digest>)>, arts: &mut Artifacts| -> Result<(), Bad> {
         if let Some((n, a, s, d)) = cur.take() {
             let (Some(arch), Some(size), Some(digest)) = (a, s, d) else {
@@ -176,6 +196,7 @@ pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, 
         match l.map_err(|why| bad(n, why))? {
             Line::Table(t) => {
                 finish(&mut cur, arts)?;
+                end_req(&mut req, arts)?;
                 at = match t {
                     "package" => In::Package,
                     "os" => In::Os,
@@ -185,8 +206,15 @@ pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, 
             }
             Line::ArrayTable("artifact") => {
                 finish(&mut cur, arts)?;
+                end_req(&mut req, arts)?;
                 at = In::Artifact;
                 cur = Some((n, None, None, None));
+            }
+            Line::ArrayTable("requires") => {
+                finish(&mut cur, arts)?;
+                end_req(&mut req, arts)?;
+                at = In::Requires;
+                req = Some((n, None, None));
             }
             Line::ArrayTable(_) => return Err(bad(n, "a table a manifest does not have")),
             Line::Pair(k, v) => match (&at, k) {
@@ -212,11 +240,17 @@ pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, 
                 }
                 (In::Artifact, "size") => { let s = int(n, v)?; if let Some(c) = &mut cur { c.2 = Some(s); } }
                 (In::Artifact, "digest") => { let d = digest(n, v)?; if let Some(c) = &mut cur { c.3 = Some(d); } }
+                (In::Requires, "name") => { let s = plain(n, v)?; if let Some(r) = &mut req { r.1 = Some(s); } }
+                (In::Requires, "version") => {
+                    let r: VersionReq = plain(n, v)?.parse().map_err(|_| bad(n, "a version range is ^, = or >= and a whole version"))?;
+                    if let Some(q) = &mut req { q.2 = Some(r); }
+                }
                 _ => return Err(bad(n, "a key a manifest does not have")),
             },
         }
     }
     finish(&mut cur, arts)?;
+    end_req(&mut req, arts)?;
     let m = Manifest {
         format: u32::try_from(format.ok_or(bad(0, "the manifest has no format"))?).map_err(|_| bad(0, "the format number is too large"))?,
         name: name.ok_or(bad(0, "the manifest has no package name"))?,
@@ -227,11 +261,15 @@ pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, 
         os_release: os.ok_or(bad(0, "the manifest has no [os] release"))?,
         contract: contract.ok_or(bad(0, "the manifest has no [contract] digest"))?,
         artifacts: &arts.items[..arts.len],
+        requires: &arts.reqs[..arts.nreq],
     };
     let mut first: Option<&'static str> = None;
     if !m.validate(|p| { first.get_or_insert(p.field); }) {
         return Err(bad(0, match first {
+            Some("format") if arts.nreq > 0 && format == Some(1) => "a manifest with requirements must be format 2",
             Some("format") => "a manifest format this machine does not read",
+            Some("requires") => "more requirements than a manifest may have",
+            Some("requires.name") => "a package required twice, or a package that requires itself",
             Some("artifact") => "the manifest names no binary",
             Some("artifact.arch") => "the binaries repeat an architecture, or are out of order",
             Some("artifact.size") => "a binary is empty or larger than any package may be",

@@ -54,8 +54,9 @@ pub const ORIGIN_MAX: usize = 1024;
 pub const NAMESPACES_MAX: usize = 8 * 1024;
 /// The most send peers a contract may request and still be installed.
 pub const MAX_PEERS: usize = 8;
-/// The longest peer name kept.
-pub const PEER_MAX: usize = 32;
+/// The longest peer name kept: a whole package name, `publisher/name`, since a package may send to a package it
+/// requires (`docs/developer-services-design.md` 16.2) - a built-in's name is far shorter.
+pub const PEER_MAX: usize = godspeed_package::FULL_MAX;
 
 /// A sentence, bounded, for a row or a log line.
 pub struct Text { b: [u8; 160], n: usize }
@@ -113,6 +114,16 @@ pub struct Checked {
     pub contract: Contract,
     /// What kind of program it is: a service, kept running, or a utility, run for one command line.
     pub kind: Kind,
+    /// The packages it requires installed (`[[requires]]`), the first `nreq` of them.
+    pub reqs: [godspeed_package::Requirement; godspeed_package::MAX_REQUIRES],
+    pub nreq: usize,
+}
+
+impl Checked {
+    /// What it requires installed and running, in the manifest's order.
+    pub fn requires(&self) -> &[godspeed_package::Requirement] {
+        &self.reqs[..self.nreq]
+    }
 }
 
 /// `32MiB`, `512KiB`, `1GiB` or a plain number of bytes.
@@ -288,6 +299,17 @@ pub fn package(ctx: &ServiceContext, publisher: &str, name: &str, version: &str,
     if cname != name || cver != version {
         return Err(text(format_args!("the contract names another service or version than the package")));
     }
+    // A PEER THAT IS A PACKAGE MUST BE REQUIRED (`docs/developer-services-design.md` 16.2). A built-in comes with the
+    // OS; a package someone installs might not be there, and one that sends to it without requiring it would start
+    // and find nobody. The CLI refuses to make such a package; this refuses to install one made some other way.
+    for p in requested.peers().filter(|p| p.contains('/')) {
+        if !man.requires.iter().any(|r| {
+            let n = r.name();
+            p.len() == n.publisher().len() + 1 + n.name().len() && p.starts_with(n.publisher()) && p.ends_with(n.name())
+        }) {
+            return Err(text(format_args!("its contract sends to the package {}, which its manifest does not require", p)));
+        }
+    }
 
     // The binary, every byte of it, handed on as it is hashed.
     let want = match arch { Some(a) => a, None => field("arch ") };
@@ -321,5 +343,8 @@ pub fn package(ctx: &ServiceContext, publisher: &str, name: &str, version: &str,
         return Err(text(format_args!("it is {} and its contract declares `handover` - only a service is replaced live; this one is stopped and started on an upgrade",
             match man.kind { Kind::Driver => "a driver", Kind::App => "an app", Kind::Utility => "a utility", _ => "not a service" })));
     }
-    Ok(Checked { arch: artifact.arch.as_str(), size: artifact.size, contract: requested, kind: man.kind })
+    let mut reqs = [godspeed_package::Requirement::default(); godspeed_package::MAX_REQUIRES];
+    let nreq = man.requires.len().min(reqs.len());
+    reqs[..nreq].copy_from_slice(&man.requires[..nreq]);
+    Ok(Checked { arch: artifact.arch.as_str(), size: artifact.size, contract: requested, kind: man.kind, reqs, nreq })
 }
