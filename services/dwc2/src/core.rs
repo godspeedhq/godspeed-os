@@ -2,7 +2,7 @@
 //! Core bring-up: soft reset, host mode, FIFO sizing, root-port power and reset.
 //!
 //! Slice 1a of the port (`docs/arm32-usb-userspace.md`). This is `dwc2::init()`'s first half, moved
-//! out of ring 0 and rewritten against the SDK's safe `Mmio` wrapper - so the service reaches its
+//! out of ring 0 and rewritten against a safe register wrapper (now `gs::driver`'s `Registers`) - so the service reaches its
 //! registers with no `unsafe` anywhere in `services/` (§18.2), where the kernel version needed a
 //! raw-pointer `read_volatile`/`write_volatile` pair.
 //!

@@ -689,7 +689,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // already owns the NIC by PCI class, and two drivers on one controller is the footgun 6.4's
     // 2026-08-09 amendment records. So these two prove their DEGRADE path - log and idle, never
     // crash (Commandment V) - and not their MMIO path, which `nic-driver` covers on every boot
-    // through the same `Mmio::read32` wrapper.
+    // through the same `Registers::read32`.
     #[cfg(feature = "examples-test")]
     ("e1000", E1000_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     #[cfg(feature = "examples-test")]

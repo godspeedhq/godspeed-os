@@ -18,7 +18,8 @@
 use core::cell::Cell;
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed_sdk::ServiceContext;
 use godspeed_wifi::sdio::{Cmd, Resp, SdioHost, Xfer};
 
 // Registers (`dw_mmc.h`).
@@ -128,7 +129,7 @@ const CCCR_ABORT: u32 = 0x06;
 
 pub struct Host<'a> {
     ctx: &'a ServiceContext,
-    m: &'a Mmio,
+    m: &'a Registers,
     /// The FIRST command after the card's power-up carries `INIT` (80 clocks before it), which a card
     /// needs to finish its own power-up. Linux keys it on `DW_MMC_CARD_NEED_INIT`, set at power-on.
     need_init: Cell<bool>,
@@ -149,7 +150,7 @@ pub struct Host<'a> {
 }
 
 impl<'a> Host<'a> {
-    pub fn new(ctx: &'a ServiceContext, m: &'a Mmio) -> Self {
+    pub fn new(ctx: &'a ServiceContext, m: &'a Registers) -> Self {
         Host {
             ctx,
             m,

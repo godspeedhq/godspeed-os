@@ -300,7 +300,7 @@ fn requested_off_ms(units: u8) -> u64 {
 /// first command - with the host's card clock stopped across the edge, so the card powers up into a quiet
 /// bus. The hold-offs are the device's and live here, not in the kernel (26.10).
 #[cfg(wifi_host_dw_mmc)]
-fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
+fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed::driver::Registers) -> ! {
     use godspeed_wifi::sdio as sd;
     const POWER_HOLD_MS: u64 = 10;
     let h = dwmmc::Host::new(ctx, mmio);
@@ -666,7 +666,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // ---- Stage 1: the register window. -------------------------------------------------------------
     // Numbered because this IS a sequence and each stage can only be reached through the one before
     // it, which is what makes the last line printed the diagnosis.
-    let mmio = match ctx.mmio() {
+    let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
         None => {
             // Not a fault, and it must not read as one. The kernel grants this window only where its

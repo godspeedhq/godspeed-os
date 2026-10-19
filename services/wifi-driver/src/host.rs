@@ -6,7 +6,7 @@
 //! `mmcnr@7e300000`, bus-width 4, `sdio_pins`). The kernel grants this service that one page of
 //! registers at spawn, by device kind (`WIFI_SDIO`) and only when its boot census saw the controller
 //! answer, so every
-//! access below goes through the SDK's safe `Mmio` wrapper and this crate contains no `unsafe`
+//! access below goes through `gs::driver`'s `Registers` and this crate contains no `unsafe`
 //! (§18.1/§18.2).
 //!
 //! ## Why this is a second SDHCI implementation and not a shared one
@@ -34,7 +34,8 @@
 //! moment of failure is captured BEFORE the line reset clears it - without that, a caller logging
 //! `INTERRUPT` after a failure always reads 0 and cannot tell a timeout from an error.
 
-use godspeed_sdk::{Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed_sdk::ServiceContext;
 use godspeed::driver::wait::{self, Budget};
 
 // Register offsets from the controller base. SDHCI-standard; the BCM2711's Arasan is a conforming
@@ -178,7 +179,7 @@ pub struct Host<'a> {
     /// For the clock that bounds the command and data waits (`godspeed::driver::wait`), which take no
     /// `ctx` of their own. `park`, `reset` and `set_clock` are handed one and use that.
     ctx: &'a ServiceContext,
-    m: &'a Mmio,
+    m: &'a Registers,
     /// The controller's base clock in Hz, from the platform. **0 means refuse**, never guess: every
     /// card clock derives from this, the Arasan reports it wrongly in CAPS on this family, and a
     /// divider from a wrong base runs the identification clock at the wrong speed - so nothing
@@ -220,7 +221,7 @@ pub struct Host<'a> {
 }
 
 impl<'a> Host<'a> {
-    pub fn new(ctx: &'a ServiceContext, m: &'a Mmio, base_clock: u32) -> Self {
+    pub fn new(ctx: &'a ServiceContext, m: &'a Registers, base_clock: u32) -> Self {
         Host {
             ctx,
             m,

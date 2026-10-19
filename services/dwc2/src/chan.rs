@@ -2,8 +2,8 @@
 //! Host channels and control transfers.
 //!
 //! Slice 1b of the port (`docs/arm32-usb-userspace.md`): program a host channel, run a DMA transfer,
-//! and compose the three of them into a USB control transfer. Everything here goes through the SDK's
-//! safe `Mmio`/`Dma` wrappers, so the service still carries no `unsafe` (§18.2).
+//! and compose the three of them into a USB control transfer. Everything here goes through
+//! `gs::driver`'s `Registers` and `Arena`, so the service still carries no `unsafe` (§18.2).
 //!
 //! **No cache maintenance, and that is a property of the grant rather than an omission.** The
 //! in-kernel driver this replaced (`arch/arm/dwc2.rs`, since deleted) bracketed every transfer with a
