@@ -2,7 +2,7 @@
 
 **Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
-converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants and their layout, and `xhci` on the grants (step 3). "Current state" below says what exists; the
+converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants and their layout, and `xhci` and `dwc2` on the grants (step 3). "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -712,3 +712,12 @@ inside the ERST page - is the next step, and the largest of any driver. QEMU: `o
 keyboard bound through the confined domain) and, on RISC-V `virt` with a USB disk behind `qemu-xhci`, `drives
 flash data`, a write read back and `drives check` with 0 bad. Built for the Pi 4 and the VisionFive. Owed:
 a card on any board with a USB keyboard - every board but the Pi 2 has one behind `xhci`.
+
+**`dwc2` sixth, its grants only** (the Pi 2). The same change as `xhci`'s, across its nine files; its arena,
+whose layout is per channel and per device, stays at its offsets for now. It found a gap in a build check:
+`scripts/arm_build.py` proves a hardware image carries the VideoCore bus alias by finding the `orr` that
+applies it, and it matched three fixed bytes - one register allocation, `orr r2, r2, #0xC0000000`. Moved onto
+`gs::driver`, the compiler chose `orr r3, r0, ...` and the check said the alias was missing. It now matches
+the instruction by its fields, any registers and condition; a `--qemu` build still verifies as having none.
+QEMU (`raspi2b`, `arm_run.py --usb --usbdisk`): the keyboard connected, `drives flash data`, a write read back,
+`drives check` 0 bad. Owed: a card on the Pi 2.

@@ -13,7 +13,8 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed_sdk::ServiceContext;
 
 use crate::regs::*;
 
@@ -30,7 +31,7 @@ use crate::regs::*;
 ///
 /// The wait is `gs::driver::wait` (`docs/driver-library.md`). Built by hand from `duration_cycles` it
 /// floored to one counter tick on an uncalibrated clock, so every core reset gave up after one look.
-fn wait_until(ctx: &ServiceContext, mmio: &Mmio, off: usize, mask: u32, want_set: bool, ms: u64) -> bool {
+fn wait_until(ctx: &ServiceContext, mmio: &Registers, off: usize, mask: u32, want_set: bool, ms: u64) -> bool {
     wait::until(ctx, Budget::ms(ms), || ((mmio.read32(off) & mask) != 0) == want_set).is_ok()
 }
 
@@ -38,7 +39,7 @@ fn wait_until(ctx: &ServiceContext, mmio: &Mmio, off: usize, mask: u32, want_set
 ///
 /// Reported loudly and treated as fatal by the caller: a driver that cannot find its controller must
 /// say so rather than proceed to program whatever is at that address (invariant 12).
-pub fn identify(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
+pub fn identify(ctx: &ServiceContext, mmio: &Registers) -> Option<u32> {
     let id = mmio.read32(GSNPSID);
     // The Synopsys OTG core IDs read "OT2"/"OT3" in the high half (0x4F54_xxxx).
     if (id & 0xFFFF_F000) != 0x4F54_2000 && (id & 0xFFFF_F000) != 0x4F54_3000 {
@@ -55,7 +56,7 @@ pub fn identify(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
 /// Returns false if any step timed out. Each timeout is reported individually, because "the core did
 /// not reset" and "the core never entered host mode" are different faults with different causes, and
 /// a single "init failed" would merge them.
-pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
+pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Registers) -> bool {
     let mut ok = true;
 
     // 1. Mask + disable global interrupts while we reset.
@@ -233,7 +234,7 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
 }
 
 /// Power the root port and reset whatever is attached. Returns the settled HPRT, or `None` on timeout.
-pub fn port_bring_up(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
+pub fn port_bring_up(ctx: &ServiceContext, mmio: &Registers) -> Option<u32> {
     // HPRT has write-1-to-clear bits mixed in with control bits, so every write must mask the W1C
     // set off first or reading-modifying-writing silently acknowledges events. This is the register
     // that punishes a naive read-modify-write.
@@ -293,7 +294,7 @@ pub fn speed_name(hprt: u32) -> &'static str {
 /// Safe to call from here because this service is SINGLE-THREADED: no other transfer can be mid-flight
 /// while a transmit is executing, and the receive path uses the RX FIFO, not this one. The AHB-idle
 /// wait is required by the programming guide and is the one precondition that is not structural.
-pub fn flush_np_tx_fifo(ctx: &ServiceContext, mmio: &Mmio) -> bool {
+pub fn flush_np_tx_fifo(ctx: &ServiceContext, mmio: &Registers) -> bool {
     if !wait_until(ctx, mmio, GRSTCTL, GRSTCTL_AHBIDLE, true, 100) {
         ctx.log("dwc2-svc: WARN AHB not idle - skipping TX FIFO flush rather than flushing mid-burst");
         return false;

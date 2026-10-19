@@ -91,7 +91,7 @@ fn is_usb_irq(msg: &godspeed_sdk::Message) -> bool {
 /// places an interrupt can be received, so none of them can forget it again.
 #[allow(clippy::too_many_arguments)]
 fn usb_irq(
-    ctx: &ServiceContext, m: &godspeed_sdk::Mmio, d: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, m: &godspeed::driver::Registers, d: &godspeed::driver::Arena,
     nic: Option<&mut (net::Nic, chan::Target)>, radio: Option<&mut rtl::Radio>,
     irq_count: &mut u64, irq_frames: &mut u64,
 ) {
@@ -219,7 +219,7 @@ fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: 
 /// it cannot be answered and silence would leave the client to time out against a clean log.
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
-    ctx: &ServiceContext, m: &godspeed_sdk::Mmio, d: &godspeed_sdk::Dma,
+    ctx: &ServiceContext, m: &godspeed::driver::Registers, d: &godspeed::driver::Arena,
     disk: Option<&mut (msc::Disk, chan::Target, u64)>, nic: Option<&mut (net::Nic, chan::Target)>,
     radio: Option<&mut rtl::Radio>,
     msg: &godspeed_sdk::Message, capless: &mut bool,
@@ -294,12 +294,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // The two hardware grants, reported rather than assumed. A driver that cannot reach its
     // registers is not a degraded driver, it is not a driver at all, and the boot log should say
     // which of the two is missing rather than leaving the reader to infer it from silence.
-    match ctx.mmio() {
+    match godspeed::driver::registers(&ctx) {
         Some(m) => ctx.log_fmt(format_args!(
             "dwc2-svc: MMIO window granted - {} bytes (DWC2 core registers)", m.len())),
         None => ctx.log("dwc2-svc: NO MMIO window - the kernel granted none (hw_device mismatch?)"),
     }
-    match ctx.dma_region() {
+    match godspeed::driver::arena(&ctx) {
         Some(d) => ctx.log_fmt(format_args!(
             "dwc2-svc: DMA arena granted - {} bytes at phys {:#x}", d.len(), d.phys_at(0))),
         None => ctx.log("dwc2-svc: NO DMA arena - the kernel granted none"),
@@ -346,7 +346,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (`usbdev`) and `OP_INFO`'s: different from the last bind, and from a restarted host's where the
     // counter is calibrated and running (`usbfn::next_gen` says where it is not).
     let mut radio_binds: u32 = 0;
-    if let Some(m) = ctx.mmio() {
+    if let Some(m) = godspeed::driver::registers(&ctx) {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
             ctx.log_fmt(format_args!(
@@ -376,7 +376,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // count had to match what the in-kernel driver reported for the same hardware (that
             // driver is deleted now). Anything else means the transfers worked and the parsing did
             // not, which a lone "looks like a hub" would hide.
-            if let Some(d) = ctx.dma_region() {
+            if let Some(d) = godspeed::driver::arena(&ctx) {
                 match enumerate::root_device(&ctx, &m, &d) {
                     Some(dev) => {
                         hub_multi_tt = dev.hub_multi_tt;
@@ -572,7 +572,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // Serving comes FIRST in the pass. A block request is a client blocked waiting on an answer,
     // where a keyboard poll that slips a period costs nothing a human can perceive.
-    if let (Some(m), Some(d)) = (ctx.mmio(), ctx.dma_region()) {
+    if let (Some(m), Some(d)) = (godspeed::driver::registers(&ctx), godspeed::driver::arena(&ctx)) {
         let mut state = hid::KeyState::new(&ctx);
         // Consecutive recoveries with no healthy polling in between, and whether we have already
         // announced giving up. Both reset the moment the keyboard actually works again.

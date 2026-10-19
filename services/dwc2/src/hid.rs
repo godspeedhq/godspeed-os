@@ -12,7 +12,8 @@
 //! was known good.
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::ServiceContext;
 
 use crate::chan::{self, Target};
 
@@ -104,7 +105,7 @@ fn find_boot_keyboard(buf: &[u8], total: usize) -> Option<(u8, Keyboard)> {
 /// `splt` is the split descriptor for this device (0 if it is directly attached), so the same code
 /// serves a keyboard on a hub port and one plugged straight into the root port.
 pub fn bind(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, splt: u32,
 ) -> Option<Keyboard> {
     // TWO ATTEMPTS, because one dropped control transfer used to cost the keyboard entirely.
     //
@@ -168,7 +169,7 @@ fn has_hid_interface(buf: &[u8], total: usize) -> bool {
 }
 
 fn try_bind(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, splt: u32,
 ) -> BindOutcome {
     // The 9-byte header first, for wTotalLength - the full descriptor's length is not knowable in
     // advance and asking for a fixed guess either truncates it or overruns the device's answer.
@@ -232,7 +233,7 @@ fn try_bind(
 /// Returns true if a report arrived. An idle keyboard NAKs, which is a positive answer of "nothing
 /// happened" rather than a failure - so a false here is the normal case and must not be logged.
 pub fn poll(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32, kbd: &Keyboard,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, splt: u32, kbd: &Keyboard,
     state: &mut KeyState, multi_tt: bool,
 ) -> bool {
     let len = (kbd.mps as u32).min(8);

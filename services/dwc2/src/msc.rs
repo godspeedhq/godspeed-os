@@ -11,7 +11,8 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::ServiceContext;
 
 use crate::chan::{self, Target};
 
@@ -127,7 +128,7 @@ fn find_bulk_only(buf: &[u8], total: usize) -> Option<(u8, u8, u16, u8)> {
 ///
 /// Returns `None` for anything else, which is an ordinary outcome and not reported.
 pub fn bind(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, splt: u32,
 ) -> Option<Disk> {
     let mut head = [0u8; 9];
     let get9 = [0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0];
@@ -200,7 +201,7 @@ pub(crate) enum XferErr {
 /// goes BUSY for tens of seconds under load, and a 45-second stall was observed on this branch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bulk_xfer(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
 ) -> Result<u32, XferErr> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
@@ -266,7 +267,7 @@ pub(crate) fn bulk_xfer(
 ///
 /// Returns the bytes moved by the data stage, or `None`.
 pub fn bot(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
     cdb: &[u8], data_in: bool, dlen: usize,
 ) -> Option<usize> {
     const TAG: u32 = 0x1234_5678;
@@ -385,7 +386,7 @@ pub fn bot(
 /// split is the entire difference between a driver that survives this stick and one that resets it
 /// 564 times in a selfcheck.
 fn stage_failed(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
     e: XferErr, what: &str, cdb0: u8,
 ) -> Option<usize> {
     match e {
@@ -415,7 +416,7 @@ fn stage_failed(
 /// machine; clear-halt only unsticks the pipes. Without it a device that lost framing stays lost -
 /// both halts clear, it is still waiting for the rest of a transfer we abandoned, and every following
 /// command fails.
-pub fn recover(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk) {
+pub fn recover(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk) {
     // FRAME THESE WITH EP0'S PACKET SIZE, not the bulk endpoint's.
     //
     // A control transfer framed with 512 instead of EP0's 64 is malformed, so the clear-halt fails
@@ -452,7 +453,7 @@ pub fn recover(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &
 
 /// READ CAPACITY(10): the device's last LBA and block size.
 pub fn read_capacity(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
 ) -> Option<(u64, u32)> {
     let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     bot(ctx, mmio, dma, t, disk, &cdb, true, 8)?;
@@ -469,7 +470,7 @@ pub fn read_capacity(
 
 /// READ(10): one block into the arena's data buffer.
 pub fn read_block(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk, lba: u32, block: u32,
 ) -> bool {
     let cdb = [
         0x28u8, 0,
@@ -497,7 +498,7 @@ pub const STATUS_NO_DISK: u8 = 2;
 
 /// WRITE(10): one block from the arena's data buffer.
 pub fn write_block(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk, lba: u32, block: u32,
 ) -> bool {
     let cdb = [
         0x2Au8, 0,
@@ -542,7 +543,7 @@ fn with_busy_retry(
 /// The reply cap is the ONLY authority to answer (§8.5). A reply that cannot be delivered is said
 /// once (`capless_logged` doubles as that latch) rather than dropped silently.
 pub fn serve(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
     msg: &godspeed_sdk::Message, sectors: u64, reply: gs::cap::Cap,
     capless_logged: &mut bool,
 ) -> bool {

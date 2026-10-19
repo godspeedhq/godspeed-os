@@ -49,7 +49,8 @@
 //! of that interface (rtlwifi's `_usbctrl_vendorreq` and rtl8xxxu's equivalent are the reference for
 //! WHAT the silicon wants, per 26.14); no code copied, and the model here is ours.
 
-use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::{Message, ServiceContext};
 use godspeed_sdk::service_context::usbdev;
 use godspeed as gs;
 use gs::cap::Cap;
@@ -174,7 +175,7 @@ const HS_BULK_MPS: u16 = 512;
 /// it - this host never did, and control transfers worked without it, but a bulk endpoint exists only in a
 /// configured device - with its bulk endpoints found, then milestone 1's two reads. Bound whatever happens, so
 /// `wifi-usb` reaches its registers and says itself what failed.
-pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
+pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
     stop(ctx, mmio);
     let e = configure(ctx, mmio, dma, t)
         .unwrap_or(Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 });
@@ -190,7 +191,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, 
 
 /// Read the configuration descriptor, find the bulk IN endpoint and the bulk OUTs, and SET_CONFIGURATION.
 /// `None`, said, on any failure; an `ep_in` of 0 when it configured but has no high-speed bulk IN.
-fn configure(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<Eps> {
+fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target) -> Option<Eps> {
     const TRIES: u32 = 4;
     let ctl = |setup: &[u8; 8], buf: &mut [u8], data_in: bool, len: usize| -> bool {
         (0..TRIES).any(|i| {
@@ -283,14 +284,14 @@ fn bulk_in(buf: &[u8], total: usize) -> Option<(u8, u16)> {
 
 /// Take the radio's channel down: halted, its interrupt masked, its status cleared. Before a binding and
 /// after a removal, so no IN is left armed at a device that has gone - or at the next one at its address.
-pub fn stop(ctx: &ServiceContext, mmio: &Mmio) {
+pub fn stop(ctx: &ServiceContext, mmio: &Registers) {
     chan::halt(ctx, mmio, CH_RADIO_RX);
     chan::release(mmio, CH_RADIO_RX);
     mmio.write32(HAINTMSK, mmio.read32(HAINTMSK) & !(1 << CH_RADIO_RX));
 }
 
 /// Arm the IN to land at `RADIO_RX_OFF + at`, for the rest of `BULK_IN_MAX`, and let it raise the interrupt.
-fn arm(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, at: usize) {
+fn arm(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, r: &mut Radio, at: usize) {
     let t = Target { addr: r.t.addr, mps: r.in_mps, low_speed: false };
     chan::program(ctx, mmio, &t, CH_RADIO_RX, true, r.pid_in, (usbfn::BULK_IN_MAX - at) as u32,
                   dma.phys_at(RADIO_RX_OFF + at) as u32, r.ep_in as u32, 2, 0);
@@ -315,7 +316,7 @@ fn arm(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, at: usize) {
 /// error is re-run from there too, up to `RX_ERROR_TRIES` in a row; a STALL stops receive, said. Called on
 /// the USB interrupt and once a pass. `true` when it found a halt to retire - what lets the interrupt
 /// handler know the line was this channel's.
-pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> bool {
+pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, r: &mut Radio) -> bool {
     // Notices named in an `OP_SYNC`, again, once the driver is between requests.
     if (r.sync_bulk || r.sync_radio)
         && r.last_req.as_ref().map_or(true, |t| t.passed(ctx, Budget::ms(DRIVER_QUIET_MS)))
@@ -377,7 +378,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> b
 
 /// `OP_BULK_IN`: the held transfer, if any, and the IN armed again. Answers on `reply` itself, with a
 /// buffer of its own, so `serve`'s frame stays the size of a control transfer.
-fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, reply: Cap) {
+fn bulk_in_request(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, r: &mut Radio, reply: Cap) {
     let mut out = [0u8; 2 + usbfn::BULK_IN_MAX];
     out[0] = usbfn::OP_BULK_IN;
     let mut n = 0usize;
@@ -405,7 +406,7 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, 
 /// disk's, by the same transfer the disk uses - one at a time, which is all one service can make - with the
 /// endpoint's toggle carried forward. The radio's IN stands aside for it as for any bulk transfer
 /// (`chan::program_ping`). A status byte.
-fn bulk_out(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, p: &[u8]) -> u8 {
+fn bulk_out(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, r: &mut Radio, p: &[u8]) -> u8 {
     let idx = p.get(1).copied().unwrap_or(u8::MAX) as usize;
     let data = p.get(2..).unwrap_or(&[]);
     if idx >= r.n_out || data.is_empty() || data.len() > usbfn::BULK_OUT_MAX {
@@ -471,7 +472,7 @@ const REG_SYS_ISO_CTRL: u16 = 0x0000;
 /// RETRIED, for the reason recorded at the enumeration retry in `hub.rs`: this controller sequences
 /// transfers in software, so a single XACTERR is a transient on a contended bus rather than a verdict,
 /// and the SAME dongle needed a retry to enumerate on 2026-09-27. Bounded and reported (26.6).
-fn read32(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, reg: u16) -> Option<u32> {
+fn read32(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, reg: u16) -> Option<u32> {
     const TRIES: u32 = 4;
     let setup = [
         DIR_IN,
@@ -548,7 +549,7 @@ const CONTROL_TRIES: u32 = 4;
 /// that is not here included, so a client is
 /// never left to time out against a clean log.
 pub fn serve(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, radio: Option<&mut Radio>, msg: &Message, reply: Cap,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, radio: Option<&mut Radio>, msg: &Message, reply: Cap,
 ) {
     let p = msg.payload_bytes();
     let op = p.first().copied().unwrap_or(0);
@@ -611,7 +612,7 @@ pub fn serve(
 }
 
 /// One control transfer: `p` is `[op, setup(8), data out...]`. Fills `out[1..]` and returns its length.
-fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], tries: u32, out: &mut [u8]) -> usize {
+fn control(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, p: &[u8], tries: u32, out: &mut [u8]) -> usize {
     if p.len() < 9 {
         out[1] = usbfn::ST_BAD_REQUEST;
         return 2;
@@ -660,7 +661,7 @@ fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], t
 /// `0x00000000` and `0xFFFFFFFF` are both treated as failures: a floating bus and a dead chip read as
 /// those, and accepting either would let this report success on a device that never replied. That is
 /// the instrument-that-agrees-with-you failure this project keeps finding, so it is refused up front.
-pub fn probe(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> bool {
+pub fn probe(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target) -> bool {
     let cfg = read32(ctx, mmio, dma, t, REG_SYS_CFG);
     let iso = read32(ctx, mmio, dma, t, REG_SYS_ISO_CTRL);
 
