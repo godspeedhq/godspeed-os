@@ -982,7 +982,7 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
         let mut shown = u64::MAX;
         // Said as the PACKAGE, not the file: `x86_64.elf` is how it is stored, not what is being fetched. And not
         // its arch: a machine fetches only its own, the card after says which, and the line has to fit a screen
-        // (the shell narrows the bar first, `fit_progress`; at 100 columns this name was what was left over).
+        // (the shell draws the bar on its own line, `split_bar`, and cuts the words at the console's width).
         let what = cell(format_args!("{} {}", name, version));
         // From a package file nothing is downloaded: it is copied out of the file, and said so.
         let verb = if s.offline() { "unpacking" } else { "downloading" };
@@ -1001,8 +1001,8 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
                 shown = step;
                 shown_secs = secs;
                 let ms = gs::driver::wait::counter_ms(ctx).saturating_sub(t0_ms);
-                crate::progress(ctx, format_args!("  {} {}  [{}]  {}%  {} / {}  {}  {}{}", verb, what.as_str(), bar(step as usize, 28).as_str(),
-                    got * 100 / total.max(1), size_text(got).as_str(), size_text(total).as_str(), rate_text(got, ms).as_str(),
+                crate::progress(ctx, format_args!("  {} {}  [{}]  {}%  {}  {}  {}{}", verb, what.as_str(), bar(step as usize, 28).as_str(),
+                    got * 100 / total.max(1), of_text(got, total).as_str(), rate_text(got, ms).as_str(),
                     time_text(secs, got, total).as_str(), if got == total { "" } else { "   [q] quit" }));
             }
             let mut rest = bytes;
@@ -1284,6 +1284,15 @@ pub(crate) fn size_text(bytes: u64) -> Cell {
     else { cell(format_args!("{}.{} MiB", bytes >> 20, (bytes & 0xfffff) * 10 >> 20)) }
 }
 
+/// How much of how much, the unit said once when both share it: `2.0 / 9.5 MiB`, `780 B / 9.5 MiB`.
+pub(crate) fn of_text(got: u64, total: u64) -> Cell {
+    let (g, t) = (size_text(got), size_text(total));
+    match (g.as_str().rsplit_once(' '), t.as_str().rsplit_once(' ')) {
+        (Some((gn, gu)), Some((_, tu))) if gu == tu => cell(format_args!("{} / {}", gn, t.as_str())),
+        _ => cell(format_args!("{} / {}", g.as_str(), t.as_str())),
+    }
+}
+
 /// `godspeed list fetched`: what has been fetched here. Columns `package version from size state`, `size` in
 /// bytes so a pipe can compare it; the count and total are the status note. None is no rows.
 pub fn list_fetched(ctx: &ServiceContext, r: &mut Rows) {
@@ -1408,15 +1417,17 @@ pub fn cleanup(ctx: &ServiceContext, r: &mut Rows, delete: bool) {
         if more { "; more are fetched than one listing shows - run it again after" } else { "" }));
 }
 
-/// How long a transfer has taken, and about how long is left: `3 s, about 4 s left`, then `done in 7 s`. The
-/// estimate is the rate so far, and only once a whole second has passed - a guess from the first chunk would be
-/// noise. Seconds, because that is the clock a program is given and the unit a download is felt in.
+/// How long a transfer has taken, or about how long is left: `1 s`, then `about 4 s left`, then `done in 7 s`.
+/// The estimate is the rate so far, and only once a whole second has passed - a guess from the first chunk would
+/// be noise. Seconds, because that is the clock a program is given and the unit a download is felt in. While it
+/// runs only the time LEFT is said: the line has to fit a 102-column console with its bar, and with both times
+/// the bar had no room on the T630 at all (2026-10-19); the time taken is said once, at the end.
 pub(crate) fn time_text(secs: i64, got: u64, total: u64) -> Cell {
     let secs = secs.max(0) as u64;
     if got >= total { return cell(format_args!("done in {}", duration_text(secs).as_str())); }
     if secs == 0 || got == 0 { return duration_text(secs); }
     let left = secs * (total - got) / got;
-    cell(format_args!("{}, about {} left", duration_text(secs).as_str(), duration_text(left.max(1)).as_str()))
+    cell(format_args!("about {} left", duration_text(left.max(1)).as_str()))
 }
 
 /// A duration as a person reads one: `45 s`, `2 min 5 s`, `1 h 3 min`. `1162 s` was the operator's example of

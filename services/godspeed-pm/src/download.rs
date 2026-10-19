@@ -107,9 +107,9 @@ impl<'c> Writer<'c> {
             self.shown_step = step;
             self.shown_secs = secs;
             let ms = gs::driver::wait::counter_ms(self.ctx).saturating_sub(self.t0_ms);
-            crate::progress(self.ctx, format_args!("  downloading {}  [{}]  {}%  {} / {}  {}  {}{}", self.name,
+            crate::progress(self.ctx, format_args!("  downloading {}  [{}]  {}%  {}  {}  {}{}", self.name,
                 crate::packages::bar(step as usize, 28).as_str(), self.got * 100 / self.total.max(1),
-                crate::packages::size_text(self.got).as_str(), crate::packages::size_text(self.total).as_str(),
+                crate::packages::of_text(self.got, self.total).as_str(),
                 crate::packages::rate_text(self.got, ms).as_str(),
                 crate::packages::time_text(secs, self.got, self.total).as_str(),
                 if self.got == self.total { "" } else { "   [q] quit" }));

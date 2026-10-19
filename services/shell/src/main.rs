@@ -16125,13 +16125,12 @@ fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
     }
 }
 
-/// One `godspeed` command's answer, its progress drawn in place on one line until it comes, then cleared.
+/// One `godspeed` command's answer, its progress drawn in place until it comes, then cleared.
 #[inline(never)]
 fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
-    // PROGRESS, drawn in place on one line until the answer comes, then cleared.
-    let drawn = core::cell::Cell::new(false);
-    // The bar's width so far, so every frame draws it at one size (`fit::fit_progress`).
-    let bar = core::cell::Cell::new(usize::MAX);
+    // PROGRESS, drawn in place until the answer comes, then cleared: the words, and the bar under them.
+    // How many lines the last frame drew, 0, 1 or 2: the words, and the bar under them when it had one.
+    let drawn = core::cell::Cell::new(0u8);
     // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
     // the line does not offer it a second time.
     let noticed_first = core::cell::Cell::new(None::<bool>);
@@ -16147,20 +16146,39 @@ fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
         };
         let text = core::str::from_utf8(line).unwrap_or("");
         let text = if already { text.trim_end().trim_end_matches("[q] quit").trim_end() } else { text };
-        let mut fit = [0u8; 192];
-        let mut held = bar.get();
-        let text = fit::fit_progress(text, clip, &mut held, &mut fit);
-        bar.set(held);
-        gs::io::print(ctx, "\r\x1b[2K");
+        // THE BAR ON ITS OWN LINE, under the words and as wide as the console (`fit`): inside them it had no
+        // room on the T630's 102 columns (2026-10-19). The last frame's lines are erased first, the cursor
+        // brought up to the words; it ends on the bar.
+        let mut words = [0u8; 192];
+        let (text, bar) = fit::split_bar(text, &mut words);
+        let text = fit::cut(text, clip);
+        unwind_progress(ctx, drawn.get());
         gs::io::print(ctx, text);
-        drawn.set(true);
+        match bar {
+            Some((filled, cells)) => {
+                let mut row = [0u8; 192];
+                gs::io::print(ctx, "\r\n");
+                gs::io::print(ctx, fit::bar_line(filled, cells, clip, &mut row));
+                drawn.set(2);
+            }
+            None => drawn.set(1),
+        }
         // The line offers `q` itself, so the watch does not print a second notice under it - unless the clip
         // cut the offer off, when the watch's own notice is what tells the reader.
         if !already && text.contains("[q] quit") { ctx.quit_shown(); }
     };
     let built = build_godspeed_table(ctx, line, Some(&show));
-    if drawn.get() { gs::io::print(ctx, "\r\x1b[2K"); }
+    unwind_progress(ctx, drawn.get());
     built
+}
+
+/// Erase a progress frame of `lines` lines (0, 1 or 2), leaving the cursor at the start of the first.
+fn unwind_progress(ctx: &ShellCtx, lines: u8) {
+    match lines {
+        0 => {}
+        1 => gs::io::print(ctx, "\r\x1b[2K"),
+        _ => gs::io::print(ctx, "\r\x1b[2K\x1b[A\r\x1b[2K"),
+    }
 }
 
 /// An answer shown: the card or the list, then its status note. Err when it failed.
