@@ -17,14 +17,16 @@
 //! capabilities - an MMIO window, a DMA arena, and an IRQ line - stated in its
 //! contract for review and granted by the kernel for the device class its spawn
 //! row names (Commandment VII). It writes NO
-//! `unsafe`: every register and DMA access goes through the SDK's audited
-//! `Mmio`/`Dma` wrappers (§18.1, Commandment X).
+//! `unsafe`: every register and DMA access goes through `gs::driver` - its
+//! `Registers` and the named parts of its arena - over the SDK's audited layer
+//! (§18.1, Commandment X).
 
 #![no_std]
 #![no_main]
 
 use godspeed as gs;
-use godspeed_sdk::{ServiceContext, Mmio, Dma, Message};
+use godspeed::driver::{Part, Registers};
+use godspeed_sdk::{ServiceContext, Message};
 
 // --- Device register map (byte offsets into the MMIO window) -----------------
 // Real values come from the device datasheet; these are illustrative.
@@ -41,33 +43,48 @@ const STATUS_READY: u32 = 1 << 0;
 
 const EXPECTED_ID:  u32 = 0xC0FF_EE00; // the device's identity magic (illustrative)
 
+// The one structure this device reads from our arena: a ring, its size and alignment from the
+// datasheet (illustrative). A real driver names every structure it places, each a part of its own.
+const RING_LEN:     usize = 4096;
+const RING_ALIGN:   usize = 4096;
+
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     ctx.log("driver-skeleton: starting");
 
     // 1. Acquire the kernel-granted hardware capabilities. At spawn the kernel
-    //    mapped our device class's MMIO window and a physically-contiguous DMA arena;
-    //    we reach them through the SDK, never a raw pointer and never `unsafe`.
-    //    If the device is absent we DEGRADE (a service is never special,
+    //    mapped our device class's register window and a physically-contiguous DMA
+    //    arena; we reach them through `gs::driver`, never a raw pointer and never
+    //    `unsafe`. If the device is absent we DEGRADE (a service is never special,
     //    Commandment V) instead of panicking.
-    let (mmio, dma) = match (ctx.mmio(), ctx.dma_region()) {
-        (Some(m), Some(d)) => (m, d),
+    let (mmio, ring) = match (gs::driver::registers(&ctx), gs::driver::arena(&ctx)) {
+        (Some(m), Some(a)) => {
+            // Lay the arena out BY NAME: each part a size and an alignment (of the physical
+            // address, which is what the device checks), and no two can overlap. A part that
+            // does not fit is refused here with a sentence naming it; an access past a part
+            // later ends the driver naming it, at the part rather than somewhere beyond it.
+            let mut parts = a.layout();
+            match parts.take("ring", RING_LEN, RING_ALIGN) {
+                Ok(ring) => (m, ring),
+                Err(e) => {
+                    ctx.log_fmt(format_args!("driver-skeleton: {} - idling (degraded)", e));
+                    idle(&ctx)
+                }
+            }
+        }
         _ => {
             ctx.log("driver-skeleton: no device mapped - idling (degraded)");
-            // Drain our IPC endpoint forever (the flood-endpoint discipline): a
-            // registered service that idles without recv'ing lets a queue flood
-            // sit at 16/16 forever. Poll + yield so the core still idles.
-            loop { while gs::ipc::try_recv(&ctx).is_some() {} gs::task::yield_now(&ctx); }
+            idle(&ctx)
         }
     };
 
     // 2. Bring the device up. This runs on EVERY spawn, including a restart - a
     //    driver never assumes the controller kept its state across its own death
     //    (Commandments V + IX). On failure, log loudly and degrade.
-    if !bring_up(&ctx, &mmio, &dma) {
+    if !bring_up(&ctx, &mmio, &ring) {
         ctx.log("driver-skeleton: device bring-up FAILED - idling");
-        loop { while gs::ipc::try_recv(&ctx).is_some() {} gs::task::yield_now(&ctx); }
+        idle(&ctx)
     }
     ctx.log("driver-skeleton: device ready, serving");
 
@@ -75,12 +92,19 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //    (the kernel routes the IRQ here as a message, §12.2), and a client
     //    REQUEST. We WAIT for one of them - never a fixed sleep hoping the device
     //    is done (Commandment VIII: wait for the event, not the clock).
-    serve(&ctx, &mmio, &dma)
+    serve(&ctx, &mmio, &ring)
+}
+
+/// Idle, degraded: drain our IPC endpoint forever (the flood-endpoint discipline) - a registered
+/// service that idles without recv'ing lets a queue flood sit at 16/16 forever. Poll + yield so the
+/// core still idles.
+fn idle(ctx: &ServiceContext) -> ! {
+    loop { while gs::ipc::try_recv(ctx).is_some() {} gs::task::yield_now(ctx); }
 }
 
 /// Reset the device, verify identity, install the DMA ring, enable interrupts.
 /// Returns false if the device never reports ready.
-fn bring_up(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> bool {
+fn bring_up(ctx: &ServiceContext, mmio: &Registers, ring: &Part) -> bool {
     // Identity check: confirm we are talking to the device we expect. Log the raw id
     // with `log_fmt` - the SDK's bounded formatted events (a fixed 256-byte stack buffer,
     // no heap, §26.6.1). Use it for any register/hex value; never hand-roll digit-by-digit
@@ -105,8 +129,8 @@ fn bring_up(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> bool {
     // Build a ring/buffer in OUR DMA arena (the arena is the driver's own, not
     // shared memory - Commandment VI). Hand the device the PHYSICAL address; the
     // device DMAs only inside this arena (IOMMU-confined where present, §6.4).
-    dma.zero();
-    let ring_phys = dma.phys_base();
+    ring.zero();
+    let ring_phys = ring.phys();
     mmio.write32(REG_RING_LO, ring_phys as u32);
     mmio.write32(REG_RING_HI, (ring_phys >> 32) as u32);
 
@@ -121,7 +145,7 @@ fn bring_up(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> bool {
 
 /// Main loop: block on the endpoint for a hardware interrupt or a client request,
 /// handle it, then re-arm. Never returns.
-fn serve(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> ! {
+fn serve(ctx: &ServiceContext, mmio: &Registers, ring: &Part) -> ! {
     let irq = gs::driver::irq::Irq::granted(ctx);
     loop {
         // Block for truth. recv() parks the task until a message arrives, so the
@@ -132,14 +156,14 @@ fn serve(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> ! {
         if is_interrupt(&msg) {
             // The device raised its IRQ: drain what it produced from the ring in
             // our DMA arena, acknowledge (write-1-to-clear), then re-arm the line.
-            let _completed = dma.read32(0);          // e.g. a finished descriptor
+            let _completed = ring.read32(0);         // e.g. a finished descriptor
             mmio.write32(REG_STATUS, mmio.read32(REG_STATUS));
             irq.rearm(ctx);
         } else {
             // A client asked for device work. Do it, then REPLY explicitly - a
             // successful send means queued, not processed (Commandment VIII), so
             // any protocol needing confirmation acknowledges on its own.
-            handle_request(ctx, mmio, dma, &msg);
+            handle_request(ctx, mmio, ring, &msg);
         }
     }
 }
@@ -148,4 +172,4 @@ fn serve(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> ! {
 // A real driver tells an interrupt from a request by the endpoint it arrived on,
 // or by a kernel-set badge; shown here as a placeholder so the shape is clear.
 fn is_interrupt(_msg: &Message) -> bool { false }
-fn handle_request(_ctx: &ServiceContext, _mmio: &Mmio, _dma: &Dma, _msg: &Message) {}
+fn handle_request(_ctx: &ServiceContext, _mmio: &Registers, _ring: &Part, _msg: &Message) {}

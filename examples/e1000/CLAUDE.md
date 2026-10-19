@@ -17,16 +17,16 @@ kernel source change of any kind**.
 
 ## What it demonstrates
 
-| Step | The shape | SDK |
+| Step | The shape | `gs` |
 |------|-----------|-----|
-| Acquire | get the kernel-granted MMIO window for the NIC | `ctx.mmio()` |
-| Read | Device Status (link up?), Receive Address (the MAC) | `Mmio::read32` |
+| Acquire | get the kernel-granted register window for the NIC | `gs::driver::registers` |
+| Read | Device Status (link up?), Receive Address (the MAC) | `Registers::read32` |
 | Report | log link + MAC | `ctx.log` / `ctx.log_fmt` |
 | Degrade | no e1000 mapped -> log and idle, never crash | `gs::ipc::try_recv` + `gs::task::yield_now` |
 
 Registers used (byte offsets into BAR0): `STATUS 0x0008` (bit 1 = Link Up), `RAL0 0x5400` + `RAH0
-0x5404` (the 6-byte MAC the NIC auto-loaded from its EEPROM). Reads go through the SDK `Mmio` wrapper,
-so the driver contains **no `unsafe`**.
+0x5404` (the 6-byte MAC the NIC auto-loaded from its EEPROM). Reads go through `gs::driver`'s
+`Registers`, so the driver contains **no `unsafe`**.
 
 ## Why it is built this way (the Commandments)
 
@@ -44,13 +44,13 @@ so the driver contains **no `unsafe`**.
   > removed it, so the kernel no longer needs to have been taught your device.
 
   The kernel still does its one job - granting a hardware capability - and nothing more. All device
-  logic lives here, in userspace, and the volatile-register `unsafe` stays isolated in the SDK
-  `Mmio` layer (§18.1). *(COMMANDMENTS.md I, X;
+  logic lives here, in userspace, and the volatile-register `unsafe` stays isolated in the SDK's
+  `Mmio` layer under `gs::driver` (§18.1). *(COMMANDMENTS.md I, X;
   CLAUDE.md §4.3, §12, §18.1, §26.10.)*
 - **Commandment VII (no ambient authority, made concrete).** The driver reaches the NIC's registers
   only because its spawn row asked for that device CLASS and the kernel's own bus scan found one. It
   is granted a window, never given the bus. Where no matching device is found the grant never
-  happens, so `ctx.mmio()` returns `None` and the driver touches no foreign hardware.
+  happens, so `gs::driver::registers` returns `None` and the driver touches no foreign hardware.
 
   > **Corrected 2026-09-26.** This said the kernel maps the BAR `if name == "e1000" && the
   > discovered NIC is actually an Intel e1000 (vendor/device 0x100E8086)`. That vendor whitelist is
@@ -83,7 +83,7 @@ log_write = true
 # The NIC's MMIO BAR is granted at spawn only if the supervisor's spawn row for this service names a
 # device CLASS, which the kernel resolves against its own bus scan (the same route xhci, ehci and
 # block-driver take); the examples-test row names none. NOT by name, and NOT from this file: nothing parses TOML at spawn (13.6). Reach
-# the window via ctx.mmio(). A read-only driver needs no DMA arena and no hw_interrupt; a full NIC
+# the window via gs::driver::registers. A read-only driver needs no DMA arena and no hw_interrupt; a full NIC
 # driver would add both (see examples/driver-skeleton for that shape).
 
 # no [placement]: this read-only example takes no interrupt, and its spawn row spawns it unpinned
@@ -118,10 +118,10 @@ of it on every restart (Commandments V + IX). `docs/networking.md` sketches that
 
 ## What you must NOT do
 
-- **Do not write `unsafe` to poke the registers.** Use `ctx.mmio()` + `Mmio::read32`/`write32`. Raw
+- **Do not write `unsafe` to poke the registers.** Use `gs::driver::registers` + `Registers::read32`/`write32`. Raw
   pointers break §18.2 and **Commandment X**.
 - **Do not assume the NIC is an e1000.** The kernel grants a window by device CLASS, not by vendor,
-  so nothing guarantees the registers behind it are an e1000's. Degrade when `ctx.mmio()` is `None`,
+  so nothing guarantees the registers behind it are an e1000's. Degrade when `gs::driver::registers` is `None`,
   and do not trust what you read from a device you have not identified (**Commandment V**).
 - **Do not widen the device class into "any NIC's BAR for anyone".** Ask for the specific class your
   driver was written for; a broad grant is ambient authority (**Commandment VII**).
@@ -132,7 +132,7 @@ of it on every restart (Commandments V + IX). `docs/networking.md` sketches that
 
 To drive a different PCI device: give it a row in the supervisor's spawn table naming its device
 class - or its PCI class CODE, which is how AHCI is addressed - write the service against
-`ctx.mmio()` (and `ctx.dma_region()` / `gs::driver::irq` if it needs DMA or interrupts), and add it
+`gs::driver::registers` (and `gs::driver::arena` / `gs::driver::irq` if it needs DMA or interrupts), and add it
 to the workspace. **No kernel edit.** If your device needs a `HwClass` variant that does not exist
 yet, that is the one case that touches `kernel/`, and it is a new device CLASS rather than a new
 name.

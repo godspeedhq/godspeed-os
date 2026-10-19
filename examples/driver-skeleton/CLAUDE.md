@@ -3,7 +3,7 @@
 How to write a userspace device driver on GodspeedOS. This folder is an annotated **template**: read
 `src/main.rs` top to bottom alongside this doc. It compiles (so `cargo build -p driver-skeleton`
 checks an adaptation), but it is not runnable as-is - the kernel wires a driver's MMIO/DMA/IRQ at
-spawn for the device CLASS its spawn row names, and this one's row names none, so `ctx.mmio()` returns
+spawn for the device CLASS its spawn row names, and this one's row names none, so `gs::driver::registers` returns
 `None` here and it idles. For a concrete
 register-reading driver see `examples/e1000`; for production drivers see `services/block-driver` (AHCI) and
 `services/xhci` (USB).
@@ -17,15 +17,16 @@ compromised driver from taking down the system.
 
 ## What it demonstrates
 
-| Phase | The shape | SDK |
+| Phase | The shape | `gs` |
 |-------|-----------|-----|
-| Acquire | get the kernel-granted MMIO window + DMA arena | `ctx.mmio()`, `ctx.dma_region()` |
-| Bring up | identity-check, reset, poll for ready, install a DMA ring, enable + unmask the IRQ | `Mmio::read32`/`write32`, `Dma::zero`/`phys_base`, `gs::driver::irq::Irq::granted(ctx).rearm(ctx)` (the vector the kernel granted, never a number of ours) |
-| Serve | block for an interrupt or a request, handle it, re-arm | `gs::ipc::recv`, `Mmio`/`Dma` |
+| Acquire | get the kernel-granted register window + DMA arena, and lay the arena out by name | `gs::driver::registers`, `gs::driver::arena`, `Arena::layout`, `Layout::take` |
+| Bring up | identity-check, reset, poll for ready, install a DMA ring, enable + unmask the IRQ | `Registers::read32`/`write32`, `Part::zero`/`phys`, `gs::driver::irq::Irq::granted(ctx).rearm(ctx)` (the vector the kernel granted, never a number of ours) |
+| Serve | block for an interrupt or a request, handle it, re-arm | `gs::ipc::recv`, `Registers`, the ring `Part` |
 | Degrade | no device mapped, or bring-up fails -> log loudly and idle, never panic | `gs::ipc::try_recv` + `gs::task::yield_now` |
 
-Every register and DMA access goes through the SDK's `Mmio`/`Dma` wrappers. The driver itself
-contains no `unsafe`.
+Every register and DMA access goes through `gs::driver`: `Registers` for the window, and a named `Part`
+of the arena for each structure the device reads, bounded to that part. The driver itself contains no
+`unsafe`.
 
 ## Why it is built this way (the Commandments)
 
@@ -37,7 +38,8 @@ where the discipline matters most.
   endpoint, and it grants the MMIO/DMA capabilities at spawn. All device logic - the register dance,
   the ring management, the protocol - lives in the driver, in userspace. The unavoidable `unsafe` of a
   volatile register write does not leak into driver code either: it is isolated to the SDK's audited
-  `Mmio`/`Dma` layer (§18.1), the one place outside the four kernel layers where `unsafe` is allowed.
+  `Mmio`/`Dma` layer under `gs::driver` (§18.1), the one place outside the four kernel layers where `unsafe`
+  is allowed.
   *(COMMANDMENTS.md I, X; CLAUDE.md §4.3, §12, §18.1, §26.10.)*
 - **Commandment VII (no ambient authority).** The kernel grants a driver **only** the window and
   the interrupt of the device class its spawn request names, resolved against the kernel's own bus
@@ -74,11 +76,11 @@ where the discipline matters most.
 
 ```toml
 [capabilities]
-hw_mmio      = ["0xfeb00000+0x1000"]  # for REVIEW: the window of the class the spawn row names; ctx.mmio()
+hw_mmio      = ["0xfeb00000+0x1000"]  # for REVIEW: the window of the class the spawn row names; gs::driver::registers
 hw_interrupt = [11]                    # for REVIEW: the kernel routes the granted class's IRQ (§12.2)
 log_write    = true
 # A DMA arena is granted at spawn when the spawn row names a device CLASS; reach it via
-# ctx.dma_region(). A new driver needs a spawn row, not a kernel change (see "How to adapt this").
+# gs::driver::arena. A new driver needs a spawn row, not a kernel change (see "How to adapt this").
 
 # [placement]
 # core = 1   # a REAL driver pins: its interrupt routes to the core it runs on. Commented out
@@ -87,7 +89,7 @@ log_write    = true
 
 ## What you must NOT do
 
-- **Do not write `unsafe` in driver code.** Every hardware access goes through `Mmio`/`Dma`. Reaching
+- **Do not write `unsafe` in driver code.** Every hardware access goes through `gs::driver`. Reaching
   for a raw pointer breaks §18.2 and **Commandment X** - the unavoidable `unsafe` belongs in the SDK,
   which is audited, not scattered through each driver.
 - **Do not busy-sleep waiting for the device.** A `sleep(some_guess)` instead of polling the ready bit
