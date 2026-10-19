@@ -3853,6 +3853,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     let waited = gs::driver::wait::ticks(&ctx).wrapping_sub(start) / ticks_ms(&ctx, 1).max(1);
                     ctx.log_fmt(format_args!("net-stack: connect waited {} ms for a closing connection's slot - {}", waited,
                         if tcpst.has_free_slot() { "freed" } else { "still full" }));
+                    if !tcpst.has_free_slot() { tcpst.log_slots(&ctx); }
                 }
                 // STILL FULL: a connection whose client has not used it in RECLAIM_IDLE_MS was abandoned - its program
                 // was ended without closing it - and its slot is taken for this one. Said, with how long it sat.

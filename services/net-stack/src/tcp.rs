@@ -105,6 +105,9 @@ pub const RTO_MAX_MS: u64 = 8_000;
 /// Retransmissions of one segment before the connection is declared dead. Bounded on purpose: a
 /// retry loop with no limit is an unbounded wait wearing a disguise (§26.6).
 pub const MAX_RETX: u8 = 6;
+/// How long a fin-wait-2 whose client has closed it waits for the peer's FIN before its slot is let go. As
+/// long as TIME_WAIT here, and inside the 4 s a connect waits for a closing slot.
+pub const FIN_WAIT_2_MS: u64 = 2_000;
 // ── Wire constants ─────────────────────────────────────────────────────────────────────────────
 
 pub const FIN: u8 = 0x01;
@@ -1024,6 +1027,18 @@ impl Tcp {
         Some((rid, idle))
     }
 
+    /// Each slot, for a log line when the table stays full: its state, whether it is owned, its unread and
+    /// unsent bytes, whether its client closed it, and how long since its client touched it.
+    pub fn log_slots(&self, ctx: &ServiceContext) {
+        let now = self.now_ms(ctx).unwrap_or(0);
+        for (i, c) in self.conns.iter().enumerate() {
+            ctx.log_fmt(format_args!(
+                "net-stack:   slot {}: {} {}, {} unread, {} unsent, client {}, untouched {} ms",
+                i, c.state.name(), if c.rid != 0 { "owned" } else { "unowned" }, c.rcv_len, c.snd_len,
+                if c.reader_gone { "closed it" } else { "has not closed it" }, now.saturating_sub(c.used_ms)));
+        }
+    }
+
     /// Release a slot outright: the capability was revoked or the client vanished.
     pub fn forget(&mut self, rid: u64) {
         if let Some(c) = self.by_rid(rid) { c.reset(); }
@@ -1783,6 +1798,13 @@ impl Tcp {
 
                     if c.state == State::FinWait1 && c.snd_una == c.snd_nxt {
                         c.state = State::FinWait2;
+                        // ORPHANED, SO BOUNDED: our FIN is acknowledged, everything sent has arrived, and a client
+                        // that closed will read nothing more - only the peer's FIN is left, and a server need not
+                        // send it soon. With two slots, a fin-wait-2 that waited on it held a slot 9 to 18 s and
+                        // the next `godspeed` command was refused (QEMU, 2026-10-19). As Linux bounds an orphan with
+                        // its FIN timeout, this one closes after FIN_WAIT_2_MS, inside the wait a connect gives a
+                        // closing slot.
+                        if c.reader_gone { c.state_deadline_ms = now + FIN_WAIT_2_MS; }
                     } else if c.state == State::LastAck && c.snd_una == c.snd_nxt {
                         c.state = State::Closed;
                         return 0;
@@ -1890,6 +1912,7 @@ impl Tcp {
             match c.state {
                 State::SynSent => { c.fault = Fault::ConnectTimeout; c.state = State::Closed; return 0; }
                 State::TimeWait => { c.state = State::Closed; return 0; }
+                State::FinWait2 => { c.state = State::Closed; return 0; }
                 _ => c.state_deadline_ms = 0,
             }
         }
