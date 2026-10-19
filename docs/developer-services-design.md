@@ -1316,7 +1316,7 @@ trusted through the registry rather than through a new kind of trust.
 
 ### 15.1 What a `.gsp` is
 
-**A slice of the registry, in a file.** It holds the very documents a fetch reads, under the very paths the
+`.gsp` stands for GodspeedOS Package. **A slice of the registry, in a file.** It holds the very documents a fetch reads, under the very paths the
 registry serves them at:
 
 ```text
