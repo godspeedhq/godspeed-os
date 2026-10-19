@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // No `unsafe` in this crate, enforced by the compiler (CLAUDE.md 18.2): registers and DMA memory are
-// reached through the SDK's safe `Mmio` and `Dma`. `deny` rather than `forbid` for one reason - the
+// reached through `gs::driver`'s `Registers` and arena parts. `deny` rather than `forbid` for one reason - the
 // exported `service_main` symbol needs `#[allow(unsafe_code)]`, because a `#[no_mangle]` declaration is
 // itself covered by this lint (a colliding symbol is a soundness hole). `forbid` cannot be relaxed there.
 #![deny(unsafe_code)]
@@ -39,8 +39,8 @@ use godspeed_audio::settings::{self, Settings};
 use godspeed_audio::sine::Sine;
 use godspeed_audio::sounds::{self, Chime};
 use godspeed_audio::wire;
-use godspeed_sdk::mmio::Mmio;
-use godspeed_sdk::{Dma, Message, ServiceContext};
+use godspeed::driver::{Arena, Part, Registers};
+use godspeed_sdk::{Message, ServiceContext};
 
 // ---- Controller registers (HDA 1.0a section 3.3) ----------------------------------------------------
 const GCAP: usize = 0x00; // u16: output/input/bidirectional stream counts, 64-bit support
@@ -234,18 +234,52 @@ const MAX_WIDGETS: usize = 64;
 /// another, then the DAC. Real codecs are two or three hops.
 const MAX_PATH: usize = 4;
 
-// ---- The DMA arena (offsets from its base; every structure 128-byte aligned, HDA 1.0a 3.3) ----------
+// ---- The DMA arena (every structure 128-byte aligned, HDA 1.0a 3.3) ------------------------------------
 //
-// Hand-written, like the arena tables in `xhci`, `ehci`, `nic-driver`, `dwmac` and `genet`: that makes it
-// the SIXTH copy of something already found repeated, and a library candidate (docs/audio.md, "The plan").
-// Recorded here so the copy is a finding, not an oversight.
-const CORB_OFF: usize = 0x0000; // 256 entries x 4 bytes
-const RIRB_OFF: usize = 0x0400; // 256 entries x 8 bytes
-const BDL_OFF: usize = 0x0C00; // BDL_ENTRIES x 16 bytes
-const PCM_OFF: usize = 0x1000; // the cyclic buffer of sound
+// Laid out by name through `gs::driver::arena` (`docs/driver-library.md` step 3) - it was the sixth
+// hand-written copy of an arena table (docs/audio.md, "The plan"). The parts land where the offsets did:
+// the CORB at 0x0, the RIRB at 0x400, the buffer descriptor list at 0xC00 and the sound at 0x1000.
+const CORB_LEN: usize = 256 * 4;
+const RIRB_LEN: usize = 256 * 8;
 const PCM_LEN: usize = 64 * 1024;
 const BDL_ENTRIES: usize = 4; // the ring as four 16 KiB periods
-const ARENA_NEEDED: usize = PCM_OFF + PCM_LEN;
+
+/// The arena's four parts. An access past one ends the driver naming it.
+struct Parts {
+    corb: Part,
+    rirb: Part,
+    bdl: Part,
+    pcm: Part,
+}
+
+impl Parts {
+    fn zero(&self) {
+        for p in [&self.corb, &self.rirb, &self.bdl, &self.pcm] { p.zero(); }
+    }
+}
+
+/// Lay the arena out, said once; `None`, said with the part that did not fit, is treated as no arena.
+fn lay_out(ctx: &ServiceContext, a: Arena) -> Option<Parts> {
+    let mut l = a.layout();
+    let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>(Parts {
+        corb: l.take("CORB", CORB_LEN, 128)?,
+        rirb: l.take("RIRB", RIRB_LEN, 128)?,
+        bdl: l.take("buffer descriptor list", BDL_ENTRIES * 16, 128)?,
+        pcm: l.take("sound", PCM_LEN, 4096)?,
+    }))();
+    match laid {
+        Ok(p) => {
+            ctx.log_fmt(format_args!(
+                "audio-driver: arena laid out - CORB at {:#x}, RIRB at {:#x}, buffer descriptors at {:#x}, sound at {:#x} ({} of {} bytes)",
+                p.corb.offset(), p.rirb.offset(), p.bdl.offset(), p.pcm.offset(), l.used(), l.len()));
+            Some(p)
+        }
+        Err(e) => {
+            ctx.log_fmt(format_args!("audio-driver: {} - treated as no arena", e));
+            None
+        }
+    }
+}
 
 // ---- The sound -----------------------------------------------------------------------------------------
 const RATE: u32 = 48_000;
@@ -280,8 +314,8 @@ const SERVE_WAIT: Budget = Budget::ms(3_600_000);
 /// set up, the CORB and RIRB after.
 struct Hda<'a> {
     ctx: &'a ServiceContext,
-    m: &'a Mmio,
-    dma: Option<&'a Dma>,
+    m: &'a Registers,
+    dma: Option<&'a Parts>,
     corb_wp: u16,
     rirb_rp: u16,
     /// The last `TRACE_LEN` verbs and their answers, for `audio debug trace` - exactly what was said to
@@ -303,7 +337,7 @@ struct Traced {
 const TRACE_LEN: usize = 64;
 
 impl<'a> Hda<'a> {
-    fn new(ctx: &'a ServiceContext, m: &'a Mmio) -> Self {
+    fn new(ctx: &'a ServiceContext, m: &'a Registers) -> Self {
         Hda { ctx, m, dma: None, corb_wp: 0, rirb_rp: 0, trace: [Traced { verb: 0, answer: None }; TRACE_LEN], verbs: 0, verbs_failed: 0 }
     }
 
@@ -359,18 +393,18 @@ impl<'a> Hda<'a> {
 
     /// Put the verb on the CORB after the last one written, and take its answer off the RIRB. An
     /// UNSOLICITED response (a codec reporting a jack, say) is passed over: it answers nobody's verb.
-    fn send_ring(&mut self, d: &Dma, word: u32) -> Option<u32> {
+    fn send_ring(&mut self, d: &Parts, word: u32) -> Option<u32> {
         let (ctx, m) = (self.ctx, self.m);
         let wp = (self.corb_wp + 1) % 256;
-        d.write32(CORB_OFF + wp as usize * 4, word);
+        d.corb.write32(wp as usize * 4, word);
         self.corb_wp = wp;
         m.write16(CORBWP, wp);
         let mut deadline = wait::Deadline::start(ctx, RESPONSE_WAIT);
         loop {
             if m.read16(RIRBWP) & 0xFF != self.rirb_rp {
                 self.rirb_rp = (self.rirb_rp + 1) % 256;
-                let at = RIRB_OFF + self.rirb_rp as usize * 8;
-                let (resp, ext) = (d.read32(at), d.read32(at + 4));
+                let at = self.rirb_rp as usize * 8;
+                let (resp, ext) = (d.rirb.read32(at), d.rirb.read32(at + 4));
                 m.write8(RIRBSTS, 0x05); // response interrupt and overrun flags, write-1-to-clear
                 if ext & RIRB_UNSOLICITED == 0 {
                     return Some(resp);
@@ -389,7 +423,7 @@ impl<'a> Hda<'a> {
 }
 
 /// Reset the controller and the link, and return the codec presence mask (STATESTS).
-fn reset(ctx: &ServiceContext, m: &Mmio) -> Option<u16> {
+fn reset(ctx: &ServiceContext, m: &Registers) -> Option<u16> {
     m.write16(STATESTS, 0x7FFF); // write-1-to-clear: forget any codec seen before this reset
     m.write32(GCTL, m.read32(GCTL) & !GCTL_CRST);
     if wait::until(ctx, CRST_WAIT, || m.read32(GCTL) & GCTL_CRST == 0).is_err() {
@@ -623,7 +657,7 @@ fn log_path(ctx: &ServiceContext, cad: u32, nodes: &[u32], dev: u32, cfg: u32) {
 /// next codec command goes through them. A pointer reset the controller does not acknowledge is
 /// reported and passed over, as Linux does ("CORB reset timeout"); a ring that will not stop or start
 /// is a failure, and commands stay on the immediate path.
-fn start_rings<'a>(h: &mut Hda<'a>, d: &'a Dma) -> bool {
+fn start_rings<'a>(h: &mut Hda<'a>, d: &'a Parts) -> bool {
     let (ctx, m) = (h.ctx, h.m);
     m.write8(CORBCTL, 0);
     m.write8(RIRBCTL, 0);
@@ -637,8 +671,8 @@ fn start_rings<'a>(h: &mut Hda<'a>, d: &'a Dma) -> bool {
             m.read8(CORBSIZE), m.read8(RIRBSIZE)));
         return false;
     }
-    let corb = d.phys_at(CORB_OFF);
-    let rirb = d.phys_at(RIRB_OFF);
+    let corb = d.corb.phys();
+    let rirb = d.rirb.phys();
     m.write32(CORBLBASE, corb as u32);
     m.write32(CORBUBASE, (corb >> 32) as u32);
     m.write8(CORBSIZE, RING_SIZE_256);
@@ -830,7 +864,7 @@ fn configure_path(h: &mut Hda, p: &OutPath) -> bool {
 }
 
 /// Fill `bytes` of the ring from absolute offset `from`, with tone while any remains and silence after.
-fn fill(d: &Dma, from: usize, bytes: usize, tone: &mut Sine, tone_left: &mut usize) {
+fn fill(d: &Parts, from: usize, bytes: usize, tone: &mut Sine, tone_left: &mut usize) {
     let mut at = from;
     while at < from + bytes {
         let s = if *tone_left > 0 {
@@ -840,7 +874,7 @@ fn fill(d: &Dma, from: usize, bytes: usize, tone: &mut Sine, tone_left: &mut usi
             0
         };
         let v = s as u16 as u32;
-        d.write32(PCM_OFF + at % PCM_LEN, v | v << 16);
+        d.pcm.write32(at % PCM_LEN, v | v << 16);
         at += FRAME_BYTES;
     }
 }
@@ -904,7 +938,7 @@ struct Amp {
 /// The playing half of the driver: the codec path, what the operator asked for, and a tone if one plays.
 struct Player<'a> {
     h: Hda<'a>,
-    d: &'a Dma,
+    d: &'a Parts,
     /// The output playing now - one of `outputs`.
     path: OutPath,
     /// Every output the codec offers, for `audio outputs` and `audio output`.
@@ -1126,10 +1160,10 @@ impl<'a> Player<'a> {
         }
         let period = PCM_LEN / BDL_ENTRIES;
         for i in 0..BDL_ENTRIES {
-            let e = BDL_OFF + i * 16;
-            d.write64(e, d.phys_at(PCM_OFF + i * period));
-            d.write32(e + 8, period as u32);
-            d.write32(e + 12, BDL_IOC);
+            let e = i * 16;
+            d.bdl.write64(e, d.pcm.phys_at(i * period));
+            d.bdl.write32(e + 8, period as u32);
+            d.bdl.write32(e + 12, BDL_IOC);
         }
         let fmt = if rate == 44_100 { FMT_44K1_16_STEREO } else { FMT_48K_16_STEREO };
         // The converter must agree with the stream, or it plays at the wrong speed.
@@ -1137,7 +1171,7 @@ impl<'a> Player<'a> {
         if self.h.verb16(cad, dac, SET_CONVERTER_FORMAT, fmt).is_none() {
             return false;
         }
-        let bdl = d.phys_at(BDL_OFF);
+        let bdl = d.bdl.phys();
         m.write32(sd + SD_BDPL, bdl as u32);
         m.write32(sd + SD_BDPU, (bdl >> 32) as u32);
         m.write32(sd + SD_CBL, PCM_LEN as u32);
@@ -1197,7 +1231,7 @@ impl<'a> Player<'a> {
         }
         for i in 0..PCM_LEN / FRAME_BYTES {
             let v = chime.next().unwrap_or(0) as u16 as u32;
-            self.d.write32(PCM_OFF + i * FRAME_BYTES, v | v << 16);
+            self.d.pcm.write32(i * FRAME_BYTES, v | v << 16);
         }
         let bytes = frames * FRAME_BYTES;
         self.tone = Some(Tone {
@@ -1286,7 +1320,7 @@ impl<'a> Player<'a> {
         for i in 0..n {
             let l = u16::from_le_bytes([data[i * per], data[i * per + 1]]) as u32;
             let r = if f.channels == 2 { u16::from_le_bytes([data[i * per + 2], data[i * per + 3]]) as u32 } else { l };
-            d.write32(PCM_OFF + (t.filled + i * FRAME_BYTES) % PCM_LEN, l | r << 16);
+            d.pcm.write32((t.filled + i * FRAME_BYTES) % PCM_LEN, l | r << 16);
         }
         t.filled += n * FRAME_BYTES;
         f.last_feed = wait::ticks(ctx);
@@ -1680,8 +1714,8 @@ impl<'a> Player<'a> {
             match (fmt >> 4) & 0x7 { 0 => 8, 1 => 16, 2 => 20, 3 => 24, 4 => 32, _ => 0 }, (fmt & 0xF) + 1);
         let _ = writeln!(w, "BDL at       {:#010x}{:08x}", m.read32(sd + SD_BDPU), m.read32(sd + SD_BDPL));
         for i in 0..BDL_ENTRIES {
-            let e = BDL_OFF + i * 16;
-            let _ = writeln!(w, "  entry {}    address {:#012x}, {} bytes, flags {:#x}", i, d.read64(e), d.read32(e + 8), d.read32(e + 12));
+            let e = i * 16;
+            let _ = writeln!(w, "  entry {}    address {:#012x}, {} bytes, flags {:#x}", i, d.bdl.read64(e), d.bdl.read32(e + 8), d.bdl.read32(e + 12));
         }
         match self.tone.as_ref() {
             Some(t) => {
@@ -1720,7 +1754,7 @@ fn debug_trace(h: &Hda, w: &mut wire::Page) {
 }
 
 /// The controller's global registers: the first look when nothing works.
-fn debug_registers(m: &Mmio, w: &mut wire::Page) {
+fn debug_registers(m: &Registers, w: &mut wire::Page) {
     use core::fmt::Write;
     let gcap = m.read16(GCAP);
     let _ = writeln!(w, "GCAP      {:#06x}: {} output, {} input, {} bidirectional stream(s), 64-bit {}",
@@ -1909,8 +1943,8 @@ fn bad(out: &mut [u8]) -> usize {
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "audio-driver");
-    let mmio = ctx.mmio();
-    let dma = ctx.dma_region();
+    let mmio = godspeed::driver::registers(&ctx);
+    let dma = godspeed::driver::arena(&ctx).and_then(|a| lay_out(&ctx, a));
     let irq = Irq::granted(&ctx);
     let dev = match (mmio.as_ref(), dma.as_ref()) {
         (None, _) => {
@@ -1924,7 +1958,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
 /// Reset the controller, survey the codecs, start the command rings and set up the output path. What
 /// comes back is either a player, ready and idle, or the reason there is none.
-fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> Device<'a> {
+fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Registers, dma: Option<&'a Parts>) -> Device<'a> {
     let gcap = m.read16(GCAP);
     ctx.log_fmt(format_args!(
         "audio-driver: HD Audio {}.{}, {} output / {} input / {} bidirectional stream(s), window {} bytes",
@@ -1965,12 +1999,6 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: &'a Mmio, dma: Option<&'a Dma>) -> D
         ctx.log("audio-driver: no DMA arena was granted - the survey is all this driver can do");
         return Device::Surveyed(wire::no_device::NO_ARENA, h, path);
     };
-    if d.len() < ARENA_NEEDED {
-        ctx.log_fmt(format_args!(
-            "audio-driver: the DMA arena is {} bytes and this driver needs {} - stopping after the survey",
-            d.len(), ARENA_NEEDED));
-        return Device::Surveyed(wire::no_device::NO_ARENA, h, path);
-    }
     d.zero();
     if !start_rings(&mut h, d) {
         return Device::Surveyed(wire::no_device::BRINGUP_FAILED, h, path);

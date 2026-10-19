@@ -2,7 +2,7 @@
 
 **Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
-converted to the first three across all four ports, and AHCI, GENET and `nic-driver`'s e1000 and RTL8168 on the grants (step 3). "Current state" below says what exists; the
+converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants (step 3). "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -699,3 +699,8 @@ the offsets were: `tx ring at 0x0, tx buffer at 0x1000, rx ring at 0x2000, rx bu
 offsets, and four entries left Commandment III's duplicate-constant debt with them (`dwmac` keeps its own).
 QEMU (the e1000): `osdev test download` 13/0, `godspeed` 166/0, `shell` 276/0. Owed: the RTL8168 on the T630
 and the Wyse.
+
+**`audio-driver` fourth.** Four parts at HDA's 128-byte alignment, the sound page-aligned: `CORB at 0x0, RIRB
+at 0x400, buffer descriptors at 0xc00, sound at 0x1000 (69632 of 98304 bytes)`. Its own size check
+(`ARENA_NEEDED`) is the layout's refusal now, so an arena too small says which part did not fit. QEMU: `osdev
+test audio` 69/0, the WAV read back. Owed: a card on the Wyse and the T630.

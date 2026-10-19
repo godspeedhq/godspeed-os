@@ -66,10 +66,10 @@ reach the SDK for, found repeated in real drivers as `docs/driver-library.md` re
 the 2026-10-11 survey:
 
 - **An arena layout.** 107 `phys_at` calls across 17 files carve DMA arenas by hand-kept offset constants
-  (`audio-driver`'s `CORB_OFF`, `dwmac`'s `TX_RING_OFF`, and `block-driver`'s AHCI offsets until 2026-10-19), with
+  (`dwmac`'s `TX_RING_OFF`, and `block-driver`'s, `nic-driver`'s and `audio-driver`'s offsets until 2026-10-19), with
   nothing checking that the pieces do not overlap or fit the granted arena. A layout of named, aligned,
   bounds-checked regions, fixed at start, fails loudly at spawn instead. **Built 2026-10-19** as
-  `gs::driver::arena` (`Layout::take`, `Part`), with `gs::driver::registers`; AHCI and GENET converted first
+  `gs::driver::arena` (`Layout::take`, `Part`), with `gs::driver::registers`; AHCI, GENET, `nic-driver` and `audio-driver` converted first
   (`docs/driver-library.md` step 3).
 - **Taking the grants.** Nine drivers each handle "no window or arena granted" in their own words. The
   shared part is taking both and saying plainly what is missing; what to do then stays the driver's.
