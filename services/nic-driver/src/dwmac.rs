@@ -31,7 +31,8 @@
 
 use crate::dwmac_ring::Dwmac;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::{Message, ServiceContext};
 
 // The radio as the link's second backend (`radio.rs`), shared with the Pi 4's GENET - see the note where
 // `genet.rs` includes it. The VisionFive gained it in phase V6 (`docs/wifi-aic8800.md`): its AIC8800
@@ -108,7 +109,7 @@ const MDIO_US: u64 = 10_000;
 /// The wait is `gs::driver::wait` (`docs/driver-library.md`). This file had its own copy, with its own
 /// uncalibrated ceiling of 20,000 looks; the library's is the 200,000 the network drivers settled on,
 /// and on such a machine either is a count of looks, not a time.
-fn mdio_idle(ctx: &ServiceContext, m: &Mmio) -> bool {
+fn mdio_idle(ctx: &ServiceContext, m: &Registers) -> bool {
     wait::until(ctx, Budget::us(MDIO_US), || m.read32(GMAC_MDIO_ADDR) & MDIO_BUSY == 0).is_ok()
 }
 
@@ -118,7 +119,7 @@ fn mdio_idle(ctx: &ServiceContext, m: &Mmio) -> bool {
 /// register, write the address register with BUSY set, wait for BUSY to clear, read the data. That
 /// FIRST wait is not redundant - it is what makes a second caller safe after a first one timed out,
 /// which is precisely the state this function can leave the bus in.
-fn mdio_read(ctx: &ServiceContext, m: &Mmio, phy: u32, reg: u32) -> Option<u16> {
+fn mdio_read(ctx: &ServiceContext, m: &Registers, phy: u32, reg: u32) -> Option<u16> {
     if !mdio_idle(ctx, m) {
         return None;
     }
@@ -141,7 +142,7 @@ fn mdio_read(ctx: &ServiceContext, m: &Mmio, phy: u32, reg: u32) -> Option<u16> 
 /// which is how a READ is issued on that bus; nothing else on the part is touched. So it cannot
 /// leave the controller in a state a later bring-up has to undo, and it cannot make the board worse
 /// than it found it.
-pub fn identify(ctx: &ServiceContext, mmio: Option<&Mmio>) {
+pub fn identify(ctx: &ServiceContext, mmio: Option<&Registers>) {
     let Some(m) = mmio else {
         ctx.log("nic-driver: dwmac - no register window was granted; nothing to identify");
         return;
@@ -251,7 +252,7 @@ const LOCAL_MAC: [u8; 6] = [0x02, 0x47, 0x53, 0x56, 0x46, 0x01];
 /// gets a plausible wrong answer out of a register that means something else there. The standard
 /// path is the arithmetic every driver does: intersect what we advertised with what the partner
 /// advertised, and take the best mode both agreed to.
-pub fn link(ctx: &ServiceContext, m: &Mmio, phy: u32) -> (bool, u32, bool) {
+pub fn link(ctx: &ServiceContext, m: &Registers, phy: u32) -> (bool, u32, bool) {
     let Some(first) = mdio_read(ctx, m, phy, PHY_BMSR) else {
         return (false, 0, false);
     };
@@ -292,7 +293,7 @@ pub fn link(ctx: &ServiceContext, m: &Mmio, phy: u32) -> (bool, u32, bool) {
 
 /// Drive the DesignWare MAC. Never returns.
 pub fn dwmac_main(ctx: ServiceContext) -> ! {
-    let (Some(m), Some(a)) = (ctx.mmio(), ctx.dma_region()) else {
+    let (Some(m), Some(a)) = (godspeed::driver::registers(&ctx), godspeed::driver::arena(&ctx)) else {
         ctx.log("nic-driver: no dwmac register window or DMA arena granted - serving empty replies");
         crate::serve_status(&ctx, &[0u8; 8]);
     };
@@ -362,12 +363,12 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
 /// The MAC, up or not. Down keeps the grant, so a cable can bring it up later without a respawn.
 enum Wire {
     Up(Dwmac),
-    Down(Mmio, Dma),
+    Down(Registers, Arena),
 }
 
 impl Wire {
     /// The register window, for the PHY's link (MDIO goes through the MAC's registers either way).
-    fn m(&self) -> &Mmio {
+    fn m(&self) -> &Registers {
         match self {
             Wire::Up(d) => &d.m,
             Wire::Down(m, _) => m,
@@ -716,7 +717,7 @@ const DELAY_CODE: u16 = ((DELAY_PS / DELAY_STEP_PS) & 0xf) as u16;
 
 /// Write one clause-22 register. Same sequence as a read with the write opcode, and the data
 /// register loaded before the address register starts the transfer.
-fn mdio_write(ctx: &ServiceContext, m: &Mmio, phy: u32, reg: u32, val: u16) -> bool {
+fn mdio_write(ctx: &ServiceContext, m: &Registers, phy: u32, reg: u32, val: u16) -> bool {
     if !mdio_idle(ctx, m) {
         return false;
     }
@@ -730,14 +731,14 @@ fn mdio_write(ctx: &ServiceContext, m: &Mmio, phy: u32, reg: u32, val: u16) -> b
     mdio_idle(ctx, m)
 }
 
-fn ytphy_read_ext(ctx: &ServiceContext, m: &Mmio, phy: u32, ext: u16) -> Option<u16> {
+fn ytphy_read_ext(ctx: &ServiceContext, m: &Registers, phy: u32, ext: u16) -> Option<u16> {
     if !mdio_write(ctx, m, phy, YTPHY_PAGE_SELECT, ext) {
         return None;
     }
     mdio_read(ctx, m, phy, YTPHY_PAGE_DATA)
 }
 
-fn ytphy_write_ext(ctx: &ServiceContext, m: &Mmio, phy: u32, ext: u16, val: u16) -> bool {
+fn ytphy_write_ext(ctx: &ServiceContext, m: &Registers, phy: u32, ext: u16, val: u16) -> bool {
     mdio_write(ctx, m, phy, YTPHY_PAGE_SELECT, ext) && mdio_write(ctx, m, phy, YTPHY_PAGE_DATA, val)
 }
 
@@ -751,7 +752,7 @@ fn ytphy_write_ext(ctx: &ServiceContext, m: &Mmio, phy: u32, ext: u16, val: u16)
 /// A speed we do not recognise leaves the bit ALONE rather than clearing it. Clearing would be a
 /// guess dressed as a decision, and the failure it produces is the invisible one described on
 /// `RC1R_TX_CLK_SEL_INVERTED`.
-pub fn configure_tx_clk_edge(ctx: &ServiceContext, m: &Mmio, phy: u32, speed: u32) {
+pub fn configure_tx_clk_edge(ctx: &ServiceContext, m: &Registers, phy: u32, speed: u32) {
     if !TX_CLK_ADJ_ENABLED {
         return;
     }
@@ -794,7 +795,7 @@ pub fn configure_tx_clk_edge(ctx: &ServiceContext, m: &Mmio, phy: u32, speed: u3
 /// Returns false when the PHY is not the part this knows how to configure, when MDIO failed, or when
 /// a delay register did not read back as written - the first two leave the link exactly as it was;
 /// the last means a write landed but did not take.
-pub fn configure_phy_delays(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
+pub fn configure_phy_delays(ctx: &ServiceContext, m: &Registers, phy: u32) -> bool {
     let (Some(id1), Some(id2)) = (mdio_read(ctx, m, phy, PHY_ID1), mdio_read(ctx, m, phy, PHY_ID2))
     else {
         ctx.log("nic-driver: dwmac could not read the PHY id - RGMII delays NOT applied");
@@ -988,7 +989,7 @@ const BMCR_RESET: u16 = 1 << 15;
 /// So bring-up starts from a defined state rather than from whatever happened last. The order
 /// matters and is the whole point: a reset CLEARS the vendor delay registers, so the delays must be
 /// applied after it, not before - which is why `configure_phy_delays` moved below this call.
-fn phy_reset(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
+fn phy_reset(ctx: &ServiceContext, m: &Registers, phy: u32) -> bool {
     let Some(bmcr) = mdio_read(ctx, m, phy, PHY_BMCR) else {
         return false;
     };
@@ -1020,7 +1021,7 @@ fn phy_reset(ctx: &ServiceContext, m: &Mmio, phy: u32) -> bool {
 /// is genuinely unplugged returns "down" after the ceiling and the driver comes up anyway, serving
 /// with no link, because refusing to start without a cable is how a machine ends up needing a reboot
 /// after someone plugs one in.
-fn wait_for_link(ctx: &ServiceContext, m: &Mmio, phy: u32) -> (bool, u32, bool) {
+fn wait_for_link(ctx: &ServiceContext, m: &Registers, phy: u32) -> (bool, u32, bool) {
     const CEILING_MS: u64 = 5_000;
     const STEP_MS: u64 = 100;
     let mut waited = 0;

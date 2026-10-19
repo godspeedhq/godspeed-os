@@ -28,7 +28,8 @@
 //! owned, bounded and reported is ours (26.14).
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Registers};
+use godspeed_sdk::ServiceContext;
 
 // ---- DMA block. `dwmac4_dma.h`. -----------------------------------------------------------------
 const DMA_BUS_MODE: usize = 0x1000;
@@ -376,8 +377,8 @@ const RESET_US: u64 = 1_000_000;
 const TX_US: u64 = 20_000;
 
 pub struct Dwmac {
-    pub m: Mmio,
-    pub a: Dma,
+    pub m: Registers,
+    pub a: Arena,
     pub mac: [u8; 6],
     /// The last TDES3 the hardware wrote back, kept so the serve loop can report WHY a transmit
     /// failed rather than only that it did.
@@ -413,12 +414,12 @@ impl Dwmac {
     /// clause-22 registers rather than a vendor one - see `dwmac::link`.
     pub fn bring_up(
         ctx: &ServiceContext,
-        m: Mmio,
-        a: Dma,
+        m: Registers,
+        a: Arena,
         mac: [u8; 6],
         speed: u32,
         full_duplex: bool,
-    ) -> Result<Self, (Mmio, Dma)> {
+    ) -> Result<Self, (Registers, Arena)> {
         // A failure HANDS THE GRANT BACK: the caller keeps the window, serves the radio without the MAC,
         // and tries again when a cable arrives (`dwmac::serve`).
         if a.len() < ARENA_NEEDED {
