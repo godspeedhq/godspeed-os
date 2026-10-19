@@ -44,7 +44,7 @@ static TASK_STATE: [AtomicU8; MAX_TASKS] =
     [const { AtomicU8::new(TaskState::Dead as u8) }; MAX_TASKS];
 /// Bytes of a task name the kernel keeps (`TASK_NAMES` below). Bounded and flat (26.6): a fixed 32
 /// bytes per slot, no heap, no interner, no lifetimes.
-const TASK_NAME_MAX: usize = 32;
+const TASK_NAME_MAX: usize = crate::task::PEER_NAME_BYTES;
 
 /// Per-task NAME, OWNED rather than borrowed.
 ///
@@ -601,8 +601,17 @@ static TASK_SPAWN_DT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX
 /// an ISA question standing in for something else: the address width IS the question, asked of the
 /// property that answers it. There is no seam member that would improve it, because the choice is
 /// about the neutral kernel's own address-space layout rather than about any hardware.
+///
+/// **And on 64-bit, 4 GiB was not above everything either** (2026-10-18). RISC-V maps physical RAM at its
+/// own addresses (`hhdm=0x0`) into every address space, and the VisionFive 2 Lite's 8 GiB of RAM runs from 1
+/// GiB to 9 GiB - over 4 GiB. Every `AllocMem` there failed on its first page (`AlreadyMapped`, now said by
+/// `handle_alloc_mem`): the supervisor could not hold a package's image, and `chaos mem-pressure` never
+/// allocated. QEMU's `virt` with 256 MiB at 2 GiB never reached 4 GiB, so nothing saw it; with `-m 4G` it
+/// fails the same way. An 8 GiB Pi 4 would too. 64 GiB is above the RAM of every board this runs on, inside
+/// every 64-bit port's user range (AArch64's 39-bit, 512 GiB; RISC-V Sv39's lower 256 GiB; x86's 128 TiB),
+/// and clear of the fixed `XHCI_MMIO_VA` (4 GiB) and `XHCI_DMA_VA` (8 GiB) windows.
 #[cfg(target_pointer_width = "64")]
-pub const TASK_HEAP_VA_START: u64 = 0x1_0000_0000; // 4 GiB
+pub const TASK_HEAP_VA_START: u64 = 0x10_0000_0000; // 64 GiB
 #[cfg(target_pointer_width = "32")]
 pub const TASK_HEAP_VA_START: u64 = 0x5000_0000;   // 1.25 GiB
 
@@ -2491,15 +2500,16 @@ fn drain_pending_kstack(cid: usize) {
     }
 }
 
-/// The longest death notice: a name, NUL, `K` and the killer's name (each name at most 64 bytes).
-const DEATH_NOTE_MAX: usize = 2 * 64 + 16;
+/// The longest death notice: a name, NUL, `K` and the killer's name (each name at most TASK_NAME_MAX bytes).
+const DEATH_NOTE_MAX: usize = 2 * TASK_NAME_MAX + 16;
 
 /// Build the death notice for `name` into `note`, returning its length: the name, a NUL, then how
-/// it ended - `K` and the name of the task that called `kill`, or `F`, the fault kind and the address
-/// (8 bytes LE). The supervisor reads the name up to the NUL (CLAUDE.md 6.2, amendment 2026-10-11).
+/// it ended - `K` and the name of the task that called `kill`, `F`, the fault kind and the address
+/// (8 bytes LE), or `E` and the status the task gave `Exit` (4 bytes LE). The supervisor reads the name up
+/// to the NUL (CLAUDE.md 6.2, amendment 2026-10-11; `E`, 14.5 amendment 2026-10-17).
 fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_MAX]) -> usize {
     let nb = name.as_bytes();
-    let mut n = nb.len().min(64);
+    let mut n = nb.len().min(TASK_NAME_MAX);
     note[..n].copy_from_slice(&nb[..n]);
     note[n] = 0;
     n += 1;
@@ -2508,7 +2518,7 @@ fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_
             note[n] = crate::task::death::KILLED;
             n += 1;
             let kb = task_name(by).as_bytes();
-            let k = kb.len().min(64);
+            let k = kb.len().min(TASK_NAME_MAX);
             note[n..n + k].copy_from_slice(&kb[..k]);
             n + k
         }
@@ -2517,6 +2527,11 @@ fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_
             note[n + 1] = kind;
             note[n + 2..n + 10].copy_from_slice(&addr.to_le_bytes());
             n + 10
+        }
+        crate::task::Cause::Exited { status } => {
+            note[n] = crate::task::death::EXITED;
+            note[n + 1..n + 5].copy_from_slice(&status.to_le_bytes());
+            n + 5
         }
     }
 }

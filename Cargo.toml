@@ -7,6 +7,7 @@ members = [
     "services/recorder",
     "services/copier",
     "services/ask",
+    "services/godspeed-pm",
     "services/console",
     "services/time",
     "services/hw-enumerator",
@@ -24,6 +25,7 @@ members = [
     "services/fs",
     "sdk/rust",
     "sdk/wifi",
+    "sdk/tls",
     "sdk/audio",
     "stdlib/rust",
     "osdev",
@@ -54,7 +56,7 @@ members = [
 # that make up a release (kernel, osdev, sdk, and the shell that displays it) inherit
 # this with `version.workspace = true`, so a release bump is a one-line change here.
 [workspace.package]
-version = "0.28.0"
+version = "0.29.0"
 
 # kernel and all services/examples build for the bare-metal target;
 # osdev builds for the host. Use `cargo build -p osdev` for the host tool,

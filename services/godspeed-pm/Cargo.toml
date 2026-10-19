@@ -1,0 +1,18 @@
+[package]
+name = "godspeed-pm"
+version = "0.1.0"
+description = "The native package manager: its settings, and the registry reached over verified TLS"
+edition = "2021"
+
+[[bin]]
+name = "godspeed-pm"
+path = "src/main.rs"
+
+[dependencies]
+godspeed-sdk = { path = "../../sdk/rust" }
+godspeed = { path = "../../stdlib/rust" }
+godspeed-tls = { path = "../../sdk/tls" }
+# The package contract the developer CLI publishes against: its trust metadata, signatures, digests and
+# artifact checks, no_std and heapless (`docs/developer-services-design.md` 10.6, option 1: a git dependency
+# on a tagged release of the CLI repository, the smallest of the three; the choice is recorded there).
+godspeed-package = { git = "https://github.com/godspeedhq/godspeed-cli", rev = "9c3d4502beb024ce7599dca0d482b73735f029ec", default-features = false }

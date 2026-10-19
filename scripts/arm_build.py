@@ -79,6 +79,37 @@ def run(cmd):
 _ALIAS_SIG = bytes([0x03, 0x21, 0x82])
 
 
+def trim_elf(b):
+    """The copy of a service ELF the supervisor embeds (`services/supervisor/build.rs`, `trim_elf`): the header,
+    the program headers and every segment's bytes, cut after the last of them, with the section header table's
+    offset, count and name index zeroed. Computed here the same way, so the check below still compares the
+    image against the artifact this build produced."""
+    import struct
+    if b[:4] != b"ELF" or b[5] != 1:
+        raise SystemExit("BUILD VERIFY FAILED: the dwc2 file is not a little-endian ELF")
+    if b[4] == 1:
+        phoff, = struct.unpack_from("<I", b, 0x1C)
+        phentsize, phnum = struct.unpack_from("<HH", b, 0x2A)
+        shoff_at, shnum_at, shstrndx_at, wide = 0x20, 0x30, 0x32, False
+    else:
+        phoff, = struct.unpack_from("<Q", b, 0x20)
+        phentsize, phnum = struct.unpack_from("<HH", b, 0x36)
+        shoff_at, shnum_at, shstrndx_at, wide = 0x28, 0x3C, 0x3E, True
+    end = phoff + phentsize * phnum
+    for i in range(phnum):
+        ph = phoff + i * phentsize
+        if wide:
+            off, = struct.unpack_from("<Q", b, ph + 8); size, = struct.unpack_from("<Q", b, ph + 0x20)
+        else:
+            off, = struct.unpack_from("<I", b, ph + 4); size, = struct.unpack_from("<I", b, ph + 0x10)
+        end = max(end, off + size)
+    out = bytearray(b[:end])
+    out[shoff_at:shoff_at + (8 if wide else 4)] = bytes(8 if wide else 4)
+    out[shnum_at:shnum_at + 2] = bytes(2)
+    out[shstrndx_at:shstrndx_at + 2] = bytes(2)
+    return bytes(out)
+
+
 def verify_image(img_path, dwc2_elf_path, want_qemu):
     """Assert the built image embeds the DWC2 variant that was actually asked for.
 
@@ -99,7 +130,9 @@ def verify_image(img_path, dwc2_elf_path, want_qemu):
     """
     img = io.open(img_path, "rb").read()
     elf = io.open(dwc2_elf_path, "rb").read()
-    if elf not in img:
+    # The supervisor embeds the TRIMMED copy (symbols and section headers dropped, 2026-10-19), so that is
+    # what the image must carry.
+    if trim_elf(elf) not in img:
         raise SystemExit(
             "BUILD VERIFY FAILED: the image does not embed the dwc2 ELF this build just produced "
             "(%s) - the embedded service ELF is stale." % dwc2_elf_path

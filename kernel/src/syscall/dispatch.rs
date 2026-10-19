@@ -110,6 +110,11 @@ pub enum SyscallNumber {
     /// the operator. The kernel learns how each board turns off and nothing about when or why
     /// (`docs/shutdown.md`).
     PowerOff               = 56,
+    /// End the CALLING task, with a status (`arg0`, the low 32 bits). Never returns. The one task it can
+    /// end is the caller, so it holds no authority over anything else and takes no capability, as `Yield`
+    /// and `Park` take none: a program that has done its job may stop. The death notice says `E` and the
+    /// status, so the supervisor tells a finished program from a crashed one (CLAUDE.md 14.5 amendment).
+    Exit                   = 57,
 }
 
 /// Raw syscall dispatcher - the one neutral entry every port's trap path calls (`arch/<isa>/`:
@@ -183,6 +188,7 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::DevicePower as u64 => handle_device_power(arg0),
         n if n == SyscallNumber::CpuClock as u64 => handle_cpu_clock(arg0),
         n if n == SyscallNumber::PowerOff as u64 => handle_power_off(arg0, arg1),
+        n if n == SyscallNumber::Exit as u64 => handle_exit(arg0),
         _ => -1, // Unknown syscall.
     }
 }
@@ -769,7 +775,8 @@ const ACQUIRE_CAP_TABLE_FULL:      i64 = -21;
 /// Upper bound on the name payload (`name` + NUL-separated peer names). It was 64, which held a
 /// name alone; a peer list needs more. Bounded and small (26.6) - the longest real payload is
 /// well under half of this.
-const SPAWN_PAYLOAD_MAX: usize = 128;
+/// A spawn request's peer list, NUL-joined: every peer at the longest a name may be.
+const SPAWN_PAYLOAD_MAX: usize = crate::task::MAX_SEND_PEERS * (crate::task::PEER_NAME_BYTES + 1);
 
 
 // ---------------------------------------------------------------------------------------------
@@ -911,10 +918,21 @@ const SPAWN_FLAG_CORE_STRICT: u32 = 1 << 2;
 const SPAWN_FLAG_WATCHED: u32 = 1 << 4;
 /// Mint the child's peer caps with GRANT (§22 Test 5A). See the SDK constant.
 const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
+/// A LIVE HANDOVER: start this beside the one task already running under its name, rather than refusing it
+/// (CLAUDE.md 2.5 amendment, 2026-10-17). Honoured only here, in `SpawnImage`, which only an `IMAGE_SPAWN` holder
+/// reaches - the supervisor alone - and only when exactly one task holds the name. The new task's endpoint takes
+/// the name in the directory; the old one keeps running until it ends itself, and its death leaves the name alone
+/// (the endpoint-id guard in `ipc::names`). The kernel learns nothing about what is handed over.
+const SPAWN_FLAG_HANDOVER: u32 = 1 << 5;
 /// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
 /// largest real request (xHCI's scratchpad, 1168 KiB) and far below anything that could starve the
 /// frame allocator.
 const MAX_DMA_PAGES: u32 = 2048;
+/// A task of that name is already running, and one name is one task. Its own code because it is the one
+/// refusal a spawner can name to an operator - `chaos` refuses ten of these a run, and the supervisor
+/// said `InvalidArgument` for each, true of none of them. Clear of the cap range (-2..-7), as the
+/// acquire codes are. Every other refusal stays -1 and the kernel's own line says which it was.
+const SPAWN_ALREADY_RUNNING: i64 = -22;
 
 fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     // The SPAWN capability gates this exactly as it gates `Spawn` (3.1): supplying an image does not
@@ -1052,8 +1070,8 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     }
 
     let name_len = req.name_len as usize;
-    if name_len == 0 || name_len > 64 {
-        crate::kprintln!("task: SpawnImage refused - name length {} (must be 1..=64)", name_len);
+    if name_len == 0 || name_len > crate::task::PEER_NAME_BYTES {
+        crate::kprintln!("task: SpawnImage refused - name length {} (must be 1..={})", name_len, crate::task::PEER_NAME_BYTES);
         return -1;
     }
     let name_bytes = match read_user_bytes(req.name_ptr, name_len) { Some(b) => b, None => return -1 };
@@ -1114,7 +1132,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
     if ni > 0 {
         // Each entry is at least 1 + 1 + 2 bytes; the buffer is read once, like every other input.
         let ilen = ni * (2 + PEER_NAME_BYTES + 2);
-        let ibuf = match read_user_bytes(req.installs_ptr, ilen.min(512)) {
+        let ibuf = match read_user_bytes(req.installs_ptr, ilen.min(crate::task::MAX_SEND_PEERS * (2 + PEER_NAME_BYTES + 2))) {
             Some(b) => b,
             None    => return -1,
         };
@@ -1158,6 +1176,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.bdf,
         req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
         req.flags & SPAWN_FLAG_WATCHED     != 0,
+        req.flags & SPAWN_FLAG_HANDOVER    != 0,
     ) {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it
@@ -1175,6 +1194,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
             }
         }
         Ok(None) => 0,
+        Err(crate::task::SpawnError::AlreadyRunning) => SPAWN_ALREADY_RUNNING,
         Err(_)   => -1,
     }
 }
@@ -1197,7 +1217,7 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
     let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
+    if len == 0 || len > crate::task::PEER_NAME_BYTES { return -1; }
     let name_bytes = match read_user_bytes(name_ptr, len) {
         Some(b) => b,
         None    => return -1,
@@ -1237,6 +1257,21 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     } else { -1 }
 }
 
+/// `Exit` (57): end the caller, saying `status` in its death notice.
+///
+/// The same path a task that kills ITSELF takes (`handle_kill`'s tail): marked Dead with its cause, the cap
+/// table checked, then switched away from for good. Only the cause differs, so a finished program is
+/// reclaimed exactly as a killed one is and nothing new can go wrong in between.
+fn handle_exit(status: u64) -> i64 {
+    let slot = scheduler::current_task_slot();
+    scheduler::kill_task_by_slot(slot, crate::task::Cause::Exited { status: status as u32 });
+    crate::invariants::assertions::assert_cap_table_consistent();
+    scheduler::yield_current();
+    // A Dead task is never scheduled again; reaching here would be a scheduler bug, said loudly.
+    crate::kprintln!("task: Exit returned to slot {} - it should never run again", slot);
+    -1
+}
+
 /// Has this name already been reported as absent from the directory? Records it if not.
 ///
 /// Bounded and heap-free (§26.6.1): a fixed table of names already warned about. When it fills, no new
@@ -1259,7 +1294,7 @@ fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
 /// after, including the name that is actually broken.
 fn warn_once_for(name: &str) -> bool {
     const MAX_NAMES: usize = 16;
-    const NAME_MAX: usize = 32;
+    const NAME_MAX: usize = crate::task::PEER_NAME_BYTES;
     static SEEN: crate::smp::SpinLock<([[u8; NAME_MAX]; MAX_NAMES], [u8; MAX_NAMES], usize)> =
         crate::smp::SpinLock::new(([[0; NAME_MAX]; MAX_NAMES], [0; MAX_NAMES], 0));
     let b = name.as_bytes();
@@ -1287,7 +1322,7 @@ fn warn_once_for(name: &str) -> bool {
 /// caller with neither, `ACQUIRE_NAME_NOT_REGISTERED` (-20) or `ACQUIRE_CAP_TABLE_FULL` (-21).
 fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> i64 {
     let len = name_len as usize;
-    if len == 0 || len > 64 { return -1; }
+    if len == 0 || len > crate::task::PEER_NAME_BYTES { return -1; }
     let name_bytes = match read_user_bytes(name_ptr, len) {
         Some(b) => b,
         None    => return -1,
@@ -1862,7 +1897,11 @@ fn handle_alloc_mem(size: u64) -> i64 {
         zero_frame(phys);
         // SAFETY: va is in the task heap range (`TASK_HEAP_VA_START`+); phys is from the
         // allocator; the task's page table is the active CR3 during this syscall.
-        if unsafe { map_in_active_tables(va, phys, flags) }.is_err() {
+        if let Err(e) = unsafe { map_in_active_tables(va, phys, flags) } {
+            // SAID, not just refused: a bare -1 told the caller "no memory" while 8 GiB sat free - the
+            // fault was the mapping, and only this line can say which page and why.
+            crate::kprintln!("alloc_mem: '{}' page {} of {} at {:#x} could not be mapped ({:?})",
+                scheduler::task_name(scheduler::current_task_slot()), i + 1, pages, va, e);
             return -1;
         }
         // Frame ownership passes to the page table (freed when task dies);
@@ -2053,7 +2092,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         2 => {
             // Endpoint generation by name.
             let len = arg2 as usize;
-            if len == 0 || len > 64 { return -1; }
+            if len == 0 || len > crate::task::PEER_NAME_BYTES { return -1; }
             let name_bytes = match read_user_bytes(arg1, len) {
                 Some(b) => b,
                 None    => return -1,
@@ -2111,11 +2150,12 @@ fn handle_remove_cap(slot: u64) -> i64 {
 // Syscall: TaskStat (16) - read task state for a given slot index.
 // ---------------------------------------------------------------------------
 
-/// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 80).
+/// arg0 = slot (u32), arg1 = buf_ptr (user VA), arg2 = buf_len (must be ≥ 176).
 ///
 /// Requires the INTROSPECT capability (READ) - discloses any task's state (§3.1).
 ///
-/// Buffer layout (80 bytes = STAT_SIZE - kept in sync with the writes below):
+/// Buffer layout (176 bytes = STAT_SIZE - kept in sync with the writes below; 80 until 2026-10-18, when names
+/// grew from 32 bytes to 128):
 ///   [0]       valid:         u8  (1 = live, 0 = dead/unused)
 ///   [1]       state:         u8  (0=Ready, 1=Running, 2=BlockedOnRecv, 3=BlockedOnSend, 4=Dead)
 ///   [2]       core:          u8
@@ -2123,14 +2163,14 @@ fn handle_remove_cap(slot: u64) -> i64 {
 ///   [4..8]    name_len:      u32 LE
 ///   [8..16]   mem_used:      u64 LE
 ///   [16..24]  mem_limit:     u64 LE
-///   [24..56]  name:          [u8; 32] (truncated; zero-padded)
-///   [56..64]  restart_count: u64 LE
-///   [64..72]  run_ticks:     u64 LE
-///   [72..80]  uptime_secs:   u64 LE
+///   [24..152] name:          [u8; 128] (zero-padded)
+///   [152..160] restart_count: u64 LE
+///   [160..168] run_ticks:     u64 LE
+///   [168..176] uptime_secs:   u64 LE
 ///
 /// Returns 0 on success, -1 on invalid args.
 fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
-    const STAT_SIZE: usize = 80;
+    const STAT_SIZE: usize = 176;
     // TaskStat discloses any task's full snapshot - requires INTROSPECT (READ)
     // (§3.1; docs/introspection-capability.md).
     if !scheduler::current_task_holds_resource(
@@ -2144,7 +2184,7 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     let stat = scheduler::task_stat(slot as usize);
 
     let name_bytes = stat.name.as_bytes();
-    let copy_len   = name_bytes.len().min(32);
+    let copy_len   = name_bytes.len().min(128);
     let name_len   = copy_len as u32;
 
     let mut buf = [0u8; STAT_SIZE];
@@ -2157,9 +2197,9 @@ fn handle_task_stat(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     buf[16..24].copy_from_slice(&stat.mem_limit.to_le_bytes());
     buf[24..24 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
     // restart_count is u64 (was a u32 endpoint generation at buf[56..60]); queue_depth moved to buf[3].
-    buf[56..64].copy_from_slice(&stat.restart_count.to_le_bytes());
-    buf[64..72].copy_from_slice(&stat.run_ticks.to_le_bytes());
-    buf[72..80].copy_from_slice(&stat.uptime_secs.to_le_bytes());
+    buf[152..160].copy_from_slice(&stat.restart_count.to_le_bytes());
+    buf[160..168].copy_from_slice(&stat.run_ticks.to_le_bytes());
+    buf[168..176].copy_from_slice(&stat.uptime_secs.to_le_bytes());
 
     if write_user_bytes(buf_ptr, &buf) { 0 } else { -1 }
 }

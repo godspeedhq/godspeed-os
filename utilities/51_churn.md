@@ -130,8 +130,9 @@ ever does surface the bytes say which iteration wrote them.
 
 ```
 gsh> churn 60
-churn: writing continuously for 60s - CUT THE POWER AT ANY POINT  [q] quit
+churn: writing continuously for 60s - CUT THE POWER AT ANY POINT
 churn: 1s elapsed, 47 writes
+  [q] quit
 churn: 2s elapsed, 95 writes
 ...
 churn: done - 2840 writes, 355 renames, 355 deletes, 3456120 bytes, 0 refused

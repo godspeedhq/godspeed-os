@@ -10,7 +10,7 @@ Rules enforced (a "line" is a line containing the word `unsafe` that does not ST
   - services/: any unsafe line at all                                       -> FAIL
   - sdk/: unsafe outside SDK_PERMITTED (matched by FILE NAME) beyond the
     SDK_GRANDFATHERED floor                                                 -> FAIL
-  - services/examples/osdev/stdlib/sdk/wifi: a crate root without
+  - services/examples/osdev/stdlib/sdk/wifi/sdk/tls: a crate root without
     `#![deny(unsafe_code)]`, or an `#[allow(unsafe_code)]` not on `#[no_mangle]` -> FAIL
 
 What it does NOT check: whether a block carries a `// SAFETY:` comment (18.3 is enforced by review,
@@ -39,7 +39,7 @@ SDK         = REPO_ROOT / "sdk"
 # file's count was never compared with anything: the audit's table says how many each holds, and a
 # new `unsafe` in `mmio.rs` changed no number this script looked at (backlog/fixed/80 T6).
 SDK_PERMITTED = {"sdk/rust/src/syscall.rs", "sdk/rust/src/mmio.rs", "sdk/rust/src/dma.rs",
-                 "sdk/rust/src/adversarial.rs"}
+                 "sdk/rust/src/adversarial.rs", "sdk/rust/src/memory.rs"}
 
 # ...and the files that hold `unsafe` anyway, frozen at their counts (18.5's grandfathering, applied
 # to the SDK). These are NOT 85 separate defects: 82 of the 85 are `unsafe { raw_syscall(..) }` call
@@ -52,7 +52,7 @@ SDK_PERMITTED = {"sdk/rust/src/syscall.rs", "sdk/rust/src/mmio.rs", "sdk/rust/sr
 # would collapse ~82 of these to nothing. That is an SDK redesign on every service's call path, so it
 # is recorded rather than done here.
 SDK_GRANDFATHERED = {
-    "sdk/rust/src/service_context.rs": 79,
+    "sdk/rust/src/service_context.rs": 80,
     "sdk/rust/src/ipc.rs": 8,
 }
 AUDIT_FILE  = REPO_ROOT / "audits" / "unsafe-audit.md"
@@ -127,7 +127,8 @@ def parse_audit() -> dict[str, int]:
 # The attribute was already there; nothing checked it, so deleting it failed no gate.
 # `sdk/wifi` is a crate directory itself, which the walk below accepts as one crate. It is the one SDK
 # crate that is NOT the audited hardware/ABI layer (18.1), so it carries no `unsafe` and says so.
-DENY_ROOTS = ("services", "examples", "osdev", "stdlib", "sdk/wifi")
+# `sdk/tls` is the same: protocol and crypto over byte slices, with nothing to reach but its caller.
+DENY_ROOTS = ("services", "examples", "osdev", "stdlib", "sdk/wifi", "sdk/tls")
 DENY_ATTR = "#![deny(unsafe_code)]"
 
 

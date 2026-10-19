@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! A TLS 1.3 client for GodspeedOS, written here from RFC 8446.
+//!
+//! # Why this exists
+//!
+//! The native `godspeed` package manager reads the registry over HTTPS, and the operator ruled out plain
+//! HTTP (`docs/developer-services-design.md` 10.3). No TLS library fits this tree as it stands: the one
+//! that fits the no-heap rule is Apache-2.0 only, which GPL-2.0-only cannot include, and the others need
+//! a heap or are C. So the protocol is written here, the way Linux's own TLS is a userspace library: the
+//! kernel learns nothing about it.
+//!
+//! # What is ours and what is not
+//!
+//! - **Ours:** the TLS 1.3 key schedule ([`schedule`]), the record layer ([`record`]), the handshake
+//!   and the connection after it ([`client`]), and the verifier that joins them to certificate checking
+//!   ([`verify::WebPkiVerifier`]: the roots, the date and the name it is given, and the reason a chain
+//!   was refused, as a [`CertProblem`]). A caller may bring its own through [`client::ServerVerifier`].
+//! - **Not ours:** the primitives and the X.509 path building. SHA-256, HMAC, HKDF and AES-128-GCM are
+//!   RustCrypto's, X25519 is dalek's, the ECDSA P-256 and P-384 checks are RustCrypto's `p256` and
+//!   `p384`, and the chain itself is checked by `rustls-webpki`. Constant-time field arithmetic and
+//!   certificate parsing are exactly the code that is easy to get subtly wrong, so they are taken from
+//!   libraries built and reviewed for them.
+//!
+//! # Scope, deliberately narrow
+//!
+//! A client, never a server. TLS 1.3 only. One cipher suite, TLS_AES_128_GCM_SHA256, which RFC 8446 makes
+//! mandatory for every server, and one key exchange, X25519. Certificates are checked by ECDSA only (the
+//! registry's chain is ECDSA end to end, `docs/developer-services-design.md` 10.3). Nothing is taken from
+//! a configuration that lives in this crate: the server name, the root certificates and the current time
+//! are the caller's (10.8).
+//!
+//! # Bounded and heap-free
+//!
+//! Every buffer is a slice the caller owns (CLAUDE.md 26.6.1). A TLS record is at most 16 KiB of
+//! plaintext, so a caller needs about 16 to 20 KiB per connection.
+//!
+//! # Tested against the RFC's own traces
+//!
+//! RFC 8448 section 3 is a complete TLS 1.3 handshake with this key exchange and this cipher suite, every
+//! secret and every encrypted record printed byte for byte. [`rfc8448`] holds those values, generated from
+//! the RFC text by a script, and the tests reproduce every one of them.
+
+#![no_std]
+#![deny(unsafe_code)]
+
+
+pub mod client;
+mod codec;
+pub mod ecdhe;
+pub mod record;
+pub mod schedule;
+pub mod verify;
+
+pub use client::{CertificateChain, Client, Event, Hello, ServerVerifier};
+pub use record::record_len;
+pub use verify::WebPkiVerifier;
+
+#[cfg(test)]
+mod rfc8448;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod client_tests;
+#[cfg(test)]
+mod certs;
+#[cfg(test)]
+mod verify_tests;
+
+/// Every way this crate refuses. Each is final for the connection it happened on: TLS has no "try again"
+/// at this layer, and a caller that carries on after one is carrying on with a broken connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsError {
+    /// A record header that is not TLS 1.3's: the wrong content type for a protected record, or the wrong
+    /// legacy version.
+    BadRecordHeader,
+    /// A record longer than RFC 8446 5.2 allows.
+    RecordTooLarge,
+    /// The record's authentication tag did not verify: it was altered, or it was not sent with these keys
+    /// in this order. RFC 8446 5.2 makes this a `bad_record_mac` alert, never something to skip past.
+    DecryptFailed,
+    /// A decrypted record that is all padding, with no content type (RFC 8446 5.4).
+    NoContentType,
+    /// The caller's buffer cannot hold the result.
+    BufferTooSmall,
+    /// 2^64 - 1 records were sent or received on one key. RFC 8446 5.3 forbids wrapping the counter; the
+    /// connection must end (this client does not rekey).
+    SequenceExhausted,
+    /// The X25519 shared secret came out all zero: the peer sent a low-order point. RFC 8446 7.4.2 says to
+    /// abort.
+    ZeroSharedSecret,
+    /// A handshake message that does not parse: short, overlong, or with bytes left over.
+    DecodeError,
+    /// The server chose something this client did not offer, or a value the RFC forbids.
+    IllegalParameter,
+    /// The server answered an extension this client did not send (RFC 8446 4.2).
+    UnsupportedExtension,
+    /// A message or record that does not belong at this point of the connection.
+    UnexpectedMessage,
+    /// The server asked for a different key share. This client offers X25519 alone, so there is nothing
+    /// else to send: the server does not support it.
+    HelloRetryRequest,
+    /// The server does not speak TLS 1.3.
+    ProtocolVersion,
+    /// A handshake message larger than the caller's handshake buffer.
+    HandshakeTooLarge,
+    /// The server's Finished did not match the handshake this client saw: something was altered in
+    /// flight, or the server does not hold the key it claims.
+    BadFinished,
+    /// The verifier refused the server's CertificateVerify signature.
+    BadSignature,
+    /// The verifier refused the server's certificate chain, for this reason.
+    CertificateRejected(CertProblem),
+    /// The server sent an empty certificate list.
+    NoCertificate,
+    /// The server asked for a client certificate, which this client does not have.
+    CertificateRequested,
+    /// The server sent this alert (RFC 8446 6) and the connection is over.
+    AlertReceived(u8),
+    /// The server name given to [`client::Client::start`] is not a DNS name.
+    BadServerName,
+    /// Application data before the handshake finished, or after close.
+    NotConnected,
+}
+
+/// Why a certificate chain was refused. Each names something a person can act on, because "the
+/// certificate was rejected" alone sends them looking in the wrong place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertProblem {
+    /// A certificate on the path has expired, or the clock is ahead.
+    Expired,
+    /// A certificate on the path is not valid yet, or the clock is behind.
+    NotYetValid,
+    /// The chain does not reach any of the trusted roots.
+    UnknownIssuer,
+    /// The leaf certificate is for another name.
+    NameMismatch,
+    /// A signature in the chain does not verify.
+    BadChainSignature,
+    /// A certificate is signed with something other than ECDSA P-256 or P-384.
+    UnsupportedAlgorithm,
+    /// A certificate used outside its role: a CA as the server, a leaf as a CA, or one not for TLS servers.
+    WrongRole,
+    /// The server sent more certificates than [`verify::MAX_CHAIN`].
+    ChainTooLong,
+    /// The verifier was given no roots, or more than [`verify::MAX_ROOTS`].
+    NoRoots,
+    /// One of the trusted roots given to the verifier does not parse.
+    BadRoot,
+    /// A certificate does not parse.
+    Malformed,
+}

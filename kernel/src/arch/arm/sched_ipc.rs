@@ -63,15 +63,15 @@ static mut STACKS: Stacks = Stacks([[0; KSTACK]; 2]);
 
 /// Write the SDK `ServiceContextData` into a freshly-allocated ctx frame.
 ///
-/// The frame is not zeroed by the allocator (SEC-21), so the whole 208-byte struct is zeroed first,
+/// The frame is not zeroed by the allocator (SEC-21), so the whole page is zeroed first,
 /// then only the fields the ARM `ping`/`pong` read are set. Byte offsets follow the `#[repr(C)]`
 /// layout in `sdk/rust/src/service_context.rs` (u64 xHCI fields at 32..72 stay zero; `send_peers`
-/// starts at byte 80, each entry `slot:u32, name_len:u32, name:[u8;24]`).
+/// starts at byte 80, each entry `slot:u32, name_len:u32, name:[u8; PEER_NAME_BYTES]`).
 fn write_ipc_ctx(ctx_frame: u32, recv_slot: u32, send_peer: Option<(&str, u32)>) {
     // SAFETY: `ctx_frame` is a fresh, identity-mapped frame we own; writing the SDK context struct.
     unsafe {
         let base = ctx_frame as *mut u8;
-        core::ptr::write_bytes(base, 0, 208);
+        core::ptr::write_bytes(base, 0, 4096);
         let w = ctx_frame as *mut u32;
         w.add(0).write_volatile(SERVICE_CTX_MAGIC);   // magic
         w.add(1).write_volatile(0);                   // log_write_slot = 0 (cap at slot 0)
@@ -88,7 +88,7 @@ fn write_ipc_ctx(ctx_frame: u32, recv_slot: u32, send_peer: Option<(&str, u32)>)
             w.add(21).write_volatile(name.len() as u32);  // send_peers[0].name_len (byte 84)
             let np = base.add(88);                        // send_peers[0].name     (byte 88)
             let nb = name.as_bytes();
-            for i in 0..nb.len().min(24) { np.add(i).write_volatile(nb[i]); }
+            for i in 0..nb.len().min(crate::task::PEER_NAME_BYTES) { np.add(i).write_volatile(nb[i]); }
         }
     }
 }

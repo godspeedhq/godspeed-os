@@ -78,10 +78,10 @@ something else` when it disagrees.
 | `audio on` | `audio on - volume 60, unmuted, output line out - verified`; if on: `already on` |
 | `audio output headphone` | `output headphone - verified`; already in use: `already playing through headphone` (nothing sent); nothing plugged in: says so on the next line |
 | `audio output speakers` | `audio: no output called 'speakers' - this device has:` and the list |
-| `audio tone 440 2` | `playing 440 Hz for 2.0 s  [q] quit`, then `played 440 Hz for 2.0 s` or `stopped after 1.2 s` |
+| `audio tone 440 2` | `playing 440 Hz for 2.0 s`, then `played 440 Hz for 2.0 s` or `stopped after 1.2 s` |
 | `audio tone` while off | ``audio is off - `audio on` first`` |
 | `audio tone` muted, or at volume 0 | plays, and says first: `muted - nothing will be heard` / `volume is 0 - nothing will be heard` |
-| `audio play /song.wav` | `playing /song.wav (48000 Hz, 16-bit, stereo, 0:02)  [q] quit`, then `played 0:02`, or `stopped after 1.4 s` |
+| `audio play /song.wav` | `playing /song.wav (48000 Hz, 16-bit, stereo, 0:02)`, then `played 0:02`, or `stopped after 1.4 s` |
 | `audio play` that ran dry | `played 0:02, 180 ms of silence where the samples did not arrive in time` - never hidden |
 | `audio play /x.wav`, 24-bit | `audio: /x.wav is 24-bit - this plays 16-bit PCM` |
 | `audio play /x.wav`, 8000 Hz | `audio: /x.wav is 8000 Hz - this codec plays 44100 or 48000 Hz` |

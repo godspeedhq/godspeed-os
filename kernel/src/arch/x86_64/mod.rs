@@ -331,8 +331,32 @@ pub fn map_fixed_device(_pt: &mut page_tables::PageTable, _kind: u32) -> Option<
 
 // USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
 pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
-// No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
-pub fn hw_random() -> Option<u32> { None }
+/// One 32-bit word from the CPU's RDRAND, or `None` where there is none (CPUID.01H:ECX[30] clear) or it
+/// did not deliver in ten tries, the bound Intel documents for a transient underflow (Digital Random
+/// Number Generator guide, 5.2.1). Both PCs here have it, the T630's AMD GX-420GI and the Wyse 5070's
+/// Intel J5005 (the shell's `random`, 2026-10-16); on any other machine `random` says.
+///
+/// **An all-ones word is refused and asked for again.** Several AMD parts have shipped an RDRAND that
+/// reports success while returning 0xFFFFFFFF every time (after a resume, or under a microcode bug), and
+/// Linux refuses it for that reason (`arch/x86/kernel/cpu/rdrand.c`). A working generator produces that
+/// word once in 2^32, so dropping it costs nothing measurable; a broken one then answers `None` after ten
+/// tries rather than handing a caller a constant it would use as a key.
+pub fn hw_random() -> Option<u32> {
+    // CPUID leaf 1 exists on every x86_64 CPU; `__cpuid` is a safe function, so no `unsafe` here.
+    let ecx = core::arch::x86_64::__cpuid(1).ecx;
+    if ecx & (1 << 30) == 0 {
+        return None;
+    }
+    for _ in 0..10 {
+        let mut word: u32 = 0;
+        // SAFETY: RDRAND is present (checked just above). It writes one register and the carry flag and
+        // touches no memory but `word`, a local it is given a unique reference to.
+        if unsafe { core::arch::x86_64::_rdrand32_step(&mut word) } == 1 && word != u32::MAX {
+            return Some(word);
+        }
+    }
+    None
+}
 
 /// Device power behind a fixed peripheral window (`DevicePower`, syscall 54): none on this port. The
 /// boards with it are the Pi 4 (`arch/aarch64`, WL_ON), whose radio returns to power-on only when WL_ON
@@ -1273,13 +1297,13 @@ pub fn cpu_identity(buf: &mut [u8]) -> usize {
     let mut push = |b: u8, n: &mut usize| {
         if *n < buf.len() { buf[*n] = b; *n += 1; }
     };
-    // SAFETY: CPUID is unprivileged and universally available on x86_64. Leaf 0x80000000 reports the
-    // highest extended leaf supported, which is the documented way to ask before using 2..4.
-    let ext = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+    // `__cpuid` is a safe function: CPUID is unprivileged and on every x86_64 CPU. Leaf 0x80000000
+    // reports the highest extended leaf supported, which is the documented way to ask before using 2..4.
+    let ext = core::arch::x86_64::__cpuid(0x8000_0000).eax;
     if ext >= 0x8000_0004 {
         for leaf in 0x8000_0002u32..=0x8000_0004 {
-            // SAFETY: guarded by the `ext` check immediately above.
-            let r = unsafe { core::arch::x86_64::__cpuid(leaf) };
+            // Present: guarded by the `ext` check immediately above.
+            let r = core::arch::x86_64::__cpuid(leaf);
             for word in [r.eax, r.ebx, r.ecx, r.edx] {
                 for b in word.to_le_bytes() {
                     // The brand string is NUL-padded and often leading-space padded; keep it printable
@@ -1291,8 +1315,8 @@ pub fn cpu_identity(buf: &mut [u8]) -> usize {
         }
         return trim_len(buf, n);
     }
-    // SAFETY: leaf 0 is present on every x86_64 CPU.
-    let r = unsafe { core::arch::x86_64::__cpuid(0) };
+    // Leaf 0 is present on every x86_64 CPU.
+    let r = core::arch::x86_64::__cpuid(0);
     for word in [r.ebx, r.edx, r.ecx] {
         for b in word.to_le_bytes() { push(b, &mut n); }
     }

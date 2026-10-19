@@ -42,6 +42,12 @@ FILES = [
     # `ask`'s vocabulary and every truthfulness rule: what a question is read as, and what each answer
     # must and must not say for fixtures of source replies (docs/ask-design.md 8).
     "services/ask/src/know.rs",
+    "services/godspeed-pm/src/config.rs",
+    "services/godspeed-pm/src/http.rs",
+    "services/godspeed-pm/src/toml_lines.rs",
+    "services/time/src/ntp_file.rs",
+    # A progress line narrowed to the console: the bar gives way first (2026-10-19).
+    "services/shell/src/fit.rs",
 ]
 
 

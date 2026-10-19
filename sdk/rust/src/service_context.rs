@@ -377,6 +377,9 @@ pub const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 /// supervisor sets it for every service it manages; the kernel keeps no list of which services those are
 /// (`docs/audio.md`, "No service names in the kernel").
 pub const SPAWN_FLAG_WATCHED:     u32 = 1 << 4;
+/// A live handover: start this beside the one task already running under its name, which keeps running until it
+/// ends itself; the new one takes the name. The supervisor's alone, since only `SpawnImage` honours it (CLAUDE.md 2.5).
+pub const SPAWN_FLAG_HANDOVER:    u32 = 1 << 5;
 
 /// Bits for `SpawnRequest::privileges`. A spawner may only request what it HOLDS ITSELF - the kernel
 /// checks, and refuses otherwise - so this passes authority on, it never mints it (3.1, 7.3).
@@ -497,7 +500,7 @@ impl SpawnRequest {
         let mut n = 0usize;
         for (label, cap) in pairs {
             let lb = label.as_bytes();
-            // The kernel's limit, `PEER_NAME_BYTES` (24): this accepted 32, and the kernel refused
+            // The kernel's limit, `PEER_NAME_BYTES`: this once accepted more than the kernel did, and the kernel refused
             // the spawn for a label it had been told was fine (`backlog/fixed/80` S5).
             if lb.is_empty() || lb.len() > PEER_NAME_BYTES { return false; }
             if n + 1 + lb.len() + 2 > buf.len() { return false; }
@@ -518,6 +521,8 @@ pub mod death {
     pub const KILLED: u8 = b'K';
     /// Ended by a user-mode CPU fault; the kind below and the address (u64 LE) follow.
     pub const FAULT: u8 = b'F';
+    /// Ended itself with `exit`; the status it gave (u32 LE) follows.
+    pub const EXITED: u8 = b'E';
     /// A fault the port does not classify.
     pub const F_OTHER: u8 = 0;
     /// A load or store its page tables do not allow; the address is the data address.
@@ -587,6 +592,23 @@ pub mod supcmd {
     /// `death::FAULT`), the fault kind and address, and the name of the task that called `kill`. The
     /// kernel says how, in the death notice; the supervisor only keeps the newest per name. `ask`.
     pub const DEATH:   u8 = b'X';
+    /// Start an installed package: `[MARKER, INSTALL, "publisher/name version"]`. The supervisor checks the fetched
+    /// copy from the disk, grants the send peers its `grant` file names and its contract requests, and starts it
+    /// under the task name `publisher/name` (`services/supervisor/src/installed.rs`). Answered `[OK]`, or
+    /// `[FAILED, reason...]` - the reason is a sentence.
+    pub const INSTALL: u8 = b'I';
+    /// Stop an installed package and forget it: `[MARKER, UNINSTALL, "publisher/name"]`. `[OK]`, or `[UNKNOWN]` when
+    /// it was not installed.
+    pub const UNINSTALL: u8 = b'O';
+    /// Which packages has this supervisor started from the disk? Read only: `[MARKER, INSTALLED]`, answered with
+    /// `[OK, count, (len, name, running 0/1)*]`. `godspeed list installed`.
+    pub const INSTALLED: u8 = b'L';
+    /// Replace a running installed package with another version WITHOUT STOPPING IT: `[MARKER, HANDOVER, "publisher/name
+    /// version"]`. The supervisor checks the new version, starts it beside the running one, and tells the running one to
+    /// hand over (`gs::handover`). Where either version cannot - it is not running, or a contract does not declare
+    /// `handover` - it stops the old and starts the new, as INSTALL after UNINSTALL would. Answered `[OK, how]`, `how`
+    /// `b'H'` handed over live or `b'R'` restarted, or `[FAILED, reason...]`.
+    pub const HANDOVER: u8 = b'H';
     /// A device's driver died and was restarted.
     pub const EV_RESTARTED: u8 = 1;
     /// A device's driver died and its restart failed.
@@ -605,8 +627,8 @@ pub mod supcmd {
     pub const FAILED:  u8 = 1;
     pub const UNKNOWN: u8 = 2;
 
-    /// Longest command payload: opcode + core + a name and its peers.
-    pub const MAX: usize = 128;
+    /// Longest command payload: opcode + core + a name and its peers, each at most `NAME_MAX` bytes.
+    pub const MAX: usize = 6 + (super::MAX_SEND_PEERS + 1) * (super::NAME_MAX + 1);
 
     /// Build `MARKER op <core> name[\0peer]*` into `buf`, returning its length.
     pub fn encode(buf: &mut [u8; MAX], op: u8, core: u32, name: &str, peers: &[&str]) -> Option<usize> {
@@ -692,10 +714,23 @@ pub const SPAWN_PAYLOAD_MAX: usize = 128;
 /// `log::BOOT_READ_CHUNK`; a reader's buffer is exactly this size, so the kernel never writes past it.
 pub const BOOT_READ_CHUNK: usize = 512;
 
-const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D5;
+/// MUST match `kernel::task::SERVICE_CTX_MAGIC`. It names the page's LAYOUT, and changes when the layout does.
+const SERVICE_CTX_MAGIC:   u32   = 0xD0_5D_EA_D6;
 /// MUST match `kernel::task::MAX_SEND_PEERS` - this indexes the kernel-written context page.
 const MAX_SEND_PEERS:      usize = 6;
-const PEER_NAME_BYTES:     usize = 24;
+/// MUST match `kernel::task::PEER_NAME_BYTES`: a send-peer's name in the page the kernel writes.
+const PEER_NAME_BYTES:     usize = NAME_MAX;
+/// The longest name the kernel holds - a task's, a send-peer's, a directory entry's - and so the longest a
+/// program can run under and be reached by. 128 since 2026-10-18: an installed package runs under its
+/// `publisher/name`, which may be that long. It was 24 for a peer and for acquiring by name, and 32 for a
+/// task, and a 26-byte package name was then unreachable by its own clients. Growing it changed the context
+/// page's layout, so its magic changed with it, and a package built before that is refused at start
+/// (`LAYOUT_RELEASE`).
+pub const NAME_MAX:        usize = 128;
+/// The first GodspeedOS release whose program layout this one runs: the context page and `TaskStat`, which
+/// changed when names grew to 128 bytes. A package built for an earlier release would read them wrongly, so
+/// the supervisor refuses to start it and says its publisher must rebuild it.
+pub const LAYOUT_RELEASE:  &str  = "0.29.0";
 
 #[repr(C)]
 struct SendPeerEntry {
@@ -775,7 +810,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 328;   // 320 + irq_count(4) + irqs[4] - the granted vector (D1b)
+const SERVICE_CONTEXT_DATA_SIZE: usize = 952;   // 320 + irq_count(4) + irqs[4] (D1b); then each of the 6 send-peer names 24 -> 128 bytes (2026-10-18), +624
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -808,12 +843,17 @@ static mut CACHE_NEXT_EVICT: usize = 0;
 struct CacheEntry {
     slot:     u32,
     name_len: u8,
-    name:     [u8; PEER_NAME_BYTES],
+    name:     [u8; NAME_MAX],
 }
 
 impl CacheEntry {
+    /// ALL ZEROS, and that is load-bearing: an empty entry is one with no name (`name_len == 0`), so the
+    /// whole table is zero and lives in `.bss`, which costs a program's image nothing. It used to mark empty
+    /// with `slot: u32::MAX`, which put the table in `.data` - stored in every program's file - and when names
+    /// grew to 128 bytes that was 4 KiB more in each of the forty-odd services the Pi 2's kernel embeds, and
+    /// pushed that kernel past the context page it must end below.
     const fn empty() -> Self {
-        CacheEntry { slot: u32::MAX, name_len: 0, name: [0u8; PEER_NAME_BYTES] }
+        CacheEntry { slot: 0, name_len: 0, name: [0u8; NAME_MAX] }
     }
 }
 
@@ -840,8 +880,8 @@ pub struct TaskStat {
     pub mem_limit:   u64,
     /// Byte length of the name stored in `name`.
     pub name_len:    usize,
-    /// Task name bytes (zero-padded to 32 bytes).
-    pub name:        [u8; 32],
+    /// Task name bytes (zero-padded to `NAME_MAX` bytes).
+    pub name:        [u8; NAME_MAX],
     /// Number of times this service has been restarted (0 on a fresh boot / first spawn, +1 per
     /// respawn). Saturating u64 - effectively unbounded.
     pub restart_count: u64,
@@ -856,7 +896,7 @@ pub struct TaskStat {
 impl TaskStat {
     /// Return the task name as a `&str`.
     pub fn name_str(&self) -> &str {
-        let len = self.name_len.min(32);
+        let len = self.name_len.min(NAME_MAX);
         core::str::from_utf8(&self.name[..len]).unwrap_or("?")
     }
 
@@ -1242,7 +1282,7 @@ impl ServiceContext {
     pub fn reacquire_cap_detail(&self, peer: &str) -> Result<CapHandle, AcquireFailure> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return Err(AcquireFailure::Refused); }
+        if len == 0 || len > NAME_MAX { return Err(AcquireFailure::Refused); }
 
         // SAFETY: syscall(10) = AcquireSendCap; peer bytes are in user space.
         let ret = unsafe {
@@ -1265,20 +1305,20 @@ impl ServiceContext {
         // used to fall through doing nothing and still return Ok: the caller believed the peer was
         // reacquired, `find_send_slot` could not find it, and the cap just acquired leaked (CACHE_SIZE).
         let mut stale: Option<u32> = None;
-        let mut evicted: Option<([u8; PEER_NAME_BYTES], usize)> = None;
+        let mut evicted: Option<([u8; NAME_MAX], usize)> = None;
         let mut placed = false;
         unsafe {
             let cache = &mut *core::ptr::addr_of_mut!(SEND_CAP_CACHE);
             for entry in cache.iter_mut() {
                 if entry.name_len as usize == len && &entry.name[..len] == bytes {
-                    if entry.slot != u32::MAX && entry.slot != new_slot { stale = Some(entry.slot); }
+                    if entry.slot != new_slot { stale = Some(entry.slot); }
                     entry.slot = new_slot;
                     placed = true;
                     break;
                 }
             }
             if !placed {
-                let free = cache.iter().position(|e| e.slot == u32::MAX);
+                let free = cache.iter().position(|e| e.name_len == 0);
                 let i = match free {
                     Some(i) => i,
                     None => {
@@ -1293,13 +1333,13 @@ impl ServiceContext {
                 let entry = &mut cache[i];
                 entry.slot     = new_slot;
                 entry.name_len = len as u8;
-                entry.name     = [0u8; PEER_NAME_BYTES];
+                entry.name     = [0u8; NAME_MAX];
                 entry.name[..len].copy_from_slice(bytes);
             }
         }
         if let Some(old) = stale { self.remove_cap(CapHandle(old)); }
         if let Some((name, nlen)) = evicted {
-            let gone = core::str::from_utf8(&name[..nlen.min(PEER_NAME_BYTES)]).unwrap_or("?");
+            let gone = core::str::from_utf8(&name[..nlen.min(NAME_MAX)]).unwrap_or("?");
             self.log_fmt(format_args!(
                 "sdk: the send-cap cache is full ({} peers) - dropped the cap to '{}' to hold '{}'; '{}' is reacquired when next used",
                 CACHE_SIZE, gone, peer, gone));
@@ -2925,7 +2965,7 @@ impl ServiceContext {
     pub fn acquire_send_grant_cap(&self, peer: &str) -> Option<CapHandle> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return None; }
+        if len == 0 || len > NAME_MAX { return None; }
         // SAFETY: syscall(10) = AcquireSendCap; arg2=1 requests SEND|GRANT.
         let ret = unsafe { raw_syscall(10, bytes.as_ptr() as u64, len as u64, 1) };
         if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
@@ -2937,7 +2977,7 @@ impl ServiceContext {
     pub fn acquire_send_cap(&self, peer: &str) -> Option<CapHandle> {
         let bytes = peer.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return None; }
+        if len == 0 || len > NAME_MAX { return None; }
         // SAFETY: syscall(10) = AcquireSendCap; arg2=0 = SEND only.
         let ret = unsafe { raw_syscall(10, bytes.as_ptr() as u64, len as u64, 0) };
         if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
@@ -2951,7 +2991,7 @@ impl ServiceContext {
     pub fn inspect_endpoint_generation(&self, name: &str) -> u64 {
         let bytes = name.as_bytes();
         let len   = bytes.len();
-        if len == 0 || len > PEER_NAME_BYTES { return 0; }
+        if len == 0 || len > NAME_MAX { return 0; }
         // SAFETY: syscall(13) = InspectKernel; query_id=2 = endpoint generation by name.
         let ret = unsafe {
             raw_syscall(13, 2, bytes.as_ptr() as u64, len as u64)
@@ -3523,15 +3563,16 @@ impl ServiceContext {
     /// is dead, `valid` will be false - and also when the caller lacks the
     /// INTROSPECT cap the kernel requires, which this cannot tell apart.
     pub fn task_stat(&self, slot: u32) -> TaskStat {
-        let mut buf = [0u8; 80];
+        // The kernel's `STAT_SIZE`: 176 bytes since names grew to 128 (`handle_task_stat`).
+        let mut buf = [0u8; 176];
         // SAFETY: syscall(16) = TaskStat; buf is a local array on the user stack.
         let ret = unsafe {
-            raw_syscall(16, slot as u64, buf.as_mut_ptr() as u64, 80)
+            raw_syscall(16, slot as u64, buf.as_mut_ptr() as u64, 176)
         };
         if ret != 0 {
             return TaskStat {
                 valid: false, state: 0, core: 0,
-                mem_used: 0, mem_limit: 0, name_len: 0, name: [0u8; 32],
+                mem_used: 0, mem_limit: 0, name_len: 0, name: [0u8; NAME_MAX],
                 restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
             };
         }
@@ -3543,16 +3584,16 @@ impl ServiceContext {
                                               buf[12], buf[13], buf[14], buf[15]]);
         let mem_limit   = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19],
                                               buf[20], buf[21], buf[22], buf[23]]);
-        let mut name = [0u8; 32];
-        let copy_len = name_len.min(32);
+        let mut name = [0u8; NAME_MAX];
+        let copy_len = name_len.min(NAME_MAX);
         name[..copy_len].copy_from_slice(&buf[24..24 + copy_len]);
-        let restart_count = u64::from_le_bytes([buf[56], buf[57], buf[58], buf[59],
-                                                buf[60], buf[61], buf[62], buf[63]]);
+        let restart_count = u64::from_le_bytes([buf[152], buf[153], buf[154], buf[155],
+                                                buf[156], buf[157], buf[158], buf[159]]);
         let queue_depth = buf[3];
-        let run_ticks   = u64::from_le_bytes([buf[64], buf[65], buf[66], buf[67],
-                                              buf[68], buf[69], buf[70], buf[71]]);
-        let uptime_secs = u64::from_le_bytes([buf[72], buf[73], buf[74], buf[75],
-                                              buf[76], buf[77], buf[78], buf[79]]);
+        let run_ticks   = u64::from_le_bytes([buf[160], buf[161], buf[162], buf[163],
+                                              buf[164], buf[165], buf[166], buf[167]]);
+        let uptime_secs = u64::from_le_bytes([buf[168], buf[169], buf[170], buf[171],
+                                              buf[172], buf[173], buf[174], buf[175]]);
         TaskStat { valid, state, core, mem_used, mem_limit, name_len: copy_len, name,
                    restart_count, queue_depth, run_ticks, uptime_secs }
     }
@@ -4102,6 +4143,20 @@ impl ServiceContext {
         unsafe { raw_syscall(18, 0, 0, 0) }
     }
 
+    /// End this program, with `status`: 0 for success, anything else for a failure it has already said.
+    ///
+    /// The kernel ends the caller and no one else - it takes no capability - and tells the supervisor how
+    /// it ended (`death::EXITED` and the status), which is how a program that FINISHED is told apart from one
+    /// that crashed. A service the supervisor keeps running is restarted all the same: exiting is for a
+    /// program that does one job (CLAUDE.md 14.5 amendment).
+    pub fn exit(&self, status: u32) -> ! {
+        // SAFETY: syscall(57) = Exit; one integer, no pointer. It does not return.
+        unsafe { raw_syscall(57, status as u64, 0, 0); }
+        // Unreachable unless the kernel refused, which it never does for the caller itself: park rather than
+        // return into code that believes it has ended.
+        self.park()
+    }
+
     /// Advisory yield (§9.3).
     pub fn yield_cpu(&self) {
         // SAFETY: syscall(4) = Yield; always valid from ring-3.
@@ -4364,7 +4419,8 @@ impl ServiceContext {
     /// step that ends that catalogue (`docs/service-ownership.md`). Requires the SPAWN capability,
     /// exactly as `spawn` does: supplying the image is not authority to start it - AND the caller
     /// must hold `IMAGE_SPAWN`, which only the supervisor has and cannot delegate (CLAUDE.md 14.1).
-    /// Every refusal comes back as `InvalidArgument`; the kernel's serial log says which it was.
+    /// A name already running comes back as `AlreadyRunning`; every other refusal as `InvalidArgument`,
+    /// and the kernel's serial log says which it was.
     ///
     /// `peers` are NUL-joined into a caller-owned buffer; each name still resolves through the
     /// kernel name directory, so this grants nothing a contract's `send_peers` would not.
@@ -4399,7 +4455,9 @@ impl ServiceContext {
                         core::mem::size_of::<SpawnRequest>() as u64, slot as u64)
         };
         // slot + 1, so 0 means "spawned, no recv endpoint" without colliding with slot 0.
-        if ret < 0 { Err(crate::Error::InvalidArgument) }
+        // -22 is the kernel's SPAWN_ALREADY_RUNNING.
+        if ret == -22 { Err(crate::Error::AlreadyRunning) }
+        else if ret < 0 { Err(crate::Error::InvalidArgument) }
         else if ret == 0 { Ok(None) }
         else { Ok(Some(CapHandle(ret as u32 - 1))) }
     }
@@ -4454,7 +4512,7 @@ impl ServiceContext {
         // SAFETY: single-threaded service process.
         unsafe {
             for entry in SEND_CAP_CACHE.iter() {
-                if entry.slot != u32::MAX
+                if entry.name_len != 0
                     && entry.name_len as usize == len
                     && &entry.name[..len] == bytes
                 {

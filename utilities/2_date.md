@@ -19,7 +19,7 @@ disk; `date` asks `time` and says which of those the reading came from.
 |---|---|
 | `date` | Full timestamp with weekday and its source, e.g. `Sat 2026-06-06 23:45:08  (rtc, scale unknown)`. |
 | `date epoch` | Seconds since 1970-01-01, the number only, e.g. `1780789511`. |
-| `date sync` | Ask `time` to fetch the time from the network now, wait for it (bounded at 10 s, `q` aborts), then print the timestamp. `time` also syncs on its own. |
+| `date sync` | Ask `time` to fetch the time from the network now, wait for it (bounded at 10 s; past 2 s the shell offers `[q] quit`, as for every wait), then print the timestamp. If `time` refuses its NTP setting (4.1), it says so at once. `time` also syncs on its own. |
 
 Default = the human stamp; the word after the verb (`epoch`) picks the machine
 form. The subcommand is `epoch`, **not** `unix` - GodspeedOS is not POSIX, so the
@@ -52,14 +52,34 @@ not a reading.
 
 ## 4. Data source
 
-- The `time` service, over IPC: `OP_NOW` returns the epoch seconds, the source and
-  the sync age; `OP_SYNC` (for `date sync`) asks it to query the network. Each
+- The `time` service, over IPC: `OP_NOW` returns the epoch seconds, the source,
+  the sync age, and whether the NTP setting is refused (byte 18); `OP_SYNC` (for
+  `date sync`) asks it to query the network. Each
   request is bounded at 2 s (`time_rpc`).
 - `time` itself reads the RTC through `InspectKernel` query 11 (packed date/time,
   ungated - wall-clock time is task-neutral hardware info, like the TSC clock,
   query 3).
 - SDK: `Datetime::from_epoch_secs` and `Datetime::weekday()` do the leap-year-aware
   arithmetic.
+
+### 4.1 The NTP server is a setting
+
+`/system/services/time/ntp` names the server `time` asks: one IPv4 address, `#`
+starting a comment. An address, not a name, because a name would need a DNS lookup
+first. A missing file is written with the default, `162.159.200.123`
+(time.cloudflare.com), so the file always shows the server in effect.
+
+```
+gsh> write /system/services/time/ntp 192.168.4.1
+gsh> date sync
+```
+
+`time` reads the file when it starts, and again at every `date sync`, so an edit
+takes effect at the next `date sync` with nothing restarted. A file that does not
+hold exactly one address - a host name, two addresses, nothing - is refused and its
+line named in the log, and no network time is asked for until it is fixed: a typo is
+never quietly replaced by the default. Only with no disk to read at all (no answer
+from `fs` within the first ~30 s) is the default asked, and the log says so.
 
 ## 5. Capabilities
 

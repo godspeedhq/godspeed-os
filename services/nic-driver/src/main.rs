@@ -95,7 +95,7 @@ const TXD_STA_DD:   u8 = 1 << 0; // (TX) descriptor done
 // RX descriptor (16 B): addr@0, length(u16)@8, status(u8)@12, errors(u8)@13.
 const RXD_STA_DD:   u8 = 1 << 0; // (RX) descriptor done - a frame landed in this buffer
 
-// DMA-arena layout (64 KiB): TX ring + one TX frame buffer, then an RX ring + 8 x 2 KiB RX buffers.
+// DMA-arena layout (64 KiB): TX ring + one TX frame buffer, then an RX ring + 24 x 2 KiB RX buffers, then the tally.
 const TX_RING_OFF:   usize = 0x0000;
 const TX_RING_COUNT: usize = 8;
 const TX_RING_BYTES: u32   = (TX_RING_COUNT * 16) as u32;
@@ -115,19 +115,29 @@ const RX_RING_OFF:   usize = 0x2000;
 //
 // This is the silicon's requirement, borrowed as such (§26.14) - nothing about our design wanted
 // four. Eight descriptors is 128 bytes exactly, the smallest legal ring.
-const RX_RING_COUNT: usize = 8;
+//
+// TWENTY-FOUR NOW (384 bytes, three times the multiple), because eight was the DOWNLOAD's limit
+// (2026-10-18). A sender puts a window's worth on the wire at once, and the ring is all that holds a
+// burst until net-stack takes it: past eight frames the rest were dropped, the sender saw loss, and a
+// download in QEMU never had more than 12.7 KiB in flight against a 64 KiB window, with three to five
+// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too. It is what the
+// 64 KiB arena holds: 24 x 2 KiB from 0x3000 ends at 0xF000, and the tally goes after it.
+const RX_RING_COUNT: usize = 24;
 const RX_RING_BYTES: u32   = (RX_RING_COUNT * 16) as u32;
 const RX_BUF_OFF:    usize = 0x3000;
 const RX_BUF_SIZE:   usize = 2048;
-// After RX_BUF (8 x 2 KiB, so it now ends at 0x7000): a 64-byte, 64-byte-aligned buffer the NIC DMAs
+// After RX_BUF (24 x 2 KiB, so it ends at 0xF000): a 64-byte, 64-byte-aligned buffer the NIC DMAs
 // its hardware tally counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error
 // counts, read straight off silicon and INDEPENDENT of net-stack.
-const TALLY_OFF:     usize = 0x7000;
+const TALLY_OFF:     usize = 0xF000;
+const _: () = assert!(RX_BUF_OFF + RX_RING_COUNT * RX_BUF_SIZE <= TALLY_OFF && TALLY_OFF + 64 <= 0x10000,
+    "the RX buffers and the tally must fit the 64 KiB arena, apart");
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
-// `RESET_WAIT` and `TX_CONFIRM_MS` are clocks (`gs::driver::wait`). `RX_POLL_MAX` is still a count of
-// yields, and a miss there is an ordinary empty reply, not a failure (`docs/driver-library.md` 1j).
+// `RESET_WAIT` and `TX_CONFIRM_MS` are clocks (`gs::driver::wait`). Receiving does not wait at all: a
+// read returns what the ring holds, and an empty ring is an ordinary empty reply (RECEIVING RETURNS WHAT IS
+// THERE, below).
 //
 // How long a controller reset may take to self-clear, for both chips. It was a COUNT - 1,000,000
 // yields here and 300,000 in the RTL8168 path - and a count of yields is no time at all: on the T630
@@ -147,12 +157,14 @@ const RESET_WAIT: Budget = Budget::ms(100);
 /// budget, so the answer arrives while it is still wanted. Commandment VIII: wait on the truth (the
 /// descriptor's done bit), bounded by a CLOCK.
 const TX_CONFIRM_MS:  u64 = 20;
-const RX_POLL_MAX:    u32 = 8_000;     // a reply arrives in ms (caught in the first hundreds of iterations).
-                                       // A MISS must give up FAST: on the T630, 50k iterations took >2s -
-                                       // LONGER than net-stack's per-request deadline, so every DNS request
-                                       // TIMED OUT before nic-driver could answer. Keep the no-frame poll
-                                       // well under that deadline so net-stack hears back and can re-poll
-                                       // ([4] collect) rather than give up (the "24 timeouts" diagnosis).
+// RECEIVING RETURNS WHAT IS THERE (2026-10-16). The RTL8168's [4] and [9] used to wait on an empty ring
+// for RX_POLL_MAX = 8,000 yields - a count, and a count is not a duration. On the T630 50,000 took over
+// 2 s, so 8,000 was about a third of a second on a quiet core and past net-stack's whole 1 s deadline on a
+// busy one: `op 9 to nic-driver timed out on the first attempt - reacquired, and the retry was answered`,
+// 21 times in five `tcp` runs on `main`, each costing a second, and the late first answer arriving as a
+// message with no reply cap. The e1000, GENET and dwmac drains never waited - "a driver that blocks until a
+// frame arrives holds a core on someone else's schedule; the caller paces its own polling" - and net-stack
+// does pace an empty poll. The RTL8168 now does what they do.
 
 const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 
@@ -162,7 +174,7 @@ const FRAME_MAX: usize = 1600; // one Ethernet frame (<= 1518) with headroom
 // in a SINGLE round-trip. This replaces the old "one [4] request per look-ahead frame" approach, whose N
 // slow round-trips (each polling the full RX budget when the ring was momentarily empty) pushed net-stack
 // past the shell's deadline. Mechanism only: the driver hands back RAW frames, it never learns what a
-// "reply" is (Commandment X). Bounded by BATCH_MAX, BATCH_MSG_MAX (< the 4 KiB IPC cap), and RX_POLL_MAX.
+// "reply" is (Commandment X). Bounded by BATCH_MAX, BATCH_MSG_MAX (< the 4 KiB IPC cap), and the ring emptying.
 const BATCH_MAX:     usize = 8;
 const BATCH_MSG_MAX: usize = 3072;
 
@@ -243,6 +255,11 @@ const RTL_MTPS_VALUE: u8 = 0x3B;
 /// How long to let the chip settle after Rx/Tx are switched off, before asking it to reset. Gives an
 /// in-flight DMA burst time to retire instead of being reset underneath itself.
 const RTL_QUIESCE_MS: u64 = 10;
+/// How long nobody has collected a frame before the receiver is restarted with its ring emptied, whether
+/// or not the chip said it stopped. Frames that waited this long were waited for by nobody: the ring
+/// filled with broadcasts while `net-stack` was idle. A ring that filled DURING a download is collected
+/// within milliseconds, so its frames are kept and the receiver restarts once they have been taken.
+const RTL_STALE_RX_MS: u64 = 1000;
 
 /// Wait, up to `TX_CONFIRM_MS`, for the NIC to say a transmit is done, yielding between looks: a send
 /// that has not landed at the first look is usually microseconds away, and the core is better given
@@ -357,6 +374,18 @@ fn rtl_arm_rx(arena: &Dma, i: usize) {
     arena.write32(d, o1);
 }
 
+/// Restart the RTL8168's receiver on an empty ring: RX off, every descriptor armed, the ring base
+/// re-pointed (which puts the chip back at descriptor 0), RX on. Whatever the ring held is gone, so this
+/// runs only for a receiver the chip stopped, and only once its frames are taken or stale (`RTL_STALE_RX_MS`).
+fn rtl_restart_rx(mmio: &Mmio, arena: &Dma) {
+    mmio.write8(RTL_CR, RTL_CR_TE);
+    for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
+    let rx_ring = arena.phys_at(RX_RING_OFF);
+    mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
+    mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
+    mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);
+}
+
 /// Answer a request on `reply_cap` and give the capability back - both halves, every time, so a reply
 /// slot cannot leak (CLAUDE.md 8.5); `gs::ipc::reply` is the two as one call. The outcome is counted,
 /// never discarded (`note_reply`).
@@ -445,6 +474,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // All three look identical from outside, and they are three different bugs.
     let mut empty_drains = 0u32;
     let mut rx_silence_logged = false;
+    // The chip said its receiver stopped (RDU or FOVW latched), and it has not been restarted since; and
+    // when a frame was last collected. Together they decide when the ring may be emptied (`RTL_STALE_RX_MS`).
+    let mut rx_stopped = false;
+    let mut collected_at = wait::Since::now(ctx);
+    // For the restart's line: how many there have been, and the ISR bits latched since the last.
+    let mut rx_restarts = 0u32;
+    let mut isr_seen = 0u16;
 
     // THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi-usb.md` 39): the USB WiFi dongle's service,
     // `wifi-usb`, reached over the same frame ops as on the Pi 2, Pi 4 and VisionFive, with the same rule
@@ -474,15 +510,51 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         // (Rx Descriptor Unavailable) or FOVW (Rx FIFO Overflow) HALTS the RTL8168 receiver - `net stats`
         // showed ISR=0x95 (RDU+TDU latched). But acking ALONE does not un-halt it once the ring actually
         // FILLED: while net-stack sits idle between operations, background broadcasts pile the ring full and
-        // the receiver stops (works first session, dead the next). So on RDU/FOVW, re-arm EVERY descriptor
-        // (empty the ring, dropping stale broadcasts) and RESTART the receiver, so the next real frame
-        // lands. Mid-session this cannot fire - net-stack drains frame-by-frame, so the ring never fills.
+        // the receiver stops (works first session, dead the next). So the receiver is RESTARTED on an empty
+        // ring (`rtl_restart_rx`) - but not at once, because the ring is not always stale.
+        //
+        // **A download fills it too** (2026-10-19). With a 256 KiB window the sender puts more than 24
+        // frames on the wire at once, the ring fills, and RDU latches mid-transfer. Emptying it then threw
+        // away frames net-stack was about to take - and this driver used to empty it before EVERY send as
+        // well, so each ACK cost up to 24 frames of data. The Wyse's fetches connected and then went
+        // silent until the timeout. So the frames are kept: the ring is emptied only when net-stack has
+        // taken everything in it (the descriptor at `rx_idx` is the chip's again), or when nobody has
+        // collected a frame for `RTL_STALE_RX_MS` - the broadcasts the restart was written for.
+        //
+        // **And a receiver that stops WITHOUT saying so** (2026-10-19, the Wyse): with the per-send restart
+        // gone, the chip took exactly one ring's worth, 24 frames, and then nothing - the same "one ring's
+        // worth" the T630 showed in July - and this RDU test never fired. Either the chip stops at the end
+        // of the ring without latching RDU, or it does not wrap there. The restart used to hide which. So a
+        // receiver that has given nothing for `RTL_STALE_RX_MS` is restarted whether or not the chip said
+        // it stopped (an empty ring loses nothing; a full one held what nobody waited for), and each
+        // restart is said, with the status bits seen since the last, until the card says which it is.
         let isr = mmio.read16(RTL_ISR);
         mmio.write16(RTL_ISR, 0xFFFF);
+        isr_seen |= isr;
         if isr & (RTL_ISR_RDU | RTL_ISR_FOVW) != 0 {
-            for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
+            rx_stopped = true;
+        }
+        let taken = arena.read32(RX_RING_OFF + rx_idx * 16) & RTL_DESC_OWN != 0;
+        let why = if rx_stopped && taken {
+            Some("the chip stopped it and every frame was taken")
+        } else if collected_at.passed(ctx, Budget::ms(RTL_STALE_RX_MS)) {
+            Some(if rx_stopped { "the chip stopped it and nothing was collected for 1 s" }
+                 else { "nothing was collected for 1 s and the chip did not say it stopped" })
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            rtl_restart_rx(mmio, arena);
+            rx_restarts = rx_restarts.saturating_add(1);
+            if rx_restarts <= 8 || rx_restarts % 64 == 0 {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: RTL8168 receiver restarted (#{}) - {}; ISR since the last 0x{:04x}, rx_idx was {}, {} frames taken",
+                    rx_restarts, why, isr_seen, rx_idx, rx_count));
+            }
             rx_idx = 0;
-            mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);
+            rx_stopped = false;
+            isr_seen = 0;
+            collected_at = wait::Since::now(ctx);
         }
         // [3] STATUS query (the `net` nic-mac diagnostic) - answer the MAC, do NOT treat it as a frame.
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 3 } {
@@ -563,30 +635,25 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 answer(ctx, reply_cap, &rxbuf[..n], &mut reply_fails);
                 continue;
             }
+            // One frame if the NIC has finished one, else an empty reply at once (RECEIVING RETURNS WHAT IS THERE, above).
             let mut n = 0usize;
-            let mut rs = 0u32;
-            while rs < RX_POLL_MAX {
-                let rd = RX_RING_OFF + rx_idx * 16;
-                let o1 = arena.read32(rd);
-                if o1 & RTL_DESC_OWN == 0 {
-                    n = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
-                    for i in 0..n { rxbuf[i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
-                    rtl_arm_rx(arena, rx_idx);
-                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
-                    break;
-                }
-                godspeed::task::yield_now(ctx);
-                rs += 1;
+            let rd = RX_RING_OFF + rx_idx * 16;
+            let o1 = arena.read32(rd);
+            if o1 & RTL_DESC_OWN == 0 {
+                n = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
+                for i in 0..n { rxbuf[i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                rtl_arm_rx(arena, rx_idx);
+                rx_idx = (rx_idx + 1) % RX_RING_COUNT;
             }
-            if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); }
+            if n > 0 { last_rx_len = n as u16; rx_count = rx_count.saturating_add(1); collected_at = wait::Since::now(ctx); }
             answer(ctx, reply_cap, &rxbuf[..n], &mut reply_fails);
             continue;
         }
 
-        // [9] BATCH RX DRAIN (see BATCH_MAX doc): drain up to BATCH_MAX frames off the ring in ONE bounded
-        // poll, length-prefixed, so net-stack scans past stray broadcasts for its reply in a single
-        // round-trip. Ready descriptors are drained back-to-back (no yield); when the ring is empty we
-        // poll (RX_POLL_MAX total) for more to arrive - so the whole call is ONE bounded poll, not N.
+        // [9] BATCH RX DRAIN (see BATCH_MAX doc): up to BATCH_MAX frames off the ring, length-prefixed, so
+        // net-stack scans past stray broadcasts for its reply in a single round-trip. Ready descriptors
+        // are drained back-to-back, and the drain stops at the first the NIC still owns: it returns what
+        // is there and never waits for more (RECEIVING RETURNS WHAT IS THERE, above).
         if { let p = req.payload_bytes(); p.len() == 1 && p[0] == 9 && !cable } {
             // THE CABLE OUT: the same batch, from the radio, one frame per ask until it has none (as on
             // the Pi 2). The room check comes BEFORE the ask, so a frame is never taken from the radio
@@ -611,8 +678,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             let mut out = [0u8; BATCH_MSG_MAX];
             let mut opos = 1usize;   // out[0] = frame count, filled at the end
             let mut nfr = 0u8;
-            let mut rs = 0u32;
-            while rs < RX_POLL_MAX && (nfr as usize) < BATCH_MAX {
+            while (nfr as usize) < BATCH_MAX {
                 let rd = RX_RING_OFF + rx_idx * 16;
                 let o1 = arena.read32(rd);
                 if o1 & RTL_DESC_OWN == 0 {
@@ -627,13 +693,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                     rtl_arm_rx(arena, rx_idx);                  // give the descriptor back to the NIC
                     rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 } else {
-                    godspeed::task::yield_now(ctx);
-                    rs += 1;
+                    break;                                      // the NIC still owns it: nothing more yet
                 }
             }
             out[0] = nfr;
             if nfr > 0 {
                 rx_count = rx_count.saturating_add(nfr as u16);
+                collected_at = wait::Since::now(ctx);
                 empty_drains = 0;
             } else {
                 empty_drains = empty_drains.saturating_add(1);
@@ -747,19 +813,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             continue;
         }
 
-        // RESET THE RECEIVER per frame request (mirrors the e1000 path). nic-driver is request-driven,
-        // so between requests the idle RX ring FILLS with background broadcasts and the NIC hits
-        // descriptor-exhaustion (RDU) and stops - and merely re-arming does NOT restart it. Disabling RX,
-        // re-arming ALL descriptors, re-pointing RDSAR, and re-enabling clears that stall, so the reply we
-        // are about to solicit lands in a FRESH ring. (This is exactly why DNS - which runs long after the
-        // boot dance had already drained one ring's worth - saw "0 frames": the ring had stalled full.)
-        mmio.write8(RTL_CR, RTL_CR_TE);                     // RX off (keep TX) while we re-arm
-        for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
-        let rx_ring = arena.phys_at(RX_RING_OFF);
-        mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
-        mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
-        mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);         // RX back on, from descriptor 0
-        rx_idx = 0;
+        // TRANSMIT TOUCHES NOTHING ON THE RECEIVE SIDE, as on the e1000. This used to restart the
+        // receiver on an emptied ring before every send, for a real stall: between requests the idle ring
+        // filled with broadcasts, the chip stopped (RDU), and DNS long after boot saw "0 frames". That
+        // stall is handled where the chip reports it, at the top of this loop, and only once the ring's
+        // frames are taken or stale. Emptying it per send threw away frames that had arrived and not yet
+        // been collected - harmless while one request had one reply, and every ACK's worth of a download
+        // once the window let a sender run ahead (2026-10-19).
 
         // --- Transmit: copy the frame in, point THE SINGLE TX descriptor (slot 0) at it, kick TPPoll,
         // wait on OWN clearing (Commandment VIII, bounded + loud). ---

@@ -89,7 +89,6 @@ verified on hardware**). `audio-driver` and `pwm-audio` were written on the libr
 
 | Site | Board | Why | Step |
 |---|---|---|---|
-| `nic-driver` `RX_POLL_MAX` | x86 | waits for traffic, tuned against `net-stack`'s deadline; needs a measurement | 1j |
 | `dwc2`'s complete-split NYET retry | Pi 2 | a retry count of sleeps on the keyboard path | 1g |
 | `dwmac`'s `rgmii_loopback_sweep` | VisionFive | compiled but never run | 1i |
 | `block-driver` `sdhci.rs` | none | not compiled | 1b |
@@ -510,6 +509,18 @@ hardware for a condition it will reach - it waits for TRAFFIC, which may never c
 tuned on the T630 to stay under `net-stack`'s request deadline (50,000 yields took longer than it). A
 time bound there is right, but choosing it needs that deadline and a measurement together, so it is left
 for a step of its own rather than guessed.
+
+**Settled 2026-10-16: the RX poll is gone, not converted.** The measurement came from the T630: on
+`main`, `op 9 to nic-driver timed out on the first attempt - reacquired, and the retry was answered`
+21 times in five `tcp` runs, each a second lost, because 8,000 yields on a busy core outlast
+`net-stack`'s 1 s deadline. No time bound was the right one, because the poll waited for traffic, which
+is the caller's to wait for: the e1000, GENET and dwmac drains never waited, and `net-stack` paces its
+empty polls. The RTL8168's single-frame read and batch drain now return what the ring holds, as they do.
+Hardware-verified on the T630 the same day (`30932658`): five `tcp 1.1.1.1 80` runs, `godspeed check`,
+`ping 8.8.8.8` 5/5 and `ping 192.168.4.1` 10/10, with no op 9 timeout and no capless request in the boot,
+against 21 timeouts in five runs on `main`'s image an hour earlier. And on the Wyse 5070 the same day, on
+two images (`30932658`, then `0eac178f`): no op 9 timeout in any `tcp`, `godspeed check` or `ping`, nor
+through a ten-round `chaos max-carnage all-services` on the second.
 
 **Verified:** builds for every port, and in QEMU on 2026-10-03 for the e1000: `osdev test shell` 215 passed, 0 failed (the two skips are the EHCI flood, which this QEMU has no controller for); the e1000 came up 6 times, its reset never failed to self-clear, and ARP, ping to the gateway and continuous `ping` passed through it, as did `chaos max-carnage`. And on the T630 (RTL8168) the same day: the RTL8168 reset self-cleared on all 20 starts (boot and `chaos max-carnage all-services`, 50 rounds, 337 kills), no transmit timed out, and `ping 8.8.8.8` answered 4 of 4 before chaos and after it.
 

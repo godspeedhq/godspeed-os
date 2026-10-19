@@ -1,6 +1,15 @@
+# PORTABLE CRYPTO ON EVERY DEVICE TARGET (2026-10-16, `sdk/tls`). The RustCrypto AES and GHASH (polyval)
+# crates and dalek's curve25519 choose a SIMD path (AES-NI, CLMUL, AVX2) by asking the CPU at RUN time, and
+# the x86 kernel saves no SSE or AVX state across a context switch, so a service using them would corrupt
+# another's registers or fault. These cfgs force their integer-only code. Measured: without them `aes` and
+# `polyval` do not compile for x86_64-unknown-none at all; with them the emitted assembly of every crypto
+# crate holds no xmm/ymm/aesenc/pclmul instruction (the host build, the control, holds thousands). They
+# change nothing for a crate that does not read them. Every shipping target carries them, so a port cannot
+# be the one that forgot.
 [target.x86_64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
+    "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft", "--cfg", "curve25519_dalek_backend=\"serial\"",
 ]
 
 # AArch64 variant (QEMU `virt`) - the arch-boundary demarcation test (docs/aarch64.md). The neutral
@@ -9,6 +18,8 @@ rustflags = [
 [target.aarch64-unknown-none]
 rustflags = [
     "-C", "relocation-model=static",
+    # Portable crypto: see the note above the x86 section.
+    "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft", "--cfg", "curve25519_dalek_backend=\"serial\"",
 ]
 
 # Build the kernel and services with:
@@ -24,6 +35,8 @@ rustflags = [
 [target.riscv64imac-unknown-none-elf]
 rustflags = [
     "-C", "relocation-model=static",
+    # Portable crypto: see the note above the x86 section.
+    "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft", "--cfg", "curve25519_dalek_backend=\"serial\"",
 ]
 
 # LoongArch64 variant (QEMU `virt`) - the FOURTH arch. softfloat = no FP-enable step.
@@ -52,4 +65,6 @@ rustflags = ["-C", "relocation-model=static"]
 # makes the linker page-align each PT_LOAD, matching what x86 services already get. Benign for the
 # kernel (a flat binary via objcopy), needed for the service ELFs.
 [target.armv7a-none-eabi]
-rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-z", "-C", "link-arg=max-page-size=0x1000"]
+rustflags = ["-C", "relocation-model=static", "-C", "link-arg=-z", "-C", "link-arg=max-page-size=0x1000",
+    # Portable crypto: see the note above the x86 section.
+    "--cfg", "aes_force_soft", "--cfg", "polyval_force_soft", "--cfg", "curve25519_dalek_backend=\"serial\""]

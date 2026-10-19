@@ -127,7 +127,7 @@ fn first_word(q: &[u8]) -> &str {
 /// The live tasks, as the task table holds them.
 struct TaskTable {
     slots: [u32; TASKS_MAX],
-    names: [[u8; 32]; TASKS_MAX],
+    names: [[u8; godspeed_sdk::service_context::NAME_MAX]; TASKS_MAX],
     lens: [usize; TASKS_MAX],
     restarts: [u64; TASKS_MAX],
     up: [u64; TASKS_MAX],
@@ -136,7 +136,7 @@ struct TaskTable {
 
 impl TaskTable {
     fn read(ctx: &ServiceContext) -> TaskTable {
-        let mut t = TaskTable { slots: [0; TASKS_MAX], names: [[0; 32]; TASKS_MAX], lens: [0; TASKS_MAX],
+        let mut t = TaskTable { slots: [0; TASKS_MAX], names: [[0; godspeed_sdk::service_context::NAME_MAX]; TASKS_MAX], lens: [0; TASKS_MAX],
                                 restarts: [0; TASKS_MAX], up: [0; TASKS_MAX], n: 0 };
         for slot in 0..SLOTS {
             let st = ctx.task_stat(slot);
@@ -144,7 +144,7 @@ impl TaskTable {
             if !st.valid || st.state == 4 || t.n == TASKS_MAX { continue; }
             // This program is not part of the system it describes, under either of its row names.
             if st.name_str() == "ask" || st.name_str() == "ask-net" { continue; }
-            let len = st.name_len.min(32);
+            let len = st.name_len.min(godspeed_sdk::service_context::NAME_MAX);
             t.slots[t.n] = slot;
             t.names[t.n][..len].copy_from_slice(&st.name[..len]);
             t.lens[t.n] = len;

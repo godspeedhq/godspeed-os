@@ -24,7 +24,7 @@ use crate::memory::frame::PhysAddr;
 // Must match the SDK's ServiceContext layout (sdk/rust/src/service_context.rs) - the kernel writes
 // this page, the service reads it. Only the fields `events` touches on startup need real values.
 pub(super) const SERVICE_CTX_VA: u32 = 0x003f_f000;
-pub(super) const SERVICE_CTX_MAGIC: u32 = 0xD0_5D_EA_D5;
+pub(super) const SERVICE_CTX_MAGIC: u32 = crate::task::SERVICE_CTX_MAGIC;
 pub(super) const USER_STACK_TOP: u32 = 0x8000_0000;
 
 /// A service loaded into a fresh address space with a task slot reserved and its cap installed, ready

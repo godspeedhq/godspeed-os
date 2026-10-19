@@ -19,7 +19,8 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/mmio.rs` | 9 | permitted (§18.1 - device registers) |
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
-| `sdk/rust/src/service_context.rs` | **79** | **grandfathered floor** (§18.5; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
+| `sdk/rust/src/memory.rs` | 3 | permitted (§18.1 - a task's own memory, 2026-10-17 amendment) |
+| `sdk/rust/src/service_context.rs` | **80** | **grandfathered floor** (§18.5; +1 `exit`, 2026-10-17 amendment; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 87 (79 + 8) are not 87 defects.** 84 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12 and moved with `power_off`, 2026-10-14; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
@@ -38,6 +39,29 @@ instead of attempted in the same change that made it visible (§26.7).
 
 Both floors are enforced: a new `unsafe` in any other `sdk/` file FAILS, and either floor growing
 FAILS. They may decrease freely.
+
+---
+
+## 2026-10-17 - Exit: a program ends itself (feat/packages)
+
+A new syscall (57), with the constitution amended at 14.5 and the floor at 18.5. The kernel's handler adds NO
+unsafe: it is the self-kill path `handle_kill` already takes, with a new cause.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/service_context.rs` | 79 -> 80 (+1) | `exit`: one `unsafe { raw_syscall(57, ..) }` call site behind the safe `ServiceContext::exit`, one integer to a syscall that ends the caller and does not return. The single design consequence the `cpu_clock` entry names. Floor amended at CLAUDE.md 18.5, 2026-10-17. |
+
+---
+
+## 2026-10-17 - Region: a task's own memory as a slice (feat/packages)
+
+A new permitted SDK module (CLAUDE.md 18.1, amended the same day), for the supervisor's install loader: it
+reads a package's image from `fs` into memory it owns before starting it, and the image is larger than a
+stack. No kernel change and no new syscall: `AllocMem` (6) already maps the pages.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `sdk/rust/src/memory.rs` | new, 2 | `Region::bytes` and `Region::bytes_mut`: one `slice::from_raw_parts` and one `from_raw_parts_mut` over exactly the pages a successful `AllocMem` mapped for this task, which only the constructor can produce. Zeroed by the kernel, so initialised; unmapped only at the task's death, so they outlive the value; the value is neither Clone nor Copy, and the mutable slice is borrowed through `&mut self`, so no two live slices alias. Not an allocator: there is no free. 2026-10-18, 3: `Region::words_mut`, the same pages as `u32` for a device FIFO read a word at a time (the AIC8800's SDIO read buffer, `services/wifi-driver`): page-aligned, so aligned for u32; a whole number of pages, so `len / 4` words fit exactly; every bit pattern is a valid u32; borrowed through `&mut self` like `bytes_mut`. |
 
 ---
 
@@ -2756,7 +2780,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/ioapic.rs | 9 | permitted |
 | arch/x86_64/acpi.rs | 5 | permitted |
 | arch/x86_64/iommu.rs | 79 | permitted |
-| arch/x86_64/mod.rs | 38 | permitted |
+| arch/x86_64/mod.rs | 36 | permitted |
 | arch/x86_64/page_tables.rs | 51 | permitted |
 | arch/x86_64/pci.rs | 22 | permitted |
 | arch/x86_64/rtc.rs | 1 | permitted |
@@ -3750,3 +3774,34 @@ block returning the selftest's two frames to the allocator (`Frame::from_phys` a
 `unsafe`). Sound because both frames came from `alloc_frame` in the same selftest and their only mapping
 was the slot just cleared, so each is freed exactly once; it is called on the failure path after mapping
 as well as at the end.
+
+## `arch/x86_64/mod.rs` 38 -> 40 (2026-10-16): `hw_random` answers from RDRAND
+
+The x86 port answered InspectKernel query 19 with `None` ("x86 RDRAND is a trivial follow-up"), so nothing
+on a PC could make a secret: the TLS client the `godspeed` package manager uses (`sdk/tls`) refuses to run
+without a hardware random source rather than guess one. Two blocks, both in `hw_random`:
+
+| Block | Why it is sound |
+|---|---|
+| `__cpuid(1)` | Leaf 1 exists on every x86_64 CPU; CPUID is unprivileged, has no side effects and touches no memory. ECX bit 30 says whether RDRAND exists, and RDRAND is not executed unless it does |
+| `_rdrand32_step(&mut word)` | Executed only where CPUID says RDRAND exists. It writes one register and the carry flag; the only memory it touches is `word`, a local it holds the only reference to |
+
+Retried at most ten times, Intel's documented bound for a transient underflow. An all-ones word is refused,
+as Linux refuses it (`arch/x86/kernel/cpu/rdrand.c`): several AMD parts have reported success while
+returning 0xFFFFFFFF every time, and a constant handed back as randomness would become a key. A CPU without
+RDRAND answers `None`, as before. Which of the boards here have it is not checked yet; `random` says on each.
+
+*(Same day, later: both PCs have it - `random` answered on the T630's AMD GX-420GI and the Wyse 5070's Intel
+J5005, and `godspeed check` completed a TLS handshake on each. And the compiler reports the `__cpuid(1)`
+block as an unnecessary `unsafe` (`unused_unsafe`: the intrinsic is a safe function on this toolchain), so
+this count holds one block more than the code needs. Removing it is a code change, left to be made on its
+own; until then the count records the block that exists.)*
+
+## `arch/x86_64/mod.rs` 40 -> 36 (2026-10-17): `__cpuid` is a safe function
+
+The note above found one unnecessary block; the compiler reports four, all in this file and all the same
+case: `core::arch::x86_64::__cpuid` is a safe function on this toolchain, so an `unsafe` around it asks for
+nothing. Removed from `hw_random` (leaf 1) and from the three in `cpu_identity` (leaves 0x80000000,
+0x80000002-4 and 0). The calls, their order and the extended-leaf guard are unchanged. `_rdrand32_step`
+keeps its block, which it needs. The `__cpuid` calls in `boot.rs` sit inside `unsafe fn` bodies, where the
+compiler does not flag them, and are left as they are.

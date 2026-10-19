@@ -441,7 +441,13 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
                                     // the Pi 4's runs under - `wifi scan`, `wifi join`, `/system/shared/wifi/keys` and the frame
                                     // path are the loop's from here (`aic_station.rs`). It does not return. ----
                                     ctx.log("wifi-driver: stage 11 - the AIC8800 is a station; serving `wifi` and the frame path");
-                                    let mut station = aic_station::Aic::new(&h, i.index, &f);
+                                    // The receive region, asked for once (`aic::RX_REGION`): without it a burst
+                                    // the chip queues past a stack buffer stops the link, so no station is served.
+                                    let Ok(rx) = godspeed::memory::Region::alloc(ctx, aic::RX_REGION) else {
+                                        ctx.log("wifi-driver: stage 11 - the 64 KiB receive region could not be had, so the station is not served");
+                                        serve_unavailable_why(ctx, Some(&h), why)
+                                    };
+                                    let mut station = aic_station::Aic::new(&h, i.index, &f, rx);
                                     serve_radio(ctx, &h, Some(&mut station as &mut dyn Station), scan::reply::DOWN_NO_RADIO, "AIC8800D80");
                                 }
                                 None => ctx.log("wifi-driver: stage 9 - the station bring-up stopped; the line above names the message"),

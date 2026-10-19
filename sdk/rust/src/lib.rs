@@ -68,6 +68,7 @@ pub mod churn;
 pub mod dma;
 pub mod hid;
 pub mod ipc;
+pub mod memory;
 pub mod mmio;
 pub mod record;
 pub mod service_context;
@@ -91,6 +92,8 @@ pub enum Error {
     Ipc(IpcError),
     NotFound,
     InvalidArgument,
+    /// A spawn named a task that is already running: one name is one task (`spawn_image`).
+    AlreadyRunning,
 }
 
 impl From<CapError> for Error {

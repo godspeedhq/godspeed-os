@@ -41,7 +41,7 @@ use godspeed_wifi::wire as reply;
 // A received 802.11 data frame as ethernet: every raw-frame radio's (`godspeed_wifi::data`).
 use godspeed_wifi::data::{llc_payload, to_ethernet};
 
-use crate::aic::{self, Packet, CFM_MAX, RX_BYTES, TASK_ME};
+use crate::aic::{self, Packet, CFM_MAX, TASK_ME};
 // Reads one pull makes at most: the Broadcom's bound, the same for this radio.
 use crate::frames::PULL_MAX_READS;
 use crate::aic_wire::{
@@ -168,10 +168,12 @@ pub struct Aic<'a> {
     keys: Option<Keys>,
     hostid: u32,
     st: Stats,
+    /// Where every read from the chip lands (`aic::RX_REGION`): asked for once, at start.
+    rx: godspeed::memory::Region,
 }
 
 impl<'a> Aic<'a> {
-    pub fn new(h: &'a dyn SdioHost, vif: u8, f: &aic::FwFacts) -> Self {
+    pub fn new(h: &'a dyn SdioHost, vif: u8, f: &aic::FwFacts, rx: godspeed::memory::Region) -> Self {
         Aic {
             h,
             vif: Some(vif),
@@ -186,6 +188,7 @@ impl<'a> Aic<'a> {
             keys: None,
             hostid: 0,
             st: Stats::default(),
+            rx,
         }
     }
 
@@ -220,8 +223,8 @@ impl<'a> Aic<'a> {
         }
         let mut d = wait::Deadline::start(ctx, CFM_WAIT);
         loop {
-            let mut bytes = [0u8; RX_BYTES];
-            let n = aic::receive_bytes(self.h, &mut bytes, Budget::ms(200), true, ctx);
+            let n = aic::receive_region(self.h, &mut self.rx, Budget::ms(200), true, ctx);
+            let bytes = self.rx.bytes();
             if n > 0 {
                 self.st.rx_bytes = self.st.rx_bytes.wrapping_add(n as u32);
                 let mut found: Option<(usize, [u8; CFM_MAX])> = None;
@@ -364,8 +367,8 @@ impl<'a> Aic<'a> {
         };
         let mut d = wait::Deadline::start(ctx, REKEY_WAIT);
         while done.is_none() && !d.expired() {
-            let mut bytes = [0u8; RX_BYTES];
-            let n = aic::receive_bytes(self.h, &mut bytes, Budget::ms(100), true, ctx);
+            let n = aic::receive_region(self.h, &mut self.rx, Budget::ms(100), true, ctx);
+            let bytes = self.rx.bytes();
             let mut key_frames = [[0u8; ETH_MAX]; 2];
             let mut key_lens = [0usize; 2];
             let mut nkeys = 0usize;
@@ -463,8 +466,8 @@ impl Station for Aic<'_> {
     /// One look at the chip, never a wait: the loop sleeps between empty turns and answers requests between
     /// them. What the look finds is walked whole - several results, and the end, may share one read.
     fn scan_step(&mut self, sc: &mut Scan, ctx: &ServiceContext) -> ScanStep {
-        let mut bytes = [0u8; RX_BYTES];
-        let n = aic::receive_bytes(self.h, &mut bytes, Budget::ms(0), true, ctx);
+        let n = aic::receive_region(self.h, &mut self.rx, Budget::ms(0), true, ctx);
+        let bytes = self.rx.bytes();
         if n == 0 {
             return ScanStep::Empty;
         }
@@ -575,8 +578,8 @@ impl Station for Aic<'_> {
         let mut d = wait::Deadline::start(ctx, JOIN_WAIT);
         let mut key_frames_seen = 0u32;
         loop {
-            let mut bytes = [0u8; RX_BYTES];
-            let n = aic::receive_bytes(self.h, &mut bytes, Budget::ms(100), true, ctx);
+            let n = aic::receive_region(self.h, &mut self.rx, Budget::ms(100), true, ctx);
+            let bytes = self.rx.bytes();
             let mut cfm: Option<u8> = None;
             let mut ind: Option<crate::aic_wire::ConnectInd> = None;
             let mut short_ind = false;
@@ -758,8 +761,8 @@ impl Station for Aic<'_> {
         let mut got = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: self.dropped.take() };
         let mut reads = 0u32;
         while reads < PULL_MAX_READS && q.has_room() && got.dropped_link.is_none() {
-            let mut bytes = [0u8; RX_BYTES];
-            let n = aic::receive_bytes(self.h, &mut bytes, Budget::ms(0), true, ctx);
+            let n = aic::receive_region(self.h, &mut self.rx, Budget::ms(0), true, ctx);
+            let bytes = self.rx.bytes();
             if n == 0 {
                 break;
             }

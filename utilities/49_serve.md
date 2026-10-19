@@ -58,13 +58,17 @@ its own (§26.2).
 
 ```
 gsh> serve 8080
-listening on 192.168.4.37:8080 - answering connections  [q] quit
-still listening - 10s, 0 served  [q] quit
+listening on 192.168.4.37:8080 - answering connections
+  [q] quit
+still listening - 10s, 0 served
 accepted a connection (1)
 received 11 byte(s): knock knock
 echoed 11 byte(s) back
-closed - waiting for the next connection  [q] quit
+closed - waiting for the next connection
 ```
+
+`[q] quit` is the shell's, once, 2 s in, as for every command that waits; it is not repeated on the
+status lines.
 
 With a duration the reminder reads `still listening - 10s of 300s, 0 served`. When it ends it says
 `serve: 300s elapsed, N connection(s) served` (a duration ran out) or `serve: stopped after N

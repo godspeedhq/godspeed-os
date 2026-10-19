@@ -153,6 +153,9 @@ const DNS_REPLY_MARGIN_SECS: i64 = 2;
 /// This is the same ordering `backlog/28` established for the stash budgets
 /// (`POLL_BUDGET_MS < HOLD_MS < shortest client deadline`) - DNS was simply never brought into it.
 const DNS_BUDGET_SECS: i64 = 4;
+/// How long a DNS query goes unanswered before it is asked again, within the same budget (`dns_resolve`).
+/// A resolver answers in tens of milliseconds; a second's silence is a lost datagram, not a slow server.
+const DNS_RESEND_MS: u64 = 1000;
 const _: () = assert!(DNS_BUDGET_SECS < CLIENT_MIN_DEADLINE_SECS,
     "net-stack must answer a DNS request - even to say it failed - BEFORE its client stops waiting, \
      or every late answer desyncs the reply stream");
@@ -183,6 +186,16 @@ const PING_MAX_PAYLOAD: usize = 1024;
 /// discard, so it is discarded. A CLIENT REQUEST is dropped with its cap reclaimed and counted, which
 /// is `docs/net-tags-design.md` phase-2 behaviour: it times out and retries, which is defined and
 /// recoverable, where consuming it corrupts both sides silently.
+/// Whether the radio carries the link now: `nic-driver`'s status ([3]) answers nine bytes where it has a radio
+/// bridge, the last saying which link carries the frames - 2 is the radio (`Carrier` in its `radio.rs`). No
+/// answer, or another shape, is the cable's answer: the large window is what every wired board was given.
+fn over_radio(ctx: &ServiceContext, pending: &mut Displaced) -> bool {
+    match nic_status_req(ctx, pending, &Message::from_bytes(&[3u8]), LINK_SECS) {
+        Some(r) => { let p = r.payload_bytes(); p.len() == 9 && p[8] == 2 }
+        None => false,
+    }
+}
+
 fn nic_status_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
     while let Some(m) = gs::ipc::try_recv(ctx) {
         // Read the badge for EVERY message, not only the ones with a reply cap. It reads and CLEARS,
@@ -359,7 +372,7 @@ fn sifted_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs
             // (backlog/fixed/29). Every other candidate was eliminated by reading; this one cannot be, so it
             // is being measured rather than assumed.
             None => {
-                if matches!(m.payload_bytes().first(), Some(&21) | Some(&22))
+                if matches!(m.payload_bytes().first(), Some(&21) | Some(&22) | Some(&OP_CONNECT))
                     && !pending.ate_client_said
                 {
                     pending.ate_client_said = true;
@@ -616,8 +629,10 @@ impl Displaced {
     ///
     /// Entries are expired from the FRONT only, which is sound because they were kept in arrival
     /// order: once the head is young enough, so is everything behind it.
+    /// The fourth value is how long the request was held, in milliseconds: its client has been waiting that
+    /// long already, and a reply that takes its whole patience on top arrives after it has given up.
     fn take(&mut self, ctx: &ServiceContext, out: &mut [u8; HELD_BYTES])
-            -> Option<(usize, Option<(u64, u8)>, Cap)> {
+            -> Option<(usize, Option<(u64, u8)>, Cap, u64)> {
         let now = gs::driver::wait::ticks(ctx);
         while self.live > 0 {
             let h = match self.held[self.head].take() { Some(h) => h, None => return None };
@@ -652,7 +667,7 @@ impl Displaced {
                     "net-stack: serving a held client request (op {}) after {} ms in the stash",
                     h.body.get(2).copied().unwrap_or(0), age_ms));
             }
-            return Some((h.len, h.badge, h.reply));
+            return Some((h.len, h.badge, h.reply, age_ms));
         }
         None
     }
@@ -695,6 +710,12 @@ fn serve_while_dancing(ctx: &ServiceContext, pending: &mut Displaced, serve_stat
 fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
                   mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) -> bool {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
+    // A SECOND BOUND, on the tick counter: the seconds above are the wall clock, and a clock that stands
+    // still would hold this loop for as long as it does. Past `secs` plus a second by the counter, it ends and
+    // says what the seconds clock read, so a wedge of this kind is visible and over.
+    let tick0 = gs::driver::wait::ticks(ctx);
+    // None where the counter is uncalibrated: `ticks_ms` floors to one quantum there, which would end every drain.
+    let tick_bound = (gs::driver::wait::ticks_per_10ms(ctx) != 0).then(|| ticks_ms(ctx, secs.max(0) as u64 * 1000 + 1000));
     let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
@@ -713,6 +734,10 @@ fn drain_scan_hit(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serv
             }
         }
         if gs::task::epoch_secs_monotonic(ctx) - t0 >= secs { return false; }
+        if tick_bound.is_some_and(|b| gs::driver::wait::ticks(ctx).wrapping_sub(tick0) >= b) {
+            ctx.log_fmt(format_args!("net-stack: a drain ran past its {} s by the tick counter while the seconds clock moved {} s - ended", secs, gs::task::epoch_secs_monotonic(ctx) - t0));
+            return false;
+        }
         // SERVE AND PACE ONLY WHEN THE WIRE CAME BACK EMPTY.
         //
         // Both of these used to run on EVERY pass, including immediately after a burst arrived, and
@@ -778,6 +803,12 @@ const EMPTY_YIELDS: u32 = 12;
 fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_status: Option<&[u8; 19]>,
               mut on_frame: impl FnMut(&[u8], &mut Displaced) -> bool) {
     let t0 = gs::task::epoch_secs_monotonic(ctx);
+    // A SECOND BOUND, on the tick counter: the seconds above are the wall clock, and a clock that stands
+    // still would hold this loop for as long as it does. Past `secs` plus a second by the counter, it ends and
+    // says what the seconds clock read, so a wedge of this kind is visible and over.
+    let tick0 = gs::driver::wait::ticks(ctx);
+    // None where the counter is uncalibrated: `ticks_ms` floors to one quantum there, which would end every drain.
+    let tick_bound = (gs::driver::wait::ticks_per_10ms(ctx) != 0).then(|| ticks_ms(ctx, secs.max(0) as u64 * 1000 + 1000));
     let mut empty_polls: u32 = 0;
     loop {
         let mut got_frames = false;
@@ -796,6 +827,10 @@ fn drain_scan(ctx: &ServiceContext, pending: &mut Displaced, secs: i64, serve_st
             }
         }
         if gs::task::epoch_secs_monotonic(ctx) - t0 >= secs { return; }
+        if tick_bound.is_some_and(|b| gs::driver::wait::ticks(ctx).wrapping_sub(tick0) >= b) {
+            ctx.log_fmt(format_args!("net-stack: a drain ran past its {} s by the tick counter while the seconds clock moved {} s - ended", secs, gs::task::epoch_secs_monotonic(ctx) - t0));
+            return;
+        }
         // Serve and pace only on an EMPTY poll - see the twin of this loop in `drain_scan_hit` for
         // why giving a receive window away mid-burst kills a host-polled NIC. On an empty poll,
         // `sleep` parks the task so the core is free for the driver trying to hand us a frame.
@@ -1190,14 +1225,24 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
     // only way to get it - and a send that fails is reported rather than discarded, which is what a
     // caller waiting on a reply needs to know.
     if nic_req(ctx, pending, &req, LINK_SECS).is_none() { *timeouts += 1; }
+    // ASKED AGAIN, NOT WAITED OUT. One query and nothing but listening meant one lost datagram - QEMU's DNS
+    // forwarder, a WiFi retry that gave up - cost this server its whole share of the client's patience, and
+    // every request held behind it waited too: four package commands in a row failed that way. A resolver
+    // re-asks; so does this, every `DNS_RESEND_MS`, within the same deadline. The same transaction id and
+    // port, so a reply to either copy matches, and a second reply is a stray frame like any other. (A resend
+    // used to drain the reply it should have caught, when the driver tied a receive to every send; it no
+    // longer does - see below.)
+    let mut last_sent = gs::driver::wait::ticks(ctx);
+    let mut asked = 1u32;
     let mut reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     // BOUNDED BY THE CLOCK (the note above `UDP_BUDGET_MS`). `LINK_SECS` rather than `DANCE_SECS` per
     // poll so one silent poll cannot eat half the budget on its own.
     loop {
         if deadline.expired() {
             ctx.log_fmt(format_args!(
-                "net-stack: DNS gave up after {} ms - answering the client rather than letting it time out \
-                 (a late answer would desync its reply stream)", budget_ms));
+                "net-stack: DNS gave up after {} ms and {} queries to {}.{}.{}.{} - answering the client rather than \
+                 letting it time out (a late answer would desync its reply stream)", budget_ms, asked,
+                dns_server[0], dns_server[1], dns_server[2], dns_server[3]));
             return None;
         }
         let (matched, answer_arp) = {
@@ -1272,6 +1317,11 @@ fn dns_resolve(ctx: &ServiceContext, pending: &mut Displaced, budget_ms: u64,
         // pacing for the same reason - a poll is a question, and asking it twelve times in a row does
         // not make the answer arrive sooner.
         deadline.pause();
+        if gs::driver::wait::ticks(ctx).wrapping_sub(last_sent) >= ticks_ms(ctx, DNS_RESEND_MS) {
+            if nic_req(ctx, pending, &req, LINK_SECS).is_none() { *timeouts += 1; }
+            last_sent = gs::driver::wait::ticks(ctx);
+            asked += 1;
+        }
         reply = nic_req(ctx, pending, &rx_only, LINK_SECS);
     }
 }
@@ -1319,6 +1369,8 @@ const LOP_CLOSE: u8 = 1;
 /// The first byte of an op 21 (TCP transaction) reply (`backlog/fixed/80` D5).
 const TCP_OK: u8 = 0;
 const TCP_FAILED: u8 = 1;
+/// Op 23: open an outbound TCP connection and hand it to the caller as a capability.
+const OP_CONNECT: u8 = 23;
 const COP_RECV: u8 = 0;
 /// Connection: queue the rest of the payload for sending.
 const COP_SEND: u8 = 1;
@@ -1557,6 +1609,64 @@ fn tcp_transact(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp,
     if got == 0 && fault != tcp::Fault::None { Err(fault) } else { Ok(got) }
 }
 
+/// Open an outbound connection owned by resource `rid` and drive it to Established, inside the request.
+///
+/// The first half of [`tcp_transact`], stopping where that one starts writing: from Established on the
+/// connection belongs to its capability, and `poll_step` moves it between requests exactly as it does
+/// an accepted one. Bounded by `budget_ms`, and by `connect`'s own 10 s handshake deadline. On failure
+/// the slot is released here, so a refused open strands nothing.
+#[inline(never)]
+fn tcp_open(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net: &tcp::Net,
+            rid: u64, dst: [u8; 4], dport: u16, budget_ms: u64) -> Result<usize, tcp::Fault> {
+    let mut frame = [0u8; 1600];
+    if !t.have_clock() {
+        ctx.log("net-stack: connect refused - no usable clock, so the handshake could not be bounded");
+        return Err(tcp::Fault::None);
+    }
+    let deadline = t.now_ms(ctx).unwrap_or(0) + budget_ms;
+    let i = match t.connect(ctx, rid, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
+    // OVER A RADIO, THE SMALL WINDOW (`Conn::small_window` says why), decided now, before the SYN settles it.
+    if over_radio(ctx, pending) {
+        t.conns[i].small_window();
+        ctx.log("net-stack: connect - the radio carries the link, so this connection offers the small window");
+    }
+    let n = t.syn_frame(ctx, net, i, &mut frame);
+    if n > 0 {
+        let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
+        t.note_tx(&frame[..n], r.is_some());
+        if r.is_none() { ctx.log("net-stack: connect - nic-driver did not take the SYN"); }
+    } else {
+        ctx.log("net-stack: connect - no SYN could be built");
+    }
+    let mut empty: u32 = 0;
+    for _ in 0..TCP_STEPS {
+        match t.conns[i].state {
+            tcp::State::Established => return Ok(i),
+            tcp::State::Closed => break,
+            _ => {}
+        }
+        if t.now_ms(ctx).unwrap_or(0) >= deadline { break; }
+        // The same pass as `tcp_transact`'s: emit what the machine owes (the SYN's retransmission, the
+        // handshake's ACK), else drain, and pace an empty pass rather than spin.
+        let n = t.poll_one(ctx, net, i, &mut frame);
+        if n > 0 {
+            let r = nic_req(ctx, pending, &Message::from_bytes(&frame[..n]), LINK_SECS);
+            t.note_tx(&frame[..n], r.is_some());
+            empty = 0;
+        } else {
+            let batch = nic_drain(ctx, pending);
+            if feed_batch(ctx, pending, t, net, batch) { empty = 0; } else { empty += 1; }
+        }
+        if empty > 0 {
+            if empty <= EMPTY_YIELDS { gs::task::yield_now(ctx); } else { gs::task::sleep_ms(ctx, RX_POLL_PACE_MS); }
+        }
+    }
+    let fault = t.conns[i].fault;
+    t.last_state = t.conns[i].state;
+    t.forget(rid);
+    Err(if fault == tcp::Fault::None { tcp::Fault::ConnectTimeout } else { fault })
+}
+
 /// Feed one RAW frame into the state machine. Returns true if it was ours.
 ///
 /// THIS FUNCTION DOES NOT TRANSMIT, and that is the point rather than an omission. net-stack has one
@@ -1594,6 +1704,28 @@ fn feed_frame(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, n
 /// 200 ms. Ten wakes a second is also the ceiling on what this costs: each is ONE drain request to
 /// `nic-driver`, and only when nothing else woke us.
 const POLL_MS: u64 = 100;
+/// WHILE FRAMES ARE ARRIVING there is no poll interval at all: a download's frames queue in the driver's
+/// receive ring, and nothing takes them out but a poll. At `POLL_MS` a window of data waited up to 100 ms to be
+/// read in - a 2 KiB window refilled ten times a second was 9 KiB/s on the VisionFive over WiFi AND Ethernet,
+/// and 5.5 KiB/s in QEMU (2026-10-18) - and a 1 ms interval was no better on a board, where any wait is a
+/// scheduler tick. So while polls find frames they run back to back in bursts (`STREAM_BURST_MS`), with a look
+/// for a client between bursts that does not wait. Back to `POLL_MS` as soon as a poll finds nothing, so an
+/// idle machine costs what it did.
+/// How long a READ may spend taking in what the driver already holds before it answers. A reader waiting
+/// on a connection is when the bytes are owed soonest, so it drains the driver while frames keep coming,
+/// up to this: bounded, so one connection's reader cannot keep the service from its other clients.
+const RECV_DRAIN_MS: u64 = 5;
+/// How long one burst of taking frames may run before a client is looked for. Short, so a request waits no
+/// more than this; long enough that the burst, not the gaps between, is what the time is spent on.
+const STREAM_BURST_MS: u64 = 4;
+/// How long a connect waits for a closing connection's slot when the table is full (`OP_CONNECT`). TIME_WAIT
+/// here is 2 s, and a FIN exchange is a round trip or two, so 4 s covers both; a client asking for a
+/// connection waits 20 s for its answer.
+const CONNECT_SLOT_WAIT_MS: u64 = 4_000;
+/// How long a connection's client may leave it untouched before a connect that finds the table full may take
+/// its slot (`Tcp::reclaim_idle`). A client reading a download touches its connection many times a second, and
+/// one between two requests for a few seconds at most; fifteen is far past either.
+const RECLAIM_IDLE_MS: u64 = 15_000;
 
 /// How long ONE frame the poll step sends may wait on the driver.
 ///
@@ -1692,6 +1824,9 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     let mut pos = 1usize;
     let mut any = false;
     let mut out = [0u8; 1600];
+    // THE BURST HAS PAUSED: the driver had nothing. Whatever a connection took in without acknowledging yet
+    // (`tcp::ACK_EVERY`) is acknowledged in this pass, by `poll_one` below.
+    if count == 0 { t.flush_acks(); }
     for _ in 0..count {
         if pos + 2 > p.len() { break; }
         let fl = u16::from_le_bytes([p[pos], p[pos + 1]]) as usize;
@@ -1751,7 +1886,8 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     // the same mistake the transaction loop's "DRAIN BEFORE LEAVING" comment records.
     for i in 0..tcp::MAX_CONNS {
         let c = &t.conns[i];
-        if c.rid != 0 && c.state == tcp::State::Closed && c.readable() == 0 {
+        // Unread bytes keep a slot only while its client may still read them (`Conn::reapable`).
+        if c.reapable() {
             let rid = c.rid;
             t.forget(rid);
             let _ = gs::resource::revoke(ctx, rid);
@@ -1879,7 +2015,7 @@ impl UdpAsks {
     /// A source port no open ask is using, chosen at random in 50000..59999 (sockets use 40000 + n).
     fn pick_port(&self, ctx: &ServiceContext) -> u16 {
         loop {
-            let r = ctx.hw_random().unwrap_or(gs::driver::wait::ticks(ctx) as u32);
+            let r = gs::task::hw_random(ctx).unwrap_or(gs::driver::wait::ticks(ctx) as u32);
             let p = 50_000 + (r % 10_000) as u16;
             if !self.slots.iter().flatten().any(|a| a.src_port == p) { return p; }
         }
@@ -2010,6 +2146,15 @@ fn build_arp_reply(f: &[u8], our_ip: &[u8; 4], our_mac: &[u8; 6], out: &mut [u8;
 /// stalls (RTL8168 RDU recovery) and the deadline no longer glitches (deglitched RTC).
 fn arp_resolve(ctx: &ServiceContext, pending: &mut Displaced, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4],
                serve_status: Option<&[u8; 19]>) -> Option<[u8; 6]> {
+    arp_resolve_tries(ctx, pending, our_ip, our_mac, target, serve_status, DANCE_TRIES)
+}
+
+/// [`arp_resolve`] with the number of requests stated. One is enough to ask "is this a neighbour?": a host
+/// on the link answers within milliseconds, so a single request and its `DANCE_SECS` drain decide it,
+/// where the full `DANCE_TRIES` - meant for a gateway that must be found - spend 12 to 18 s on every
+/// address that is simply not local.
+fn arp_resolve_tries(ctx: &ServiceContext, pending: &mut Displaced, our_ip: &[u8; 4], our_mac: &[u8; 6], target: &[u8; 4],
+                     serve_status: Option<&[u8; 19]>, tries: u32) -> Option<[u8; 6]> {
     let mut arp = [0u8; 42];
     for b in arp.iter_mut().take(6) { *b = 0xff; }   // eth dst = broadcast
     arp[6..12].copy_from_slice(our_mac);
@@ -2059,7 +2204,7 @@ fn arp_resolve(ctx: &ServiceContext, pending: &mut Displaced, our_ip: &[u8; 4], 
     // now answers nothing and there is one place a frame can arrive. The matcher stays factored anyway -
     // it is the protocol's definition of "is this our reply", and one copy of that is the right number.
     let mut result: Option<[u8; 6]> = None;
-    for _ in 0..DANCE_TRIES {
+    for _ in 0..tries {
         let mut scan = |f: &[u8], pending: &mut Displaced, result: &mut Option<[u8; 6]>| -> bool {
             seen += 1;
             if f.len() >= 6 && f[0..6] == our_mac[..] { unicast += 1; }
@@ -2714,8 +2859,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // negative and cannot be produced on demand, so it is asserted where it can be, at a cost worth
     // paying. That cost is memory and arithmetic only - no frame is transmitted, no driver is asked
     // anything - and it is paid once, before the first client can be served.
+    // The self-test's large arena, handed on to the live table below rather than asked for twice.
+    let mut spare = None;
     {
-        let (p, f) = tcp::selftest(&ctx);
+        let (p, f) = tcp::selftest(&ctx, &mut spare);
         if f == 0 {
             ctx.log_fmt(format_args!("net-stack: tcp selftest PASS - {} checks", p));
         } else {
@@ -2743,6 +2890,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     /// When the last poll step ran. The poll is owed every `POLL_MS`, and this is what makes that a
     /// schedule rather than a hope - see the loop below.
     let mut last_poll: u64 = 0;
+    /// Whether the last poll found frames: while it does, polls run back to back (`STREAM_BURST_MS`).
+    let mut streaming = false;
     // When this service last reached the top of its wait. See `SLOW_PASS_MS`.
     let mut last_pass: u64 = 0;
     let mut slow_passes: u32 = 0;
@@ -2754,6 +2903,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let boot_tsc_hz = calibrate_tsc_hz(&ctx);
     let mut tcpst = tcp::Tcp::new(boot_tsc_hz, gs::driver::wait::ticks(&ctx));
     tcpst.warn_if_no_clock(&ctx);
+    // The large receive arenas, asked for once. A slot without one still works, at the small window - said.
+    let given = tcpst.give_buffers(&ctx, spare);
+    if given == tcp::MAX_CONNS {
+        ctx.log_fmt(format_args!("net-stack: tcp receive window {} KiB per connection, scaled (RFC 7323)", tcp::RCV_BIG / 1024));
+    } else {
+        ctx.log_fmt(format_args!("net-stack: tcp - only {} of {} connections have the {} KiB receive window; the rest keep {} KiB, so a download on them is slower",
+            given, tcp::MAX_CONNS, tcp::RCV_BIG / 1024, tcp::RCV_SMALL / 1024));
+    }
 
     // Configure the stack (DHCP -> ARP -> ICMP). These are `mut` because `net renew` (op 8) re-runs the
     // dance in place - a link that comes up after boot recovers without a reboot.
@@ -2907,8 +3064,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // driver conversation and is arriving LATE; one from the queue arrived directly. When a
         // client says it got no answer, that difference is the first thing worth knowing.
         let mut from_stash = true;
+        // How long this request waited in the stash before being served: spent from its client's patience.
+        let mut held_ms = 0u64;
         let (pl_raw, badge, reply_cap) = match pending.take(&ctx, &mut heldbuf) {
-            Some((len, badge, reply)) => (&heldbuf[..len], badge, reply),
+            Some((len, badge, reply, age)) => { held_ms = age; (&heldbuf[..len], badge, reply) }
             None => {
                 // WAIT FOR A CLIENT, BUT NOT FOREVER - answer for ourselves in the gaps.
                 //
@@ -2990,7 +3149,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // Any work owed on a schedule has to be driven by the schedule. Gating it on the
                     // service being idle means the busier it gets, the less it keeps its promises -
                     // which is exactly backwards.
-                    if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= ticks_ms(&ctx, POLL_MS) {
+                    let interval = if streaming { 0 } else { ticks_ms(&ctx, POLL_MS) };
+                    if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= interval {
                         last_poll = gs::driver::wait::ticks(&ctx);
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
                                             dns_server, status };
@@ -2998,7 +3158,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // every established connection carries its own peer MAC on the `Conn`,
                         // so `poll_one` addresses its frames correctly whatever is passed here.
                         let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
-                        poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                        streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks)
+                            && tcpst.conns.iter().any(|c| c.state == tcp::State::Established);
+                        // WHILE FRAMES ARE ARRIVING, KEEP TAKING THEM, for up to STREAM_BURST_MS: one poll is one
+                        // batch, two full frames at most, and a wait between batches is a scheduler tick on a
+                        // board however short it is asked to be. Paced by the tick, the VisionFive took 465
+                        // batches a second - 1.3 MB/s at most - while a gigabit sender filled its 24-frame ring
+                        // and lost the rest (`RBU`, 2026-10-18). A displaced client request ends the burst.
+                        let burst = gs::driver::wait::ticks(&ctx);
+                        while streaming && !pending.has_work()
+                            && gs::driver::wait::ticks(&ctx).wrapping_sub(burst) < ticks_ms(&ctx, STREAM_BURST_MS)
+                        {
+                            last_poll = gs::driver::wait::ticks(&ctx);
+                            streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                        }
                     }
                     // AND THE ASK DEADLINES, HERE AS WELL AS AT THE TOP. This wait goes round without
                     // returning to the top of the serve loop for as long as no message arrives, so a
@@ -3006,6 +3179,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // in QEMU, an NTP query nobody answered got its "no reply" eight seconds late, after
                     // `time` had already given up on it (2026-10-02).
                     asks.expire(&ctx);
+                    // Streaming, a client is looked for WITHOUT waiting and the burst goes on: a wait of any
+                    // length here is a tick, and a tick is frames lost.
+                    if streaming {
+                        if let Some(m) = gs::ipc::try_recv(&ctx) { break m; }
+                        if pending.has_work() { continue 'serve; }
+                        continue;
+                    }
                     if let Some(m) = gs::ipc::recv_within_ms(&ctx, POLL_MS) { break m; }
                     // ---- DO NOT SLEEP ON WORK WE ALREADY HAVE ----
                     //
@@ -3100,7 +3280,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 _ => (pl_raw, Reply { cap: reply_cap, tag: None }),
             },
         };
-        // ARRIVAL RECEIPT for the two ops a person waits on, and ONLY those two.
+        // ARRIVAL RECEIPT for the ops a person waits on, and ONLY those: `tcp`, `serve`'s listen, and a
+        // connect (op 23), which opens one connection per conversation.
         //
         // `tcp` and `serve`'s listen are typed by hand and answered in one round trip, so one line
         // each is no flood - unlike the status and accept polls, which run ten times a second and are
@@ -3108,7 +3289,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // from "it reached dispatch and the work went wrong", which on a Wyse could not be told apart:
         // net-stack logged nothing for a `tcp ... big` while it went on answering ping, and every
         // silent loss path was eliminated by reading except one (backlog/fixed/29).
-        if matches!(pl.first(), Some(&21) | Some(&22)) {
+        if matches!(pl.first(), Some(&21) | Some(&22) | Some(&OP_CONNECT)) {
             ctx.log_fmt(format_args!("net-stack: op {} reached dispatch (from the {})",
                                      pl[0], if from_stash { "stash" } else { "queue" }));
         }
@@ -3337,8 +3518,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 tcpst.conns[k].rid == rid && rid != 0 && tcpst.conns[k].state != tcp::State::Closed
             }) {
                 let op = pl.first().copied().unwrap_or(COP_STAT);
+                tcpst.touch(&ctx, i);
                 let body = if pl.len() > 1 { &pl[1..] } else { &[][..] };
-                let mut resp = [0u8; 2048];
+                // A whole message's worth, less the tag byte the reply leads with: what one read can move.
+                let mut resp = [0u8; gs::ipc::MAX_BYTES - 1];
                 let n = match op {
                     // Reading takes READ; sending takes WRITE. The kernel has already checked the
                     // cap carries `right`; this enforces that the OPERATION is within it, which is
@@ -3351,6 +3534,28 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             [lo, hi, ..] => (u16::from_le_bytes([*lo, *hi]) as usize).min(resp.len()),
                             _ => resp.len(),
                         };
+                        // A READER IS WAITING: take in what the driver holds, while frames keep coming and
+                        // there is room for them, for at most RECV_DRAIN_MS - so the bytes it waits for are
+                        // read in now, and the window its last read freed is told to the peer, rather than
+                        // at the next scheduled poll. One poll is one batch, two full frames at most (a
+                        // message is 4 KiB), so one poll per read was a download paced by this loop.
+                        let t0 = gs::driver::wait::ticks(&ctx);
+                        let budget = ticks_ms(&ctx, RECV_DRAIN_MS);
+                        // A reader whose answer is already waiting is answered at once: the stream poll keeps
+                        // taking frames in between reads, so draining here as well only adds a driver round trip.
+                        while tcpst.conns[i].readable() < max
+                            && gs::driver::wait::ticks(&ctx).wrapping_sub(t0) < budget
+                            && tcpst.conns[i].window() as usize >= tcp::MSS
+                            && tcpst.conns[i].state != tcp::State::Closed
+                        {
+                            last_poll = gs::driver::wait::ticks(&ctx);
+                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                            let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
+                            streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                            // Nothing more in the driver: answer with what there is. And a reader with enough
+                            // to fill its answer is not kept waiting for more.
+                            if !streaming || tcpst.conns[i].readable() >= max { break; }
+                        }
                         tcpst.read(rid, &mut resp[..max])
                     }
                     COP_SEND if right & RIGHT_WRITE != 0 => {
@@ -3609,6 +3814,99 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // that returns 0 has already said why in the log.
             resp[0] = if n > 0 { TCP_OK } else { TCP_FAILED };
             reply.send(&ctx, &resp[..1 + n]);
+        } else if pl.first() == Some(&OP_CONNECT) {
+            // TCP CONNECT (op 23): [23, ip(4), port_hi, port_lo]. Open a connection and hand it to the
+            // caller as a capability, the way an accepted one is (op 22): from then on it is read,
+            // written and closed with COP_RECV / COP_SEND / COP_CLOSE, and `poll_step` keeps it moving
+            // between requests. The one-shot transaction (op 21) cannot carry a conversation, and TLS
+            // is one: the client speaks, waits, speaks again (`docs/developer-services-design.md`
+            // 10.3). Reply `[1]` with the capability, or `[0]` alone with the reason in this log.
+            let mut granted = false;
+            if pl.len() >= 7 && gw_known {
+                let dip = [pl[1], pl[2], pl[3], pl[4]];
+                let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
+                // An address that answers ARP is on-link and is reached directly, as for op 21 - but asked
+                // ONCE: a neighbour answers in milliseconds, and op 21's six tries cost 12 to 18 s on every
+                // address beyond the gateway, longer than a client will wait for the connection.
+                let on_link = arp_resolve_tries(&ctx, pending, &our_ip, &our_mac, &dip, None, 1);
+                let peer_mac = on_link.unwrap_or(gw_mac);
+                ctx.log_fmt(format_args!("net-stack: connect {}.{}.{}.{}:{} - {}",
+                    dip[0], dip[1], dip[2], dip[3], dport,
+                    if on_link.is_some() { "on-link, direct" } else { "via the gateway" }));
+                let net = tcp::Net { our_mac, peer_mac, our_ip };
+                // A FULL TABLE THAT IS EMPTYING IS WAITED FOR, briefly. The connection before this one is
+                // often still closing when its client's next command asks for a new one - a client that
+                // ran `godspeed check` and then `godspeed list available` found both slots held by
+                // connections that were reaped two seconds later, and was told the table was full. A slot
+                // on its way out frees itself (`any_closing`), so this polls for up to CONNECT_SLOT_WAIT_MS
+                // and connects into it. A table full of connections that are NOT closing is still refused
+                // at once, as before.
+                if !tcpst.has_free_slot() && tcpst.any_closing() {
+                    let start = gs::driver::wait::ticks(&ctx);
+                    let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                    let poll_net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
+                    while !tcpst.has_free_slot()
+                        && gs::driver::wait::ticks(&ctx).wrapping_sub(start) < ticks_ms(&ctx, CONNECT_SLOT_WAIT_MS) {
+                        poll_step(&ctx, pending, &st, &mut tcpst, &poll_net, &mut asks);
+                        if !tcpst.has_free_slot() { gs::task::sleep_ms(&ctx, POLL_MS); }
+                    }
+                    let waited = gs::driver::wait::ticks(&ctx).wrapping_sub(start) / ticks_ms(&ctx, 1).max(1);
+                    ctx.log_fmt(format_args!("net-stack: connect waited {} ms for a closing connection's slot - {}", waited,
+                        if tcpst.has_free_slot() { "freed" } else { "still full" }));
+                    if !tcpst.has_free_slot() { tcpst.log_slots(&ctx); }
+                }
+                // STILL FULL: a connection whose client has not used it in RECLAIM_IDLE_MS was abandoned - its program
+                // was ended without closing it - and its slot is taken for this one. Said, with how long it sat.
+                if !tcpst.has_free_slot() {
+                    if let Some((rid, idle)) = tcpst.reclaim_idle(&ctx, RECLAIM_IDLE_MS) {
+                        let _ = gs::resource::revoke(&ctx, rid);
+                        ctx.log_fmt(format_args!(
+                            "net-stack: the connection table was full - released one its client had not used for {} s (a program ended without closing it)",
+                            idle / 1000));
+                    }
+                }
+                match gs::resource::mint(&ctx, RIGHT_READ | RIGHT_WRITE | RIGHT_GRANT) {
+                    Ok((crid, cap)) => {
+                        match tcp_open(&ctx, pending, &mut tcpst, &net, crid, dip, dport, 8_000) {
+                            Ok(_) => {
+                                granted = gs::cap::duplicate(&ctx, cap).ok()
+                                    .map(|c| reply.send_with_cap(&ctx, c, &[1]))
+                                    .unwrap_or(false);
+                                if granted {
+                                    ctx.log_fmt(format_args!("net-stack: connected to {}.{}.{}.{}:{} for a client",
+                                        dip[0], dip[1], dip[2], dip[3], dport));
+                                } else {
+                                    // The capability did not reach the client, so nobody holds the
+                                    // connection: release it rather than leave it owned by no one.
+                                    ctx.log("net-stack: connect succeeded but the capability could not be handed over - released");
+                                    tcpst.forget(crid);
+                                    let _ = gs::resource::revoke(&ctx, crid);
+                                }
+                            }
+                            Err(f) => {
+                                ctx.log_fmt(format_args!(
+                                    "net-stack: connect to {}.{}.{}.{}:{} failed - {} (reached '{}')",
+                                    dip[0], dip[1], dip[2], dip[3], dport,
+                                    match f {
+                                        tcp::Fault::Reset => "peer refused the connection",
+                                        tcp::Fault::RetxExhausted => "no acknowledgement after 6 retransmissions",
+                                        tcp::Fault::ConnectTimeout => "no answer to our SYN in time",
+                                        tcp::Fault::None => "the connection table is full",
+                                    },
+                                    tcpst.last_state.name()));
+                                let _ = gs::resource::revoke(&ctx, crid);
+                            }
+                        }
+                        gs::cap::remove(&ctx, cap);
+                    }
+                    Err(_) => ctx.log("net-stack: connect refused - no resource id could be minted"),
+                }
+            } else if !gw_known {
+                ctx.log("net-stack: connect asked for before the stack is configured");
+            } else {
+                ctx.log_fmt(format_args!("net-stack: connect refused - {} byte(s), not [23, ip(4), port(2)]", pl.len()));
+            }
+            if !granted { reply.send(&ctx, &[0]); }
         } else if pl.first() == Some(&1) {
             // DNS request (byte 0 = 1, then the hostname) - net-stack-internal resolution.
             // Try the DHCP-learned server, then a public fallback (8.8.8.8). A home router may do DHCP +
@@ -3637,8 +3935,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let header_patience = if pl_raw.len() == pl.len() + 2 { pl_raw.get(1).copied() } else { None };
                 let patience = header_patience.filter(|p| *p > 0)
                                  .map(|p| p as i64).unwrap_or(CLIENT_MIN_DEADLINE_SECS);
-                let usable = (patience - DNS_REPLY_MARGIN_SECS).max(1);
-                let per_server_ms = ((usable * 1000) / 2).max(500) as u64;
+                // What is LEFT of it: a request held in the stash has spent that much already, and a lookup
+                // given the whole of it again answered a client that had stopped waiting (2026-10-18: three
+                // held 1 to 3 s, each then given 8 s, each answered after its client said `OutcomeUnknown`).
+                let usable_ms = ((patience - DNS_REPLY_MARGIN_SECS) * 1000 - held_ms as i64).max(1000);
+                let per_server_ms = (usable_ms / 2).max(500) as u64;
                 for server in [dns_server, [8, 8, 8, 8]] {
                     let mut got = false;
                     ip = dns_resolve(&ctx, pending, per_server_ms, &pl[1..], &gw_mac, &our_ip, &our_mac, &server, &mut got,

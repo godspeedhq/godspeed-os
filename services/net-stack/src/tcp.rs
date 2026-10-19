@@ -5,7 +5,7 @@
 //! every line here:
 //!
 //!   * **No heap** (§26.6.1). A fixed connection table, fixed per-connection arenas, and a fixed
-//!     number of out-of-order segments held. The maximum footprint is readable off the constants
+//!     number of out-of-order ranges tracked. The maximum footprint is readable off the constants
 //!     below and cannot grow at runtime.
 //!   * **The advertised receive window IS the free space in the receive arena.** TCP's own flow
 //!     control therefore enforces §26.6 rather than fighting it, and the peer is told the exact truth
@@ -23,23 +23,56 @@ use godspeed_sdk::service_context::ServiceContext;
 
 /// Connections held at once. TWO, not a larger round number, because the transaction model uses
 /// exactly one at a time and a table sized for concurrency that does not exist yet is the
-/// speculative abstraction §26.2 forbids. Each connection costs its two arenas plus its held
-/// out-of-order segments, and this table lives in `service_main`'s frame: on the Pi 2 that stack is
-/// 256 KiB, a debug ARM build has already overflowed one, and four connections put this service's
-/// entry frame at 98 KiB. Raise it when concurrent connections exist to need it.
+/// speculative abstraction §26.2 forbids. Each connection costs its small arenas in `service_main`'s frame
+/// (about 10 KiB) and a 256 KiB region beside it ([`RCV_BIG`]). FOUR was tried on 2026-10-18 and overflowed
+/// that 256 KiB stack at start in QEMU, a crash loop; what it was for - two connections left by programs ended
+/// with `q` filling the table on the VisionFive - is answered by reclaiming an abandoned one
+/// (`Tcp::reclaim_idle`) instead.
 pub const MAX_CONNS: usize = 2;
 /// Per-connection send arena: data handed to us that the peer has not acknowledged yet. A segment
 /// cannot be dropped from here until its ACK arrives, because retransmission is reading from it.
 pub const SND_BUF: usize = 2048;
-/// Per-connection receive arena. Its FREE SPACE is what we advertise as the window, so this constant
-/// is the largest amount of un-read data a peer can ever push at this machine.
-pub const RCV_BUF: usize = 2048;
-/// Out-of-order segments held while waiting for the gap to fill. Beyond this we DROP and let the peer
-/// retransmit, which is always-legal TCP and is what keeps reassembly bounded. FreeBSD holds far
-/// more; that is a property of their design, not of the protocol.
-pub const MAX_OOO: usize = 4;
+/// Per-connection receive arena, the SMALL one: inside the connection, in `service_main`'s frame. Its FREE
+/// SPACE is what we advertise as the window, so it is the most un-read data a peer can push at this machine,
+/// and so how much a download moves per round trip. It is what a connection has when the large one below
+/// could not be had, and what the startup self-test uses. 8 KiB, not 2: at 2 KiB a package came down at
+/// 5.5 KiB/s in QEMU and 9 KiB/s on the VisionFive over WiFi and Ethernet alike (2026-10-18).
+pub const RCV_SMALL: usize = 8192;
+/// Per-connection receive arena, the LARGE one: pages net-stack asks the kernel for once, at start
+/// ([`Tcp::give_buffers`]), one region per connection, reused for every connection that slot ever holds
+/// (26.6.1: there is no free, so it is asked for once). A window this size needs the window-scale option
+/// (RFC 7323), because the header's window field is 16 bits and stops at 64 KiB.
+///
+/// **What it is for: a download as fast as the link.** A sender may have at most one window un-acknowledged,
+/// so a connection moves at most `window / round trip`: 8 KiB over a 25 ms internet path is 320 KiB/s
+/// whatever the link can do. 256 KiB over the same path is 10 MiB/s, which is past what this stack can take
+/// in through 4 KiB messages today, so the window stops being the limit.
+pub const RCV_BIG: usize = 256 * 1024;
+/// Out-of-order RANGES tracked while waiting for a gap to fill. A segment that arrives ahead of a gap is put
+/// straight into its place in the receive arena - the window is the arena's free space, so anything in the
+/// window has a place - and only its sequence range is kept here; neighbouring ranges merge. A segment that
+/// would need a range past this many is dropped and the peer retransmits it, which is always-legal TCP and
+/// keeps reassembly bounded.
+///
+/// **Why ranges, not copies.** This held four whole segments, copied aside. With a 256 KiB window one lost
+/// frame is followed by up to 180 more, and all but four of them were thrown away - and with no selective
+/// acknowledgement the peer then resends them one round trip at a time. Placed in the arena, the whole
+/// window survives a loss, and one resent segment fills the hole.
+pub const MAX_OOO: usize = 16;
 /// Maximum segment size we announce and honour. 1460 = 1500 MTU - 20 IP - 20 TCP, the Ethernet case.
 pub const MSS: usize = 1460;
+/// In-order data acknowledged at most this far behind (RFC 1122 4.2.3.2 allows a delay; RFC 5681 4.2 asks for
+/// at least every second full segment, which is a SHOULD, and this is past it on purpose). Eight segments, or
+/// sooner when the burst pauses (`Tcp::flush_acks`): every acknowledgement is a frame handed to the driver and
+/// waited on, which is milliseconds on the dwmac and 20 to 60 ms through the AIC8800, so one per two segments
+/// was what paced a download on the VisionFive (2026-10-19). Out of order, a duplicate, the segment that fills
+/// a hole, and a FIN are still answered at once - those acknowledgements carry news the sender acts on.
+pub const ACK_EVERY: u32 = 8 * MSS as u32;
+/// The window-scale option (RFC 7323 2): kind 3, length 3, the shift - sent after a No-Operation so the
+/// option list stays in whole 32-bit words.
+const OPT_WS_LEN: usize = 4;
+/// The largest shift RFC 7323 2.3 allows; a larger one is read as this.
+const WS_MAX: u8 = 14;
 
 /// What a peer that sent us NO maximum-segment-size option is assumed to accept (RFC 1122 §4.2.2.6).
 ///
@@ -72,6 +105,9 @@ pub const RTO_MAX_MS: u64 = 8_000;
 /// Retransmissions of one segment before the connection is declared dead. Bounded on purpose: a
 /// retry loop with no limit is an unbounded wait wearing a disguise (§26.6).
 pub const MAX_RETX: u8 = 6;
+/// How long a fin-wait-2 whose client has closed it waits for the peer's FIN before its slot is let go. As
+/// long as TIME_WAIT here, and inside the 4 s a connect waits for a closing slot.
+pub const FIN_WAIT_2_MS: u64 = 2_000;
 // ── Wire constants ─────────────────────────────────────────────────────────────────────────────
 
 pub const FIN: u8 = 0x01;
@@ -151,23 +187,8 @@ pub enum Fault {
     ConnectTimeout,
 }
 
-// ── A held out-of-order segment ────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy)]
-struct Ooo {
-    seq: u32,
-    len: u16,
-    used: bool,
-    data: [u8; MSS],
-}
-
-impl Ooo {
-    const fn empty() -> Self { Ooo { seq: 0, len: 0, used: false, data: [0u8; MSS] } }
-}
-
 // ── A connection ───────────────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy)]
 pub struct Conn {
     pub state: State,
     pub fault: Fault,
@@ -203,8 +224,9 @@ pub struct Conn {
     pub snd_una: u32,
     /// Next byte we will send.
     pub snd_nxt: u32,
-    /// The peer's advertised window: how much it will accept beyond `snd_una`.
-    pub snd_wnd: u16,
+    /// The peer's advertised window: how much it will accept beyond `snd_una`, in BYTES - its window field
+    /// shifted by its scale ([`Conn::peer_window`]).
+    pub snd_wnd: u32,
     /// Our initial send sequence, kept so `bytes_sent` can be reported without exposing raw seqs.
     iss: u32,
 
@@ -217,11 +239,26 @@ pub struct Conn {
     snd_buf: [u8; SND_BUF],
     snd_len: usize,
 
-    /// Received, in-order, not yet read by the client.
-    rcv_buf: [u8; RCV_BUF],
+    /// Received, in-order, not yet read by the client: a ring of `rcv_len` bytes from `rcv_head`, in
+    /// `rcv_big` when this slot has one ([`Tcp::give_buffers`]) and in `rcv_small` when it does not.
+    rcv_small: [u8; RCV_SMALL],
+    rcv_big: Option<godspeed::memory::Region>,
+    rcv_head: usize,
     rcv_len: usize,
 
-    ooo: [Ooo; MAX_OOO],
+    /// Window scaling (RFC 7323), settled by the handshake: in force only when BOTH SYNs carried the option.
+    /// `rcv_shift` is ours - what our window field is shifted right by - and `snd_shift` the peer's. Both 0
+    /// otherwise, which is plain 16-bit windows.
+    rcv_shift: u8,
+    snd_shift: u8,
+    /// The shift the peer's SYN offered, kept until our SYN-ACK settles whether scaling is on.
+    peer_ws: Option<u8>,
+    /// The most of the arena this connection may offer the peer, set before its SYN ([`Conn::small_window`]).
+    rcv_limit: usize,
+
+    /// Out-of-order ranges already in the arena, `[start, end)` in sequence numbers, beyond `rcv_nxt`.
+    ooo: [(u32, u32); MAX_OOO],
+    ooo_n: usize,
 
     // Timers, all in milliseconds of monotonic service time.
     /// When the oldest unacknowledged segment must be resent. 0 = no timer armed.
@@ -241,6 +278,11 @@ pub struct Conn {
     state_deadline_ms: u64,
     /// Set when the client has asked to close and the send buffer must drain first.
     close_pending: bool,
+    /// The client CLOSED it: it will read nothing more, so what is unread, or arrives after, is no one's.
+    reader_gone: bool,
+    /// When its client last used it (any invocation), in this table's milliseconds: what says a connection
+    /// whose program was ended without closing it has been abandoned ([`Tcp::reclaim_idle`]).
+    used_ms: u64,
     /// An acknowledgement is owed to the peer, to be sent by `poll_one` on its next pass.
     ///
     /// `on_frame` USED TO SEND IT ITSELF, and that was the last hardware bug on this branch. Doing so
@@ -254,13 +296,16 @@ pub struct Conn {
     /// Reacting to the peer and making our own progress are now separable, which is what
     /// `docs/tcp-design.md` said the architecture had to be before any of this was written.
     ack_due: bool,
+    /// In-order bytes received since the last acknowledgement went out: owed one at [`ACK_EVERY`], or when the
+    /// burst pauses ([`Tcp::flush_acks`]).
+    ack_owed: u32,
     /// The window most recently ADVERTISED to the peer.
     ///
     /// Without this there is no way to notice that the window has reopened. Reading data out of the
     /// arena frees space, and a peer that was told 608 bytes stays limited to 608 until it is told
     /// otherwise - so a reply larger than the arena stalls partway and the connection then closes
-    /// with the rest unread. Measured, not theorised: a 2888-byte reply arrived as 1440 bytes.
-    last_adv: u16,
+    /// with the rest unread. Measured, not theorised: a 2888-byte reply arrived as 1440 bytes. In BYTES.
+    last_adv: u32,
 
     // ── Congestion control (RFC 5681) ──────────────────────────────────────────────────────────
     /// What the PEER will accept in one segment, from its SYN's option or the RFC 1122 default.
@@ -304,8 +349,9 @@ impl Conn {
             local_port: 0, remote_ip: [0; 4], remote_port: 0,
             snd_una: 0, snd_nxt: 0, snd_wnd: 0, iss: 0, rcv_nxt: 0,
             snd_buf: [0u8; SND_BUF], snd_len: 0,
-            rcv_buf: [0u8; RCV_BUF], rcv_len: 0,
-            ooo: [Ooo::empty(); MAX_OOO],
+            rcv_small: [0u8; RCV_SMALL], rcv_big: None, rcv_head: 0, rcv_len: 0,
+            rcv_shift: 0, snd_shift: 0, peer_ws: None, rcv_limit: RCV_BIG,
+            ooo: [(0, 0); MAX_OOO], ooo_n: 0,
             snd_mss: MSS_DEFAULT,
             cwnd: 0, ssthresh: u32::MAX / 2,
             dup_acks: 0, recover: 0, in_recovery: false, fast_retx: false,
@@ -313,19 +359,124 @@ impl Conn {
             retx_at_ms: 0, retx_count: 0,
             srtt_ms: 0, rttvar_ms: 0, rto_ms: RTO_MIN_MS,
             rtt_timed_seq: 0, rtt_timed_at_ms: 0, rtt_timing: false,
-            state_deadline_ms: 0, close_pending: false, ack_due: false, last_adv: 0,
+            state_deadline_ms: 0, close_pending: false, reader_gone: false, used_ms: 0, ack_due: false, ack_owed: 0, last_adv: 0,
         }
+    }
+
+    /// Back to free for a new connection, KEEPING this slot's large receive arena: it was asked for once and
+    /// is this slot's for good (26.6.1). `*c = Conn::free()` would drop it, and the kernel cannot be asked
+    /// for it back.
+    fn reset(&mut self) {
+        let big = self.rcv_big.take();
+        *self = Conn::free();
+        self.rcv_big = big;
     }
 
     pub fn in_use(&self) -> bool { self.state != State::Closed || self.rid != 0 }
 
-    /// Free space in the receive arena. THIS IS THE ADVERTISED WINDOW - see the module header.
-    pub fn window(&self) -> u16 { (RCV_BUF - self.rcv_len) as u16 }
+    /// The receive arena's size: the region, or the small arena, and no more than this connection may offer.
+    fn rcv_cap(&self) -> usize {
+        let have = match &self.rcv_big { Some(r) => r.len().min(RCV_BIG), None => RCV_SMALL };
+        have.min(self.rcv_limit)
+    }
+
+    /// Offer the peer no more than the small window ([`RCV_SMALL`]), for a connection whose link cannot take a
+    /// large one's bursts. Before the SYN: the window and its scale are settled by the handshake.
+    ///
+    /// **Why a link would not.** Over a radio both drivers here read the chip into fixed buffers, and a large
+    /// window lets the access point send bursts the chip hands over as one transfer: 26 KiB through the
+    /// VisionFive's AIC8800 (which now reads its whole queue) and superframes of 4.7 to 14 KB through the Pi 4's
+    /// CYW43455, whose driver reads at most 4 KiB - so the rest stayed unread, the radio stopped, and after a
+    /// `godspeed fetch` even `ping` failed (2026-10-19). Until the radio drivers can take a large window's
+    /// bursts, a connection over a radio keeps the window it had before, which worked.
+    pub fn small_window(&mut self) {
+        self.rcv_limit = RCV_SMALL;
+    }
+
+    fn rcv_ring(&mut self) -> &mut [u8] {
+        let cap = self.rcv_cap();
+        match &mut self.rcv_big { Some(r) => &mut r.bytes_mut()[..cap], None => &mut self.rcv_small[..] }
+    }
+
+    /// Free space in the receive arena, in bytes. THIS IS THE ADVERTISED WINDOW - see the module header.
+    pub fn window(&self) -> u32 { (self.rcv_cap() - self.rcv_len) as u32 }
+
+    /// The shift our SYN offers: the smallest that fits this arena's free space in the 16-bit field.
+    fn our_ws(&self) -> u8 {
+        let mut shift = 0u8;
+        while (self.rcv_cap() >> shift) > 0xffff && shift < WS_MAX { shift += 1; }
+        shift
+    }
+
+    /// The most the window field can tell the peer now, in bytes: the free space as the field can carry it.
+    /// Less than [`window`](Conn::window) when the arena is larger than the field reaches - with no scaling,
+    /// 64 KiB of a 256 KiB arena.
+    fn advertisable(&self) -> u32 {
+        ((self.window() >> self.rcv_shift).min(0xffff)) << self.rcv_shift
+    }
+
+    /// The window field to send, and recorded as what the peer was told. On a SYN the field is never scaled
+    /// (RFC 7323 2.2); after it, it is the free space shifted by ours, rounded DOWN so we never offer room
+    /// we do not have.
+    fn adv(&mut self, syn: bool) -> u16 {
+        // Every segment that tells the window acknowledges too, so nothing received is owed one any more.
+        self.ack_owed = 0;
+        let w = self.window();
+        let (field, told) = if syn {
+            let f = w.min(0xffff);
+            (f as u16, f)
+        } else {
+            let f = (w >> self.rcv_shift).min(0xffff);
+            (f as u16, f << self.rcv_shift)
+        };
+        self.last_adv = told;
+        field
+    }
+
+    /// The peer's window, in bytes, from a segment's field: shifted by its scale, except on a SYN.
+    fn peer_window(&self, field: u16, syn: bool) -> u32 {
+        if syn { field as u32 } else { (field as u32) << self.snd_shift }
+    }
+
+    /// Write bytes `off` past the ring's end without counting them as received: an out-of-order segment's
+    /// place, or (at 0) the next in-order bytes. How many fitted in the free space.
+    fn rcv_place(&mut self, off: usize, data: &[u8]) -> usize {
+        let cap = self.rcv_cap();
+        let free = cap - self.rcv_len;
+        if off >= free { return 0; }
+        let n = data.len().min(free - off);
+        let at = (self.rcv_head + self.rcv_len + off) % cap;
+        let first = n.min(cap - at);
+        let ring = self.rcv_ring();
+        ring[at..at + first].copy_from_slice(&data[..first]);
+        ring[..n - first].copy_from_slice(&data[first..n]);
+        n
+    }
+
+    /// Take bytes from the ring's front; how many.
+    fn rcv_pop(&mut self, out: &mut [u8]) -> usize {
+        let cap = self.rcv_cap();
+        let n = out.len().min(self.rcv_len);
+        let head = self.rcv_head;
+        let first = n.min(cap - head);
+        let ring = self.rcv_ring();
+        out[..first].copy_from_slice(&ring[head..head + first]);
+        out[first..n].copy_from_slice(&ring[..n - first]);
+        // The head moves on and never jumps back: an out-of-order segment was placed relative to it.
+        self.rcv_head = (head + n) % cap;
+        self.rcv_len -= n;
+        n
+    }
 
     /// Bytes the client has sent that the peer has not acknowledged.
     pub fn unacked(&self) -> usize { self.snd_len }
     /// Bytes received and waiting to be read.
     pub fn readable(&self) -> usize { self.rcv_len }
+    /// Finished and its slot can go back: closed by the protocol, owned, and with nothing left that its client
+    /// will read - nothing unread, or a client that has closed it and so will read nothing more.
+    pub fn reapable(&self) -> bool {
+        self.rid != 0 && self.state == State::Closed && (self.rcv_len == 0 || self.reader_gone)
+    }
     /// Total payload bytes handed to the peer and acknowledged.
     pub fn bytes_acked(&self) -> u32 { self.snd_una.wrapping_sub(self.iss).saturating_sub(1) }
 
@@ -358,6 +509,8 @@ pub struct Seg<'a> {
     /// The peer's maximum segment size, when this is a SYN that carried the option. `None` on every
     /// other segment, and on a SYN that offered nothing - which RFC 1122 says to read as 536.
     pub mss: Option<u16>,
+    /// The peer's window-scale shift, when this is a SYN that carried the option (RFC 7323), at most 14.
+    pub ws: Option<u8>,
     pub payload: &'a [u8],
 }
 
@@ -390,10 +543,11 @@ pub fn parse(f: &[u8]) -> Option<Seg<'_>> {
     // The peer's maximum segment size, if it offered one. Only ever present on a SYN, so only ever
     // looked for there - options on an ordinary segment are somebody else's extension and are
     // skipped by `doff` above, which is the whole reason that field exists.
-    let mss = if f[t + 13] & SYN != 0 && doff > TCP_LEN {
-        parse_mss(&f[t + TCP_LEN..t + doff])
+    let (mss, ws) = if f[t + 13] & SYN != 0 && doff > TCP_LEN {
+        let opts = &f[t + TCP_LEN..t + doff];
+        (parse_mss(opts), parse_ws(opts))
     } else {
-        None
+        (None, None)
     };
 
     let mut src_ip = [0u8; 4]; src_ip.copy_from_slice(&f[ETH_LEN + 12..ETH_LEN + 16]);
@@ -407,7 +561,7 @@ pub fn parse(f: &[u8]) -> Option<Seg<'_>> {
         ack: be32(&f[t + 8..t + 12]),
         flags: f[t + 13],
         wnd: be16(&f[t + 14..t + 16]),
-        mss,
+        mss, ws,
         payload: &f[t + doff..ip_end],
     })
 }
@@ -441,6 +595,18 @@ fn tcp_checksum(src: &[u8; 4], dst: &[u8; 4], tcp: &[u8]) -> u16 {
 /// stops the walk instead of being interpreted - a length byte of 0 or 1 would otherwise loop
 /// forever on a frame a hostile peer controls entirely (Commandment V).
 fn parse_mss(opts: &[u8]) -> Option<u16> {
+    let v = find_opt(opts, 2, 4)?;
+    Some(((v[0] as u16) << 8) | v[1] as u16)
+}
+
+/// Read a window-scale option (RFC 7323 2.2) out of a SYN's option field. A shift above 14 is read as 14,
+/// as 2.3 says.
+fn parse_ws(opts: &[u8]) -> Option<u8> {
+    find_opt(opts, 3, 3).map(|v| v[0].min(WS_MAX))
+}
+
+/// The value bytes of the option `kind` of length `len`, walking the list as `parse_mss` describes.
+fn find_opt(opts: &[u8], want: u8, want_len: usize) -> Option<&[u8]> {
     let mut i = 0;
     while i < opts.len() {
         match opts[i] {
@@ -450,8 +616,8 @@ fn parse_mss(opts: &[u8]) -> Option<u16> {
                 if i + 1 >= opts.len() { return None; }
                 let len = opts[i + 1] as usize;
                 if len < 2 || i + len > opts.len() { return None; }
-                if kind == 2 && len == 4 {
-                    return Some(((opts[i + 2] as u16) << 8) | opts[i + 3] as u16);
+                if kind == want && len == want_len {
+                    return Some(&opts[i + 2..i + len]);
                 }
                 i += len;
             }
@@ -469,10 +635,19 @@ fn parse_mss(opts: &[u8]) -> Option<u16> {
 pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4],
             dst_ip: &[u8; 4], src_port: u16, dst_port: u16,
             seq: u32, ack: u32, flags: u8, wnd: u16, payload: &[u8]) -> usize {
+    emit_ws(out, peer_mac, our_mac, our_ip, dst_ip, src_port, dst_port, seq, ack, flags, wnd, None, payload)
+}
+
+/// [`emit`], with a window-scale option on a SYN when `ws` says one.
+#[allow(clippy::too_many_arguments)]
+fn emit_ws(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8; 4],
+           dst_ip: &[u8; 4], src_port: u16, dst_port: u16,
+           seq: u32, ack: u32, flags: u8, wnd: u16, ws: Option<u8>, payload: &[u8]) -> usize {
     // A SYN, and only a SYN, carries our maximum segment size. Announcing it is not a nicety: a
     // peer that receives no option must assume 536 (RFC 1122 §4.2.2.6), so a stack that stays silent
     // is asking every peer on the internet to talk to it in 536-byte pieces. We were silent.
-    let opt_len = if flags & SYN != 0 { OPT_MSS_LEN } else { 0 };
+    let ws = if flags & SYN != 0 { ws } else { None };
+    let opt_len = if flags & SYN != 0 { OPT_MSS_LEN } else { 0 } + if ws.is_some() { OPT_WS_LEN } else { 0 };
     let total = HDR + opt_len + payload.len();
     if total > out.len() || payload.len() > MSS { return 0; }
     for b in out[..total].iter_mut() { *b = 0; }
@@ -521,10 +696,16 @@ pub fn emit(out: &mut [u8], peer_mac: &[u8; 6], our_mac: &[u8; 6], our_ip: &[u8;
     out[t + 12] = (((TCP_LEN + opt_len) / 4) as u8) << 4;
     out[t + 13] = flags;
     out[t + 14] = (wnd >> 8) as u8; out[t + 15] = wnd as u8;
-    if opt_len == OPT_MSS_LEN {
+    if flags & SYN != 0 {
         out[t + 20] = 2;                                         // kind: maximum segment size
         out[t + 21] = 4;                                         // length, including these two bytes
         out[t + 22] = (MSS >> 8) as u8; out[t + 23] = MSS as u8;
+    }
+    if let Some(shift) = ws {
+        out[t + 24] = 1;                                         // No-Operation, to a word boundary
+        out[t + 25] = 3;                                         // kind: window scale
+        out[t + 26] = 3;                                         // length
+        out[t + 27] = shift;
     }
     out[t + TCP_LEN + opt_len..total].copy_from_slice(payload);
 
@@ -612,7 +793,7 @@ pub struct Tcp {
 impl Tcp {
     pub fn new(tsc_hz: u64, now_tsc: u64) -> Self {
         Tcp {
-            conns: [Conn::free(); MAX_CONNS],
+            conns: [const { Conn::free() }; MAX_CONNS],
             listeners: [Listener::free(); MAX_LISTEN],
             next_port: 49152,
             cyc_per_ms: tsc_hz / 1000,
@@ -637,6 +818,23 @@ impl Tcp {
 
     pub fn have_clock(&self) -> bool { self.cyc_per_ms != 0 }
 
+    /// Give every slot its large receive arena ([`RCV_BIG`]), asked of the kernel once. How many slots got
+    /// one: a slot that did not keeps the small arena and works, slower, and the caller says so (26.7).
+    /// `spare` is a region already asked for (the self-test's), used first.
+    pub fn give_buffers(&mut self, ctx: &ServiceContext, mut spare: Option<godspeed::memory::Region>) -> usize {
+        let mut given = 0usize;
+        for c in self.conns.iter_mut() {
+            if c.rcv_big.is_none() { c.rcv_big = spare.take(); }
+            if c.rcv_big.is_none() {
+                if let Ok(r) = godspeed::memory::Region::alloc(ctx, RCV_BIG) {
+                    c.rcv_big = Some(r);
+                }
+            }
+            if c.rcv_big.is_some() { given += 1; }
+        }
+        given
+    }
+
     /// Record one transmitted frame by its TCP flags, and whether the driver answered.
     ///
     /// Reads the flags out of the frame that is actually going out, not from what the caller
@@ -659,6 +857,20 @@ impl Tcp {
 
     fn free_slot(&mut self) -> Option<usize> {
         self.conns.iter().position(|c| !c.in_use())
+    }
+
+    /// Is a slot free for a new connection now?
+    pub fn has_free_slot(&self) -> bool {
+        self.conns.iter().any(|c| !c.in_use())
+    }
+
+    /// Is a slot held by a connection on its way out: our FIN sent, both FINs exchanged, or closed and not yet
+    /// reaped? Each of those ends by itself within seconds (TIME_WAIT is 2 s here), so a connect that finds
+    /// the table full can wait for one. `CloseWait` is not among them: it waits for its owner to close, and
+    /// nothing says when that will be.
+    pub fn any_closing(&self) -> bool {
+        self.conns.iter().any(|c| c.in_use() && matches!(c.state,
+            State::FinWait1 | State::FinWait2 | State::LastAck | State::TimeWait | State::Closed))
     }
 
     fn find(&mut self, lport: u16, rip: &[u8; 4], rport: u16) -> Option<&mut Conn> {
@@ -725,8 +937,9 @@ impl Tcp {
         let now = self.now_ms(ctx).unwrap_or(0);
         let i = self.free_slot()?;
         let c = &mut self.conns[i];
-        *c = Conn::free();
+        c.reset();
         c.rid = rid;
+        c.used_ms = now;
         c.peer_mac = peer_mac;
         c.state = State::SynSent;
         c.local_port = port;
@@ -757,26 +970,78 @@ impl Tcp {
     /// Take up to `out.len()` bytes of received data. Returns how many were copied.
     pub fn read(&mut self, rid: u64, out: &mut [u8]) -> usize {
         let c = match self.by_rid(rid) { Some(c) => c, None => return 0 };
-        let n = c.rcv_len.min(out.len());
-        out[..n].copy_from_slice(&c.rcv_buf[..n]);
-        c.rcv_buf.copy_within(n..c.rcv_len, 0);
-        c.rcv_len -= n;
-        n
+        c.rcv_pop(out)
     }
 
     /// Ask for an orderly close. The FIN is not sent until the send arena has drained, so data
     /// already accepted from the client is not discarded by the act of closing.
     pub fn close(&mut self, rid: u64) {
         if let Some(c) = self.by_rid(rid) {
+            // THE CLIENT HAS SAID IT WILL READ NOTHING MORE, whatever state the protocol is in. This used to act
+            // only on an open connection, so one the server had already finished - `Closed`, with its last few
+            // bytes (a TLS close_notify) unread - stayed owned and unread forever, and the reaper, which waits
+            // for unread bytes to be taken, never released its slot. With two slots, two `godspeed` commands in
+            // a row filled the table and every later connect was refused (the VisionFive over Ethernet,
+            // 2026-10-18, where those bytes land before the command ends).
+            c.reader_gone = true;
+            c.rcv_len = 0;
+            c.rcv_head = 0;
+            c.ooo_n = 0;
             if c.state == State::Established || c.state == State::CloseWait {
                 c.close_pending = true;
             }
         }
     }
 
+    /// The burst has paused (a poll found nothing): every connection owed an acknowledgement for data it has
+    /// taken in is given one now, rather than at the next segment that may not come.
+    pub fn flush_acks(&mut self) {
+        for c in self.conns.iter_mut() {
+            if c.ack_owed > 0 && c.state != State::Closed { c.ack_due = true; }
+        }
+    }
+
+    /// The client used connection `i` just now.
+    pub fn touch(&mut self, ctx: &ServiceContext, i: usize) {
+        let now = self.now_ms(ctx).unwrap_or(0);
+        if let Some(c) = self.conns.get_mut(i) { c.used_ms = now; }
+    }
+
+    /// A connection its client has not used for `idle_ms`, released to make room: the longest idle first. Its
+    /// resource id, for the caller to revoke, or `None` when every connection is in use.
+    ///
+    /// **Why a connection can be abandoned at all.** A client that is ENDED - `q` on a download, a killed task -
+    /// never closes what it held, and nothing tells this service: the capability went with the task. Its
+    /// connection stays in the table, owned, until the peer gives up, which can be minutes. Only asked when a
+    /// connect finds the table full, so an idle connection that is still wanted keeps its slot while there is
+    /// room. Nothing is sent to the peer; its next segment finds no connection and it times out on its own.
+    pub fn reclaim_idle(&mut self, ctx: &ServiceContext, idle_ms: u64) -> Option<(u64, u64)> {
+        let now = self.now_ms(ctx)?;
+        let (i, idle) = (0..MAX_CONNS)
+            .filter(|&i| self.conns[i].rid != 0)
+            .map(|i| (i, now.saturating_sub(self.conns[i].used_ms)))
+            .filter(|&(_, idle)| idle >= idle_ms)
+            .max_by_key(|&(_, idle)| idle)?;
+        let rid = self.conns[i].rid;
+        self.conns[i].reset();
+        Some((rid, idle))
+    }
+
+    /// Each slot, for a log line when the table stays full: its state, whether it is owned, its unread and
+    /// unsent bytes, whether its client closed it, and how long since its client touched it.
+    pub fn log_slots(&self, ctx: &ServiceContext) {
+        let now = self.now_ms(ctx).unwrap_or(0);
+        for (i, c) in self.conns.iter().enumerate() {
+            ctx.log_fmt(format_args!(
+                "net-stack:   slot {}: {} {}, {} unread, {} unsent, client {}, untouched {} ms",
+                i, c.state.name(), if c.rid != 0 { "owned" } else { "unowned" }, c.rcv_len, c.snd_len,
+                if c.reader_gone { "closed it" } else { "has not closed it" }, now.saturating_sub(c.used_ms)));
+        }
+    }
+
     /// Release a slot outright: the capability was revoked or the client vanished.
     pub fn forget(&mut self, rid: u64) {
-        if let Some(c) = self.by_rid(rid) { *c = Conn::free(); }
+        if let Some(c) = self.by_rid(rid) { c.reset(); }
     }
 }
 // ── Proving the parts QEMU cannot reach ────────────────────────────────────────────────────────
@@ -797,7 +1062,7 @@ impl Tcp {
 /// Returns `(passed, failed)`. Each failure is logged with what it expected, because a self-test that
 /// reports only a count tells you something is wrong and nothing about what.
 #[inline(never)]
-pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
+pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Region>) -> (u32, u32) {
     let mut pass = 0u32;
     let mut fail = 0u32;
     let mut check = |ok: bool, what: &str, p: &mut u32, f: &mut u32| {
@@ -1046,6 +1311,128 @@ pub fn selftest(ctx: &ServiceContext) -> (u32, u32) {
         check(t3.conns[j].dup_acks == 0, "a window change disqualifies an acknowledgement as a duplicate", &mut pass, &mut fail);
     }
 
+    // ---- a finished connection its client has closed goes back, unread bytes or not ----
+    //
+    // The reaper waits for unread bytes to be read, so a peer's last bytes are never thrown away from under a
+    // client still reading. A client that has CLOSED is not reading: its connection must be released, or the
+    // table fills one leftover close_notify at a time.
+    let mut t = Tcp::new(0, 0);
+    t.conns[0].state = State::Closed;
+    t.conns[0].rid = 9;
+    t.conns[0].rcv_len = 37;
+    check(!t.conns[0].reapable(), "a finished connection with unread bytes is kept while its client may read them", &mut pass, &mut fail);
+    t.close(9);
+    check(t.conns[0].reapable(), "and released once its client closes it", &mut pass, &mut fail);
+    t.conns[0].rcv_len = 5;
+    check(t.conns[0].reapable(), "even if bytes arrived after the client closed it", &mut pass, &mut fail);
+
+    // ---- delayed acknowledgement: in-order data is acknowledged every ACK_EVERY bytes, or when the burst pauses ----
+    {
+        let mut c = Conn::free();
+        c.state = State::Established;
+        c.rcv_nxt = 0;
+        let mut t = Tcp::new(0, 0);
+        t.conns[0] = c;
+        let seg = [7u8; MSS];
+        let mut owed_early = false;
+        let mut seq = 0u32;
+        for _ in 0..3 {
+            deliver(&mut t.conns[0], seq, &seg);
+            seq += MSS as u32;
+            t.conns[0].ack_owed += MSS as u32;
+            owed_early |= t.conns[0].ack_owed >= ACK_EVERY;
+        }
+        check(!owed_early && !t.conns[0].ack_due, "three in-order segments are not yet owed an acknowledgement", &mut pass, &mut fail);
+        t.flush_acks();
+        check(t.conns[0].ack_due, "and are owed one the moment the burst pauses", &mut pass, &mut fail);
+        let _ = t.conns[0].adv(false);
+        check(t.conns[0].ack_owed == 0, "a segment that tells the window acknowledges what was owed", &mut pass, &mut fail);
+    }
+
+    // ---- a connection its client abandoned (ended without closing it) is released when the table is full ----
+    // A clock of one tick per millisecond, so the counter itself is the time and a connection last used at 0
+    // has been idle as long as the machine has been up.
+    let mut t = Tcp::new(1000, 0);
+    t.conns[0].state = State::Established;
+    t.conns[0].rid = 5;
+    t.touch(ctx, 0);
+    t.conns[1].state = State::Established;
+    t.conns[1].rid = 6;
+    let r = t.reclaim_idle(ctx, 1);
+    check(matches!(r, Some((6, _))) && t.conns[1].rid == 0 && t.conns[0].rid == 5,
+          "the connection nobody has used is released, and the one just used is kept", &mut pass, &mut fail);
+
+    // ---- the receive arena is a ring: bytes come out in order across its end ----
+    let mut pat = [0u8; 6000];
+    for (k, b) in pat.iter_mut().enumerate() { *b = (k * 7 + k / 251) as u8; }
+    let mut c = Conn::free();
+    c.state = State::Established;
+    c.rcv_nxt = 1000;
+    deliver(&mut c, 1000, &pat[..5000]);
+    let mut got = [0u8; 6000];
+    let first = c.rcv_pop(&mut got[..4000]);
+    deliver(&mut c, 6000, &pat[..5000]);
+    let n = c.rcv_pop(&mut got[..]);
+    check(first == 4000 && n == 6000 && got[..1000] == pat[4000..5000] && got[1000..] == pat[..5000],
+          "the ring gives bytes back in order across its end", &mut pass, &mut fail);
+
+    // ---- out-of-order segments wait IN the arena, and one in-order segment releases them all ----
+    let mut c = Conn::free();
+    c.state = State::Established;
+    c.rcv_nxt = 0;
+    hold_ooo(&mut c, 3000, &pat[3000..4000]);
+    hold_ooo(&mut c, 1000, &pat[1000..2000]);
+    hold_ooo(&mut c, 2000, &pat[2000..3000]);
+    check(c.ooo_n == 1 && c.readable() == 0, "touching out-of-order ranges merge into one, and none is readable yet", &mut pass, &mut fail);
+    deliver(&mut c, 0, &pat[..1000]);
+    let n = c.rcv_pop(&mut got[..]);
+    check(n == 4000 && got[..4000] == pat[..4000] && c.ooo_n == 0,
+          "the segment that fills the gap makes everything held behind it readable, in order", &mut pass, &mut fail);
+    let mut c = Conn::free();
+    // Inside the 8 KiB window, apart from each other, so it is the count that refuses and not the window.
+    for k in 0..(MAX_OOO + 2) { hold_ooo(&mut c, (200 + 200 * k) as u32, &pat[..100]); }
+    check(c.ooo_n == MAX_OOO, "past MAX_OOO separate ranges a segment is dropped, not held", &mut pass, &mut fail);
+
+    // ---- window scaling (RFC 7323): offered on a SYN, read back, and the field scaled after it ----
+    let mut buf = [0u8; 1600];
+    let n = emit_ws(&mut buf, &[1; 6], &[2; 6], &[10, 0, 0, 1], &[10, 0, 0, 2], 5000, 80, 7, 0, SYN, 0xffff, Some(3), &[]);
+    match parse(&buf[..n]) {
+        Some(sg) => check(sg.ws == Some(3) && sg.mss == Some(MSS as u16), "a SYN carries the window scale and the MSS, and both parse",
+                          &mut pass, &mut fail),
+        None => check(false, "a SYN with a window scale parses", &mut pass, &mut fail),
+    }
+    check(parse_ws(&[1, 3, 3, 20]) == Some(WS_MAX), "a scale above 14 is read as 14", &mut pass, &mut fail);
+    let mut c = Conn::free();
+    c.rcv_shift = 3;
+    check(c.adv(false) == (RCV_SMALL >> 3) as u16 && c.last_adv == RCV_SMALL as u32,
+          "after the SYN the window field is the free space shifted, and what was told is recorded in bytes", &mut pass, &mut fail);
+    check(c.adv(true) == 0xffff.min(RCV_SMALL) as u16, "a SYN's window field is never scaled", &mut pass, &mut fail);
+    c.snd_shift = 4;
+    check(c.peer_window(100, false) == 1600 && c.peer_window(100, true) == 100, "the peer's window is read through its scale, except on a SYN",
+          &mut pass, &mut fail);
+    // A window update is owed when what CAN be told has grown, not when the free space has: unscaled, a big
+    // arena's field is full at 64 KiB, and an update on every poll starved the data behind it.
+    // With a REAL large arena: the case that broke needs one larger than the field reaches. It is asked for
+    // here and handed on to the live table afterwards (`spare`), so the check costs no memory.
+    let mut c = Conn::free();
+    c.rcv_big = godspeed::memory::Region::alloc(ctx, RCV_BIG).ok();
+    if c.rcv_big.is_some() {
+        let _ = c.adv(false);                      // unscaled: the field is full at 64 KiB of 256
+        check(c.advertisable().saturating_sub(c.last_adv) == 0,
+              "an unscaled peer told 64 KiB of a 256 KiB arena is owed no window update", &mut pass, &mut fail);
+        c.rcv_shift = c.our_ws();
+        let _ = c.adv(false);
+        check(c.last_adv as usize == RCV_BIG, "a scaled peer is told the whole arena", &mut pass, &mut fail);
+    }
+    if c.rcv_big.is_some() {
+        // Over a radio the large arena offers only the small window, and its SYN asks no scale.
+        c.reset();
+        c.small_window();
+        check(c.window() as usize == RCV_SMALL && c.our_ws() == 0,
+              "a connection over a radio offers the small window, unscaled, from the large arena", &mut pass, &mut fail);
+    }
+    *spare = c.rcv_big.take();
+
     (pass, fail)
 }
 
@@ -1097,57 +1484,64 @@ fn deliver(c: &mut Conn, seq: u32, data: &[u8]) {
     let skip = c.rcv_nxt.wrapping_sub(seq) as usize;
     if skip >= data.len() { return; }
     let fresh = &data[skip..];
-    let room = RCV_BUF - c.rcv_len;
-    let n = fresh.len().min(room);
-    c.rcv_buf[c.rcv_len..c.rcv_len + n].copy_from_slice(&fresh[..n]);
+    let n = c.rcv_place(0, fresh);
     c.rcv_len += n;
     c.rcv_nxt = c.rcv_nxt.wrapping_add(n as u32);
 
-    // Now that rcv_nxt moved, a held segment may have become the next one. Repeat until nothing
-    // fits: a bounded loop, because MAX_OOO is fixed and each pass consumes at least one slot.
-    let mut progress = true;
-    while progress {
-        progress = false;
-        for k in 0..MAX_OOO {
-            if !c.ooo[k].used { continue; }
-            let s = c.ooo[k].seq;
-            let l = c.ooo[k].len as usize;
-            if seq_le(s, c.rcv_nxt) && seq_gt(s.wrapping_add(l as u32), c.rcv_nxt) {
-                let off = c.rcv_nxt.wrapping_sub(s) as usize;
-                let room = RCV_BUF - c.rcv_len;
-                let n = (l - off).min(room);
-                // Copy through a temporary: `c.ooo[k].data` and `c.rcv_buf` are both fields of `c`,
-                // so a direct slice-to-slice copy would need two simultaneous borrows.
-                let mut tmp = [0u8; MSS];
-                tmp[..n].copy_from_slice(&c.ooo[k].data[off..off + n]);
-                c.rcv_buf[c.rcv_len..c.rcv_len + n].copy_from_slice(&tmp[..n]);
-                c.rcv_len += n;
-                c.rcv_nxt = c.rcv_nxt.wrapping_add(n as u32);
-                c.ooo[k].used = false;
-                progress = true;
-            } else if seq_le(s.wrapping_add(l as u32), c.rcv_nxt) {
-                c.ooo[k].used = false;               // wholly stale now
-                progress = true;
+    // Now that rcv_nxt moved, a held range may start at or before it: its bytes are already in place, so
+    // taking it is counting them. Bounded: each pass removes a range, and there are at most MAX_OOO.
+    let mut k = 0;
+    while k < c.ooo_n {
+        let (start, end) = c.ooo[k];
+        if seq_le(start, c.rcv_nxt) {
+            if seq_gt(end, c.rcv_nxt) {
+                let more = end.wrapping_sub(c.rcv_nxt) as usize;
+                c.rcv_len += more;
+                c.rcv_nxt = end;
             }
+            c.ooo_n -= 1;
+            c.ooo[k] = c.ooo[c.ooo_n];
+            k = 0;                                   // rcv_nxt moved: every range is a candidate again
+        } else {
+            k += 1;
         }
     }
 }
 
-/// Hold an out-of-order segment, or drop it if there is no room.
+/// Put an out-of-order segment in its place in the arena and record its range, or drop it if no range can
+/// be had.
 ///
 /// Dropping is not a failure here: the peer will retransmit, and refusing to grow is the whole
-/// point (§26.6.1). What would be a failure is pretending to hold it.
+/// point (§26.6.1). What would be a failure is pretending to hold it - so a segment is counted as held only
+/// when its range is recorded. Bytes placed without one are harmless: nothing counts them, and the
+/// retransmission writes the same bytes to the same place.
 fn hold_ooo(c: &mut Conn, seq: u32, data: &[u8]) {
-    if data.is_empty() || data.len() > MSS { return; }
-    for k in 0..MAX_OOO {
-        if c.ooo[k].used && c.ooo[k].seq == seq { return; }   // already have this one
+    let win = c.window() as usize;
+    let off = seq.wrapping_sub(c.rcv_nxt) as usize;
+    if data.is_empty() || off >= win { return; }
+    // Only what is inside the window has a place; the rest is the peer's to send again.
+    let data = &data[..data.len().min(win - off)];
+    // Merge with every range it touches first, so a full table still takes a segment that extends one.
+    let mut start = seq;
+    let mut end = seq.wrapping_add(data.len() as u32);
+    let mut k = 0;
+    let mut merged = false;
+    while k < c.ooo_n {
+        let (a, b) = c.ooo[k];
+        if seq_le(a, end) && seq_le(start, b) {
+            if seq_lt(a, start) { start = a; }
+            if seq_gt(b, end) { end = b; }
+            c.ooo_n -= 1;
+            c.ooo[k] = c.ooo[c.ooo_n];
+            merged = true;
+        } else {
+            k += 1;
+        }
     }
-    if let Some(k) = (0..MAX_OOO).find(|&k| !c.ooo[k].used) {
-        c.ooo[k].seq = seq;
-        c.ooo[k].len = data.len() as u16;
-        c.ooo[k].data[..data.len()].copy_from_slice(data);
-        c.ooo[k].used = true;
-    }
+    if !merged && c.ooo_n == MAX_OOO { return; }
+    c.rcv_place(off, data);
+    c.ooo[c.ooo_n] = (start, end);
+    c.ooo_n += 1;
 }
 
 // ── This machine's identity on the wire ────────────────────────────────────────────────────────
@@ -1208,6 +1602,7 @@ impl Tcp {
             pmac.copy_from_slice(&f[6..12]);
             let iss = (godspeed::driver::wait::ticks(ctx) as u32) ^ 0x7a7a_0000;
             let mss = seg.mss;
+            let ws = seg.ws;
             let wnd = seg.wnd;
             let sseq = seg.seq;
             let i = match self.free_slot() {
@@ -1226,7 +1621,7 @@ impl Tcp {
                 }
             };
             let c = &mut self.conns[i];
-            *c = Conn::free();
+            c.reset();
             c.accepted = true;
             c.peer_mac = pmac;
             c.local_port = lp;
@@ -1236,7 +1631,13 @@ impl Tcp {
             c.snd_una = iss;
             c.snd_nxt = iss.wrapping_add(1);       // our SYN takes one sequence number
             c.rcv_nxt = sseq.wrapping_add(1);      // ...and so does theirs
-            c.snd_wnd = wnd;
+            c.snd_wnd = wnd as u32;                // a SYN's window is never scaled
+            // SCALING ONLY IF THE PEER OFFERED IT: our SYN-ACK answers with ours, and both are then in force.
+            if let Some(shift) = ws {
+                c.peer_ws = Some(shift);
+                c.snd_shift = shift;
+                c.rcv_shift = c.our_ws();
+            }
             if let Some(m) = mss { if m >= 88 { c.snd_mss = m; } }
             c.cc_open();
             c.state = State::SynReceived;
@@ -1282,7 +1683,12 @@ impl Tcp {
                 }
                 c.snd_una = seg.ack;
                 c.rcv_nxt = seg.seq.wrapping_add(1);
-                c.snd_wnd = seg.wnd;
+                c.snd_wnd = seg.wnd as u32;            // a SYN's window is never scaled
+                // Our SYN offered a scale; it is in force only if the answer carries one too (RFC 7323 2.2).
+                match seg.ws {
+                    Some(shift) => { c.snd_shift = shift; c.rcv_shift = c.our_ws(); }
+                    None => { c.snd_shift = 0; c.rcv_shift = 0; }
+                }
                 // The peer's segment size is settled HERE and nowhere else: the SYN-ACK is the only
                 // segment that carries it, and everything sent afterwards is sized by it. A peer
                 // that offered nothing keeps the RFC 1122 default of 536 rather than our own 1460,
@@ -1313,7 +1719,7 @@ impl Tcp {
             // our SYN consumed; anything else is for a connection we do not have.
             if seg.flags & ACK != 0 && seg.ack == c.snd_nxt {
                 c.snd_una = seg.ack;
-                c.snd_wnd = seg.wnd;
+                c.snd_wnd = c.peer_window(seg.wnd, false);
                 c.state = State::Established;
                 c.retx_at_ms = 0;
                 c.retx_count = 0;
@@ -1392,6 +1798,13 @@ impl Tcp {
 
                     if c.state == State::FinWait1 && c.snd_una == c.snd_nxt {
                         c.state = State::FinWait2;
+                        // ORPHANED, SO BOUNDED: our FIN is acknowledged, everything sent has arrived, and a client
+                        // that closed will read nothing more - only the peer's FIN is left, and a server need not
+                        // send it soon. With two slots, a fin-wait-2 that waited on it held a slot 9 to 18 s and
+                        // the next `godspeed` command was refused (QEMU, 2026-10-19). As Linux bounds an orphan with
+                        // its FIN timeout, this one closes after FIN_WAIT_2_MS, inside the wait a connect gives a
+                        // closing slot.
+                        if c.reader_gone { c.state_deadline_ms = now + FIN_WAIT_2_MS; }
                     } else if c.state == State::LastAck && c.snd_una == c.snd_nxt {
                         c.state = State::Closed;
                         return 0;
@@ -1399,7 +1812,7 @@ impl Tcp {
                 } else if seg.ack == c.snd_una
                     && seg.payload.is_empty()
                     && seg.flags & (SYN | FIN) == 0
-                    && seg.wnd == c.snd_wnd
+                    && c.peer_window(seg.wnd, false) == c.snd_wnd
                     && c.snd_nxt != c.snd_una
                 {
                     // ---- a DUPLICATE acknowledgement (RFC 5681 3.2) ----
@@ -1429,20 +1842,32 @@ impl Tcp {
                         c.fast_retx = true;
                     }
                 }
-                c.snd_wnd = seg.wnd;
+                c.snd_wnd = c.peer_window(seg.wnd, seg.flags & SYN != 0);
             }
 
             // ---- data ----
             if !seg.payload.is_empty() && c.state != State::TimeWait {
                 if seg.seq == c.rcv_nxt {
+                    let had_hole = c.ooo_n > 0;
+                    let before = c.rcv_nxt;
                     deliver(c, seg.seq, seg.payload);
-                } else if seq_gt(seg.seq, c.rcv_nxt)
-                    && seq_lt(seg.seq, c.rcv_nxt.wrapping_add(RCV_BUF as u32)) {
-                    hold_ooo(c, seg.seq, seg.payload);
+                    // IN ORDER, AND NOTHING WAS MISSING: acknowledged in a while (`ACK_EVERY`). A segment that
+                    // fills a hole, or that the arena had no room for, is news and is answered now.
+                    let took = c.rcv_nxt.wrapping_sub(before);
+                    c.ack_owed = c.ack_owed.saturating_add(took);
+                    if had_hole || took < seg.payload.len() as u32 || c.ack_owed >= ACK_EVERY {
+                        need_ack = true;
+                    }
+                } else {
+                    if seq_gt(seg.seq, c.rcv_nxt)
+                        && seq_lt(seg.seq, c.rcv_nxt.wrapping_add(c.window())) {
+                        hold_ooo(c, seg.seq, seg.payload);
+                    }
+                    // Out of order, or a duplicate below rcv_nxt (dropped, still acknowledged: the peer is
+                    // retransmitting because it did not hear us, and staying silent repeats that). Both at once:
+                    // the duplicate acknowledgements are how the sender learns of a loss.
+                    need_ack = true;
                 }
-                // A duplicate below rcv_nxt is dropped, but still acknowledged: the peer is
-                // retransmitting because it did not hear us, and staying silent repeats that.
-                need_ack = true;
             }
 
             // ---- FIN, only when it is the next thing in sequence ----
@@ -1487,6 +1912,7 @@ impl Tcp {
             match c.state {
                 State::SynSent => { c.fault = Fault::ConnectTimeout; c.state = State::Closed; return 0; }
                 State::TimeWait => { c.state = State::Closed; return 0; }
+                State::FinWait2 => { c.state = State::Closed; return 0; }
                 _ => c.state_deadline_ms = 0,
             }
         }
@@ -1504,8 +1930,7 @@ impl Tcp {
                 let n = c.snd_len.min(c.smss());
                 let mut tmp = [0u8; MSS];
                 tmp[..n].copy_from_slice(&c.snd_buf[..n]);
-                let w = c.window();
-                c.last_adv = w;
+                let w = c.adv(false);
                 c.rtt_timing = false;              // Karn: a resent segment cannot be timed
                 if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
                 return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
@@ -1540,21 +1965,23 @@ impl Tcp {
             c.fast_retx = false;
 
             if c.state == State::SynSent {
-                return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
-                            c.local_port, c.remote_port, c.iss, 0, SYN, RCV_BUF as u16, &[]);
+                let w = c.adv(true);
+                let ws = c.our_ws();
+                return emit_ws(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                               c.local_port, c.remote_port, c.iss, 0, SYN, w, Some(ws), &[]);
             }
             if c.snd_len > 0 {
                 let n = c.snd_len.min(c.smss());
                 let mut tmp = [0u8; MSS];
                 tmp[..n].copy_from_slice(&c.snd_buf[..n]);
-                let w = c.window();
+                let w = c.adv(false);
                 return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_una, c.rcv_nxt,
                             ACK | PSH, w, &tmp[..n]);
             }
             // Nothing buffered, so the unacknowledged thing is our FIN.
             if matches!(c.state, State::FinWait1 | State::LastAck) {
-                let w = c.window();
+                let w = c.adv(false);
                 return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_nxt.wrapping_sub(1), c.rcv_nxt,
                             ACK | FIN, w, &[]);
@@ -1580,10 +2007,10 @@ impl Tcp {
                 c.retx_at_ms = now + c.rto_ms;
             }
             c.ack_due = false;
-            let w = c.window();
-            c.last_adv = w;
-            return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
-                        c.local_port, c.remote_port, c.iss, c.rcv_nxt, SYN | ACK, w, &[]);
+            let w = c.adv(true);
+            let ws = c.peer_ws.map(|_| c.rcv_shift);
+            return emit_ws(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                           c.local_port, c.remote_port, c.iss, c.rcv_nxt, SYN | ACK, w, ws, &[]);
         }
 
         // ---- the acknowledgement owed from the last inbound segment ----
@@ -1593,8 +2020,7 @@ impl Tcp {
         // might send is less urgent than the thing it is blocked on.
         if c.ack_due {
             c.ack_due = false;
-            let w = c.window();
-            c.last_adv = w;
+            let w = c.adv(false);
             return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                         c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
         }
@@ -1608,16 +2034,19 @@ impl Tcp {
         // segment's worth has opened up, so a byte-at-a-time reader cannot turn this into a storm of
         // ACKs (the silly-window problem, from the other side).
         if matches!(c.state, State::Established | State::CloseWait | State::FinWait1 | State::FinWait2) {
-            // THE THRESHOLD IS min(MSS, RCV_BUF/2), not MSS (RFC 1122 4.2.2.17). With MSS 1460 and
+            // THE THRESHOLD IS min(MSS, arena/2), not MSS (RFC 1122 4.2.2.17). With MSS 1460 and
             // a 2048-byte arena the window can NEVER reopen by a full MSS after a single segment -
             // 2048 - 1440 = 608, then 1440 - which is less than 1460. So an MSS-only threshold makes
             // this branch unreachable on exactly the buffer sizes this stack uses, and the first
             // version of it was: the fix changed nothing and the reply still arrived truncated at
             // 1440 of 2888 bytes.
-            const WND_STEP: u16 = if MSS < RCV_BUF / 2 { MSS as u16 } else { (RCV_BUF / 2) as u16 };
-            let w = c.window();
-            if w.saturating_sub(c.last_adv) >= WND_STEP {
-                c.last_adv = w;
+            // AGAINST WHAT CAN BE TOLD, not the free space. With a peer that does not scale (QEMU's user
+            // network does not), the field stops at 64 KiB of a 256 KiB arena: comparing the free space sent
+            // an update on every poll, forever, and since this comes before new data the TLS ClientHello was
+            // never sent at all (2026-10-18, read off the capture).
+            let step = (MSS as u32).min(c.rcv_cap() as u32 / 2);
+            if c.advertisable().saturating_sub(c.last_adv) >= step {
+                let w = c.adv(false);
                 return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                             c.local_port, c.remote_port, c.snd_nxt, c.rcv_nxt, ACK, w, &[]);
             }
@@ -1648,8 +2077,7 @@ impl Tcp {
                         c.rtt_timed_at_ms = now;
                     }
                     if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
-                    let w = c.window();
-                    c.last_adv = w;
+                    let w = c.adv(false);
                     return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                                 c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | PSH, w, &tmp[..n]);
                 }
@@ -1687,8 +2115,7 @@ impl Tcp {
                     let seq = c.snd_nxt;
                     c.snd_nxt = c.snd_nxt.wrapping_add(1);
                     if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
-                    let w = c.window();
-                    c.last_adv = w;
+                    let w = c.adv(false);
                     return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                                 c.local_port, c.remote_port, seq, c.rcv_nxt, ACK, w, &b);
                 }
@@ -1703,7 +2130,7 @@ impl Tcp {
             c.snd_nxt = c.snd_nxt.wrapping_add(1);
             c.state = if c.state == State::CloseWait { State::LastAck } else { State::FinWait1 };
             if c.retx_at_ms == 0 { c.retx_at_ms = now + c.rto_ms; }
-            let w = c.window();
+            let w = c.adv(false);
             return emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
                         c.local_port, c.remote_port, seq, c.rcv_nxt, ACK | FIN, w, &[]);
         }
@@ -1718,8 +2145,10 @@ impl Tcp {
         c.rtt_timing = true;
         c.rtt_timed_seq = c.snd_nxt;
         c.rtt_timed_at_ms = now;
-        emit(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
-             c.local_port, c.remote_port, c.iss, 0, SYN, RCV_BUF as u16, &[])
+        let w = c.adv(true);
+        let ws = c.our_ws();
+        emit_ws(out, &c.peer_mac, &net.our_mac, &net.our_ip, &c.remote_ip,
+                c.local_port, c.remote_port, c.iss, 0, SYN, w, Some(ws), &[])
     }
 
     /// Say once, loudly, that timers are inert. `backlog/27`: without a calibrated clock a deadline

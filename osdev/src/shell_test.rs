@@ -404,6 +404,12 @@ pub fn run(image_path: &Path, smp: u32) {
            && ping_out.contains("Ping statistics for 10.0.2.2")
            && (ping_out.contains("Reply from 10.0.2.2") || ping_out.contains("Request timed out")),
            "ping: continuous ICMP echo (count-limited) prints Windows-style output + stats (ping <gateway>)");
+    // `[q] quit` once, BEFORE the results, never among them (the VisionFive card, 2026-10-18).
+    let q_at = ping_out.find("[q] quit");
+    check!(q_at.is_some_and(|q| ping_out.find("Pinging").is_some_and(|p| q < p)),
+           "ping: `[q] quit` is said before the results start, not in the middle of them");
+    check!(!ping_out.contains("bytes of data:  [q] quit") && ping_out.matches("[q] quit").count() <= 1,
+           "ping: `[q] quit` is the shell's, at most once, never on the header line");
 
     // net stats: raw NIC register dump (chip state). On QEMU the e1000 path answers with CTRL/STATUS/etc.
     send(&mut write_half, b"net stats\r");
@@ -810,6 +816,12 @@ pub fn run(image_path: &Path, smp: u32) {
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
         Some(r) => check!(r.contains("net arp"), "tab: 'net a' completes to 'net arp'"),
         None    => { println!("shell-test: FAIL - tab net-arp completion timed out"); fail += 1; }
+    }
+    // selfcheck's parts complete, from the list that runs them: `selfcheck pac<Tab>` -> `selfcheck packages`.
+    send(&mut write_half, b"selfcheck pac\t\x03");
+    match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(5)) {
+        Some(r) => check!(r.contains("selfcheck packages"), "tab: 'selfcheck pac' completes to 'selfcheck packages'"),
+        None    => { println!("shell-test: FAIL - tab selfcheck-part completion timed out"); fail += 1; }
     }
     // The menu reprints the prompt ("gsh> write "), so collect that frame first…
     send(&mut write_half, b"write \t");
@@ -2108,8 +2120,13 @@ pub fn run(image_path: &Path, smp: u32) {
             check!(r.contains("total:") && r.contains("rounds"), "chaos: max-carnage ran a bounded round count + self-terminated");
             check!(r.contains("kernel: alive"), "chaos: max-carnage - kernel survived the kill+flood carnage (shell included)");
             check!(r.contains("chaos: seed 4242 (given)") && r.contains("seed: 4242"), "chaos: a given seed is used, and said at the start and in the report");
+            // Rounds 2-5 fire a mem-pressure spawn while the first still runs; the supervisor names that
+            // refusal for what it is (the kernel's SPAWN_ALREADY_RUNNING), where it said InvalidArgument.
+            check!(r.contains("'mem-pressure' from image FAILED (AlreadyRunning)")
+                       && !r.contains("'mem-pressure' from image FAILED (InvalidArgument)"),
+                   "chaos: a mem-pressure spawn refused as already running is reported as AlreadyRunning");
         }
-        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 5; }
+        None => { println!("shell-test: FAIL - chaos max-carnage (service) timed out (wedged / foreground stuck?)"); fail += 6; }
     }
     // After chaos, the (possibly respawned) shell prints a startup banner and/or a regain prompt, so the
     // first `gsh>` we hit can precede the `cores` response. Drain prompts until the response appears -
@@ -8179,6 +8196,577 @@ pub fn run_fs_reuse(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `osdev test godspeed` (`utilities/61_godspeed.md`): the package manager's settings on a real disk, its
+/// refusals, its pipes, and `godspeed check` reaching the real registry over verified TLS.
+///
+/// The CPU is `qemu64,+rdrand`: TLS refuses to run without a hardware random source, and QEMU's default x86
+/// model has none. The registry is reached through SLIRP, so the last checks need this machine online; when
+/// the name does not resolve they are counted as SKIPPED, never as passed.
+pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize; let mut skipped = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("godspeed: PASS - {}", $label); pass += 1; }
+        else { println!("godspeed: FAIL - {}", $label); fail += 1; }
+    }; }
+
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-device",  "e1000,netdev=n0",
+        // QEMU's teaching device, for the driver package `godspeed/hello-driver` (class 00ff00, which no GodspeedOS
+        // driver claims), so a driver from the registry has a device of its own to drive.
+        "-device",  "edu",
+        "-netdev",  "user,id=n0",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        // No `-no-reboot`: the suite reboots once, to see an installed service started at boot.
+        "-display", "none", "-no-shutdown",
+    ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("godspeed: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("godspeed: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("godspeed: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    // ---- THE FIRST NETWORK COMMAND OF A BOOT IS A `tcp`. On the Wyse the shell starts before net-stack, and
+    //      a `tcp` before any other network command said "net-stack did not answer within 20s" in a few
+    //      seconds, having never reached it: the noticing wait did not reacquire a peer it could not send to
+    //      (`stdlib/rust/src/call.rs`, `request_within_notice`). It waits for net-stack to have configured, as
+    //      the Wyse had: sent during the DHCP dance, the request is HELD until the lease, and the lease plus an
+    //      8 s connect to a port nobody answers is a real 20 s deadline, not this bug. Port 1 on the gateway
+    //      is silent, so the answer is "connected to nothing" - net-stack answered - and never "did not answer".
+    let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+    let first_tcp = run!(b"tcp 10.0.2.2 1 hi\r", 60);
+    check!(!first_tcp.contains("tcp: net-stack did not answer")
+           && (first_tcp.contains("tcp: connected to nothing") || first_tcp.contains("byte(s) back")),
+           "the boot's first `tcp` reaches net-stack, whatever order the shell and net-stack started in");
+
+    // ---- `drives flash ... yes` answers the confirmation in advance (`utilities/15_drives.md`), and the
+    //      fresh volume is the one every check below runs on.
+    let flashed = run!(b"drives flash data yes\r", 60);
+    check!(flashed.contains("yes (given on the command line)") && !flashed.contains("aborted"),
+           "`drives flash data yes` formats without asking, and says the answer came from the command line");
+    let listed = run!(b"drives\r", 30);
+    check!(listed.contains("data"), "the drive flashed with `yes` carries its label");
+
+    // ---- the command explains itself.
+    let bare = run!(b"godspeed\r", 20);
+    check!(bare.contains("usage: godspeed search") && bare.contains("registry"), "a bare `godspeed` prints its usage");
+    let help = run!(b"godspeed help\r", 20);
+    check!(help.contains("godspeed check") && help.contains("godspeed registry add") && help.contains("godspeed config set"),
+           "`godspeed help` lists every command");
+
+    // ---- FIRST START writes the file with every default, so it shows what is in effect.
+    let first = run!(b"godspeed config\r", 60);
+    check!(first.contains("written") && first.contains("/system/services/godspeed/config"),
+           "the first `godspeed config` writes the settings file and says so");
+    check!(first.contains("/system/services/godspeed/roots/isrg-root-x2.der"),
+           "the roots folder is given ISRG Root X2 on first start");
+    let regs = run!(b"godspeed registry\r", 60);
+    check!(regs.contains("default") && regs.contains("https://godspeed-registry.bankole-422.workers.dev") && regs.contains("in use"),
+           "`godspeed registry` lists the default registry, in use");
+    let file = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(file.contains("registry default https://godspeed-registry.bankole-422.workers.dev sha256:") && file.contains("use default")
+           && file.contains("timeout-secs 30"),
+           "the file on disk holds the registry line, the `use` line and the settings");
+    let again = run!(b"godspeed config\r", 60);
+    check!(!again.contains("written") && again.contains("file"),
+           "a second `godspeed config` writes nothing and reads every value from the file");
+
+    // ---- SET checks first and keeps the rest of the file.
+    let set = run!(b"godspeed config set timeout-secs 45\r", 60);
+    check!(set.contains("timeout-secs") && set.contains("45"), "`config set` writes a checked value");
+    let one = run!(b"godspeed config timeout-secs\r", 60);
+    check!(one.contains("45") && !one.contains("tls-roots"), "`godspeed config <key>` shows that one setting");
+    let after = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(after.contains("timeout-secs 45") && after.contains("# how long a request may go with nothing moving"),
+           "the new value is in the file and the comments around it are kept");
+    let notset = run!(b"godspeed config set registry https://registry.example/\r", 60);
+    check!(notset.contains("not set here") && notset.contains("godspeed registry"),
+           "a registry is not a plain setting, and the refusal names the command that manages it");
+    let notshown = run!(b"godspeed config registry\r", 60);
+    check!(notshown.contains("not a plain setting"), "`godspeed config registry` points at `godspeed registry`");
+    let nokey = run!(b"godspeed config set speed 9\r", 60);
+    check!(nokey.contains("not a setting"), "an unknown key is refused, naming the settings");
+    let range = run!(b"godspeed config set timeout-secs 0\r", 60);
+    check!(range.contains("1 to 100"), "a value out of range is refused with the range");
+
+    // ---- REGISTRIES: one in use, others known.
+    const PIN: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    send(&mut write_half, format!("godspeed registry add mirror https://mirror.example/ {PIN}\r").as_bytes());
+    let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20)).unwrap_or_default();
+    check!(asked.contains("anything signed by sha256:bbbb"), "`registry add` shows the root it would trust and asks");
+    let declined = run!(b"n\r", 30);
+    check!(declined.contains("cancelled - nothing was added"), "answering no adds nothing");
+    let none = run!(b"godspeed registry\r", 60);
+    check!(!none.contains("mirror"), "and the list is unchanged");
+    let added = run!(format!("godspeed registry add mirror https://mirror.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(added.contains("mirror") && added.contains("godspeed registry use mirror"),
+           "`registry add ... yes` adds it, not in use, and says how to use it");
+    let two = run!(b"godspeed registry\r", 60);
+    check!(two.contains("mirror") && two.contains("in use; signed by sha256:d769"),
+           "both are listed and the default is still the one in use");
+    let dup = run!(format!("godspeed registry add mirror https://other.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(dup.contains("already known"), "a name already taken is refused");
+    let http = run!(format!("godspeed registry add plain http://registry.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(http.contains("https:// only"), "an http:// registry is refused with the reason");
+    let badpin = run!(b"godspeed registry add short https://short.example/ sha256:abc yes\r", 60);
+    check!(badpin.contains("64 hex digits"), "a signing root of the wrong form is refused");
+    let used = run!(b"godspeed registry use mirror\r", 60);
+    check!(used.contains("mirror") && used.contains("in use"), "`registry use` switches to it");
+    let check_mirror = run!(b"godspeed check\r", 90);
+    check!(check_mirror.contains("https://mirror.example/") && check_mirror.contains("mirror (in use)"),
+           "`godspeed check` reaches the registry in use, not the first one listed");
+    let inuse = run!(b"godspeed registry remove mirror\r", 60);
+    check!(inuse.contains("in use"), "the registry in use cannot be removed");
+    let _ = run!(b"godspeed registry use default\r", 60);
+    let removed = run!(b"godspeed registry remove mirror\r", 60);
+    check!(removed.contains("removed"), "a registry not in use is removed");
+    let gone = run!(b"godspeed registry\r", 60);
+    check!(!gone.contains("mirror") && gone.contains("in use"), "and the default is the only one, in use");
+
+    // ---- PIPES: the reports are records; the actions refuse.
+    let piped = run!(b"godspeed config | where item=timeout-secs\r", 60);
+    check!(piped.contains("45") && !piped.contains("tls-roots"), "`godspeed config` pipes as records");
+    let regpipe = run!(b"godspeed registry | count\r", 60);
+    check!(regpipe.contains('1'), "`godspeed registry` pipes as records");
+    let refused = run!(b"godspeed config set timeout-secs 30 | count\r", 30);
+    check!(refused.contains("is an action, not a report"), "`godspeed config set` refuses to start a pipe");
+    let refused2 = run!(b"godspeed registry use default | count\r", 30);
+    check!(refused2.contains("is an action, not a report"), "`godspeed registry use` refuses to start a pipe");
+    let still = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(still.contains("timeout-secs 45"), "the refused pipes changed nothing");
+
+    // ---- A BROKEN FILE is refused whole, naming the line.
+    let _ = run!(b"write append /system/services/godspeed/config colour blue\r", 30);
+    let broken = run!(b"godspeed config\r", 60);
+    check!(broken.contains("no setting is called 'colour'"), "a file with an unknown key is named by line and refused");
+    let fixed = run!(b"godspeed config set timeout-secs 30\r", 60);
+    check!(fixed.contains("no setting is called 'colour'"), "a set on a broken file is refused rather than writing past it");
+    let regbroken = run!(format!("godspeed registry add other https://other.example/ {PIN} yes\r").as_bytes(), 60);
+    check!(regbroken.contains("no setting is called 'colour'"), "so is a registry change");
+
+    // ---- A FILE FROM BEFORE NAMED REGISTRIES reads as one called `default`, and moves to the new form.
+    let _ = run!(b"write /system/services/godspeed/config registry https://godspeed-registry.bankole-422.workers.dev\r", 30);
+    let old = run!(b"godspeed registry\r", 60);
+    check!(old.contains("default") && old.contains("in use") && old.contains("https://godspeed-registry.bankole-422.workers.dev"),
+           "an old `registry <url>` file reads as one registry called `default`, in use");
+    let _ = run!(format!("godspeed registry add other https://other.example/ {PIN} yes\r").as_bytes(), 60);
+    let migrated = run!(b"read /system/services/godspeed/config\r", 30);
+    check!(migrated.contains("registry default https://godspeed-registry.bankole-422.workers.dev sha256:d769")
+           && migrated.contains("registry other https://other.example/") && migrated.contains("use default"),
+           "the first registry change rewrites it in the new form, the old address kept as `default`");
+    let _ = run!(b"delete /system/services/godspeed/config\r", 30);
+
+    // ---- THE ROOTS: an empty folder trusts nothing, and says so before any connection.
+    let _ = run!(b"mkdir /noroots\r", 30);
+    let _ = run!(b"godspeed config\r", 60);
+    let _ = run!(b"godspeed config set tls-roots /noroots/\r", 60);
+    let empty = run!(b"godspeed check\r", 60);
+    check!(empty.contains("no certificate authority is trusted"), "`check` with no roots refuses before connecting");
+    let _ = run!(b"godspeed config set tls-roots /system/services/godspeed/roots/\r", 60);
+
+    // ---- THE REGISTRY, over verified TLS. Needs the network.
+    let live = run!(b"godspeed check\r", 150);
+    let offline = live.contains("did not resolve");
+    if offline {
+        println!("godspeed: SKIP - the registry's name did not resolve; this machine is offline, so TLS was not tried");
+        skipped += 1;
+    } else {
+        check!(live.contains("verified"), "`godspeed check` verifies the registry's chain to ISRG Root X2");
+        check!(live.contains("HTTP/1.1 200"), "the registry answers HTTP 200 over the TLS connection");
+        check!(live.contains("Godspeed package registry"), "and says what it is");
+        // The clock row names its source: `time` sets the clock from the network soon after boot, and the
+        // hardware clock stands in until then. Either is a clock; "unset" would have refused the check.
+        check!(live.contains("network time") || live.contains("hardware clock"),
+               "the row says which clock the certificate's dates were checked against");
+    }
+    let piped_check = if offline { String::new() } else { run!(b"godspeed check | where item=tls\r", 150) };
+    if !offline {
+        check!(piped_check.contains("verified") && !piped_check.contains("HTTP/1.1"), "`godspeed check` pipes as records");
+        // BACK TO BACK: each connection is still closing when the next command asks for one, and net-stack
+        // holds two. A connect that finds the table full of closing connections waits for a slot rather than
+        // refusing (`OP_CONNECT`, CONNECT_SLOT_WAIT_MS), so all three answer.
+        let mut quick = 0;
+        for _ in 0..3 {
+            if run!(b"godspeed check | where item=tls\r", 150).contains("verified") { quick += 1; }
+        }
+        check!(quick == 3, "three `godspeed check` back to back all reach the registry: a closing connection's slot is waited for");
+        let so_far = String::from_utf8_lossy(&buf.lock().unwrap()).into_owned();
+        check!(!so_far.contains("the connection table is full"), "no connect so far was refused for a full table");
+        println!("godspeed: the closing-slot wait fired {} time(s) so far", so_far.matches("for a closing connection's slot - freed").count());
+    }
+
+    // ---- PACKAGES, against the real registry and its real package, `godspeed/hello` (design 10.1). Every answer
+    //      is verified on this machine by the shared crate's checks: root 1 by the pin, then timestamp ->
+    //      snapshot -> namespaces -> index -> manifest -> signature -> contract -> binary.
+    if !offline {
+        let bare = run!(b"godspeed search\r", 60);
+        check!(bare.contains("a word is needed") && bare.contains("godspeed list available"), "a bare `godspeed search` asks for a word and names the list of everything");
+        let bare_list = run!(b"godspeed list\r", 60);
+        check!(bare_list.contains("godspeed list available | fetched | installed") && bare_list.contains("say which"), "a bare `godspeed list` asks which list");
+        let first = run!(b"godspeed list available\r", 180);
+        check!(first.contains("godspeed/hello"), "`godspeed list available` lists the registry's package from the verified snapshot");
+        check!(first.contains("first contact: root 1 matched the pin"), "first contact checks root 1 against the pinned digest, and says so under the list");
+        check!(!first.contains("(kept)"), "first contact downloads the snapshot: none is kept yet");
+        let again = run!(b"godspeed search hel\r", 180);
+        check!(again.contains("godspeed/hello") && again.contains("against the root this machine already trusts"),
+               "a search filters by word and verifies against the root this machine kept");
+        check!(again.contains("(kept)"), "the snapshot the timestamp names is the one kept on disk: not downloaded again");
+        // A PAGE starts `from` a count of matches: the snapshot is read back from the disk a line at a time.
+        let page = run!(b"godspeed list available from 1\r", 180);
+        check!(page.contains("2 to ") && page.contains("here") && !page.contains("not a number"),
+               "`godspeed list available from 1` starts its page at the second package, and says which are here");
+        let past = run!(b"godspeed list available from 100000\r", 180);
+        check!(past.contains("none from 100000"), "a page past the end is empty, and says how many there are");
+        let bad_from = run!(b"godspeed list available from x\r", 60);
+        check!(bad_from.contains("[from <n>]"), "`from` needs a number");
+        let kept = run!(b"dir /system/services/godspeed/trust/default\r", 60);
+        check!(kept.contains("snapshot.toml") && !kept.contains("snapshot.partial"), "the verified snapshot is kept on disk, and no staging copy is left");
+        let none = run!(b"godspeed search zzzz\r", 180);
+        check!(none.contains("0 packages") && none.contains("verified: root"), "a word nothing matches is an empty list, not a failure, with the chain it was checked by");
+        let info = run!(b"godspeed info godspeed/hello\r", 180);
+        check!(info.contains("godspeed/hello 0.3.0") && info.contains("latest; published") && info.contains("bankole"),
+               "`godspeed info` is a card headed by the release: the latest, when and by whom");
+        check!(info.contains("The service template") && info.contains("licence") && info.contains("GPL-2.0-only") && !info.contains("ITEM"),
+               "the card gives the manifest's description and licence, and is not a three-column table");
+        check!(info.contains("built for") && info.contains("0.29.0") && info.contains("ships") && info.contains("this machine's, x86_64, is one"),
+               "and the release it was built for, the architectures it ships and whether this machine's is one");
+        check!(info.contains("requests") && info.contains("log_write") && info.contains("an active key of the publisher's"),
+               "and what its contract requests and who signed it");
+        let nope = run!(b"godspeed info godspeed/nothing-here\r", 180);
+        check!(nope.contains("never published on this registry"), "a package the snapshot does not list is said to be unpublished");
+
+        let fetched = run!(b"godspeed fetch godspeed/hello\r", 240);
+        check!(fetched.contains("/system/packages/godspeed/hello/0.3.0") && fetched.contains("fetched"),
+               "`godspeed fetch` verifies the package and fetches it to /system/packages/");
+        check!(fetched.contains("x86_64") && fetched.contains("its size and digest the manifest's"),
+               "it keeps this machine's binary, checked against the manifest");
+        check!(fetched.contains("an active key of the publisher's"), "the manifest's signature is by a key the signed namespaces vouch for");
+        check!(fetched.contains("log_write"), "it says what the contract requests");
+        check!(fetched.contains("installed") && fetched.contains("not installed") && fetched.contains("`godspeed install` starts it"),
+               "and that it is fetched, not installed, and how to install it");
+        check!(fetched.contains("downloading godspeed/hello 0.3.0  [") && !fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
+               "`godspeed fetch` draws a progress bar naming the package, not the file, while it downloads");
+        check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
+        let kept = run!(b"dir /system/packages/godspeed/hello/0.3.0\r", 60);
+        check!(kept.contains("x86_64.elf") && kept.contains("manifest.toml") && kept.contains("manifest.sig")
+               && kept.contains("contract.toml") && kept.contains("origin") && !kept.contains("aarch64.elf"),
+               "the folder holds the binary, the documents that prove it, and where it came from - and no other architecture's");
+        let twice = run!(b"godspeed fetch godspeed/hello@0.3.0\r", 240);
+        check!(twice.contains("already fetched"), "fetching a fetched version again leaves it as it is");
+        let listed = run!(b"godspeed list fetched\r", 60);
+        check!(listed.contains("PACKAGE") && listed.contains("VERSION") && listed.contains("FROM") && listed.contains("SIZE"),
+               "`godspeed list fetched` is a list with real columns");
+        check!(listed.contains("godspeed/hello") && listed.contains("0.3.0") && listed.contains("default"), "it shows the package, its version and registry");
+        check!(listed.contains("KiB") && listed.contains("1 package,"), "with its size, and the count and total under the list");
+        let verified = run!(b"godspeed verify\r", 120);
+        check!(verified.contains("intact") && verified.contains("1 checked, 0 damaged"), "`godspeed verify` checks the fetched copy from the disk: intact");
+        let updates = run!(b"godspeed list updates\r", 180);
+        check!(updates.contains("godspeed/hello") && updates.contains("up to date on default"), "`godspeed list updates` asks the registry it came from");
+        let trust = run!(b"godspeed trust\r", 60);
+        check!(trust.contains("root") && trust.contains("expires 2028") && trust.contains("the configuration's") && trust.contains("key godspeed/")
+               && trust.contains("active"), "`godspeed trust` is a card: the root, the pin, and the publishers' keys, from this machine's record");
+        let installed = run!(b"godspeed list installed\r", 60);
+        check!(installed.contains("0 packages") && installed.contains("installs a fetched package"),
+               "`godspeed list installed` is an empty list with the way to install one, not a refusal");
+        let piped = run!(b"godspeed search | where item=package | count\r", 60);
+        check!(piped.contains("a word is needed") || piped.lines().any(|l| l.trim() == "0"), "a bare search refuses in a pipe too");
+        let piped = run!(b"godspeed list available | where package=godspeed/hello | count\r", 180);
+        check!(piped.lines().any(|l| l.trim() == "1") && !piped.contains("where:"), "`godspeed list available` pipes as records with a package column");
+        let sized = run!(b"godspeed list fetched | where size>1000 | count\r", 60);
+        check!(sized.lines().any(|l| l.trim() == "1") && !sized.contains("where:"), "`size` is a number a pipe can compare");
+        let refused = run!(b"godspeed fetch godspeed/hello | count\r", 30);
+        check!(refused.contains("are actions, not reports"), "`godspeed fetch` refuses to start a pipe");
+        let missing = run!(b"godspeed fetch godspeed/hello@9.9.9\r", 240);
+        check!(missing.contains("not published") && missing.contains("0.3.0"), "a version not published is refused, naming the ones that are");
+
+        // INSTALL: the supervisor checks the fetched copy from the disk again and starts it, under its package name.
+        let notfetched = run!(b"godspeed install godspeed/nothing-here yes\r", 60);
+        check!(notfetched.contains("not fetched here"), "installing what is not fetched is refused, naming `godspeed fetch`");
+        let inst = run!(b"godspeed install godspeed/hello yes\r", 180);
+        check!(inst.contains("godspeed/hello 0.3.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
+               "`godspeed install` asks once, naming everything the package would be given, and `yes` answers it");
+        check!(inst.contains("installed") && inst.contains("running, as the task godspeed/hello") && inst.contains("privilege"),
+               "the supervisor started it, under its package name, with no privilege");
+        check!(inst.contains("installed godspeed/hello 0.3.0 started") && inst.contains("checked from disk"),
+               "the supervisor says it checked the copy from the disk before starting it");
+        check!(inst.contains("hello: started"), "and the installed program ran");
+        let li = run!(b"godspeed list installed\r", 60);
+        check!(li.contains("godspeed/hello") && li.contains("running") && li.contains("1 package"), "`godspeed list installed` lists it, running");
+        let lf = run!(b"godspeed list fetched\r", 60);
+        check!(lf.contains("installed") && !lf.contains("fetched, not installed"), "`godspeed list fetched` says the copy is the installed one");
+        let rm = run!(b"godspeed remove godspeed/hello\r", 60);
+        check!(rm.contains("`godspeed uninstall` it first"), "an installed copy is not removed");
+        let k = run!(b"kill godspeed/hello\r", 60);
+        let li2 = run!(b"godspeed list installed\r", 60);
+        // The supervisor's line lands once the prompt is back, so it is in either answer's window.
+        let both = format!("{}{}", k, li2);
+        check!(both.contains("installed godspeed/hello died") && both.contains("restarting (1 of 5)"),
+               "an installed package that dies is restarted from the disk, counted");
+        check!(li2.contains("running") && !li2.contains("NOT running"), "and is running again");
+        let un = run!(b"godspeed uninstall godspeed/hello yes\r", 60);
+        check!(un.contains("[y/N]: yes (given on the command line)") && un.contains("uninstalled") && un.contains("stopped"),
+               "`godspeed uninstall` asks, and stops it");
+        check!(un.contains("installed godspeed/hello stopped and forgotten"), "the supervisor forgets it, so it is not restarted");
+        let li3 = run!(b"godspeed list installed\r", 60);
+        check!(li3.contains("0 packages"), "and it is no longer listed");
+        let un2 = run!(b"godspeed uninstall godspeed/hello yes\r", 60);
+        check!(un2.contains("not installed here"), "uninstalling what is not installed says so");
+
+        // A UTILITY: installed, run by its name for one command line, its output shown and piped, its status said.
+        let uf = run!(b"godspeed fetch godspeed/hello-utility\r", 240);
+        check!(uf.contains("godspeed/hello-utility 0.2.0") && uf.contains("fetched") && uf.contains("a utility: `godspeed install` makes it a command"),
+               "`godspeed fetch` fetches a utility package and says what installing it does");
+        let ui = run!(b"godspeed install godspeed/hello-utility yes\r", 180);
+        check!(ui.contains("godspeed/hello-utility 0.2.0 asks for nothing (no peers, no privilege) and becomes a command, run when typed")
+               && ui.contains("a utility: type `hello-utility"),
+               "installing a utility asks once and says how to run it");
+        check!(ui.contains("checked from disk - a utility, run when typed") && !ui.contains("hello-utility' spawned OK"),
+               "the supervisor checks a utility at install and does not start it");
+        let ul = run!(b"godspeed list installed\r", 60);
+        check!(ul.contains("godspeed/hello-utility") && ul.contains("utility: type `hello-utility`"), "`godspeed list installed` says it is a utility");
+        let ur = run!(b"hello-utility Ada\r", 60);
+        check!(ur.contains("hello, Ada"), "typing an installed utility's name runs it with its arguments");
+        check!(!ur.contains("did not end by itself"), "it ends by itself, not because the shell ended it");
+        let ub = run!(b"hello-utility\r", 60);
+        check!(ub.contains("hello, world"), "with no arguments it is handed an empty line");
+        // The supervisor's line can land after the prompt, so it is looked for in either window.
+        let both = format!("{}{}", ur, ub);
+        check!(both.contains("installed godspeed/hello-utility ended - exited with status 0 - not restarted"),
+               "it ends itself with status 0, and a utility is not restarted");
+        let up = run!(b"hello-utility Ada | match Ada | count\r", 60);
+        // `count` on text says lines, words and bytes: one line, "hello, Ada".
+        check!(up.contains("1 line, 2 words, 11 bytes") && !up.contains("not a pipe source"), "an installed utility starts a pipe");
+        let uq = run!(b"godspeed/hello-utility Grace\r", 60);
+        check!(uq.contains("hello, Grace"), "it runs by its package name too");
+        let uu = run!(b"godspeed uninstall godspeed/hello-utility yes\r", 60);
+        check!(uu.contains("uninstalled"), "`godspeed uninstall` removes a utility");
+        let ug = run!(b"hello-utility Ada\r", 60);
+        check!(ug.contains("unknown: hello-utility"), "and its name is no longer a command");
+        let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
+
+        // A SERVICE, by its own name: installed, started now and kept running. 0.8.0 and 0.9.0 declare `handover`; 0.7.0 does not.
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.8.0\r", 240);
+        let si = run!(b"godspeed install godspeed/hello-service@0.8.0 yes\r", 180);
+        check!(si.contains("godspeed/hello-service 0.8.0 asks for nothing (no peers, no privilege) and starts at every boot"),
+               "installing a service says it starts at every boot");
+        check!(si.contains("hello-service 0.8.0: started") && si.contains("running, as the task godspeed/hello-service"),
+               "`godspeed/hello-service` is started by the supervisor and runs");
+        // A LIVE HANDOVER: upgraded while it runs, its count carried to the new version, nothing stopped.
+        let _ = run!(b"date\r", 30);
+        let _ = run!(b"date\r", 30);
+        let mut up = run!(b"godspeed upgrade godspeed/hello-service yes\r", 300);
+        // The supervisor answers once the offer is SENT; the successor says it took over when the state arrives,
+        // which can be just after the prompt. So that line is waited for, not assumed to be before the prompt.
+        if !up.contains("took over, live, at") {
+            if let Some(t) = collect_until(&buf, &mut cursor, b"took over, live, at", Duration::from_secs(15)) {
+                up.push_str(&t);
+                up.push_str(&collect_until(&buf, &mut cursor, b"\n", Duration::from_secs(5)).unwrap_or_default());
+            }
+        }
+        check!(up.contains("upgrade from 0.8.0") && up.contains("0.9.0"), "`godspeed upgrade` offers 0.9.0 in place of 0.8.0");
+        check!(up.contains("task: spawn 'godspeed/hello-service' beside the running one: a live handover"),
+               "the kernel starts the new version beside the running one, under the same name");
+        check!(up.contains("hello-service 0.8.0: handing over at") && up.contains("hello-service 0.9.0: took over, live, at"),
+               "the running version hands its state over, and the new one takes it");
+        let carried = up.split("took over, live, at ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        check!(carried > 0, "the count it took over is the one the old version had, not zero: the state carried across");
+        check!(up.contains("live, with no restart") && !up.contains("died, restarting") && !up.contains("hello-service 0.9.0: started") && !up.contains("wrong key"),
+               "it was replaced live: no death, no restart, no fresh start");
+        let lr = run!(b"godspeed list installed\r", 60);
+        check!(lr.contains("godspeed/hello-service") && lr.contains("0.9.0") && lr.contains("running"), "0.9.0 is the installed one, running");
+        // VERSIONS: every release, newest first, and what each is here. Then an older one installed by its version.
+        let lv = run!(b"godspeed list versions godspeed/hello-service\r", 180);
+        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.9.0") && lv.contains("0.7.0")
+               && lv.contains("installed") && lv.contains("9 versions, the latest 0.9.0"),
+               "`godspeed list versions` lists every release, newest first, the installed one marked");
+        check!(lv.find("0.9.0").unwrap_or(usize::MAX) < lv.find("0.7.0").unwrap_or(0), "newest first");
+        // A VERSION BUILT BEFORE 0.29.0 (names to 128 bytes) is refused, and the running one is left alone.
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.6.0\r", 240);
+        let old = run!(b"godspeed install godspeed/hello-service@0.6.0 yes\r", 180);
+        check!(old.contains("built for GodspeedOS 0.28.0") && old.contains("must rebuild it"),
+               "a package built for a release before the layout change is refused, and says its publisher must rebuild it");
+        let still = run!(b"godspeed list installed\r", 60);
+        check!(still.contains("godspeed/hello-service") && still.contains("0.9.0") && still.contains("running"),
+               "the refused install leaves the running version running");
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.7.0\r", 240);
+        let dg = run!(b"godspeed install godspeed/hello-service@0.7.0 yes\r", 180);
+        check!(dg.contains("a DOWNGRADE from the installed 0.9.0, whose data stays as that version left it"),
+               "installing an older version says it is a downgrade, and what that means for its data");
+        check!(dg.contains("installed godspeed/hello-service 0.7.0 started") && dg.contains("stopped and started"),
+               "0.7.0 cannot hand over, so it replaces 0.9.0 by a stop and start - and says so");
+        let lv2 = run!(b"godspeed list installed\r", 60);
+        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.7.0") && !lv2.contains("0.9.0"), "the older version is the installed one now");
+        for v in ["0.6.0", "0.8.0", "0.9.0"] {
+            let _ = run!(format!("godspeed remove godspeed/hello-service@{}\r", v).as_bytes(), 60);
+        }
+        let su = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);
+        check!(su.contains("uninstalled") && su.contains("stopped"), "and is stopped by `godspeed uninstall`");
+
+        // AN APP: the screen and the keyboard are its while it runs, and the shell's again when it ends.
+        let af = run!(b"godspeed fetch godspeed/hello-app\r", 240);
+        check!(af.contains("an app: `godspeed install` makes it a command that has the screen while it runs"),
+               "`godspeed fetch` says what installing an app does");
+        let ai = run!(b"godspeed install godspeed/hello-app yes\r", 180);
+        check!(ai.contains("asks for: console") && ai.contains("has the screen and keyboard while it runs"),
+               "installing an app asks for the console, by name, and says what it means");
+        check!(ai.contains("an app: type `hello-app"), "and says how to run it");
+        send(&mut write_half, b"hello-app Ada\r");
+        let shown = collect_until(&buf, &mut cursor, b"give it back to the shell", Duration::from_secs(60)).unwrap_or_default();
+        check!(shown.contains("hello, Ada"), "the app has the screen: it says hello to its argument");
+        send(&mut write_half, b"x");
+        let back = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(30)).unwrap_or_default();
+        check!(back.contains("installed godspeed/hello-app ended - exited with status 0") && !shown.contains("gsh>"),
+               "a key ends it, with status 0 - and no prompt was drawn under its screen");
+        let after = run!(b"godspeed list installed\r", 60);
+        check!(after.contains("app: type `hello-app`"), "and the shell has the console back: its next command runs");
+        let ap = run!(b"hello-app | count\r", 60);
+        check!(ap.contains("is an app - it has the screen while it runs, so it cannot start a pipe"), "an app cannot start a pipe");
+        let _ = run!(b"godspeed uninstall godspeed/hello-app yes\r", 60);
+        let _ = run!(b"godspeed remove godspeed/hello-app\r", 60);
+        let _ = run!(b"godspeed remove godspeed/hello-service\r", 60);
+
+        // A DRIVER: its device by PCI class, approved at install, found by the OS, registers only.
+        let df = run!(b"godspeed fetch godspeed/hello-driver\r", 240);
+        check!(df.contains("a driver: `godspeed install` starts it with its device"), "`godspeed fetch` says what installing a driver does");
+        let di = run!(b"godspeed install godspeed/hello-driver yes\r", 180);
+        check!(di.contains("asks for: device") && di.contains("driving that device"),
+               "installing a driver asks for its device, by name, and says it starts at every boot driving it");
+        check!(di.contains("its device, checked from disk"), "the supervisor starts it with its device");
+        check!(di.contains("hello-driver: device id 0x010000ed, alive true, 5! = 120"),
+               "the driver reads QEMU edu's identity, its liveness register inverts, and the device computes 5! = 120");
+        let du = run!(b"godspeed uninstall godspeed/hello-driver yes\r", 60);
+        check!(du.contains("uninstalled") && du.contains("stopped"), "and `godspeed uninstall` stops it");
+        let _ = run!(b"godspeed remove godspeed/hello-driver\r", 60);
+
+        // A CHANGED PIN is trusting another registry: refused until the operator clears what this machine kept.
+        let _ = run!(b"write /system/services/godspeed/trust/default/pin sha256:0000000000000000000000000000000000000000000000000000000000000000\r", 60);
+        let changed = run!(b"godspeed search hello\r", 180);
+        check!(changed.contains("changed since this machine first reached it") && changed.contains("godspeed trust reset default"),
+               "a pin that changed since first contact is refused, naming the command that forgets it");
+        let trust_changed = run!(b"godspeed trust\r", 60);
+        check!(trust_changed.contains("NOT the pin now in the configuration"), "`godspeed trust` says the record's pin is not the configuration's");
+        let refused_reset = run!(b"godspeed trust reset default | count\r", 30);
+        check!(refused_reset.contains("are actions, not reports"), "`godspeed trust reset` refuses to start a pipe");
+        let forgot = run!(b"godspeed trust reset default yes\r", 60);
+        check!(forgot.contains("forgotten"), "`godspeed trust reset` forgets what was accepted");
+        let fresh = run!(b"godspeed search hello\r", 180);
+        check!(fresh.contains("first contact: root 1 matched the pin"), "and the registry is met again from root 1");
+
+        // DAMAGE on disk is found without the network.
+        let _ = run!(b"write /system/packages/godspeed/hello/0.3.0/contract.toml name = \"other\"\r", 60);
+        let damaged = run!(b"godspeed verify godspeed/hello\r", 120);
+        check!(damaged.contains("DAMAGED") && damaged.contains("contract.toml is not the contract the manifest names"),
+               "`godspeed verify` finds a fetched file changed on disk, and names it");
+
+        let removed = run!(b"godspeed remove godspeed/hello\r", 60);
+        check!(removed.contains("removed") && removed.contains("/system/packages/godspeed/hello"), "`godspeed remove` deletes the fetched copy");
+        let after = run!(b"godspeed list fetched\r", 60);
+        check!(after.contains("0 packages") && after.contains("godspeed fetch <publisher/name>"), "and `godspeed list fetched` is then empty, with the way to fetch one");
+        let gone = run!(b"godspeed remove godspeed/hello\r", 60);
+        check!(gone.contains("not fetched here"), "removing what is not fetched says so");
+    }
+
+    // ---- THE NTP SERVER IS A SETTING, `/system/services/time/ntp`, re-read by `date sync` (the same rule as
+    //      the package manager's, `docs/developer-services-design.md`). `time` logs what it decided after the
+    //      shell's answer, so each check looks in the command's output and in what follows it.
+    macro_rules! saw { ($out:expr, $needle:expr) => {{
+        let out: String = $out;
+        out.contains($needle)
+            || collect_until(&buf, &mut cursor, $needle.as_bytes(), Duration::from_secs(20)).is_some()
+    }}; }
+    let _ = run!(b"delete /system/services/time/ntp\r", 30);
+    let fresh = run!(b"date sync\r", 60);
+    check!(saw!(fresh, "asking the default NTP server 162.159.200.123, and writing it there"),
+           "with no NTP setting, `date sync` asks the default server and writes it to the file");
+    let ntpfile = run!(b"read /system/services/time/ntp\r", 30);
+    check!(ntpfile.contains("162.159.200.123") && ntpfile.contains("# time.cloudflare.com"),
+           "the file shows the server in effect");
+    let _ = run!(b"write /system/services/time/ntp time.cloudflare.com\r", 30);
+    let named = run!(b"date sync\r", 60);
+    check!(saw!(named.clone(), "/system/services/time/ntp line 1 is not an IPv4 address - no network time until it is"),
+           "a name in place of an address is refused by line, not replaced by the default");
+    check!(named.contains("date sync: /system/services/time/ntp does not name one IPv4 address")
+               && !named.contains("is the cable in"),
+           "`date sync` says the setting is refused, not that the cable is out");
+    check!(named.matches("[q] quit").count() <= 1 && !named.contains("(q aborts)"),
+           "`date sync` offers `[q] quit` once at most, from the shell's watch");
+    let _ = run!(b"write /system/services/time/ntp 216.239.35.0\r", 30);
+    let other = run!(b"date sync\r", 60);
+    check!(saw!(other, "time: NTP server 216.239.35.0, from /system/services/time/ntp"),
+           "an edited server is taken at the next `date sync`, with no restart");
+    let _ = run!(b"write /system/services/time/ntp 162.159.200.123\r", 30);
+    let back = run!(b"date sync\r", 60);
+    check!(saw!(back, "time: NTP server 162.159.200.123, from /system/services/time/ntp"),
+           "and set back the same way");
+
+    // ---- `selfcheck packages`: the lifecycle again, as a board runs it - its own `godspeed/selfcheck-*`
+    //      packages only, from nothing to nothing. QEMU has the driver's `edu`, so here nothing is skipped.
+    if !offline {
+        let sc = run!(b"selfcheck packages\r", 900);
+        check!(sc.contains("failed 0") && !sc.contains("FAIL "), "`selfcheck packages` runs with no failure");
+        check!(sc.contains("live, with no restart") && sc.contains("took over, live, at"), "its service upgrade 1.1.0 -> 1.2.0 is hot");
+        check!(sc.contains("stopped and started"), "and its replacement by 1.0.0 is cold");
+        check!(!sc.contains("selfcheck-driver - its device"), "with QEMU's edu here, the driver is started, not skipped");
+        check!(!sc.contains("registry is not reachable"), "the registry was reached, so nothing was skipped for it");
+
+        // ---- AT BOOT: an installed service starts on its own after a reboot, from the disk. `fs` mounts after
+        //      the supervisor is ready, so the supervisor's first read of the installed list can go unanswered;
+        //      it is asked again until `fs` answers (`Installed::try_boot`) rather than given up on.
+        // Fetched again: the version tests above removed every fetched copy.
+        let _ = run!(b"godspeed fetch godspeed/hello-service@0.7.0\r", 240);
+        let bi = run!(b"godspeed install godspeed/hello-service@0.7.0 yes\r", 180);
+        check!(bi.contains("installed godspeed/hello-service 0.7.0 started"), "a service is installed before the reboot");
+        send(&mut write_half, b"reboot now\r");
+        let up = collect_until(&buf, &mut cursor, b"supervisor: ready", Duration::from_secs(180)).unwrap_or_default();
+        let started = collect_until(&buf, &mut cursor, b"hello-service 0.7.0: started", Duration::from_secs(150));
+        check!(up.contains("supervisor: ready") && started.is_some(),
+               "after a reboot the installed service is started from the disk, by the supervisor, unasked");
+        let after = format!("{}{}", up, started.unwrap_or_default());
+        check!(!after.contains("could not be read") && !after.contains("no installed package started"),
+               "the boot read of the installed list waited for fs rather than giving up");
+        let _ = collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60));
+        let bu = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);
+        check!(bu.contains("uninstalled"), "and is uninstalled again");
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    // The whole serial transcript, for the failure a PASS/FAIL line cannot explain.
+    let _ = std::fs::write("build/tests/godspeed_serial.log", &*buf.lock().unwrap());
+    println!("\ngodspeed: {pass} passed, {fail} failed, {skipped} skipped (serial: build/tests/godspeed_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 pub fn run_jobs(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");
@@ -11233,4 +11821,340 @@ pub fn run_quit(image_path: &Path, persist_path: &str, smp: u32) {
     println!("quit-test: {} case(s), {} not meeting the bar - report in build/tests/quit_report.md", rows.len(), bad);
     child.kill().ok();
     child.wait().ok();
+}
+
+/// `osdev test gsp`: a package carried as ONE FILE (`docs/developer-services-design.md` 15). Boot 1 is online: a
+/// fetch saves the release as a `.gsp`, the machine forgets the registry, and the file installs as on a machine
+/// that was never online. Boot 2 is the same disk with NO network and the clock 60 days on: the file is checked
+/// offline, its age is asked about, `yes` does not answer that, and `accept-old` does.
+pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("gsp: PASS - {}", $label); pass += 1; }
+        else { println!("gsp: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let mut transcript: Vec<u8> = Vec::new();
+
+    for boot in 1..=2 {
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-cpu",     "qemu64,+rdrand",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+        ]);
+        if boot == 1 {
+            cmd.args(["-device", "e1000,netdev=n0", "-netdev", "user,id=n0"]);
+        } else {
+            // No network at all, and the clock 60 days past the file's day.
+            let later = std::time::SystemTime::now() + Duration::from_secs(60 * 86_400);
+            let secs = later.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let (days, rem) = (secs / 86_400, secs % 86_400);
+            let z = days as i64 + 719_468;
+            let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + i64::from(month <= 2);
+            cmd.args(["-nic", "none", "-rtc",
+                &format!("base={year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}", rem / 3600, rem % 3600 / 60, rem % 60)]);
+        }
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("gsp: QEMU launch failed: {e}"); std::process::exit(1); } };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+            Some(s) => s,
+            None => { child.kill().ok(); eprintln!("gsp: no shell serial"); std::process::exit(1); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+            child.kill().ok(); eprintln!("gsp: never reached a prompt"); std::process::exit(1);
+        }
+        macro_rules! run { ($c:expr, $secs:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+        }}; }
+
+        if boot == 1 {
+            let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+            // The disk is not flashed here: osdev formatted it and put the unpublished file on it.
+            let _ = run!(b"godspeed config\r", 60);
+            // MADE ON THE MACHINE: a fetch that keeps every document it read, as one file.
+            let saved = run!(b"godspeed fetch godspeed/hello-utility offline\r", 300);
+            check!(saved.contains("saved") && saved.contains("/users/default/hello-utility-0.2.0.gsp") && saved.contains("installs it with no network"),
+                   "`godspeed fetch ... offline` writes the verified release as one file, named from it, in this folder");
+            let listed = run!(b"dir /users/default\r", 30);
+            check!(listed.contains("hello-utility-0.2.0.gsp"), "the file is on the disk");
+            // The fetched copy the save left goes: what is checked next must come from the file or the registry.
+            let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
+            // INSPECTED, the file and the registry's copy alike: every check, nothing kept.
+            let insp = run!(b"godspeed inspect hello-utility-0.2.0.gsp\r", 300);
+            check!(insp.contains("inspected from a package file") && insp.contains("nothing was kept, nothing installed")
+                       && insp.contains("offline, as of"),
+                   "`godspeed inspect <file>.gsp` checks the file through the whole chain and keeps nothing");
+            let reg = run!(b"godspeed inspect godspeed/hello-utility\r", 300);
+            check!(reg.contains("inspected from default") && reg.contains("verified against the registry"),
+                   "`godspeed inspect <publisher/name>` checks the registry's release the same way, and keeps nothing");
+            let still = run!(b"godspeed list fetched\r", 60);
+            check!(!still.contains("hello-utility"), "inspecting kept nothing: it is not fetched");
+            // A MACHINE THAT HAS NEVER BEEN ONLINE: no fetched copy, no record of the registry.
+            let _ = run!(b"godspeed trust reset default yes\r", 60);
+            let inst = run!(b"godspeed install hello-utility-0.2.0.gsp yes\r", 300);
+            check!(inst.contains("unpacked from a package file") && inst.contains("offline, as of"),
+                   "installing the file checks it offline and unpacks it, saying as of when");
+            check!(inst.contains("asks for nothing") && inst.contains("a utility: type `hello-utility"),
+                   "then it installs as any fetched package, with the same question");
+            let ran = run!(b"hello-utility Ada\r", 60);
+            check!(ran.contains("hello, Ada"), "and it runs");
+            // NOT A PACKAGE FILE: refused, with no question.
+            let _ = run!(b"write /users/default/bad.gsp hello\r", 30);
+            let bad = run!(b"godspeed install bad.gsp yes\r", 60);
+            check!(bad.contains("not a Godspeed package file") && !bad.contains("[y/N]"),
+                   "a file that is not a package file is refused by name, with no question");
+
+            // UNPUBLISHED (`godspeed package --local`): no registry vouches for it, so only a key the operator trusts.
+            const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+            let refused = run!(b"godspeed install /hello-utility-0.9.0.gsp yes\r", 120);
+            check!(refused.contains("which this machine's operator does not trust for godspeed/")
+                       && refused.contains("godspeed trust add godspeed") && !refused.contains("installed godspeed/hello-utility 0.9.0"),
+                   "an unpublished file is refused until the operator trusts its key, and the refusal says how");
+            send(&mut write_half, format!("godspeed trust add godspeed {KEY}\r").as_bytes());
+            let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20)).unwrap_or_default();
+            check!(asked.contains("with no registry vouching for it") && asked.contains("only `godspeed trust remove` ends it"),
+                   "`godspeed trust add` asks first, saying what trusting a key directly means");
+            let added = run!(b"y\r", 60);
+            check!(added.contains("trusted by this machine's operator"), "answered yes, the key is trusted");
+            let shown = run!(b"godspeed trust\r", 60);
+            check!(shown.contains("operator") && shown.contains(KEY), "`godspeed trust` lists the operator's key apart from the registries'");
+            let looked = run!(b"godspeed inspect /hello-utility-0.9.0.gsp\r", 120);
+            check!(looked.contains("inspected from an UNPUBLISHED package file") && looked.contains("OPERATOR trusts"),
+                   "`godspeed inspect` checks the unpublished file and says who vouches for it");
+            let local = run!(b"godspeed install /hello-utility-0.9.0.gsp yes\r", 180);
+            check!(local.contains("unpacked from an UNPUBLISHED package file") && local.contains("a utility: type `hello-utility"),
+                   "with its key trusted, the unpublished file installs as any package, with the same question");
+            check!(local.contains("unpacking godspeed/hello-utility 0.9.0") && !local.contains("downloading godspeed/hello-utility 0.9.0"),
+                   "and its progress says it is unpacking the file, not downloading");
+            check!(local.contains("100%") && local.contains("done in ") && local.contains("% "),
+                   "the progress line gives the percentage and how long it took");
+            let ran_local = run!(b"hello-utility Bo\r", 60);
+            check!(ran_local.contains("hello, Bo"), "and it runs");
+            let listed_local = run!(b"godspeed list fetched\r", 60);
+            check!(listed_local.contains("(operator)"), "`godspeed list fetched` says it came from the operator, not a registry");
+            let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
+            check!(removed.contains("no longer trusted"), "`godspeed trust remove` withdraws the key");
+            let stopped = run!(b"hello-utility Cy\r", 60);
+            check!(!stopped.contains("hello, Cy") && stopped.contains("hello-utility: not run - its signing key is not one this machine's operator trusts"),
+                   "and the supervisor's check at the next start refuses what it signed, saying why on the shell's own line");
+            // CLEANUP: 0.9.0 is installed and 0.2.0 still fetched, and an interrupted fetch left a `.partial`.
+            let _ = run!(b"mkdir /system/packages/godspeed/hello-utility/0.1.0.partial\r", 30);
+            send(&mut write_half, b"godspeed cleanup\r");
+            let listed = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(60)).unwrap_or_default();
+            check!(listed.contains("older than the installed 0.9.0") && listed.contains("left by an interrupted fetch")
+                       && listed.contains("Package files (.gsp) are not touched") && !listed.contains("0.9.0   not"),
+                   "`godspeed cleanup` lists the copy nothing uses and the leftover, not the installed version, and asks");
+            let declined = run!(b"n\r", 60);
+            check!(declined.contains("nothing was deleted"), "answered no, nothing is deleted");
+            let still = run!(b"godspeed list fetched\r", 60);
+            check!(still.contains("0.2.0"), "and the copy is still there");
+            let cleaned = run!(b"godspeed cleanup yes\r", 120);
+            check!(cleaned.contains("deleted 1 fetched copy") && cleaned.contains("1 leftover"), "`godspeed cleanup yes` deletes them, with no question");
+            let after = run!(b"godspeed list fetched\r", 60);
+            check!(!after.contains("0.2.0") && after.contains("0.9.0"), "and the installed version is kept");
+            let empty = run!(b"godspeed cleanup\r", 60);
+            check!(empty.contains("nothing to clean up") && !empty.contains("[y/N]"), "with nothing to clean, it says so and asks nothing");
+            let file_kept_c = run!(b"dir /users/default\r", 30);
+            check!(file_kept_c.contains("hello-utility-0.2.0.gsp"), "and the package file is not touched");
+            // PURGE: uninstalled AND every fetched version deleted, in one command that asks first, naming both.
+            send(&mut write_half, b"godspeed uninstall godspeed/hello-utility purge\r");
+            let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(30)).unwrap_or_default();
+            check!(asked.contains("and every fetched version of it is deleted") && asked.contains("a package file you keep is not touched"),
+                   "`godspeed uninstall ... purge` asks first, saying the fetched copies go too");
+            let kept = run!(b"n\r", 60);
+            check!(kept.contains("left installed"), "answered no, nothing is uninstalled or deleted");
+            let purged = run!(b"godspeed uninstall godspeed/hello-utility purge yes\r", 120);
+            check!(purged.contains("uninstalled") && purged.contains("removed") && !purged.contains("`godspeed remove` deletes it"),
+                   "`purge yes` uninstalls it and deletes its fetched copies, with no question");
+            let none_left = run!(b"godspeed list fetched\r", 60);
+            check!(!none_left.contains("hello-utility"), "and no version of it is left fetched");
+            let file_kept = run!(b"dir /users/default\r", 30);
+            check!(file_kept.contains("hello-utility-0.2.0.gsp"), "the package file the operator keeps is not touched");
+        } else {
+            // `net` FIRST, ON PURPOSE: with no link, net-stack holds the shell's requests and answers every one of them
+            // after the shell has moved on. Those late answers used to land on the endpoint the next command's
+            // answer arrives on, and the `inspect` below then read as "not a record stream" (found here,
+            // 2026-10-18). The shell's requests now go through its reply mailbox; this is the test that they do.
+            let netless = run!(b"net\r", 30);
+            check!(netless.contains("link     down"), "`net` answers with no network");
+            let old_insp = run!(b"godspeed inspect hello-utility-0.2.0.gsp\r", 300);
+            check!(old_insp.contains("installing it would ask"), "inspecting an old file says installing it would ask");
+            check!(!old_insp.contains("does not read as an answer"), "and `net`'s late answers did not become this command's");
+            // OLD: asked, and `yes` does not answer it.
+            send(&mut write_half, b"godspeed install hello-utility-0.2.0.gsp yes\r");
+            let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(300)).unwrap_or_default();
+            check!(asked.contains("its registry check ran out on") && asked.contains("days ago") && asked.contains("Install it anyway?"),
+                   "a file older than offline-max-age-days asks, saying how old its check is");
+            check!(asked.contains("`yes` on the line does not answer the question below"), "and `yes` on the line does not answer it");
+            let no = run!(b"n\r", 60);
+            check!(no.contains("not installed - nothing of it was kept"), "answering no keeps nothing");
+            let none = run!(b"godspeed list fetched\r", 60);
+            check!(!none.contains("hello-utility"), "and nothing was unpacked");
+            // `accept-old` answers it.
+            let ok = run!(b"godspeed install hello-utility-0.2.0.gsp yes accept-old\r", 300);
+            check!(ok.contains("accepted although old") && ok.contains("a utility: type `hello-utility"),
+                   "`accept-old` accepts it, the card says so, and it installs with no network");
+            let ran = run!(b"hello-utility offline\r", 60);
+            check!(ran.contains("hello, offline"), "and it runs");
+            let origin = run!(b"read /system/packages/godspeed/hello-utility/0.2.0/origin\r", 30);
+            check!(origin.contains("from-file /users/default/hello-utility-0.2.0.gsp") && origin.contains("accepted although old"),
+                   "its origin records the file and the acceptance");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        transcript.extend_from_slice(format!("\n===== boot {boot} =====\n").as_bytes());
+        transcript.extend_from_slice(&buf.lock().unwrap());
+    }
+    let _ = std::fs::write("build/tests/gsp_serial.log", &transcript);
+    println!("\ngsp: {pass} passed, {fail} failed (serial: build/tests/gsp_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// `osdev test download`: how fast this machine downloads over HTTPS, measured, at sizes a package can be.
+/// `godspeed check <url>` reads a page from a public speed-test server to its end and says how fast; the server's
+/// chain reaches GTS Root R4, which is put beside the registry's root for this (`osdev/fixtures/README.md`). It
+/// needs this machine online, and what it reports is QEMU's user network as well as this system's.
+pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("download: PASS - {}", $label); pass += 1; }
+        else { println!("download: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+        "-device", "e1000,netdev=n0", "-netdev", "user,id=n0",
+        // The wire, kept: when a download is slow or stalls, the capture says which side stopped.
+        "-object", "filter-dump,id=wire,netdev=n0,file=build/tests/download.pcap",
+    ]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("download: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("download: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("download: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+    let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+    let _ = run!(b"godspeed config\r", 60);
+    let copied = run!(b"copy /gts-root-r4.der /system/services/godspeed/roots/gts-root-r4.der\r", 30);
+    check!(!copied.contains("error") && !copied.contains("not found"), "GTS Root R4 is beside the registry's root");
+    let _ = run!(b"godspeed config set timeout-secs 20\r", 30);
+    // Not 16 MiB: that one size is refused by the server (403), 10 MB and 25 MB are not (2026-10-18).
+    for (bytes, secs) in [(1_000_000u64, 300u64), (10_000_000, 900)] {
+        let line = format!("godspeed check https://speed.cloudflare.com/__down?bytes={bytes}\r");
+        let t0 = std::time::Instant::now();
+        let out = run!(line.as_bytes(), secs);
+        let took = t0.elapsed().as_secs_f64();
+        let text = out.clone();
+        let speed = text.lines().find(|l| l.contains("speed")).unwrap_or("").trim().to_string();
+        println!("download: {} bytes: {:.1} s at the host, guest says: {}", bytes, took, speed);
+        check!(text.contains("HTTP/1.1 200") && text.contains(&format!("{bytes} bytes")),
+               format!("{bytes} bytes arrive, all of them"));
+    }
+    // THE REGISTRY'S OWN PATH: 10 MB of random bytes beside the packages, reached through the registry's
+    // certificate and the default root alone - what a package download crosses, and what a board can run as is.
+    let t0 = std::time::Instant::now();
+    let out = run!(b"godspeed check https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin\r", 900);
+    let took = t0.elapsed().as_secs_f64();
+    let speed = out.lines().find(|l| l.contains("speed")).unwrap_or("").trim().to_string();
+    println!("download: the registry's 10 MB: {:.1} s at the host, guest says: {}", took, speed);
+    check!(out.contains("HTTP/1.1 200") && out.contains("10000000 bytes"), "the registry's 10 MB test file arrives, all of it");
+
+    // ---- `download` (utilities/65_download.md): the registry's 10 MB file to disk, checked, then plain http ----
+    let t0 = std::time::Instant::now();
+    let got = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin\r", 900);
+    println!("download: `download` of the registry's 10 MB file: {:.1} s at the host", t0.elapsed().as_secs_f64());
+    println!("download: it said:\n{}", got.trim_end_matches("gsh>").trim());
+    check!(got.contains("/users/default/10mb.bin") && got.contains("9.5 MiB") && got.contains("https"),
+           "`download <https link>` saves the file in this folder, named from the link, and says it was checked");
+    let listed = run!(b"dir /users/default\r", 30);
+    // `dir` rounds sizes; `download` itself refuses to keep a file unless every byte the server stated arrived and was written.
+    check!(listed.contains("10mb.bin") && listed.contains("9.5 MiB") && !listed.contains(".partial"),
+           "the saved file is there at its size, and no .partial is left");
+    let again = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin\r", 60);
+    check!(again.contains("already exists"), "an existing file is never replaced");
+    let plain = run!(b"download http://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin to /users/default/plain.bin\r", 900);
+    check!(plain.contains("/users/default/plain.bin") && plain.contains("NOT checked"),
+           "`download <http link> to <file>` saves it there, and says nothing checked it");
+    let missing = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/nope.bin\r", 60);
+    let after = run!(b"dir /users/default\r", 30);
+    check!(missing.contains("HTTP 404") && !after.contains("nope.bin"), "a 404 is said, and nothing is saved");
+    let rsa = run!(b"download http://proof.ovh.net/files/1Mb.dat\r", 120);
+    check!(rsa.contains("ECDSA") && !run!(b"dir /users/default\r", 30).contains("1Mb.dat"),
+           "a redirect to https is followed, and a certificate this client cannot check is said and nothing saved");
+    let bad = run!(b"download ftp://example.com/f\r", 30);
+    check!(bad.contains("http:// or https://"), "a link that is not http or https is refused with the reason");
+    let piped = run!(b"download https://godspeed-registry.bankole-422.workers.dev/packages/godspeed/speedtest/1/10mb.bin | count\r", 30);
+    check!(piped.contains("pipe"), "download is an action and refuses to start a pipe");
+
+    // THE DISK'S HALF: a download is written as it arrives, so it is no faster than this.
+    let t0 = std::time::Instant::now();
+    let copied = run!(b"copy /big.bin /big-copy.bin\r", 600);
+    let took = t0.elapsed().as_secs_f64();
+    println!("download: copying 4 MiB on the disk took {:.1} s at the host ({:.0} KiB/s, read and written)", took, 4096.0 / took);
+    check!(!copied.contains("error") && !copied.contains("failed"), "the 4 MiB copy completes");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::write("build/tests/download_serial.log", &*buf.lock().unwrap());
+    println!("\ndownload: {pass} passed, {fail} failed (serial: build/tests/download_serial.log)");
+    if fail > 0 { std::process::exit(1); }
 }

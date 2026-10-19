@@ -750,12 +750,26 @@ const SCAN_RX_BLOCKS: usize = 16;
 /// queues before it is read.
 pub(crate) const RX_BYTES: usize = SCAN_RX_BLOCKS * BLOCK;
 
-/// `receive`, into bytes: what the chip had waiting within `budget`, little-endian as the FIFO gives it.
-pub(crate) fn receive_bytes(h: &dyn SdioHost, bytes: &mut [u8; RX_BYTES], budget: Budget, quiet: bool, ctx: &ServiceContext) -> usize {
-    let mut buf = [0u32; RX_BYTES / 4];
-    let n = receive(h, &mut buf, budget, quiet, ctx);
-    for (i, w) in buf[..n / 4].iter().enumerate() {
-        bytes[4 * i..4 * i + 4].copy_from_slice(&w.to_le_bytes());
+/// The receive region's size: the most the chip can report waiting, 127 blocks, rounded to whole pages.
+///
+/// **It used to be 16 blocks, and that was the download's limit over this radio.** The chip queues what the
+/// access point sends until it is read, and reports the whole queue as one length; a queue longer than the
+/// buffer was "left unread" - and stayed, because it only grows. With an 8 KiB TCP window the queue never
+/// passed 8 KiB. With a 256 KiB one it reached 26 KiB within a second, and the link stopped (the VisionFive,
+/// 2026-10-18). The vendor driver reads the whole length in one transfer, so this does too, into a region
+/// asked for once, at start: 64 KiB is more than a stack can hold twice.
+pub(crate) const RX_REGION: usize = 128 * BLOCK;
+
+/// `receive`, into the station's region: what the chip had waiting within `budget`. Its bytes are
+/// `rx.bytes()[..n]`, little-endian as the FIFO gives them.
+pub(crate) fn receive_region(h: &dyn SdioHost, rx: &mut godspeed::memory::Region, budget: Budget, quiet: bool, ctx: &ServiceContext) -> usize {
+    let words = rx.words_mut();
+    let take = words.len().min(RX_REGION / 4);
+    let n = receive(h, &mut words[..take], budget, quiet, ctx);
+    // The FIFO's words are little-endian on the wire; in place they are the machine's order. A no-op on every
+    // port this radio is on, and correct on one that is not little-endian.
+    for w in words[..n / 4].iter_mut() {
+        *w = u32::from_ne_bytes(w.to_le_bytes());
     }
     n
 }

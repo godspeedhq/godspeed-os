@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 3 of 10: hw-enumerator, the lifecycle guardrails, and trace
+# GodspeedOS self-check, part 3 of 11: hw-enumerator, the lifecycle guardrails, and trace
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck hardware` runs THIS part alone; `selfcheck` runs them all

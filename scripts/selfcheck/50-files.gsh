@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 6 of 10: files, directories, copy/move/rename, cd, dir/find/tree, seal
+# GodspeedOS self-check, part 6 of 11: files, directories, copy/move/rename, cd, dir/find/tree, seal
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck files` runs THIS part alone; `selfcheck` runs them all

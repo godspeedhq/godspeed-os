@@ -80,9 +80,10 @@ Every failure is named rather than folded into "it did not work":
 ## Bounds
 
 One transaction is capped at 8 seconds and at a fixed number of protocol steps; a connection holds a
-2 KiB send and a 2 KiB receive arena, and **at most 2 connections** exist at once. The advertised
-receive window is the free space in that receive arena, so the peer is told exactly what this machine
-can hold (`docs/tcp-design.md`).
+2 KiB send arena and a 256 KiB receive arena (8 KiB if the large one could not be had), and **at most 2
+connections** exist at once; when they are all taken, one whose client has not used it for 15 s is released
+for a new one. The advertised receive window is the free space in that receive arena, scaled (RFC 7323), so
+the peer is told exactly what this machine can hold (`docs/tcp-design.md`).
 
 *(This said "at most four connections" until 2026-09-15. `MAX_CONNS` was reduced from 4 to 2 when
 `service_main`'s stack frame reached 37% of the 256 KiB user stack on arm32, and the spec was not

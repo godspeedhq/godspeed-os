@@ -84,6 +84,8 @@ fails.
 | [`cores`](utilities/cores.md) | the cores that came up |
 | [`hardware`](utilities/hardware.md) | this machine's devices, and what drives each |
 | [`ask`](utilities/ask.md) | plain questions about this machine, answered from what its services know |
+| [`godspeed`](utilities/godspeed.md) | the native package manager: its settings, and the registry reached over verified TLS |
+| [`download`](utilities/download.md) | a file from a web server, saved here: https:// checked, http:// said to be unchecked |
 | [`spawncap`](utilities/spawncap.md) | diagnostic: spawn a service and prove the capability to it routes |
 | [`uptime`](utilities/uptime.md) | how long since boot |
 | [`date`](utilities/date.md) | the wall clock |

@@ -670,6 +670,13 @@ CpuClock                 = 55
 # Ops 3 and 4 (2026-10-15) set and cancel a REBOOT on the same one deadline, gated by REBOOT, also the shell's;
 # the deadline records which of the two it is, and a request for the other kind is refused, never replaces it.
 PowerOff                 = 56
+# EXIT - end the CALLING task, with a status (`utility`, docs/stdlib-design.md 1 option B). Why isn't this a
+# service? Nothing above the kernel can end a task's own execution: ending is the scheduler's (4.3). It takes
+# no capability because the one task it ends is the caller, as Yield and Park take none. The kernel learns a
+# number and says it in the death notice (`E`, beside `K` and `F`); what an exit MEANS - restart or not, whom
+# to tell - is the supervisor's (26.10). It is the self-kill path the `kill` syscall already takes, with a
+# different cause. CLAUDE.md 14.5 amendment, 2026-10-17.
+Exit                     = 57
 Gpio                     = 45
 UsbDiskInfo              = 46
 UsbDiskRead              = 47
@@ -744,6 +751,14 @@ SpawnImage               = 52
 # driver's status. The peers are chosen per BOARD at build time (`board::ASK_PEERS`, at most six), so
 # this line is their union across boards. No spawn, kill, console or write authority of any kind.
 "ask" = ["peer:block-driver", "peer:dwc2", "peer:fs", "peer:shell", "peer:supervisor", "peer:wifi-driver", "peer:wifi-usb", "peer:xhci", "priv:INTROSPECT"]
+# godspeed-pm (2026-10-16, docs/developer-services-design.md 10): the native package manager, a foreground
+# program for one `godspeed` command. The shell for its answer; `fs` for its own settings and roots under
+# /system/services/godspeed/; `net-stack` for the registry's TCP connection (op 23); `time` for the date a
+# certificate is checked against. No privilege of any kind.
+# godspeed-pm reaches the supervisor (2026-10-17) to have it start, stop and list an INSTALLED package
+# (`supcmd::INSTALL`, `UNINSTALL`, `INSTALLED`): IMAGE_SPAWN is the supervisor's alone and undelegated, so the
+# package manager asks rather than spawns. It gains no privilege; CLAUDE.md 14.1 amendment of the same date.
+"godspeed-pm" = ["peer:fs", "peer:net-stack", "peer:shell", "peer:supervisor", "peer:time"]
 # ask-net: the same program, started for a network question, with that question's peers instead
 # (`board::ASK_NET_PEERS`): the shell, the supervisor, `net-stack` (its status) and the board's radio.
 "ask-net" = ["peer:net-stack", "peer:shell", "peer:supervisor", "peer:wifi-driver", "peer:wifi-usb", "priv:INTROSPECT"]

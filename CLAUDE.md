@@ -104,6 +104,28 @@ A deliberately small, fully-understood capability microkernel, built to internal
 | Zero-copy IPC      | **Rejected, permanent** | Violates "no shared mutable memory"             |
 | Live code updates  | **Rejected, permanent** | Restart-with-reacquisition is sufficient        |
 
+> **Amendment 2026-10-17 (live handover): a running service may be REPLACED without stopping, by a second program -
+> code is still never changed inside a running one.** The operator asked for Erlang's upgrade-in-place. What this row
+> rejects stays rejected: no new code is ever loaded into a running address space, so W^X holds and the bytes that run
+> are always the bytes the supervisor checked from the disk (14.1). What is now allowed is the observable half of
+> Erlang's feature, made out of mechanisms the system already has: the new version is a separate, isolated program,
+> started BESIDE the running one under the same name; the running one hands it its state over IPC and ends itself
+> (`gs::handover`, `docs/developer-services-design.md` 14). What Erlang calls code change is the successor reading the old
+> version's state - written by the package, explicitly.
+>
+> **What the kernel learns: one spawn flag, `SPAWN_FLAG_HANDOVER`.** `SpawnImage` (which only the supervisor can call,
+> 14.1) may start a task beside the ONE task already running under its name; the name directory re-points to the new
+> endpoint, and the old task's death leaves the name alone (the endpoint-id guard that already handles a respawn racing a
+> death). No new syscall, no shared memory, no capability passed between the two except the successor's endpoint, which
+> the supervisor sends with the offer. A name never has more than two instances. Not a seventh responsibility: it is
+> spawning (4.3), with one refusal relaxed for one caller.
+>
+> **What is opt-in, and what is not promised.** A package declares `handover = true`; without it, an upgrade stops the
+> old version and starts the new as before. Capabilities do not travel (the successor holds its own spawn request's), a
+> request sent to the old version after it drained its queue is lost with it - its caller's `gs::call` reports
+> `OutcomeUnknown`, exactly as for a death - and the state is one message. Services only; an app's handover (its screen
+> moving with its state) is not built.
+
 ### 2.6 Reference Systems
 
 | System  | What we borrow                                          |
@@ -1923,6 +1945,37 @@ Every syscall checks the calling task's capability table, populated at spawn tim
 > worth being exact about which: **narrower for the dozen `SPAWN` holders**, who lost the ability to
 > introduce code at all, and **wider for the supervisor alone**, as the paragraph above records.
 
+> **Amendment 2026-10-17 (install): the supervisor starts an image READ FROM THE DISK, for an installed package,
+> and only after checking its signature.** Step 1 above holds for every built-in service; an installed package
+> (`godspeed install`, `utilities/61_godspeed.md` 4b) is the one exception, and it is the step-2 shape the
+> amendment above names. The supervisor reads a fetched package from `/system/packages/`, checks it with the code
+> `godspeed verify` runs - the publisher's signature over its manifest, the signing key's standing in this
+> machine's trust record, the contract and this machine's binary against the manifest's digests - and hands the
+> kernel the very bytes it hashed, through `SpawnImage` as for any other image (`services/supervisor/src/installed.rs`).
+> It does so at install, at every boot and at every restart, with nothing cached between.
+>
+> **What an installed package is given, and why it is safe to give:** no privilege at all - none is asked for and
+> none can be granted - and send peers only where its signed contract requests them AND the operator approved them,
+> never `supervisor`. It runs under its package name, `publisher/name`, which no built-in service can hold, so it can
+> never stand in for one when a client reacquires a name (14.3). Restarts are bounded: five a boot, then it is left
+> down, loudly.
+>
+> **What is NOT closed, recorded rather than hidden (26.7).** The signature is checked against the trust record and
+> the grant read from the package's folder, and both are on `/system`, which every `fs` holder can write: something
+> that can write there can replace the trust record or widen a grant, up to what the signed contract requests. The
+> narrowing to the contract is what keeps a forged grant from reaching further. `IMAGE_SPAWN` stays the supervisor's
+> alone and undelegated; `godspeed-pm` asks over IPC (`supcmd::INSTALL`). No kernel change, no new syscall, and no
+> responsibility added: the supervisor already starts images and already decides with what.
+>
+> **Amendment 2026-10-17, later (apps): one thing beyond peers, the console, for an `app` and only with the
+> operator's answer.** An installed package of kind `app` is a utility that owns the screen and the keyboard while it
+> runs (`gs::app`, `docs/developer-services-design.md` 13.2, approved by the operator the same day). The supervisor
+> starts it with `SPAWN_FLAG_REQ_CONSOLE` - the console read capability `chaos` and the shell already hold - when its
+> grant names `console`, which `godspeed install` asks about by name, and refuses to start an app whose grant does
+> not. Still no privilege bit: the console is a spawn flag, and a service or a utility is never given it. The
+> residual is SEC-2's (6.4): a holder of the keyboard can read what is typed while it runs, which is exactly what the
+> operator was asked to approve. The kernel gives the console back when the app dies, so a crash cannot keep it.
+
 ### 14.2 Restart and Cap Rebinding (Possibly Cross-Core)
 
 ```text
@@ -1972,6 +2025,24 @@ Required capability: `service_control` (held only by supervisor).
 ### 14.5 Kill Semantics
 
 Kill is for misbehaving services and for restart. It is not a graceful shutdown mechanism.
+
+> **Amendment 2026-10-17 (`Exit`, syscall 57): a program may END ITSELF, with a status, and the death notice
+> says so.** Until now nothing ended a task but the `kill` syscall or a fault, so every program was a service
+> that never returns, and a program that does one job - a `utility` - could not exist outside the shell
+> (`docs/stdlib-design.md` 1, option B, chosen by the operator). `Exit(status)` ends the caller by the path a
+> task that kills itself already takes (`handle_kill`'s tail), with a third cause: the notice carries `E` and the
+> status, beside `K` (killed by) and `F` (a fault) (6.2 amendment 2026-10-11).
+>
+> **It takes no capability, and that is deliberate, not an oversight against 21.** The rule there - a syscall
+> that does not validate a capability is rejected - exists so that no syscall reaches authority without one.
+> `Exit` reaches nothing: the one task it can end is the caller, as `Yield` and `Park` act on the caller and
+> take none. A program could already end itself by faulting; this makes the same end deliberate and says how.
+>
+> **What the kernel learns, and what it does not.** A number, said in the notice. What an exit MEANS is the
+> supervisor's (26.10): an installed package that ends itself is not restarted, because it finished; a service
+> in `MANAGED` that exits is restarted as any death is, because it is meant to run. The kernel keeps no record.
+> No responsibility is added: ending a task is the scheduler's already (4.3). Pinned in
+> `COMMANDMENTS.baseline.toml`; one more SDK call site (18.5, `exit`).
 
 ---
 
@@ -2044,6 +2115,19 @@ block carrying a `// SAFETY:` comment - keeps the *driver services themselves*
 `unsafe`-free behind safe wrappers (`Mmio::read32`, `Dma::write32`, etc.), exactly
 as the kernel isolates its `unsafe` to the four layers above. This is a recognition
 of what the syscall ABI already required, extended to the hardware access §12 needs.
+
+> **Amendment 2026-10-17 (install): the SDK's `memory.rs` is a fourth permitted module, for a task's OWN
+> memory.** `AllocMem` (syscall 6) returns an address, and an address becomes something a service can read
+> and write only through `unsafe`. Until now nothing outside the tests needed that - every working set fit
+> a stack (26.6.1) - and the one case that did, P7's stamped pages, lives in `adversarial.rs`. The install
+> loader is the first production case: the supervisor reads a package's image from `fs`, checks its digest
+> and signature, and hands the kernel those same bytes, and an image is larger than any stack. `Region`
+> is two blocks (`bytes`, `bytes_mut`) over exactly the pages a successful `AllocMem` mapped, and the
+> supervisor stays `unsafe`-free behind it, as a driver does behind `Mmio`.
+>
+> **What it is not:** an allocator. There is no free - the kernel reclaims a task's memory at its death
+> (10.5) - so a region is asked for once, its size is the bound, and it is reused. No syscall and no
+> kernel change; the rule that new `unsafe` lives in a permitted layer (18.5) is met by naming this one.
 
 **Plus the SDK's audited adversarial test module (`sdk/rust/src/adversarial.rs`).** The §22 red-team /
 fuzz / chaos suite must reach the raw ABI with *fuzzed* syscall numbers and arguments, and must execute
@@ -2133,7 +2217,12 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 and to 80 on 2026-10-17 by the amendments below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+
+> **Amendment 2026-10-17 (`Exit`): `sdk/rust/src/service_context.rs` 79 -> 80.** One call site, `exit`: one
+> `unsafe { raw_syscall(57, ..) }` behind the safe `ServiceContext::exit` and `gs::program::exit`, for the 14.5
+> amendment of the same date. Necessity: a program cannot reach a syscall any other way. Safety: one integer and
+> no pointer, and the syscall does not return.
 
 > **Amendment 2026-10-14 (`PowerOff`): `sdk/rust/src/service_context.rs` 77 -> 79.** Two call sites behind
 > the §12.3 amendment of the same date: `power_off_call`, one `unsafe { raw_syscall(56, ..) }` behind the three

@@ -1,4 +1,4 @@
-# GodspeedOS self-check, part 7 of 10: byte pipes, records, json, fsck, scrub, file-as-capability, fmt, churn, jobs
+# GodspeedOS self-check, part 7 of 11: byte pipes, records, json, fsck, scrub, file-as-capability, fmt, churn, jobs
 #
 # One of the parts `selfcheck` runs, in the order they are listed in `SELFCHECK_PARTS`
 # (`services/shell/src/main.rs`). `selfcheck data` runs THIS part alone; `selfcheck` runs them all

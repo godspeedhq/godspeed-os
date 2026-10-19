@@ -42,6 +42,8 @@
 //! slices are done, with `kernel/src/clock.rs` kept as the paragraph above records, and since
 //! 2026-10-01 this service also runs the NTP exchange itself - `net-stack` no longer calls it.)
 
+mod ntp_file;
+
 use godspeed_sdk::{ServiceContext, Message};
 
 use godspeed as gs;
@@ -53,7 +55,12 @@ pub const OP_NOW: u8 = 1; // -> [ok, epoch(8, le), source, age(8, le)]  age = -1
 /// `net-stack` pushing an SNTP result, and this service now fetches and checks that result itself.
 pub const OP_SET: u8 = 2;
 pub const OP_FLOOR_GET: u8 = 3; // -> [ok, floor(8, le)]
-pub const OP_FLOOR_SET: u8 = 4; // [floor(8, le)] -> [ok]
+/// RETIRED 2026-10-16, answered `[0]`. It let any client of this service raise the clock floor to any
+/// value, and the floor only ever rises and is persisted, so one message could push the machine's date
+/// years ahead for good (`docs/developer-services-design.md` 3.3). Its only caller was the shell seeding
+/// the floor from `/system/services/time/floor` - this service's own file, which it already reads itself.
+/// The floor is now set by this service alone: from that file, and from the clock readings it takes.
+pub const OP_FLOOR_SET: u8 = 4;
 /// Fetch the network time NOW (`date sync`). -> `[1]` once a query is on its way (or already was), `[0]` if it
 /// could not be sent. The answer is NOT waited for: the caller watches the sync age in `OP_NOW` change.
 pub const OP_SYNC: u8 = 5;
@@ -189,6 +196,9 @@ const FS_OP_WRITE: u8 = 10;
 const FS_OP_READ: u8 = 11;
 const FS_OP_MKDIR_P: u8 = 18;
 const FS_OK: u8 = 0;
+/// A READ of a path that does not exist (`fs`'s own `FS_NOTFOUND`). Its writes say "not found" as an
+/// `FS_ERR` instead, so this is a READ's answer only.
+const FS_NOTFOUND: u8 = 2;
 /// Telling `fs` the wall clock: `[FS_CLOCK_PUSH, epoch:i64]`, one way, no reply capability.
 /// Mirrors `FS_CLOCK_PUSH` in `fs`, where the reasoning for it being a push is written out.
 const FS_CLOCK_PUSH: u8 = 0xC1;
@@ -207,9 +217,11 @@ const NTP_WAIT_SECS: u8 = 3;
 /// its answer was dropped. Past this a new query may go out; an answer to the old one is then refused by
 /// its nonce, so a late arrival cannot be mistaken for the new question's answer.
 const NTP_GIVE_UP_SECS: i64 = 8;
-/// A fixed anycast NTP server (time.cloudflare.com, 162.159.200.123). A name would need a DNS lookup, and
-/// `net-stack` runs those inside its loop; an address costs it nothing.
-const NTP_SERVER: [u8; 4] = [162, 159, 200, 123];
+// THE SERVER ASKED IS A SETTING, `/system/services/time/ntp` (`ntp_file`), and no longer a constant here:
+// changing it is editing a file, not rebuilding the image (2026-10-16). Read at start, with the floor's
+// paced retries, and again at every `date sync`; until the file has answered either way nothing is asked,
+// so a server the operator replaced is never asked once at boot. See `NtpCfg`.
+
 /// Seconds between the NTP epoch (1900) and the Unix epoch (1970).
 const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
 
@@ -222,11 +234,98 @@ struct NtpAsk {
     sent_at: i64,
 }
 
-/// Send an NTP query through `net-stack`, without waiting. `Some` if it went.
-fn ntp_ask(ctx: &ServiceContext) -> Option<NtpAsk> {
+/// Which NTP server to ask, as far as the settings file has said.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NtpCfg {
+    /// `fs` has not answered the read yet: nothing is asked.
+    Unread,
+    /// The server to ask: the file's, or the default when there is no file (one is then written) or no
+    /// disk to hold one.
+    Use([u8; 4]),
+    /// The file does not say one address. Nothing is asked until it does - a typo is never quietly
+    /// replaced by the default - and the log says which line, once.
+    Refused,
+}
+
+/// Ask `fs` for the NTP setting. Non-blocking: the answer arrives later, tagged.
+fn ntp_cfg_load(ctx: &ServiceContext) -> bool {
+    let mut req = [0u8; 64];
+    req[0] = TAG_NTP_CFG_READ;
+    req[1] = FS_OP_READ;
+    req[2] = ntp_file::PATH.len() as u8;
+    req[3..3 + ntp_file::PATH.len()].copy_from_slice(ntp_file::PATH);
+    fs_send_noblock(ctx, &req[..3 + ntp_file::PATH.len()])
+}
+
+/// Write the default setting where there is none, so the file shows the server in effect. Non-blocking;
+/// the folder first, as for the floor.
+fn ntp_cfg_write_default(ctx: &ServiceContext) -> bool {
+    let mut dir = [0u8; 64];
+    dir[0] = TAG_FLOOR_DIR;
+    dir[1] = FS_OP_MKDIR_P;
+    dir[2] = FLOOR_DIR.len() as u8;
+    dir[3..3 + FLOOR_DIR.len()].copy_from_slice(FLOOR_DIR);
+    if !fs_send_noblock(ctx, &dir[..3 + FLOOR_DIR.len()]) {
+        return false;
+    }
+    let mut req = [0u8; 256];
+    req[0] = TAG_NTP_CFG_WRITE;
+    req[1] = FS_OP_WRITE;
+    req[2] = ntp_file::PATH.len() as u8;
+    let off = 3 + ntp_file::PATH.len();
+    req[3..off].copy_from_slice(ntp_file::PATH);
+    let end = off + ntp_file::DEFAULT_FILE.len();
+    req[off..end].copy_from_slice(ntp_file::DEFAULT_FILE);
+    fs_send_noblock(ctx, &req[..end])
+}
+
+/// The setting from an `fs` READ reply, logging what was decided, or `None` when the reply settles
+/// nothing and the paced retries go on. A missing file is the default, and is written so it shows; a file
+/// that does not say one address is refused, by line.
+///
+/// ONLY `FS_NOTFOUND` IS "NO FILE". Any other refusal - storage not up yet, a read that failed - may be
+/// a file that exists, and writing the default then would overwrite the operator's setting.
+fn ntp_cfg_adopt(ctx: &ServiceContext, p: &[u8]) -> Option<NtpCfg> {
+    let path = core::str::from_utf8(ntp_file::PATH).unwrap_or("?");
+    if p.len() <= R_STATUS || (p[R_STATUS] == FS_OK && p.len() < R_READ_DATA) {
+        return None;
+    }
+    if p[R_STATUS] == FS_NOTFOUND {
+        let [a, b, c, d] = ntp_file::DEFAULT;
+        let wrote = ntp_cfg_write_default(ctx);
+        ctx.log_fmt(format_args!("time: no {} - asking the default NTP server {}.{}.{}.{}{}", path, a, b, c, d,
+                                 if wrote { ", and writing it there so the file shows it" } else { "" }));
+        return Some(NtpCfg::Use(ntp_file::DEFAULT));
+    }
+    if p[R_STATUS] != FS_OK {
+        return None;
+    }
+    Some(match ntp_file::parse(&p[R_READ_DATA..]) {
+        Ok(ip) => {
+            ctx.log_fmt(format_args!("time: NTP server {}.{}.{}.{}, from {}", ip[0], ip[1], ip[2], ip[3], path));
+            NtpCfg::Use(ip)
+        }
+        Err(why) => {
+            match why {
+                ntp_file::Bad::Empty => ctx.log_fmt(format_args!(
+                    "time: {} names no server - no network time until it holds one IPv4 address, then `date sync`", path)),
+                ntp_file::Bad::NotAnAddress(n) => ctx.log_fmt(format_args!(
+                    "time: {} line {} is not an IPv4 address - no network time until it is, then `date sync`", path, n)),
+                ntp_file::Bad::TwoAddresses(n) => ctx.log_fmt(format_args!(
+                    "time: {} line {} is a second server, and one is asked - no network time until it names one, then `date sync`", path, n)),
+                ntp_file::Bad::NotText => ctx.log_fmt(format_args!(
+                    "time: {} is not text - no network time until it holds one IPv4 address, then `date sync`", path)),
+            }
+            NtpCfg::Refused
+        }
+    })
+}
+
+/// Send an NTP query to `server` through `net-stack`, without waiting. `Some` if it went.
+fn ntp_ask(ctx: &ServiceContext, server: [u8; 4]) -> Option<NtpAsk> {
     let nonce: [u8; 8] = {
-        let hi = ctx.hw_random().unwrap_or((gs::driver::wait::ticks(ctx) >> 13) as u32);
-        let lo = ctx.hw_random().unwrap_or(gs::driver::wait::ticks(ctx) as u32);
+        let hi = gs::task::hw_random(ctx).unwrap_or((gs::driver::wait::ticks(ctx) >> 13) as u32);
+        let lo = gs::task::hw_random(ctx).unwrap_or(gs::driver::wait::ticks(ctx) as u32);
         let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
         [h[0], h[1], h[2], h[3], l[0], l[1], l[2], l[3]]
     };
@@ -235,7 +334,7 @@ fn ntp_ask(ctx: &ServiceContext) -> Option<NtpAsk> {
     req[1] = NTP_WAIT_SECS + 2;                   // our patience, for net-stack's stash
     req[2] = NS_OP_UDP_ASK;
     req[3] = NTP_WAIT_SECS;
-    req[4..8].copy_from_slice(&NTP_SERVER);
+    req[4..8].copy_from_slice(&server);
     req[8..10].copy_from_slice(&123u16.to_be_bytes());
     let ntp = &mut req[10..];
     ntp[0] = 0x23;                                // LI 0, version 4, mode 3 (client)
@@ -273,6 +372,10 @@ fn ntp_answer(ask: &NtpAsk, ntp: &[u8]) -> Result<i64, &'static str> {
 const TAG_FLOOR_READ: u8 = 0xF1;
 const TAG_FLOOR_WRITE: u8 = 0xF2;
 const TAG_FLOOR_DIR: u8 = 0xF3;
+/// The NTP setting's read and its default's write (`ntp_file`). Its folder is the floor's, so the folder's
+/// answer is `TAG_FLOOR_DIR`'s too.
+const TAG_NTP_CFG_READ: u8 = 0xF4;
+const TAG_NTP_CFG_WRITE: u8 = 0xF5;
 /// How often to retry loading the floor while it has not been loaded yet.
 const FLOOR_RETRY_MS: u64 = 2_000;
 /// How long between NTP queries, while we still have no network time.
@@ -508,6 +611,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut store_left = 0u32;                    // writes still owed (0 = nothing to persist)
     let mut store_epoch = 0i64;                   // the value those writes are for
     let mut tries_left = 15u32;                   // ~30 s of asking, then stop
+    let mut ntp_cfg = NtpCfg::Unread;             // the NTP server, as `/system/services/time/ntp` says
+    let mut cfg_tries = 15u32;                    // the same ~30 s for that file, then the default
+    let mut sync_after_read = false;              // `date sync` re-read the file: ask once it answers
     let mut last_nudge = i64::MIN / 2;            // monotonic second the last NTP query went out
     let mut nudge_ok: Option<bool> = None;        // did the last query reach net-stack? None = never tried
     let mut ntp: Option<NtpAsk> = None;           // the NTP query in flight, if any
@@ -561,7 +667,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
-        let wake_ms = if unsynced || !floor_settled || store_left > 0 {
+        let wake_ms = if unsynced || !floor_settled || store_left > 0 || ntp_cfg == NtpCfg::Unread {
             FLOOR_RETRY_MS
         } else {
             SETTLED_WAKE_MS
@@ -608,8 +714,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // ASK FOR THE TIME, since nobody else will - see `SYNC_NUDGE_SECS`. Through `net-stack`'s
                     // op 12, which sends the datagram and goes on serving: nothing waits on the answer, here or
                     // there, so a `ping` never queues behind a time server.
-                    if sync_due && ntp.is_none() {
-                        ntp = ntp_ask(&ctx);
+                    //
+                    // THE SETTING FIRST. Until its file has answered nothing is asked; with no answer in
+                    // the floor's ~30 s there is no disk to hold one, so there is nothing to honour and the
+                    // default is asked, said once.
+                    if ntp_cfg == NtpCfg::Unread && cfg_tries > 0 {
+                        cfg_tries -= 1;
+                        let _ = ntp_cfg_load(&ctx);
+                        if cfg_tries == 0 {
+                            ntp_cfg = NtpCfg::Use(ntp_file::DEFAULT);
+                            ctx.log("time: fs gave no answer for /system/services/time/ntp - asking the default NTP server, 162.159.200.123");
+                        }
+                    }
+                    if let (true, None, NtpCfg::Use(server)) = (sync_due, ntp, ntp_cfg) {
+                        ntp = ntp_ask(&ctx, server);
                         let ok = ntp.is_some();
                         // ONLY A SENT QUERY COUNTS AGAINST THE INTERVAL: a failed send is retried at the
                         // heartbeat, not rewarded with the full twenty seconds (see `SYNC_NUDGE_SECS`).
@@ -656,6 +774,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match p.first().copied() {
                     Some(TAG_FLOOR_READ) => {
                         floor_settled = floor_adopt(&ctx, &mut clock, p);
+                    }
+                    // A LATE ANSWER to an earlier paced read changes nothing once the setting is decided. At
+                    // boot the reads go out every 2 s while `fs` is still mounting, queue there, and are all
+                    // answered together; adopting each wrote the default three times for one decision.
+                    // Only a `date sync` re-read is taken after that.
+                    Some(TAG_NTP_CFG_READ) if ntp_cfg != NtpCfg::Unread && !sync_after_read => {}
+                    Some(TAG_NTP_CFG_READ) => {
+                        if let Some(cfg) = ntp_cfg_adopt(&ctx, p) {
+                            ntp_cfg = cfg;
+                        }
+                        // `date sync` waited for this answer, so it asks the server the file names NOW.
+                        if sync_after_read && ntp_cfg != NtpCfg::Unread {
+                            sync_after_read = false;
+                            if let (None, NtpCfg::Use(server)) = (ntp, ntp_cfg) {
+                                ntp = ntp_ask(&ctx, server);
+                                if ntp.is_some() {
+                                    last_nudge = gs::task::epoch_secs_monotonic(&ctx);
+                                    ntp_said = None;
+                                }
+                            }
+                        }
+                    }
+                    Some(TAG_NTP_CFG_WRITE) => {
+                        if p.len() <= R_STATUS || p[R_STATUS] != FS_OK {
+                            ctx.log("time: fs refused the default NTP setting's file - the default server is still asked; the file just does not show it");
+                        }
                     }
                     // THE ANSWER TO OUR NTP QUERY, from `net-stack`'s op 12: `[tag, status, datagram..]`.
                     Some(TAG_NTP) => {
@@ -768,11 +912,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the two would let a clock that was never set read as freshly authoritative.
                 let age = if clock.source == SRC_NTP { gs::task::epoch_secs_monotonic(&ctx) - clock.synced_at }
                           else { -1 };
-                let mut out = [0u8; 18];
+                // Byte 18, appended the same way: 1 when the NTP setting is REFUSED and no re-read of it is
+                // pending, so no network time will be asked until the file is fixed. `date sync` reads it to
+                // say that at once, rather than waiting out its bound and blaming the cable. While a
+                // `date sync` re-read is outstanding it is 0, since the file may just have been fixed.
+                let mut out = [0u8; 19];
                 out[0] = 1;
                 out[1..9].copy_from_slice(&now.to_le_bytes());
                 out[9] = clock.source;
                 out[10..18].copy_from_slice(&age.to_le_bytes());
+                out[18] = u8::from(ntp_cfg == NtpCfg::Refused && !sync_after_read);
                 reply(&ctx, cap, &out);
             }
             OP_SET => {
@@ -782,14 +931,35 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             OP_SYNC => {
                 // `date sync`: ask NOW rather than at the next twenty-second tick. Answered at once - the
                 // caller watches the sync age in `OP_NOW` change, so nothing here waits on the network.
-                if ntp.is_none() {
-                    ntp = ntp_ask(&ctx);
+                //
+                // A floor that never loaded - `fs` slower than the ~30 s of retries at boot - is read
+                // again here, because asking for the time is when it matters: a fetched time is checked
+                // against it. This replaces the shell's old seed, which read this same file itself and
+                // sent the value back over `OP_FLOOR_SET` (retired above). Non-blocking, like every
+                // floor read; the answer arrives tagged and a few more timed retries follow.
+                if !floor_settled {
+                    let _ = floor_load(&ctx);
+                    if tries_left == 0 {
+                        tries_left = 3;
+                    }
+                }
+                //
+                // The NTP setting is re-read too, so an edit to `/system/services/time/ntp` takes effect
+                // here without a restart. The query then waits for that answer (`TAG_NTP_CFG_READ`
+                // asks), or it would go to the server the file named before the edit. Only when the read
+                // cannot be sent at all is the server already known asked straight away.
+                let reread = ntp.is_none() && ntp_cfg_load(&ctx);
+                if reread {
+                    sync_after_read = true;
+                    ntp_said = None;         // an operator asked: say the outcome again even if it repeats
+                } else if let (None, NtpCfg::Use(server)) = (ntp, ntp_cfg) {
+                    ntp = ntp_ask(&ctx, server);
                     if ntp.is_some() {
                         last_nudge = gs::task::epoch_secs_monotonic(&ctx);
                         ntp_said = None;     // an operator asked: say the outcome again even if it repeats
                     }
                 }
-                reply(&ctx, cap, &[u8::from(ntp.is_some())]);
+                reply(&ctx, cap, &[u8::from(reread || ntp.is_some())]);
             }
             OP_FLOOR_GET => {
                 let mut out = [0u8; 9];
@@ -797,16 +967,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 out[1..9].copy_from_slice(&clock.floor.to_le_bytes());
                 reply(&ctx, cap, &out);
             }
-            OP_FLOOR_SET if p.len() >= 9 => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&p[1..9]);
-                let f = i64::from_le_bytes(b);
-                // The floor only ever rises. A floor that could fall is not a floor, and the whole
-                // point is that a fresh boot cannot report a time before the last one it recorded.
-                if f > clock.floor {
-                    clock.floor = f;
-                }
-                reply(&ctx, cap, &[1]);
+            OP_FLOOR_SET => {
+                ctx.log("time: OP_FLOOR_SET is retired - the clock floor is set only by this service, from its own file");
+                reply(&ctx, cap, &[0]);
             }
             other => {
                 ctx.log_fmt(format_args!("time: unknown op {} - answering, not ignoring", other));

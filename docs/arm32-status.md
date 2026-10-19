@@ -52,11 +52,16 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   service** (DWC2 bulk frames) and reached by `nic-driver` over IPC (opcodes `0x10+` on `dwc2`'s endpoint -
   the same endpoint that serves the block protocol), which bridges to the **unchanged** `net-stack`. The
   `NET_DEVICE` syscalls (42-44) that used to front an in-kernel USB-net device are **stubbed inert** on
-  this arch (`arch/arm/mod.rs`), because no frame passes through the kernel any more. Verified in QEMU (`arm_run.py --usbnet`): DHCP, ARP,
-  ICMP, DNS, and the shell `net` + `ping` all work over USB. The Pi 2's onboard **LAN9514 (`smsc95xx`) is
-  now driven on real hardware too**: DHCP, ARP and internet ping all work, with RX **client-polled**: a bulk-IN
+  this arch (`arch/arm/mod.rs`), because no frame passes through the kernel any more. **The device it
+  drives is the Pi 2's onboard LAN9514 (`smsc95xx`) and nothing else**: DHCP, ARP and internet ping all
+  work on real hardware, with RX **client-polled**: a bulk-IN
   is kept armed, and `rx()` harvests the completed burst and re-arms it when a client asks for frames.
   The DWC2 core auto-retries NAKs in hardware, so an idle device costs nothing.
+
+  **There is no network under QEMU on this port.** QEMU's `usb-net` is a CDC-ECM device, and the
+  `dwc2` service speaks only the SMSC vendor requests (`services/dwc2/src/net.rs`), so `arm_run.py
+  --usbnet` attaches a device nothing here configures (checked 2026-10-16: no DHCP, no link). The
+  QEMU-verified CDC-ECM path below was the in-kernel driver's, and went with it.
 
   **CORRECTED 2026-08-25.** This paragraph used to say RX was "interrupt-driven ... its halt-ISR parses
   each burst", and that mechanism did not exist. The handler lived in the fallback loop entered only
@@ -222,10 +227,14 @@ GodspeedOS way.
   (`cntpct()/timer_hz()`).
 
   *(Note 2026-10-09: the three entries above are the 2026-07-23 state, when the USB stack was in the
-  kernel. It is not any more: `arch/arm/dwc2.rs` is deleted, CDC-ECM and mass storage are driven by the
-  `dwc2` SERVICE, `nic-driver` reaches it over IPC (ops `0x10+` on `dwc2`'s endpoint), and the
+  kernel. It is not any more: `arch/arm/dwc2.rs` is deleted, mass storage and the SMSC LAN9514 are driven
+  by the `dwc2` SERVICE, `nic-driver` reaches it over IPC (ops `0x10+` on `dwc2`'s endpoint), and the
   `NET_DEVICE` syscalls 42-44 are stubs that answer "no device" on this arch (see "Networking" above).
   The USB stick IS the `block-driver` backend now; there is no SD/EMMC backend beside it.)*
+
+  *(Note 2026-10-17: the note above first said the `dwc2` service drives CDC-ECM. It does not; CDC-ECM
+  was not carried over, so the `arm_run.py --usbnet` results above cannot be reproduced today. See
+  "Networking" above.)*
 - **LAN9514 (`smsc95xx`) for the real Pi 2** - **DONE + HW-verified, ZERO packet loss.** Lives in
   `services/dwc2/src/net.rs` (`smsc_bring_up`, `link_up`, `link_reconfigure`). DHCP, ARP and internet
   ping all work on real hardware: 56 ping replies, 0 timeouts, 117 frames parsed = 117 handed out (tag

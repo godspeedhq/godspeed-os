@@ -38,8 +38,9 @@
 //! it is a second delete whose failure looks like success. `ReplyDead` says the request was DELIVERED
 //! (CLAUDE.md 8.6), so it is the same case with a dead peer instead of a slow one.
 //!
-//! This diagram is [`request_within`]. [`request_within_notice`] with a callback cannot draw it: see
-//! its own documentation.
+//! This diagram is [`request_within`]. [`request_within_notice`] with a callback follows it with two
+//! differences - a peer that died holding the request reads as `OutcomeUnknown`, and a person can
+//! press `q` - which its own documentation explains.
 //!
 //! # ONE OF THESE IS SAFE FOR A SERVING CALLER, AND THE OTHER IS NOT
 //!
@@ -108,14 +109,16 @@ pub const NOTICE_AFTER_SECS: i64 = 2;
 /// same machinery as [`request_within`].
 ///
 /// With `notice` set to `None` this IS [`request_within`]. With a callback it rides the SDK's `_qhint`
-/// request, and three things differ:
+/// request, which reads its outcomes differently, so:
 ///
-/// - **No retry.** A stale capability is not reacquired, so after the peer restarts every call fails
-///   until something else reacquires the name ([`crate::cap::reacquire`]).
-/// - **A request that never left reads as [`Error::OutcomeUnknown`]**, and at once rather than at the
-///   deadline: `_qhint` reports a failed send and a passed deadline as the same `Timeout`, so this
-///   cannot tell "nothing happened" from "it may have happened" and must say the second.
-/// - **A peer that died holding the request is also [`Error::OutcomeUnknown`]**, never
+/// - **A request that never left is retried once, as in [`request_within`]**, after reacquiring the
+///   peer by name; if it still cannot be sent the answer is [`Error::Unreachable`]. What differs is how
+///   the failed send is recognised: `_qhint` reports a failed send and a passed deadline as the same
+///   `Timeout`, but it reports the deadline only once it has passed, so a `Timeout` sooner than `secs`
+///   is the send that never left (as [`request_watched`] reads it). A deadline that passed is
+///   [`Error::OutcomeUnknown`] and is never re-sent. (Until 2026-10-16 there was no retry at all, and a
+///   peer that started after the caller could not be reached until something else reacquired it.)
+/// - **A peer that died holding the request is [`Error::OutcomeUnknown`]**, never
 ///   [`Error::PeerDied`]: the wait is a timed receive, so no `ReplyDead` reaches it.
 ///
 /// It also adds [`Error::Cancelled`], for a person who pressed `q` - and it is not safe for a task
@@ -145,23 +148,45 @@ pub fn request_within_notice(
         None => return request_within(ctx, peer, msg, secs),
         Some(f) => f,
     };
-    let out = match keep {
-        Some(k) => ctx.request_with_reply_qhint_keeping(peer, msg, NOTICE_AFTER_SECS, secs, || notice(), k),
-        None => ctx.request_with_reply_qhint(peer, msg, NOTICE_AFTER_SECS, secs, || notice()),
-    };
-    match out {
-        ReqOutcome::Reply(r) => Ok(r),
-        // `ReqOutcome` does not separate a failed send from a passed deadline the way
-        // `DeadlineOutcome` does, so the retry `request_within` performs cannot be done safely here:
-        // retrying a timeout is the one thing this module refuses. Reported as unknown, which is the
-        // honest reading of the coarser answer.
-        ReqOutcome::Timeout => Err(Error::OutcomeUnknown),
-        // The caller stopped waiting. Reported as ITSELF, not folded into the timeout: a person
-        // pressing `q` and a service going silent are different facts and a caller will say
-        // different things about them. Collapsing those two would be the same mistake this module
-        // exists to stop the SDK's `Option` making.
-        ReqOutcome::Aborted => Err(Error::Cancelled),
+    let secs = secs.max(1);
+    for attempt in 0..2 {
+        let t0 = ctx.epoch_secs_monotonic();
+        let out = match keep {
+            Some(k) => ctx.request_with_reply_qhint_keeping(peer, msg, NOTICE_AFTER_SECS, secs, || notice(), k),
+            None => ctx.request_with_reply_qhint(peer, msg, NOTICE_AFTER_SECS, secs, || notice()),
+        };
+        // Name the outcome before acting on it, as `request_watched` does. `ReqOutcome` answers a passed
+        // deadline and a send that never left with the same `Timeout`, but it reports the deadline only once
+        // it has passed - so a `Timeout` sooner than `secs` is the send that never left, and nothing else.
+        let outcome = match out {
+            ReqOutcome::Reply(r) => DeadlineOutcome::Reply(r),
+            // The caller stopped waiting. Reported as ITSELF, not folded into the timeout: a person
+            // pressing `q` and a service going silent are different facts and a caller will say
+            // different things about them. Collapsing those two would be the same mistake this module
+            // exists to stop the SDK's `Option` making.
+            ReqOutcome::Aborted => return Err(Error::Cancelled),
+            ReqOutcome::Timeout if ctx.epoch_secs_monotonic().saturating_sub(t0) >= secs => DeadlineOutcome::Timeout,
+            ReqOutcome::Timeout => DeadlineOutcome::SendFailed,
+        };
+        match outcome {
+            DeadlineOutcome::Reply(r) => return Ok(r),
+            // A live peer that is slow: the request may have happened, so it is never re-sent.
+            DeadlineOutcome::Timeout => return Err(Error::OutcomeUnknown),
+            // THE SEND NEVER LEFT: no live capability to the peer - it restarted, or it started after the
+            // caller and was never acquired. Nothing happened, so the one safe retry: reacquire by name and
+            // send again. Until 2026-10-16 this answered `OutcomeUnknown` at once, and on the Wyse, where the
+            // shell starts before `net-stack`, the first `tcp` of a boot said "net-stack did not answer
+            // within 20s" after a few seconds, having never reached it.
+            DeadlineOutcome::SendFailed => {
+                if attempt == 0 && ctx.reacquire_cap(peer).is_ok() {
+                    continue;
+                }
+                return Err(Error::Unreachable);
+            }
+            DeadlineOutcome::QueueFull => return Err(Error::Busy),
+        }
     }
+    Err(Error::Unreachable)
 }
 
 /// A COMMAND's watch over its waits, lent by the program the operator is typing at (the shell).

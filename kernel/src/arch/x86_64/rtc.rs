@@ -14,6 +14,9 @@ use portable_atomic::AtomicU64;
 const CMOS_INDEX: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;
 
+/// Held for a whole clock read: the index/data port pair is one reader's at a time (`read_datetime_raw`).
+static CMOS: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
 /// The packed wall-clock datetime captured once at boot (see `read_datetime` for the layout).
 /// 0 until `capture_boot_time` runs. `uptime` reads it via InspectKernel query 12 and subtracts
 /// it from the current time - a wall-clock delta, portable across APIC timer modes (a tick
@@ -130,12 +133,29 @@ pub fn set_wall_clock(_epoch: i64) -> bool { false }   // the CMOS RTC is the au
 /// good value instead. A single kernel-owned clock cache (like MONOTONIC_TICKS or the boot stamp), not
 /// service state. `date` keeps the raw read (an on-demand display tolerates a rare one-off).
 static LAST_NOW_EPOCH: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+/// Whether a BACKWARD read is being held (rejected, so `last` is returned), and since which read: said when it
+/// starts and when it ends. Only a backward hold is said. A read far AHEAD (QEMU's CMOS reads about eleven
+/// years ahead every few seconds, measured 2026-10-18) is rejected and the next good read moves on, so it
+/// stands nothing still. A backward one means an earlier read AHEAD was accepted, and the seconds then stand
+/// still until real time passes it - and every bounded wait measures its deadline in these seconds.
+static HOLDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static HOLD_RAW: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
 pub fn now_epoch_monotonic() -> i64 {
     use core::sync::atomic::Ordering;
     let last     = LAST_NOW_EPOCH.load(Ordering::Relaxed);
     // The pure decision lives in `crate::clock` (hardware-free, host-unit-tested); this wrapper just
     // supplies the live RTC read and the high-water-mark store.
-    let accepted = crate::clock::deglitch_epoch(epoch_secs(read_datetime()), last);
+    let raw      = epoch_secs(read_datetime());
+    let accepted = crate::clock::deglitch_epoch(raw, last);
+    let held     = last != 0 && accepted == last && raw < last;
+    if held && !HOLDING.swap(true, Ordering::Relaxed) {
+        HOLD_RAW.store(raw, Ordering::Relaxed);
+        crate::kprintln!("rtc: a CMOS read of {} is {} s from the last good {} - holding {} until the clock passes it (deadlines measured in these seconds do not move meanwhile)",
+            raw, raw - last, last, last);
+    } else if !held && accepted != last && HOLDING.swap(false, Ordering::Relaxed) {
+        crate::kprintln!("rtc: the clock moved on to {} - the hold that began with a read of {} is over",
+            accepted, HOLD_RAW.load(Ordering::Relaxed));
+    }
     LAST_NOW_EPOCH.store(accepted, Ordering::Relaxed);
     accepted
 }
@@ -161,6 +181,16 @@ fn year_plausible(packed: u64) -> bool {
 /// no need to disable interrupts). Decodes BCD and 12-hour mode per status
 /// register B, so the returned fields are always binary and 24-hour.
 fn read_datetime_raw() -> u64 {
+    // ONE READER AT A TIME. A CMOS register is read by writing its number to 0x70 and then reading 0x71, and
+    // that pair is not atomic: two cores reading the clock at once can interleave, so one core's 0x71 returns
+    // the register the OTHER selected - a year where a minute belongs, a minute where an hour does. Every
+    // field then decodes, the double-read below can agree on the mixture, and the result is a plausible time
+    // that is wrong by seconds, hours or years. Measured in QEMU on 2026-10-18 as reads 55 s and 14 s
+    // BEHIND, and eleven years ahead, every few seconds; and a read a little AHEAD that the high-water mark
+    // accepted stands `now_epoch_monotonic` still until real time catches it, which stretches every deadline
+    // in the system that long. Read under this lock, the pair is one reader's. The callers are syscalls,
+    // the spawn path and boot - no interrupt handler reads the clock - so the lock cannot be re-entered.
+    let _cmos = CMOS.lock();
     wait_update_clear();
     let (mut sec, mut min, mut hour) = (cmos_read(0), cmos_read(2), cmos_read(4));
     let (mut day, mut month, mut year, mut century) =

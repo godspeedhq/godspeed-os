@@ -36,7 +36,8 @@ with a clear message - use `net dns <host>` to resolve, then `ping` the IP.
 
 ```
 gsh> ping 192.168.4.1
-Pinging 192.168.4.1 with 32 bytes of data:  [q] quit
+  [q] quit
+Pinging 192.168.4.1 with 32 bytes of data:
 Reply from 192.168.4.1: bytes=32 time=2ms TTL=64
 Reply from 192.168.4.1: bytes=32 time=3ms TTL=64
 Request timed out.
@@ -49,7 +50,9 @@ Approximate round trip times in milliseconds:
     Minimum = 2ms, Maximum = 3ms, Average = 2ms
 ```
 
-(The `[q] quit` hint is on the header line of a continuous run only; a `count` run has none.)
+(`[q] quit` is the shell's, not `ping`'s, and appears once. For every other command that waits it comes 2 s
+in; `ping` prints until it is stopped, so it is said FIRST, on its own line above the header, and never among
+the replies.)
 
 - **`time=`** - the measured round trip, in **microseconds** below 1 ms (`time=412us`, `time<1us`
   for zero) and whole milliseconds above. The summary uses one unit for all three figures, chosen

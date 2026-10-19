@@ -72,7 +72,8 @@ use godspeed_sdk::service_context::usbdev;
 /// The reply is NON-BLOCKING and the reply cap is reclaimed either way: a caller that has gone away
 /// must never block the supervisor, which is the one service everything else depends on, and a
 /// retained return address burns a cap-table slot per request (the `events` leak, §26.6).
-fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &DevEvents, payload: &[u8]) -> bool {
+fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &DevEvents,
+                  inst: &mut installed::Installed, payload: &[u8]) -> bool {
     if payload.first() != Some(&supcmd::MARKER) { return false; }
 
     // `supcmd::DEVICES`, `EVENTS` and `WHY` answer with a body rather than a status byte; everything else
@@ -84,6 +85,11 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     let mut spawned_cap: Option<CapHandle> = None;
     // ...and when that cap is one the supervisor does not keep, it is SENT rather than copied (below).
     let mut handed: Option<CapHandle> = None;
+    // The reply capability, taken BEFORE the command runs. The kernel keeps one pending capability per task - the
+    // one that came with the last message received - and a command that makes requests of its own (an install
+    // reads the package from `fs`) receives replies that replace it. Taken after, an install's answer had nowhere
+    // to go and `godspeed install` waited out its deadline on a package that had started.
+    let reply = gs::ipc::take_sent_cap(ctx);
     let status = if payload.len() == 2 && payload[1] == supcmd::DEVICES {
         body_len = devices_answer(usb, &mut body);
         supcmd::OK
@@ -93,6 +99,62 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     } else if payload.len() > 2 && payload[1] == supcmd::DEATH {
         let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
         body_len = events.death_answer(name, &mut body);
+        supcmd::OK
+    } else if payload.len() > 2 && payload[1] == supcmd::INSTALL {
+        // `publisher/name version`: an installed package, checked from the disk and started (`installed.rs`).
+        let spec = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        let mut it = spec.split(' ');
+        match (it.next(), it.next(), it.next()) {
+            (Some(pkg), Some(version), None) => match inst.start(ctx, pkg, version) {
+                Ok(()) => supcmd::OK,
+                Err(why) => {
+                    ctx.log_fmt(format_args!("supervisor: installed {} {} NOT started: {}", pkg, version, why.as_str()));
+                    let w = why.as_str().as_bytes();
+                    let len = w.len().min(body.len() - 1);
+                    body[0] = supcmd::FAILED;
+                    body[1..1 + len].copy_from_slice(&w[..len]);
+                    body_len = 1 + len;
+                    supcmd::FAILED
+                }
+            },
+            _ => supcmd::UNKNOWN,
+        }
+    } else if payload.len() > 2 && payload[1] == supcmd::HANDOVER {
+        // `publisher/name version`: live where both versions can, a restart where they cannot (`installed.rs`).
+        let spec = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        let mut it = spec.split(' ');
+        match (it.next(), it.next(), it.next()) {
+            (Some(pkg), Some(version), None) => {
+                let live = inst.hand_over(ctx, pkg, version);
+                let outcome = match live {
+                    Ok(true) => Ok(b'H'),
+                    // COLD: checked first, so a version that would not start never stops the one running.
+                    Ok(false) => inst.verify(ctx, pkg, version).and_then(|()| {
+                        inst.stop(ctx, pkg);
+                        inst.start(ctx, pkg, version).map(|()| b'R')
+                    }),
+                    Err(why) => Err(why),
+                };
+                match outcome {
+                    Ok(how) => { body[0] = supcmd::OK; body[1] = how; body_len = 2; supcmd::OK }
+                    Err(why) => {
+                        ctx.log_fmt(format_args!("supervisor: installed {} {} NOT started: {}", pkg, version, why.as_str()));
+                        let w = why.as_str().as_bytes();
+                        let len = w.len().min(body.len() - 1);
+                        body[0] = supcmd::FAILED;
+                        body[1..1 + len].copy_from_slice(&w[..len]);
+                        body_len = 1 + len;
+                        supcmd::FAILED
+                    }
+                }
+            }
+            _ => supcmd::UNKNOWN,
+        }
+    } else if payload.len() > 2 && payload[1] == supcmd::UNINSTALL {
+        let pkg = core::str::from_utf8(&payload[2..]).unwrap_or("");
+        if inst.stop(ctx, pkg) { supcmd::OK } else { supcmd::UNKNOWN }
+    } else if payload.len() == 2 && payload[1] == supcmd::INSTALLED {
+        body_len = inst.answer(ctx, &mut body);
         supcmd::OK
     } else if payload.len() == 2 && payload[1] == supcmd::MANAGED {
         body_len = managed_answer(map, usb, &mut body);
@@ -117,9 +179,11 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
             // does: `producer\0sink` is how a pipe arrives. A pipe is not a special kind of spawn -
             // it is a spawn whose producer is given its downstream as a peer, which is precisely what
             // the kernel's by-name pipe spawn did before it was retired (backlog/fixed/80 K14).
-            Ok(spec) if !spec.is_empty() => {
+            // A name first. An empty one is UNKNOWN below, not an early return, which would drop the reply cap
+            // taken at the top.
+            Ok(spec) if !spec.is_empty() && !spec.starts_with('\0') => {
                 let mut it = spec.split('\0');
-                let name = match it.next() { Some(n) if !n.is_empty() => n, _ => return true };
+                let name = it.next().unwrap_or("");
                 let mut peers: [&str; 6] = [""; 6];
                 let mut np = 0usize;
                 for pr in it { if !pr.is_empty() && np < peers.len() { peers[np] = pr; np += 1; } }
@@ -131,7 +195,24 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
                 // restarting a service that already died is exactly the case the harness drives.
                 // SPAWN does not kill - starting something already running must fail, not replace it.
                 if restart { let _ = ctx.kill(name); }
-                let ok = if let Some(r) = probes::row(name) {
+                let ok = if inst.is_utility(name) {
+                    // An INSTALLED UTILITY, which the shell runs for one command line: checked from the disk and
+                    // started now, wired to the shell (`installed.rs`).
+                    match inst.run_utility(ctx, name, &peers[..np]) {
+                        Ok(()) => true,
+                        Err(why) => {
+                            ctx.log_fmt(format_args!("supervisor: installed {} NOT run: {}", name, why.as_str()));
+                            // The reason goes back too, so the person who typed the command reads it on their
+                            // screen and not only on a serial line they may not have.
+                            let w = why.as_str().as_bytes();
+                            let len = w.len().min(body.len() - 1);
+                            body[0] = supcmd::FAILED;
+                            body[1..1 + len].copy_from_slice(&w[..len]);
+                            body_len = 1 + len;
+                            false
+                        }
+                    }
+                } else if let Some(r) = probes::row(name) {
                     // A TEST PROBE, asked for by a probe respawning its own victim. Its parameters
                     // come from the shared table here rather than off the wire - the caller sends a
                     // name, not a configuration, so a probe cannot ask to be something it is not.
@@ -208,7 +289,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
     // A copy is DERIVED for the caller and the supervisor keeps its own (it needs it to wire
     // dependents later) - for a service the map keeps. One it does not is sent itself (`handed`). If the send fails the derived copy is reclaimed - an orphaned cap is a
     // table slot leaked per request (26.6).
-    if let Some(reply_cap) = gs::ipc::take_sent_cap(ctx) {
+    if let Some(reply_cap) = reply {
         let msg = if body_len > 0 { Message::from_bytes(&body[..body_len]) } else { Message::from_bytes(&[status]) };
         // A cap the supervisor does not keep goes as it is: copying it would leave the supervisor holding
         // the original, which is what `map_keeps` exists to stop.
@@ -293,6 +374,7 @@ static EVENTS_ELF: &[u8] = include_bytes!(env!("SVC_EVENTS_ELF"));
 static RECORDER_ELF: &[u8] = include_bytes!(env!("SVC_RECORDER_ELF"));
 static COPIER_ELF: &[u8] = include_bytes!(env!("SVC_COPIER_ELF"));
 static ASK_ELF: &[u8] = include_bytes!(env!("SVC_ASK_ELF"));
+static GODSPEED_PM_ELF: &[u8] = include_bytes!(env!("SVC_GODSPEED_PM_ELF"));
 static UPPER_ELF: &[u8] = include_bytes!(env!("SVC_UPPER_ELF"));
 static MEM_PRESSURE_ELF: &[u8] = include_bytes!(env!("SVC_MEM_PRESSURE_ELF"));
 static ROSTER_ELF: &[u8] = include_bytes!(env!("SVC_ROSTER_ELF"));
@@ -541,6 +623,14 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("ask", ASK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX,
      board::ASK_PEERS,
      godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
+    // NOT in the boot set and not in `MANAGED`: the native package manager, started by the shell for ONE
+    // command (`godspeed ...`) and ended once its answer is in, as `ask` is
+    // (`docs/developer-services-design.md` 10.2). Its peers are exactly what that command uses: the shell
+    // for the answer, `fs` for its settings and roots (`/system/services/godspeed/`), `net-stack` for the
+    // registry's connection, `time` for the date a certificate is checked against, and this supervisor, which
+    // starts and stops an installed package for it (`supcmd::INSTALL`, `UNINSTALL`, `INSTALLED`). No privilege.
+    ("godspeed-pm", GODSPEED_PM_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, u32::MAX,
+     &["shell", "fs", "net-stack", "time", "supervisor"], 0, 0, 0),
     ("asker", ASKER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 64 * 1024 * 1024, u32::MAX, &["reply-server"], 0, 0, 0),
     // FIRST service to move carrying a PRIVILEGE. RESOURCE_MINT arrives in the spawn request and the
     // kernel refuses it unless the SUPERVISOR holds it too - so this passes authority on, never mints.
@@ -925,6 +1015,28 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
 
 #[path = "../../probe/src/table.rs"]
 mod probes;
+
+// The checks `godspeed verify` runs on a fetched package, by `#[path]`, so the supervisor judges an installed
+// package by the same code before it starts one (`installed.rs`). `meta` and `toml_lines` carry readers it does
+// not use (the registry's index), hence the allowances.
+#[allow(dead_code)]
+#[path = "../../godspeed-pm/src/toml_lines.rs"]
+mod toml_lines;
+#[allow(dead_code)]
+#[path = "../../godspeed-pm/src/meta.rs"]
+mod meta;
+#[path = "../../godspeed-pm/src/check.rs"]
+mod check;
+mod installed;
+
+/// The in-tree driver whose spawn row names PCI class `class`, if one does: a driver package is not given a device
+/// the OS already drives (`installed.rs`).
+fn in_tree_driver_of(class: u32) -> Option<&'static str> {
+    use godspeed_sdk::service_context::hwclass;
+    IMAGES.iter().chain(USB_IMAGES.iter())
+        .find(|row| row.8 & hwclass::PCI != 0 && row.8 & 0x00FF_FFFF == class)
+        .map(|row| row.0)
+}
 
 /// The test-probe image - 193 test modes in one binary (docs/probe-params-design.md).
 ///
@@ -1418,7 +1530,7 @@ struct DevEvent {
     what: u8,
     vid: u16,
     pid: u16,
-    name: [u8; 16],
+    name: [u8; godspeed_sdk::service_context::NAME_MAX],
     nlen: u8,
 }
 
@@ -1437,21 +1549,22 @@ const DEATHS: usize = 32;
 /// One service's newest death notice: when, how many, and how (the kernel's words, `death`).
 #[derive(Clone, Copy)]
 struct Death {
-    name: [u8; 16],
+    /// The whole name, never cut: an installed package runs as `publisher/name`, and two cut short can collide.
+    name: [u8; godspeed_sdk::service_context::NAME_MAX],
     nlen: u8,
     count: u32,
     secs: u32,
     how: u8,
     kind: u8,
     addr: u64,
-    by: [u8; 16],
+    by: [u8; godspeed_sdk::service_context::NAME_MAX],
     blen: u8,
 }
 
 impl DevEvents {
     fn new(ctx: &ServiceContext) -> Self {
-        let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; 16], nlen: 0 };
-        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let blank = DevEvent { secs: 0, what: 0, vid: 0, pid: 0, name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0 };
+        let none = Death { name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; godspeed_sdk::service_context::NAME_MAX], blen: 0 };
         DevEvents { ring: [blank; DEV_EVENTS], recorded: 0, since: gs::task::uptime_secs(ctx).max(0) as u32,
                     deaths: [none; DEATHS] }
     }
@@ -1460,7 +1573,7 @@ impl DevEvents {
     /// fault kind and the address. A notice without it (none should arrive) is kept as `how` 0.
     fn note_death(&mut self, ctx: &ServiceContext, name: &str, how: &[u8]) {
         let nb = name.as_bytes();
-        let nl = nb.len().min(16);
+        let nl = nb.len().min(godspeed_sdk::service_context::NAME_MAX);
         let secs = gs::task::uptime_secs(ctx).max(0) as u32;
         // This name's entry, else an empty one, else the oldest.
         let i = match self.deaths.iter().position(|d| d.nlen as usize == nl && d.name[..nl] == nb[..nl]) {
@@ -1476,7 +1589,7 @@ impl DevEvents {
             },
         };
         let d = &mut self.deaths[i];
-        d.name = [0; 16];
+        d.name = [0; godspeed_sdk::service_context::NAME_MAX];
         d.name[..nl].copy_from_slice(&nb[..nl]);
         d.nlen = nl as u8;
         d.count = d.count.wrapping_add(1);
@@ -1486,8 +1599,8 @@ impl DevEvents {
             Some(&death::KILLED) => {
                 d.how = death::KILLED;
                 let b = &how[1..];
-                let bl = b.len().min(16);
-                d.by = [0; 16];
+                let bl = b.len().min(godspeed_sdk::service_context::NAME_MAX);
+                d.by = [0; godspeed_sdk::service_context::NAME_MAX];
                 d.by[..bl].copy_from_slice(&b[..bl]);
                 d.blen = bl as u8;
             }
@@ -1498,6 +1611,11 @@ impl DevEvents {
                 a.copy_from_slice(&how[2..10]);
                 d.addr = u64::from_le_bytes(a);
             }
+            // An exit's status rides in `addr`, the one numeric field: `how` says which it is.
+            Some(&death::EXITED) if how.len() >= 5 => {
+                d.how = death::EXITED;
+                d.addr = u32::from_le_bytes([how[1], how[2], how[3], how[4]]) as u64;
+            }
             _ => {}
         }
     }
@@ -1505,8 +1623,8 @@ impl DevEvents {
     /// `[OK, since, deaths, secs, how, kind, addr, by_len, by...]`, as `supcmd::DEATH` documents.
     fn death_answer(&self, name: &str, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
         let nb = name.as_bytes();
-        let nl = nb.len().min(16);
-        let none = Death { name: [0; 16], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; 16], blen: 0 };
+        let nl = nb.len().min(godspeed_sdk::service_context::NAME_MAX);
+        let none = Death { name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0, count: 0, secs: 0, how: 0, kind: 0, addr: 0, by: [0; godspeed_sdk::service_context::NAME_MAX], blen: 0 };
         let d = self.deaths.iter().find(|d| d.nlen != 0 && d.nlen as usize == nl && d.name[..nl] == nb[..nl])
             .copied().unwrap_or(none);
         out[0] = supcmd::OK;
@@ -1525,7 +1643,7 @@ impl DevEvents {
     /// hardware event, and the record is short.
     fn note(&mut self, ctx: &ServiceContext, what: u8, name: &str, vid: u16, pid: u16) {
         if !drives_device(name) { return; }
-        let mut e = DevEvent { secs: gs::task::uptime_secs(ctx).max(0) as u32, what, vid, pid, name: [0; 16], nlen: 0 };
+        let mut e = DevEvent { secs: gs::task::uptime_secs(ctx).max(0) as u32, what, vid, pid, name: [0; godspeed_sdk::service_context::NAME_MAX], nlen: 0 };
         let n = name.len().min(e.name.len());
         e.name[..n].copy_from_slice(&name.as_bytes()[..n]);
         e.nlen = n as u8;
@@ -2381,6 +2499,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     ctx.log("supervisor: ready");
     usb.ready = true;
+    // The packages installed on this machine, started from the disk once everything they could name is up. A
+    // respawned supervisor adopts the ones still running rather than starting a second (`installed.rs`).
+    let mut inst = installed::Installed::new();
+    inst.boot(&ctx);
 
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).
     // The kernel enqueues the name of a dead restartable service to our endpoint; we respawn
@@ -2396,9 +2518,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         gs::ipc::park(&ctx);
     }
     loop {
-        let msg = gs::ipc::recv(&ctx);
-        handle_message(&ctx, &mut name_map, &mut usb, &mut events, &msg);
-        name_map.release_handoff(&ctx);
+        // While the installed list is still owed (`fs` had not answered at boot), the wait is BOUNDED so the
+        // list is asked for again; once read, this blocks as it always did.
+        let msg = if inst.boot_pending() { gs::ipc::recv_within(&ctx, 2) } else { Some(gs::ipc::recv(&ctx)) };
+        if let Some(msg) = msg {
+            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &mut inst, &msg);
+            name_map.release_handoff(&ctx);
+        }
+        inst.try_boot(&ctx);
         // DRAIN WHAT IS ALREADY QUEUED, THEN SWEEP. The sweep ran after every single message, so after a
         // multi-kill it found the services whose notifications were still QUEUED behind this one, respawned
         // them, and logged "missed death notification" for each - and then each notification arrived and
@@ -2412,7 +2539,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut drained = 0;
         while drained < DRAIN_MAX {
             let Some(next) = gs::ipc::try_recv(&ctx) else { break };
-            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &next);
+            handle_message(&ctx, &mut name_map, &mut usb, &mut events, &mut inst, &next);
             name_map.release_handoff(&ctx);
             drained += 1;
         }
@@ -2432,6 +2559,8 @@ impl core::fmt::Display for How<'_> {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self.0.first() {
             Some(&death::KILLED) => write!(f, " - killed by {}", core::str::from_utf8(&self.0[1..]).unwrap_or("?")),
+            Some(&death::EXITED) if self.0.len() >= 5 =>
+                write!(f, " - exited with status {}", u32::from_le_bytes([self.0[1], self.0[2], self.0[3], self.0[4]])),
             Some(&death::FAULT) if self.0.len() >= 10 => {
                 let mut a = [0u8; 8];
                 a.copy_from_slice(&self.0[2..10]);
@@ -2449,7 +2578,8 @@ impl core::fmt::Display for How<'_> {
 
 /// One message on the supervisor's endpoint: an operator command, or a death notification. Taken out of
 /// the main loop so the loop can drain its queue before the reconcile sweep (see there).
-fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, msg: &Message) {
+fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents,
+                  inst: &mut installed::Installed, msg: &Message) {
     // A USB host's device report, before the commands it shares `supcmd::MARKER` with: it carries no reply
     // capability and is never answered.
     if let Some(r) = usbdev::decode(msg.payload_bytes()) {
@@ -2457,13 +2587,15 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
         return;
     }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).
-    if handle_command(ctx, name_map, usb, events, msg.payload_bytes()) { return; }
+    if handle_command(ctx, name_map, usb, events, inst, msg.payload_bytes()) { return; }
     // The notice is the name, a NUL, and how the task ended (`death`): the kernel says how; this keeps the
     // newest per name for `supcmd::DEATH`, whatever happens to the restart below.
     let p = msg.payload_bytes();
     let (nb, how) = match p.iter().position(|&b| b == 0) { Some(z) => (&p[..z], &p[z + 1..]), None => (p, &p[p.len()..]) };
     let name = core::str::from_utf8(nb).unwrap_or("");
-    if !name.is_empty() && is_watched(name) { events.note_death(ctx, name, how); }
+    if !name.is_empty() && (is_watched(name) || inst.has(name)) { events.note_death(ctx, name, how); }
+    // An installed package's death is that module's: it restarts it from the disk, a bounded number of times.
+    if !name.is_empty() && inst.has(name) { inst.on_death(ctx, name, &How(how), how.first() == Some(&death::EXITED)); return; }
     // Two recovery paths race after a mass-kill: the convergence (converge()/reconcile()) may have
     // ALREADY respawned this service before its queued death notification reached us. If it is
     // already alive, a restart here hits the kernel singleton guard ("already running") and logs a

@@ -66,6 +66,7 @@ REPLACEMENT = {
     "uptime_secs": "gs::task::uptime_secs",
     "epoch_secs_monotonic": "gs::task::epoch_secs_monotonic",
     "datetime": "gs::task::datetime",
+    "hw_random": "gs::task::hw_random",
     "core_id": "gs::task::core_id",
     "irq_unmask": "gs::driver::irq",
     "irq_vector": "gs::driver::irq",

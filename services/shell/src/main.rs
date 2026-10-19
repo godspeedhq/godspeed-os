@@ -73,6 +73,7 @@ impl Utf8In {
 #[allow(dead_code)]
 #[path = "../../ask/src/know.rs"]
 mod ask_know;
+mod fit;
 use godspeed_sdk::{ServiceContext, CapInfo, CapHandle, Message, IpcError, ReqOutcome, ClockSource, Datetime};
 use godspeed_sdk::record::{Table, Value, RecordSink, parse_predicate, AggOp, AggErr, REC_MAX_ROWS, REC_ARENA};
 
@@ -588,6 +589,16 @@ impl ShellCtx {
     fn end_command(&self) {
         self.cmd_active.set(false);
     }
+    /// The command's `[q] quit`, once 2 s have passed since Enter, for a loop that reads its own keys and
+    /// makes no watched wait: the notice still comes, and from the one place every other wait's comes from.
+    fn offer_quit(&self) {
+        if self.cmd_active.get() && gs::call::Watch::notice_due_in(self) == 0 { gs::call::Watch::notice(self); }
+    }
+    /// A key legend the command prints itself because it offers keys the watch does not (`[b]` handled in
+    /// its own loop, a countdown's line): it counts as the command's notice, so no second one follows.
+    fn quit_shown(&self) {
+        if self.cmd_active.get() { self.cmd_noticed.set(true); }
+    }
     /// The next key if one is waiting: a kept type-ahead key first, then the console.
     fn try_console_read(&self) -> Option<u8> {
         if let Some(b) = self.typeahead.borrow_mut().pop() { return Some(b); }
@@ -626,6 +637,14 @@ impl gs::call::Watch for ShellCtx {
     }
     fn keep(&self, key: u8) { self.keep_key(key); }
     fn quit(&self) { self.quit.set(true); }
+}
+
+/// The `[q] quit` a hand-made wait prints when it lingers. Inside a command it is the command's ONE notice
+/// (`gs::call::Watch`), so two waits, or a wait and the watch, cannot each print it - the duplicate the
+/// operator found on `date sync` and `ping` (2026-10-17). Between commands there is no command clock, and
+/// it is printed here as before.
+fn say_quit(ctx: &ShellCtx) {
+    if ctx.cmd_active.get() { gs::call::Watch::notice(ctx); } else { say_quit(ctx); }
 }
 
 impl core::ops::Deref for ShellCtx {
@@ -1154,6 +1173,8 @@ const NO_PATH_CMDS: &[&str] = &[
     "hardware",
     // A question, never a path.
     "ask",
+    // Settings and a check, never a path.
+    "godspeed",
     // `paginate` takes NO arguments at all, so Tab after it must offer nothing rather than a
     // directory listing for a position that accepts neither a path nor a keyword.
     "paginate",
@@ -1175,9 +1196,27 @@ const _: () = assert!(
 /// argument parsing (verified against utilities/*.md + the `cmd_*` parsers). The universal `version`
 /// and `help` subcommands are appended automatically in `complete_keyword` (every utility answers
 /// `<util> version` / `<util> help`), so they are NOT listed here.
+/// `selfcheck`'s first word: its parts, taken from `SELFCHECK_PARTS` - the list that runs them - so a new part
+/// completes the moment it exists and a removed one stops completing; then `save`, and the universal
+/// `version` and `help` it offered when it was one of `INFO_CMDS`.
+const SELFCHECK_WORDS: [&str; SELFCHECK_PARTS.len() + 3] = {
+    let mut w = [""; SELFCHECK_PARTS.len() + 3];
+    let mut i = 0;
+    while i < SELFCHECK_PARTS.len() {
+        w[i] = SELFCHECK_PARTS[i].0;
+        i += 1;
+    }
+    w[i] = "save";
+    w[i + 1] = "version";
+    w[i + 2] = "help";
+    w
+};
+
 const SUBCMD_FIRST: &[(&str, &[&str])] = &[
+    ("selfcheck", &SELFCHECK_WORDS),
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
+    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "cleanup", "trust", "registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -1366,7 +1405,8 @@ const CMDNAME_AFTER: &[(&str, &str)] = &[
 /// every one of these is a keyword command, so a new one belongs here (conventions rule 9).
 const INFO_CMDS: &[&str] = &[
     "about", "version", "mem", "sock", "uptime", "status", "roster", "clear",
-    "result", "selfcheck", "caps", "help",
+    // `selfcheck` is NOT one: it takes its parts' names, which `SUBCMD_FIRST` completes (`SELFCHECK_WORDS`).
+    "result", "caps", "help",
     // Library scripts whose only first-arg subcommands are the universal version/help ("size" is
     // absent on purpose - its argument is a path, so it keeps path completion; "repeat" has its own
     // command-name completion case; "busiest" completes its column keywords via SUBCMD_FIRST).
@@ -2325,6 +2365,8 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
         "audio"   => cmd_audio(ctx, cwd, s["audio".len()..].trim(), out),
         "hardware" => cmd_hardware(ctx, cwd, s["hardware".len()..].trim(), out),
         "ask"     => cmd_ask(ctx, s["ask".len()..].trim()),
+        "godspeed" => cmd_godspeed(ctx, cwd, s["godspeed".len()..].trim()),
+        "download" => cmd_download(ctx, cwd, s["download".len()..].trim()),
         "ping"    => cmd_ping(ctx, s["ping".len()..].trim(), out),
         "sock"    => cmd_sock(ctx, out),
         "tcp"     => cmd_tcp(ctx, &args[..argc], out),
@@ -2456,6 +2498,12 @@ fn execute(ctx: &ShellCtx, line: &[u8], cwd: &mut Cwd, prev: Result<(), ShellErr
             // script runs that script (a fresh, self-contained run; any args become $arg1..). Like
             // run/selfcheck it is one interpreter layer, so it is refused inside another script
             // (depth > 0) to keep the bounded user stack safe.
+            // An INSTALLED UTILITY, by its name (`hello-utility`) or its package name (`godspeed/hello-utility`).
+            if let Some((task, app)) = installed_utility(ctx, other) {
+                let rest = s[other.len()..].trim();
+                let task = core::str::from_utf8(task.as_bytes()).unwrap_or("");
+                return if app { run_app(ctx, task, rest) } else { run_utility(ctx, task, rest, out) };
+            }
             if let Some(src) = library_script(other) {
                 if depth > 0 {
                     gs::io::println_fmt(ctx, format_args!(
@@ -4920,7 +4968,7 @@ fn run_parts(ctx: &ShellCtx, cwd: &mut Cwd, parts: &[(&str, &[u8])], depth: u8, 
             out.line_fmt(ctx, format_args!(
                 "##### [{}] part {}/{}  {:<8}{} #####",
                 str_of(&bar), k + 1, parts.len(), name,
-                if abortable { "   [q] quit" } else { "" }));
+                if abortable && k == 0 { "   [q] quit" } else { "" }));
             if abortable { ctx.cmd_noticed.set(true); }
         }
         // The per-part result is discarded ON PURPOSE: `t.failed` is the answer for the suite, and a
@@ -5061,6 +5109,7 @@ const SELFCHECK_PARTS: &[(&str, &str)] = &[
     ("cleanup",  include_str!("../../../scripts/selfcheck/70-cleanup.gsh")),
     ("network",  include_str!("../../../scripts/selfcheck/80-network.gsh")),
     ("ask",      include_str!("../../../scripts/selfcheck/90-ask.gsh")),
+    ("packages", include_str!("../../../scripts/selfcheck/95-packages.gsh")),
 ];
 
 /// The whole suite's size, for the line `selfcheck` prints before it starts.
@@ -5388,6 +5437,9 @@ const FOREIGN_HINTS: &[(&str, &str)] = &[
     ("speaker-test", "audio tone"),
     ("amixer", "audio volume"),
     ("alsamixer", "audio volume"),
+    // Files from the web (utilities/65_download.md).
+    ("wget",  "download"),
+    ("curl",  "download"),
 ];
 
 /// The hint for a word we do not have, if there is one worth giving.
@@ -5414,6 +5466,8 @@ const UTILS: &[&str] = &[
     "audio",
     "hardware",
     "ask",
+    "godspeed",
+    "download",
     "background", "jobs", "foreground",
     "first", "last",
     // record-pipe verbs (pipe-only stages; see docs/records.md)
@@ -5678,6 +5732,37 @@ fn util_help(ctx: &ServiceContext, util: &str) -> bool {
             ("audio system sounds on | off", "the short sounds the system makes on its own: an error, a refusal, a finished job, a USB plug", "audio system sounds off"),
             ("audio status | write <path>", "a report is data: pipe status or info", "audio status | write /audio.txt"),
         ], true),
+        "download" => help_block(ctx, "download", "a file from a web server, saved here", &[
+            ("download <link>", "saved in this folder, named from the link's last part; https:// is checked, http:// is taken and said to be unchecked", "download https://example.com/file.zip"),
+            ("download <link> to <file>", "saved as that file instead", "download https://example.com/a.bin to /users/default/a.bin"),
+            ("while it runs", "a bar with the percentage, the size and the time left; [q] quits, and nothing is kept", ""),
+            ("the file", "written as <file>.partial and renamed when its last byte is in, so a file there is always whole; an existing file is never replaced", ""),
+            ("redirects", "followed, up to 5; an https:// link sent to http:// is refused unless you typed http:// yourself", ""),
+            ("the roots", "the same certificate authorities as `godspeed`: /system/services/godspeed/roots/", ""),
+        ], false),
+        "godspeed" => help_block(ctx, "godspeed", "the native package manager - packages verified against the registry's signed metadata, kept here", &[
+            ("godspeed search <word> [from <n>]", "the packages whose name holds the word, from the registry's verified snapshot, 40 a page", "godspeed search hello"),
+            ("godspeed info <publisher/name>[@version]", "its versions, then what it is: description, licence, the release it was built for, what it ships and requests, who signed it", "godspeed info godspeed/hello"),
+            ("godspeed fetch <publisher/name>[@version]", "verify a package end to end and fetch it to /system/packages/ - fetched, not installed", "godspeed fetch godspeed/hello"),
+            ("godspeed list available | fetched | installed | updates", "what the registry offers, what has been fetched here (with sizes), what is installed and running, what is newer", "godspeed list updates"),
+            ("godspeed verify [<publisher/name>[@version]]", "check fetched copies again from the disk alone: the signature, the contract, the binary", "godspeed verify"),
+            ("godspeed remove <publisher/name>[@version]", "delete a fetched copy, one version or every one", "godspeed remove godspeed/hello"),
+            ("godspeed trust [reset <registry>]", "what this machine has accepted from each registry, and the publishers' keys; reset forgets one (asks [y/N])", "godspeed trust"),
+            ("godspeed install <publisher/name>[,...] [yes]", "start a fetched package now and at every boot; asks [y/N], naming what it would be given", "godspeed install godspeed/hello"),
+            ("godspeed upgrade <publisher/name>[,...] | all [yes]", "fetch the newest release of what is installed and install it in its place; asks [y/N]", "godspeed upgrade all"),
+            ("godspeed uninstall <publisher/name>[,...] [purge] [yes]", "stop it and no longer start it at boot; the fetched copy stays, unless `purge`", "godspeed uninstall godspeed/hello purge"),
+            ("godspeed cleanup [yes]", "delete every fetched copy nothing uses; asks [y/N]; package files are not touched", "godspeed cleanup"),
+            ("godspeed registry", "the registries this machine knows; exactly one is in use", "godspeed registry"),
+            ("godspeed registry add <name> <url> <root>", "know another registry; asks [y/N] before trusting its signing root", "godspeed registry add mirror https://mirror.example/ sha256:..."),
+            ("godspeed registry use <name>", "search and install from that one from now on", "godspeed registry use mirror"),
+            ("godspeed registry remove <name>", "forget one; the one in use is refused", "godspeed registry remove mirror"),
+            ("godspeed config [<key>]", "the plain settings, or one, and whether each came from the file or the default", "godspeed config timeout-secs"),
+            ("godspeed config set <key> <value>", "change one setting, checked first; the rest of the file is kept", "godspeed config set timeout-secs 45"),
+            ("godspeed check", "reach the registry in use over TLS, verified to the trusted roots, one row per step", "godspeed check"),
+            ("the file", "/system/services/godspeed/config, one `key value` per line; `edit` works on it too", ""),
+            ("the roots", "/system/services/godspeed/roots/: the certificate authorities TLS accepts, one file each", ""),
+            ("godspeed search | where item=package", "a report is records: item, value, note", "godspeed config | where note=file"),
+        ], false),
         "ask" => help_block(ctx, "ask", "plain questions about this machine, answered from what its services know", &[
             ("ask \"<question>\"", "the answer: a verdict, and what it rests on", "ask \"is my system healthy?\""),
             ("ask \"what to say?\"", "what it can be asked, with suggestions from this machine as it is now", "ask \"what to say?\""),
@@ -6011,6 +6096,94 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("wifi radio off hard", "cut the CHIP's power and stay powered down; `wifi radio on` brings it back cold (~20 s)", "wifi radio off hard"),
             ("wifi radio powercycle", "cut and restore the CHIP's power and restart the driver on it - the radio comes back from power-on and rejoins", "wifi radio powercycle"),
         ], false),
+        ("godspeed", "config") => help_block(ctx, "godspeed config", "the package manager's plain settings", &[
+            ("godspeed config", "each setting: item (the key), value, note (file or default); the file is written with the defaults on first start", "godspeed config"),
+            ("godspeed config <key>", "one setting", "godspeed config timeout-secs"),
+            ("godspeed config set <key> <value>", "tls-roots (a folder ending in /), timeout-secs (1-100), max-package-mib (1-4096)", "godspeed config set timeout-secs 45"),
+            ("registries", "not settings: a registry is a name, an address and its signing root - `godspeed registry`", ""),
+        ], false),
+        ("godspeed", "registry") => help_block(ctx, "godspeed registry", "the registries this machine knows, and the one in use", &[
+            ("godspeed registry", "one row each: item (its name), value (its address), note (in use, and the root it is signed by)", "godspeed registry"),
+            ("godspeed registry add <name> <url> <root> [yes]", "a name (lower-case, digits, hyphens), an https:// address, and sha256: plus 64 hex digits; asks [y/N] first unless `yes`", "godspeed registry add mirror https://mirror.example/ sha256:..."),
+            ("godspeed registry use <name>", "only the one in use is searched and installed from, so a package is never found in two places", "godspeed registry use mirror"),
+            ("godspeed registry remove <name>", "the one in use is refused; use another first", "godspeed registry remove mirror"),
+            ("what an install remembers", "the registry it came from: an update fetches from there, not from whichever is in use", ""),
+        ], false),
+        ("godspeed", "search") => help_block(ctx, "godspeed search", "the packages the registry vouches for", &[
+            ("godspeed search <word> [from <n>]", "those whose name holds the word, from the verified snapshot, 40 a page from the n-th; the chain root -> timestamp -> snapshot is checked first, and said under the list", "godspeed search hello"),
+            ("everything", "`godspeed list available`", "godspeed list available"),
+            ("first contact", "root 1 must match the pin on the registry's line; after that, every root and version seen is remembered, so nothing older is accepted", ""),
+        ], false),
+        ("godspeed", "info") => help_block(ctx, "godspeed info", "one package: its versions, and what it is", &[
+            ("godspeed info <publisher/name>", "each version (when, by whom, the latest), then the latest's manifest", "godspeed info godspeed/hello"),
+            ("godspeed info <publisher/name>@<version>", "the same, describing that version", "godspeed info godspeed/hello@0.1.0"),
+            ("description, license", "the publisher's words, not interpreted", ""),
+            ("built for", "the GodspeedOS release it was built against, beside the one this machine runs", ""),
+            ("ships, requests, signed", "its architectures and whether this machine's is one; what its contract asks for; the key and its standing", ""),
+            ("checked", "all of it as fetch checks it: the index by the snapshot, the manifest, its signature and the contract by digest", ""),
+        ], false),
+        ("godspeed", "verify") => help_block(ctx, "godspeed verify", "check fetched copies again, with no network", &[
+            ("godspeed verify", "every fetched copy", "godspeed verify"),
+            ("godspeed verify <publisher/name>[@version]", "one package, or one version", "godspeed verify godspeed/hello"),
+            ("what is checked", "the signature over the manifest, the key against the one recorded at fetch, the contract and the binary against the manifest's digests and sizes", ""),
+            ("what is not", "whether the registry still vouches for the key: that needs the network (`godspeed list updates`)", ""),
+        ], false),
+        ("godspeed", "trust") => help_block(ctx, "godspeed trust", "what this machine has accepted from each registry", &[
+            ("godspeed trust", "per registry: its root, timestamp and namespaces versions, the root's expiry, the pin it was reached under; then each publisher's keys and their standing", "godspeed trust"),
+            ("godspeed trust reset <registry> [yes]", "forget what was accepted from it, so the next command meets it again from root 1 against its pin; asks [y/N] unless `yes`", "godspeed trust reset default"),
+            ("godspeed trust add <publisher> <key> [yes]", "trust a key YOURSELF for one publisher, so an unpublished package file it signed (`godspeed package --gsp`) installs with no registry; asks [y/N] unless `yes`", "godspeed trust add alice ed25519:..."),
+            ("godspeed trust remove <publisher> <key>", "stop trusting it: its packages no longer start, since the supervisor checks this list at every start", ""),
+        ], false),
+        ("godspeed", "cleanup") => help_block(ctx, "godspeed cleanup", "delete what the package manager keeps that nothing uses", &[
+            ("godspeed cleanup [yes]", "lists every fetched copy that is not the installed version - left by `uninstall`, never installed, or older than an upgrade - and what an interrupted fetch left; asks [y/N] before deleting, unless `yes`", "godspeed cleanup"),
+            ("what it never touches", "the installed version of anything, a package file (.gsp) wherever it is, the registries' trust and the settings", ""),
+            ("godspeed cleanup | count", "piped, the listing alone: nothing is deleted", ""),
+        ], false),
+        ("godspeed", "inspect") => help_block(ctx, "godspeed inspect", "check a release as installing it would - and keep nothing", &[
+            ("godspeed inspect <file>.gsp", "a package file, with no network: its chain as of the day it was made, its signature, contract and this machine's binary; says if installing it would ask about its age", "godspeed inspect hello.gsp"),
+            ("godspeed inspect <publisher/name>[@version]", "the same on the registry, this machine's binary included - what `info` does not download", "godspeed inspect godspeed/hello"),
+        ], false),
+        ("godspeed", "fetch") => help_block(ctx, "godspeed fetch", "verify a package and fetch it here - fetched, not installed", &[
+            ("godspeed fetch <publisher/name>[@version]", "the latest, or the version named", "godspeed fetch godspeed/hello@0.1.0"),
+            ("godspeed fetch <publisher/name>[@version] offline", "and write it here as one file too, <name>-<version>.gsp, which `godspeed install` installs on a machine with no network", "godspeed fetch godspeed/hello offline"),
+            ("what is checked", "the manifest by the index's digest, its signature by a key the signed namespaces vouch for, the contract and this machine's binary by the manifest's digests and sizes", ""),
+            ("where it goes", "/system/packages/<publisher>/<name>/<version>/: the binary, manifest, signature, contract and where it came from", ""),
+            ("what it does not do", "run it, or grant what its contract requests: `godspeed install` does that, and asks first", ""),
+        ], false),
+        ("godspeed", "list") => help_block(ctx, "godspeed list", "packages: say which list", &[
+            ("godspeed list available [from <n>]", "every package the registry in use offers, from its verified snapshot kept on disk, 40 a page; the note gives the next page's command", "godspeed list available from 40"),
+            ("godspeed list fetched", "the packages fetched here: publisher/name@version, the registry it came from and its size; the total under the list", "godspeed list fetched"),
+            ("godspeed list installed", "what is installed, and whether the supervisor has each running", "godspeed list installed"),
+            ("godspeed list updates", "each fetched package against the registry it came from: newer there, up to date, or no longer listed", "godspeed list updates"),
+            ("an empty list", "no rows, and not a failure: the console says `0 packages`; piped, only the status row is left", ""),
+        ], false),
+        ("godspeed", "remove") => help_block(ctx, "godspeed remove", "delete a fetched copy", &[
+            ("godspeed remove <publisher/name>", "every fetched version of it", "godspeed remove godspeed/hello"),
+            ("godspeed remove <publisher/name>@<version>", "that version only", "godspeed remove godspeed/hello@0.1.0"),
+        ], false),
+        ("godspeed", "uninstall") => help_block(ctx, "godspeed uninstall", "stop an installed package, and no longer start it at boot", &[
+            ("godspeed uninstall <publisher/name>[,<publisher/name>...] [yes]", "each asked [y/N], unless `yes`; the fetched copy stays, for a reinstall", "godspeed uninstall godspeed/hello"),
+            ("godspeed uninstall <publisher/name>[,...] purge [yes]", "and delete every fetched version of it too - what `remove` did after; a package file you keep is not touched", "godspeed uninstall godspeed/hello purge"),
+            ("what stays", "the fetched copy: `godspeed remove` deletes it", "godspeed remove godspeed/hello"),
+        ], false),
+        ("godspeed", "install") => help_block(ctx, "godspeed install", "start a fetched package, now and at every boot", &[
+            ("godspeed install <publisher/name>[@version][,...] [yes]", "the newest fetched version, or the one named; each asked [y/N], naming what it would be given, unless `yes`", "godspeed install godspeed/hello"),
+            ("godspeed install <file>.gsp [yes] [accept-old]", "a package file, with no network: checked through its chain as of the day it was made (or, unpublished, by a key `godspeed trust add` trusts), then asked about as any package; a file older than offline-max-age-days is asked about first, and only `accept-old` answers that", "godspeed install hello.gsp"),
+            ("godspeed install <publisher/name> grant <peer>,... | grant none", "give only some of the peers its contract requests, without the question", "godspeed install godspeed/hello grant none"),
+            ("what it is given", "the send peers its contract requests and you approve, never `supervisor`, and no privilege", ""),
+            ("what is checked", "the copy on disk, again, by the supervisor, before every start: signature, key, contract, binary", ""),
+            ("if it dies", "restarted from the disk, up to 5 times a boot, then left down and said so", ""),
+        ], false),
+        ("godspeed", "upgrade") => help_block(ctx, "godspeed upgrade", "the newest release of what is installed, in its place", &[
+            ("godspeed upgrade <publisher/name>[,...] [yes]", "fetch and verify the newest release, then install it; asks [y/N], naming the version change and what it asks for", "godspeed upgrade godspeed/hello"),
+            ("godspeed upgrade all [yes]", "every installed package; one already newest is said to be up to date", "godspeed upgrade all"),
+        ], false),
+        ("godspeed", "check") => help_block(ctx, "godspeed check", "reach the registry, one row per step", &[
+            ("registry, clock, roots", "what the check used: the address, the date a certificate is checked against and its source, how many roots", ""),
+            ("address, tls, http, says", "the registry's address, the verified handshake, its HTTP status and the first line it said", ""),
+            ("a failure", "the step it stopped at and why: an expired certificate, an unknown root, no clock, no network", ""),
+            ("godspeed check <https-url>", "that page instead, read to its end and thrown away, with a speed row: how fast this machine downloads from there", "godspeed check https://example.com/"),
+        ], false),
         ("ask", "evidence") => help_block(ctx, "ask evidence", "the same answer, with every line labelled and its source named", &[
             ("ask evidence \"<question>\"", "FACT: a source said it; INFERENCE: concluded by the named rule; UNKNOWN: nothing available establishes it", "ask evidence \"what failed?\""),
         ], false),
@@ -6132,7 +6305,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("fcap gsreuse", "as fcap reuse, holding the file through gs::cap", "fcap gsreuse"),
         ], false),
         ("date", "sync") => help_block(ctx, "date sync", "sync the clock from the internet NOW", &[
-            ("date sync", "the clock already syncs itself once the network is up - the clock service asks about every 20 s while it is unset; this asks for it immediately instead of waiting (q aborts)", "date sync"),
+            ("date sync", "the clock already syncs itself once the network is up - the clock service asks about every 20 s while it is unset; this asks for it immediately instead of waiting", "date sync"),
         ], false),
         ("net", "dns") => help_block(ctx, "net dns", "resolve a hostname to an IPv4 address", &[
             ("net dns <host>", "DNS A-record lookup via net-stack (the DNS server DHCP named)", "net dns example.com"),
@@ -6165,6 +6338,7 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("drives flash", "format the only drive, no label", "drives flash"),
             ("drives flash <label>", "format + name it", "drives flash data"),
             ("drives flash <drive> <label>", "format drive <drive>, name it", "drives flash 0 data"),
+            ("drives flash ... yes", "answer the y/N in advance; the warning still prints", "drives flash 0 data yes"),
         ], false),
         ("drives", "label") => help_block(ctx, "drives label", "name / rename a drive", &[
             ("drives label <name>", "name the only drive", "drives label archive"),
@@ -6279,6 +6453,8 @@ static HELP: &[HelpRow] = &[
     Row("mem", "physical memory usage"),
     Row("hardware [section|device]", "this machine's devices and their drivers (records when piped)"),
     Row("ask \"<question>\"", "plain questions about this machine: health, what failed, why a service restarted"),
+    Row("godspeed registry | config | check", "the package manager: its registries, its settings, the registry reached over verified TLS"),
+    Row("download <link> [to <file>]", "a file from a web server, saved here: https:// checked, http:// said to be unchecked"),
     Row("date [epoch]", "date + time; 'epoch' = secs since 1970"),
     Row("uptime", "how long the system has been up (records when piped)"),
     Row("random [n]", "words from the hardware random number generator"),
@@ -7734,6 +7910,7 @@ fn cmd_power(ctx: &ShellCtx, act: PowerAct, arg: &str) -> Result<(), ShellError>
             shown = left;
             gs::io::print_fmt(ctx, format_args!("\r\x1b[2K{} in {}   [q] quit   [b] background",
                                                  cmd, Delay(left)));
+            ctx.quit_shown();
             if first { shutdown_cue_power(ctx); }
         }
         let key = if ctx.quit.get() { Some(b'q') } else { ctx.try_console_read() };
@@ -7821,8 +7998,9 @@ fn cmd_cores(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
         }
     }
     let t0 = gs::task::epoch_secs_monotonic(ctx);
-    out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...  [q] quit", SAMPLE_SECS));
+    out.line_fmt(ctx, format_args!("sampling {}s (RTC-paced)...", SAMPLE_SECS));
     while gs::task::epoch_secs_monotonic(ctx) - t0 < SAMPLE_SECS {
+        ctx.offer_quit();
         // q quits the 5 s wait (conventions rule 10; `backlog/fixed/80` H21 - it had no way out).
         if let Some(b) = ctx.try_console_read() {
             if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
@@ -9387,13 +9565,11 @@ fn build_hw_interrupts_table(ctx: &ShellCtx) -> Option<Table> {
     Some(t)
 }
 
-/// Where the last-known-good time is recorded. Deliberately a plain visible file, not a hidden one: it is
-/// a fact about this machine an operator may want to read or delete (§26.4 - keep the mechanism visible).
+/// Where the last-known-good time is recorded - the `time` service's own file, which only it reads and
+/// writes. Named here only so `date` can say where the floor it shows came from. Deliberately a plain
+/// visible file, not a hidden one: it is a fact about this machine an operator may want to read or delete
+/// (§26.4 - keep the mechanism visible).
 const CLOCK_FLOOR_PATH: &[u8] = b"/system/services/time/floor";
-/// Budget for the floor's disk I/O. The floor is best-effort by design, so a slow or still-mounting `fs`
-/// must cost a shrug, never a wedge: an UNBOUNDED request here would hang the boot prompt before the
-/// first `gsh>` (the exact hazard the history loader documents) and hang `date` with no q escape.
-const CLOCK_FS_SECS: i64 = 2;
 
 /// Render a duration the way a person reads one ("4m", "2h", "3d") for the clock's freshness note.
 struct HumanSecs(i64);
@@ -9425,27 +9601,6 @@ fn fs_read_file(ctx: &ShellCtx, path: &[u8], dst: &mut [u8], max_secs: i64) -> O
     r.ok()
 }
 
-/// Seed the kernel's clock floor from the last-known time on disk, at startup. The floor is a BOUND, never
-/// a reading: it is not shown as the time and no "estimate" is derived from it (a machine powered off for
-/// six months would otherwise display a six-month-old timestamp indistinguishable from a measured one).
-/// Its whole job is to let the kernel REFUSE a clock value from before we last ran.
-fn clock_floor_seed(ctx: &ShellCtx) {
-    let mut buf = [0u8; 24];
-    let n = match fs_read_file(ctx, CLOCK_FLOOR_PATH, &mut buf, CLOCK_FS_SECS) {
-        Some(n) if n > 0 => n,
-        _ => return,                   // no record yet / no fs - no floor this boot, which is the honest state
-    };
-    if let Ok(s) = core::str::from_utf8(&buf[..n]) {
-        if let Some(v) = parse_u32(s.trim()) {
-            if !time_floor_set(ctx, v as i64) {
-                // `time` keeps the higher floor and never refuses one, so false means it did not
-                // answer (`backlog/fixed/80` H12 - this said "refused").
-                gs::io::println(ctx, "shell: the time service did not answer with the recorded clock floor - not seeded");
-            }
-        }
-    }
-}
-
 /// Wall-clock date+time. Default renders a full timestamp with weekday AND where the time came from,
 /// e.g. `Sat 2026-06-06 22:05:09  (ntp, synced 4m ago)`; `date epoch` prints seconds since 1970-01-01 as a
 /// bare pipeable number; `date sync` fetches the time over the network. Deliberately these three forms -
@@ -9459,12 +9614,11 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     // `time` reaches the network on its own (about every 20 s until it has the time), or immediately by
     // this command.
     if arg == "sync" {
-        // Seed the floor HERE, where it is used: it exists to let the kernel refuse a fetched time from
-        // before we last ran, so the moment we are about to fetch one is exactly when it must be known.
-        // Reading it at boot instead put fs I/O on the startup path at fs's slowest moment - see the note
-        // in service_main for what that cost.
-        clock_floor_seed(ctx);
-        out.line_fmt(ctx, format_args!("Asking the network for the time now (NTP, by the time service)... (q aborts)"));
+        // The floor is the `time` service's alone (2026-10-16): it reads `/system/services/time/floor`
+        // itself, and re-reads it on this very request if it never loaded. The shell used to read that
+        // file and send the value to `time` over OP_FLOOR_SET, an op that let ANY client push the floor
+        // forward for good; it is retired (`docs/developer-services-design.md` 3.3).
+        out.line_fmt(ctx, format_args!("Asking the network for the time now (NTP, by the time service)..."));
         // ASK `time`, THEN WATCH THE CLOCK (2026-10-01). The clock is the `time` service's, and so is
         // fetching it: `net-stack` no longer runs the exchange, so a `ping` never waits behind a time
         // server. `time` answers at once - "a query is on its way" - and the result shows up as the
@@ -9476,6 +9630,11 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         // `time` itself, and the next sync on its own cadence still sets the clock.
         const SYNC_WAIT_SECS: i64 = 10;
         const SYNC_POLL_MS: u64 = 250;
+        // The last sync's age BEFORE asking, so a sync `time` made on its own in the same second is not taken
+        // for this one: only a sync newer than that one counts. Comparing the age with the wait alone did take
+        // it, and reported a sync while the setting was being refused (`osdev test godspeed`, 2026-10-17).
+        let (age_before, _) = time_sync_state(ctx);
+        let asked_at = gs::task::epoch_secs_monotonic(ctx);
         match time_rpc(ctx, &[5]) {                  // OP_SYNC -> [1] query on its way, [0] could not send
             Some(r) if r.payload_bytes().first() == Some(&1) => {}
             // Every way the sync did not happen is an Err - all of them returned Ok (`backlog/fixed/80` H10).
@@ -9490,29 +9649,37 @@ fn cmd_date(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
         }
         let t0 = gs::task::epoch_secs_monotonic(ctx);
         let mut synced = false;
-        let mut sync_noticed = false;
         loop {
             let waited = gs::task::epoch_secs_monotonic(ctx) - t0;
-            // Synced SINCE WE ASKED: an age no older than the wait so far. An older sync is not this one.
-            if matches!(time_synced_secs_ago(ctx), Some(age) if age <= waited) {
+            // Read BEFORE the age, so a second ticking over between the two can only make an old sync look
+            // older, never newer.
+            let since_asked = gs::task::epoch_secs_monotonic(ctx) - asked_at;
+            let (age, refused) = time_sync_state(ctx);
+            // Synced SINCE WE ASKED: newer than the sync before the question, which by now would be its age
+            // then plus the time since. No sync before means any sync is this one.
+            let newer = match (age, age_before) {
+                (Some(a), Some(b)) => a < b + since_asked,
+                (Some(_), None) => true,
+                (None, _) => false,
+            };
+            if newer {
                 synced = true;
                 break;
             }
-            if waited >= SYNC_WAIT_SECS { break; }
-            // Say it once the wait lingers (rule 10): `q` was always taken here, and never offered.
-            if !sync_noticed && waited >= gs::call::NOTICE_AFTER_SECS {
-                sync_noticed = true;
-                gs::io::println(ctx, "  [q] quit");
+            // `time` read the setting again and refused it: no query will be sent, so waiting longer only
+            // delays the reason - and "is the cable in?" would be the wrong one.
+            if refused {
+                out.line_fmt(ctx, format_args!(
+                    "date sync: /system/services/time/ntp does not name one IPv4 address, so no network time is asked (the log names the line)"));
+                return Err(ShellError::Unknown);
             }
-            // The console itself, not the type-ahead: a key that is not `q` is KEPT for the prompt, and
-            // reading the buffer it goes into would hand it straight back.
-            if let Some(b) = ctx.inner.try_console_read() {
-                // An abort is the USER's decision, not a network failure - blaming the cable for it is a lie.
-                if godspeed_sdk::ServiceContext::QUIT_KEYS.contains(&b) {
-                    out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
-                    return Err(ShellError::Unknown);
-                }
-                ctx.keep_key(b);
+            if waited >= SYNC_WAIT_SECS { break; }
+            // The command's watch offers `[q] quit` once 2 s have passed, like every wait in the shell, and
+            // takes the key. An abort is the USER's decision, not a network failure - blaming the cable for
+            // it is a lie.
+            if gs::call::Watch::stopped(ctx) {
+                out.line_fmt(ctx, format_args!("date sync: aborted (the clock service may still finish the sync)"));
+                return Err(ShellError::Unknown);
             }
             gs::task::sleep_ms(ctx, SYNC_POLL_MS);
         }
@@ -9673,7 +9840,7 @@ fn pause_quittable(ctx: &ShellCtx, secs: i64) -> bool {
         // The command's `[q] quit`, once it has run 2 s (`gs::call::Watch`), and a `q` is the COMMAND's: a
         // `wait` inside a script loop used to end only that `wait`, and the loop went on.
         if ctx.quit.get() { return false; }
-        if ctx.cmd_active.get() && gs::call::Watch::notice_due_in(ctx) == 0 { gs::call::Watch::notice(ctx); }
+        ctx.offer_quit();
         if quit_key_or_keep(ctx) { ctx.quit.set(true); return false; }
         if gs::task::epoch_secs_monotonic(ctx) - start >= secs { return true; }
         // SLEEP, not yield: a yield loop kept this core busy for the whole wait (`backlog/fixed/80` H21).
@@ -9739,8 +9906,8 @@ fn cmd_repeat(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8, out: &mut Ou
     loop {
         ran += 1;
         match count {
-            Some(n) => out.line_fmt(ctx, format_args!("repeat {} of {}: {}   [q] quit", ran, n, cmd)),
-            None => out.line_fmt(ctx, format_args!("repeat {}: {}   [q] quit", ran, cmd)),
+            Some(n) => out.line_fmt(ctx, format_args!("repeat {} of {}: {}", ran, n, cmd)),
+            None => out.line_fmt(ctx, format_args!("repeat {}: {}", ran, cmd)),
         }
         // Into the caller's output, so a function capture, `$(f)`, holds the runs and the verdict as it
         // would any other command's (`backlog/84` S2). Refusals above still go to the console.
@@ -9753,6 +9920,7 @@ fn cmd_repeat(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8, out: &mut Ou
         let quit = if wait > 0 {
             !pause_quittable(ctx, wait as i64)
         } else {
+            ctx.offer_quit();
             quit_key_or_keep(ctx)
         };
         if quit { stopped = true; break; }
@@ -9797,12 +9965,13 @@ fn cmd_ping(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError> 
     };
     let b = bytes.min(1024);                          // matches net-stack's PING_MAX_PAYLOAD
     let bl = (b as u16).to_le_bytes();
-    // Continuous mode shows the q hint up front so it is obvious BEFORE the replies start scrolling.
-    if count.is_none() {
-        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:  [q] quit", ip[0], ip[1], ip[2], ip[3], b));
-    } else {
-        out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
-    }
+    // `[q] quit` FIRST, on its own line, from the command's watch - so it is still the command's one notice, and
+    // none follows. Waited for, the watch offers it 2 s in, which for ping is between two replies: the notice
+    // landed in the middle of the results it is about (seen on the VisionFive, 2026-10-18). A ping prints until
+    // it is stopped, so the way to stop it is said before it starts. The header carries none of its own (it used
+    // to, and then it showed twice).
+    if ctx.cmd_active.get() { gs::call::Watch::notice(ctx); }
+    out.line_fmt(ctx, format_args!("Pinging {}.{}.{}.{} with {} bytes of data:", ip[0], ip[1], ip[2], ip[3], b));
 
     let mut sent = 0u32; let mut recv = 0u32;
     let mut rmin = u16::MAX; let mut rmax = 0u16; let mut rsum = 0u64; let mut vcount = 0u32;
@@ -10760,13 +10929,14 @@ fn audio_tone(ctx: &ShellCtx, out: &mut Out, rest: &str) -> Result<(), ShellErro
     put_u16(&mut req, 1, hz);
     put_u32(&mut req, 3, ms);
     audio_reply(ctx, out, audio_ask(ctx, &req, AUDIO_REPLY_MS), 1)?;
-    gs::io::println_fmt(ctx, format_args!("playing {} Hz for {}.{} s  [q] quit", hz, ms / 1000, ms % 1000 / 100));
+    gs::io::println_fmt(ctx, format_args!("playing {} Hz for {}.{} s", hz, ms / 1000, ms % 1000 / 100));
     // Watch: a status every 200 ms, the key every 50. Bounded by the tone's length plus five seconds, so a
     // driver that stops answering costs this shell a bounded wait, never the prompt.
     let t0 = gs::driver::wait::Since::now(ctx);
     let limit = gs::driver::wait::Budget::ms(ms as u64 + 5000);
     let mut since_status = 0u32;
     loop {
+        ctx.offer_quit();
         if let Some(k) = ctx.try_console_read() {
             if k == b'q' || k == b'Q' || k == 0x1b {
                 let r = audio_reply(ctx, out, audio_ask(ctx, &[OP_STOP], AUDIO_REPLY_MS), 6)?;
@@ -10940,7 +11110,7 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
     let r = audio_reply(ctx, out, r, 5)?;
     let mut free = get_u32(r.payload_bytes(), 1) as u64;
     let (mm, ss) = audio_clock(length_ms);
-    gs::io::println_fmt(ctx, format_args!("playing {} ({} Hz, 16-bit, {}, {}:{:02})  [q] quit",
+    gs::io::println_fmt(ctx, format_args!("playing {} ({} Hz, 16-bit, {}, {}:{:02})",
         str_of(path), w.rate, if w.channels == 2 { "stereo" } else { "mono" }, mm, ss));
 
     // Send. A chunk is whole frames, at most one file read and one message.
@@ -10953,6 +11123,7 @@ fn audio_play(ctx: &ShellCtx, cwd: &Cwd, out: &mut Out, arg: &str) -> Result<(),
     let t0 = gs::driver::wait::Since::now(ctx);
     let limit = gs::driver::wait::Budget::ms(length_ms * 2 + 10_000);
     while sent < w.data_len {
+        ctx.offer_quit();
         if let Some(k) = ctx.try_console_read() {
             if k == b'q' || k == b'Q' || k == 0x1b {
                 return audio_stop_said(ctx, out);
@@ -11366,7 +11537,7 @@ fn ask_sifted_quittable(ctx: &ShellCtx, peer: &str, msg: &Message, max_ms: u64,
     let s0 = gs::driver::wait::Since::now(ctx);
     let out = ctx.inner.request_with_reply_keyhint_sifted_keeping(peer, msg, hint, secs,
         ServiceContext::QUIT_KEYS,
-        || { if !noticed.get() { noticed.set(true); gs::io::println(ctx, "  [q] quit"); } },
+        || { if !noticed.get() { noticed.set(true); say_quit(ctx); } },
         mine, &|b| ctx.keep_key(b));
     match out {
         ReqOutcome::Reply(r) => (Some(r), true),
@@ -11449,7 +11620,7 @@ fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64, noticed: &core::cell::Cell<bool>
         }
         if !noticed.get() && t0.passed(ctx, notice_at) {
             noticed.set(true);
-            gs::io::println(ctx, "  [q] quit");
+            say_quit(ctx);
         }
         if noticed.get() {
             while let Some(b) = ctx.inner.try_console_read() {
@@ -11467,7 +11638,7 @@ fn wifi_await_owed(ctx: &ShellCtx, max_ms: u64, noticed: &core::cell::Cell<bool>
 /// `wifi status` has the outcome. A "timeout" that comes back at once is a failed send (a respawned driver);
 /// it is reacquired and asked once more, as `wifi_ask` does. A real timeout is never re-sent.
 fn wifi_ask_q(ctx: &ShellCtx, req: &[u8], hint_secs: i64, max_secs: i64) -> ReqOutcome {
-    wifi_ask_keys(ctx, req, hint_secs, max_secs, || gs::io::println(ctx, "  [q] quit"))
+    wifi_ask_keys(ctx, req, hint_secs, max_secs, || say_quit(ctx))
 }
 
 /// The tagged, key-abortable radio request behind `wifi_ask_q` and the join. The answer is the one carrying
@@ -11714,6 +11885,7 @@ fn wifi_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     }
 
     out.line_fmt(ctx, format_args!("scanning  [q] quit  [b] background"));
+    ctx.quit_shown();
     wifi_header(ctx, out);
 
     let t0 = gs::task::epoch_secs_monotonic(ctx);
@@ -11904,14 +12076,14 @@ fn wifi_join(ctx: &ShellCtx, out: &mut Out, ssid: &[u8], pass: &[u8]) -> Result<
         req[2 + SSID_MAX] = pass.len() as u8;
         req[3 + SSID_MAX..3 + SSID_MAX + pass.len()].copy_from_slice(pass);
 
-        out.line_fmt(ctx, format_args!("joining {}  [q] quit", name));
+        out.line_fmt(ctx, format_args!("joining {}", name));
         // Reacquire and ask once more ONLY for a send that failed - which the abortable form reports as a
         // `Timeout` that returns at once, since it cannot tell the two apart. A timeout that took its full
         // thirty seconds is the driver not answering, and re-sending a join to it would be a second join
         // whose answer arrives when nobody is listening (see `wifi_ask`).
-        // Tagged like every radio request (`wifi_ask_keys`); the "joining ... [q] quit" line above is the
-        // hint, so none is printed on a linger.
-        let outcome = wifi_ask_keys(ctx, &req, MAX_SECS + 1, MAX_SECS, || {});
+        // Tagged like every radio request (`wifi_ask_keys`), and the command's `[q] quit` when it lingers past
+        // 2 s, as for every wait (the "joining" line used to carry it, and the watch printed a second).
+        let outcome = wifi_ask_keys(ctx, &req, gs::call::NOTICE_AFTER_SECS, MAX_SECS, || say_quit(ctx));
         for b in req.iter_mut() { *b = 0; }
 
         let status = match &outcome {
@@ -13091,6 +13263,7 @@ fn wifi_powercycle_watch(ctx: &ShellCtx, out: &mut Out, verb: &str) -> WatchOutc
         ctx.log_fmt(format_args!("shell: {} stale message(s) cleared before watching the power cycle", stale + other));
     }
     out.line_fmt(ctx, format_args!("the radio is coming back from power-on  [q] quit  [b] background"));
+    ctx.quit_shown();
     let t0 = gs::task::epoch_secs_monotonic(ctx);
     let mut last = "";
     // Whether the radio, once up and not joined, has been asked if it will rejoin at all (`OP_USE`).
@@ -13239,7 +13412,7 @@ fn wifi_radio_hard_off(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> 
 /// `net renew` - re-run net-stack's DHCP/ARP/ICMP dance (op 8) so a link that came up AFTER boot (a
 /// cable plugged in later) reconfigures the stack without a reboot. Bounded + abortable with q.
 fn net_renew(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
-    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway)  [q] quit"));
+    out.line_fmt(ctx, format_args!("renewing (DHCP + ARP + ping the gateway)"));
     let outcome = ns_abortable(ctx, &[8u8], 30);
     match outcome {
         ReqOutcome::Reply(r) => {
@@ -13267,7 +13440,7 @@ fn net_arp(ctx: &ShellCtx, ip_str: &str, out: &mut Out) -> Result<(), ShellError
         Some(ip) => ip,
         None => { out.line_fmt(ctx, format_args!("net arp: '{}' is not an IPv4 address", ip_str)); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{}  [q] quit", ip[0], ip[1], ip[2], ip[3]));
+    out.line_fmt(ctx, format_args!("resolving {}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
     // ABORTABLE (q). Reacquire once on a clean timeout (net-stack may have restarted).
     let outcome = ns_abortable(ctx, &[6, ip[0], ip[1], ip[2], ip[3]], 8);
     match outcome {
@@ -13300,7 +13473,7 @@ fn net_scan(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
         ReqOutcome::Aborted  => { out.line_fmt(ctx, format_args!("net scan: aborted")); return Ok(()); }
         ReqOutcome::Timeout  => { out.line_fmt(ctx, format_args!("net: net-stack unavailable")); return Ok(()); }
     };
-    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts:  [q] quit", our[0], our[1], our[2]));
+    out.line_fmt(ctx, format_args!("Scanning {}.{}.{}.0/24 for live hosts:", our[0], our[1], our[2]));
     // Walk the /24 host-by-host (net-stack op 6 = one ARP resolve), driven FROM THE SHELL so an abort
     // actually STOPS the work: q ends the loop and net-stack is only ever mid-ONE resolve (fast), never
     // wedged finishing a 254-host sweep (which is why a batch op 7 left the NEXT command stuck). Each
@@ -13403,8 +13576,14 @@ fn net_query(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64, tag: Opti
         while let Some(b) = ctx.try_console_read() {
             if b == b'q' || b == b'Q' || b == 0x1b { return NetQ::Aborted; }
         }
+        // THROUGH THE REPLY MAILBOX (`gs::call::request_once`, the kernel's reply-matched `CallDeadline`), not
+        // `request_with_reply_deadline`, which hands the peer a reply cap to the shell's MAIN endpoint. This loop
+        // asks again every second, so a peer that holds requests - net-stack with no link - answers every one of
+        // them after the shell has its answer or has given up, and those late answers landed on the endpoint pipe
+        // stages send to: the next command's answer began with net-stack's status and did not decode (`osdev test
+        // gsp`, 2026-10-18). In the mailbox a late answer waits for the SDK to discard it before the next request.
         // quit-ok: 1 s a pass of a loop that reads `q` before every pass
-        if let Some(r) = ctx.request_with_reply_deadline(peer, msg, 1) {
+        if let Ok(r) = gs::call::request_once(ctx, peer, msg, 1) {
             // A TAGGED channel checks the answer belongs to the question. An overtaken reply is
             // discarded and the poll continues rather than being believed - which is the entire point
             // of the tag, and is what `net_query`'s blind drain above could only approximate.
@@ -13421,7 +13600,8 @@ fn net_query(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64, tag: Opti
         }
         // Only tell the user about q if the reply DIDN'T come in the first second (a stall) - so a fast
         // query stays clean, but a wedged one advertises how to escape it.
-        if i == 0 { gs::io::println(ctx, "net: waiting for a reply  [q] quit"); }
+        // Inside a command, the command's one notice at 2 s; between commands, this line after the first second.
+        if ctx.cmd_active.get() { ctx.offer_quit(); } else if i == 0 { gs::io::println(ctx, "net: waiting for a reply  [q] quit"); }
         let _ = gs::cap::reacquire(ctx, peer);   // best-effort: the caller retries regardless
     }
     NetQ::Timeout
@@ -13781,7 +13961,7 @@ fn cmd_tcp(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellErro
 
     // `[q] quit` while it lingers. The library fires this and knows nothing else about it: the
     // callback takes nothing and returns nothing, so the console stays entirely on this side.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let mut buf = [0u8; 512];
     let mut net = gs::net::Net::with_notice(&*ctx, &notice);
     match net.tcp(gs::net::Ipv4(ip), port, &req[..n], &mut buf) {
@@ -13904,7 +14084,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
     // Through `gs::net`: the opcodes, the capability lifetimes and the correlation tag are the
     // library's now. What stays here is what `serve` MEANS.
     // A notice, so `q` reaches the `Cancelled` arm below, and a keep, so type-ahead survives (H16).
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut gnet = gs::net::Net::with_notice(&**ctx, &notice).keeping(&keep);
     let mut lis = match gnet.listen(port) {
@@ -13930,14 +14110,14 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // status: our_ip(4) gateway(4) gw_mac(6) flags(1) dns(4)
         if st.len() >= 4 && st[..4] != [0, 0, 0, 0] {
             out.line_fmt(ctx, format_args!(
-                "listening on {}.{}.{}.{}:{} - answering connections  [q] quit",
+                "listening on {}.{}.{}.{}:{} - answering connections",
                 st[0], st[1], st[2], st[3], port));
             shown = true;
         }
     }
     if !shown {
         out.line_fmt(ctx, format_args!(
-            "listening on port {} - answering connections  [q] quit", port));
+            "listening on port {} - answering connections", port));
     }
 
     let mut last_note: i64 = -1;
@@ -13984,9 +14164,9 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
                 last_note = waited;
                 match limit {
                     Some(n) => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s of {}s, {} served  [q] quit", waited, n, served)),
+                        "still listening - {}s of {}s, {} served", waited, n, served)),
                     None => out.line_fmt(ctx, format_args!(
-                        "still listening - {}s, {} served  [q] quit", waited, served)),
+                        "still listening - {}s, {} served", waited, served)),
                 }
             }
             // 250 ms, not 100. The accept poll is a CLIENT REQUEST to net-stack, and asking four
@@ -14042,7 +14222,7 @@ fn cmd_serve(ctx: &ShellCtx, args: &[&str], out: &mut Out) -> Result<(), ShellEr
         // Give the close a moment to go out before the capability is dropped - the connection is
         // driven by net-stack's poll step, which needs a pass to put the FIN on the wire.
         gs::task::sleep_ms(ctx, 200);
-        out.line(ctx, "closed - waiting for the next connection  [q] quit");
+        out.line(ctx, "closed - waiting for the next connection");
         // THE LISTENER IS KEPT. Releasing it here is what made this one-shot; it stays open across
         // connections and is released once, below, by every exit path.
     }
@@ -14094,7 +14274,7 @@ fn cmd_sock(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     };
 
     // A notice, so `q` quits a wait that can run about 40 s; type-ahead kept (H16).
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut gnet = gs::net::Net::with_notice(&**ctx, &notice).keeping(&keep);
     let r = match gnet.socket() {
@@ -14259,7 +14439,7 @@ fn cmd_random(ctx: &ServiceContext, arg: &str, out: &mut Out) -> Result<(), Shel
         }
     };
     for _ in 0..n {
-        match ctx.hw_random() {
+        match gs::task::hw_random(ctx) {
             Some(v) => out.line_fmt(ctx, format_args!("{:#010x}  {}", v, v)),
             None => { out.line(ctx, "random: no hardware RNG on this machine"); return Err(ShellError::Unknown); }
         }
@@ -14334,7 +14514,7 @@ fn build_observe_table(ctx: &ServiceContext, arg: &str) -> Option<Table> {
 /// (search hits), `observe now`, `uptime`, `jobs` and the record views of `events` and `trace` are
 /// built in the shell, so no wire codec is needed - they pass by value like `status`.
 fn is_record_producer(name: &str) -> bool {
-    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs" | "ask")
+    matches!(name, "status" | "dir" | "caps" | "drives" | "find" | "observe" | "uptime" | "events" | "trace" | "jobs" | "ask" | "godspeed")
 }
 
 /// `dir` as a record producer: directory entries as a table (`name` / `type` / `size`). Mirrors
@@ -14360,7 +14540,7 @@ fn build_dir_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     // q quits the wait, as bare `dir`'s does; type-ahead is kept (H16). A `q` typed AHEAD for a stage
     // later in the pipe (`dir /many | paginate`) is not taken as a quit: the SDK's wait reads no key
     // before it has shown `[q] quit`, so a quick listing never sees it.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut g = ctx.fs_waiting(&notice, &keep);
     let walked = g.list_dir(path, |e| {
@@ -14532,7 +14712,7 @@ fn build_find_table(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Option<Table> {
     let mut t = Table::new(&["name", "type", "path", "size"]);
     let mut dir = [0u8; PATH_MAX];
     let mut cancelled = false;
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits the walk; type-ahead kept (H16, see `build_dir_table`)
     while let Some(dlen) = stack.pop(&mut dir) {
         let mut g = ctx.fs_waiting(&notice, &keep);
@@ -14655,6 +14835,14 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
         Stream::Bytes(cap)
     } else if is_record_producer(c0) || wifi_records || hardware_records || audio_records {
         let arg = split_first(stages[0]).1;
+        // An ACTION refuses here too: `godspeed config set ... | count` would otherwise run the set while
+        // looking like a report, which is the one thing a refusal exists to prevent.
+        if c0 == "godspeed" {
+            if let Some(why) = producer_refusal(c0, arg) {
+                gs::io::println(ctx, why);
+                return Err(ShellError::Unknown);
+            }
+        }
         let t = match c0 {
             "dir"      => match build_dir_table(ctx, cwd, arg)    { Some(t) => t, None => return Err(ShellError::Unknown) },
             "caps"    => match build_caps_table(ctx, arg)       { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -14669,6 +14857,9 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
                 let q = match split_first(arg) { ("evidence", rest) if !rest.is_empty() => rest, _ => arg };
                 match build_ask_table(ctx, q) { Some(t) => t, None => return Err(ShellError::Unknown) }
             }
+            // `godspeed config | where note=file`: the reports as records. `config set` is refused before
+            // here (`producer_refusal`): its value is its effect.
+            "godspeed" => match build_godspeed_table(ctx, arg, None) { Some(t) => t, None => return Err(ShellError::Unknown) },
             "wifi" if arg.trim() == "hardware" => build_wifi_hardware_table(ctx),
             "audio" if arg.trim() == "hardware" => build_audio_hardware_table(ctx),
             "audio" => match build_audio_outputs_table(ctx) { Some(t) => t, None => return Err(ShellError::Unknown) },
@@ -14739,6 +14930,21 @@ fn pipe_run(ctx: &ShellCtx, cwd: &Cwd, line: &str, out: &mut Out, depth: u8) -> 
     } else if is_pipe_producer_service(c0) {
         let mut cap = Cap::new();
         if !drain_service(ctx, c0, None, &mut cap) { return Err(ShellError::Unknown); }
+        Stream::Bytes(cap)
+    } else if let Some((task, app)) = installed_utility(ctx, c0) {
+        // An INSTALLED UTILITY starts a pipe as any producer does: what it writes is the stream. A failure goes to
+        // the console and stops the pipe, as a built-in producer's does. An APP owns the screen, so it has no stream.
+        if app {
+            gs::io::println_fmt(ctx, format_args!("pipe: '{}' is an app - it has the screen while it runs, so it cannot start a pipe", c0));
+            return Err(ShellError::Unknown);
+        }
+        let mut cap = Cap::new();
+        let ran = run_utility(ctx, core::str::from_utf8(task.as_bytes()).unwrap_or(""), split_first(stages[0]).1,
+                              &mut Out::Capture(&mut cap));
+        if ran.is_err() {
+            Out::Console.put_bytes(ctx, cap.bytes());
+            return Err(ShellError::Unknown);
+        }
         Stream::Bytes(cap)
     } else if c0 == "result" || c0 == "assert" {
         // The classic mix-up: piping into the *outcome* channel. `result`/`assert` read a
@@ -15134,7 +15340,7 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
         ask_know::Reading::One(ask_know::Kind::Network, _) => "ask-net",
         _ => "ask",
     };
-    let how = drain_service_with(ctx, row, ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep));
+    let how = drain_service_with(ctx, row, ASK_PEERS, Some(q.as_bytes()), &mut cap, ASK_WAIT_SECS, Some(&keep), None);
     match how {
         // Already said on the console: "pipe: aborted" for a `q`, the spawn or feed failure otherwise.
         Drained::Failed | Drained::Aborted => return None,
@@ -15224,6 +15430,741 @@ fn cmd_ask(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         Some(_) => Err(ShellError::Unknown),
         None => { gs::io::println(ctx, "ask: the answer had no status - treat it as incomplete"); Err(ShellError::Unknown) }
     }
+}
+
+/// How long the package manager may take to send its answer: its own requests are bounded by
+/// `timeout-secs`, at most 100 (`services/godspeed-pm`), and this leaves it room to say why one ended.
+const GODSPEED_WAIT_SECS: i64 = 120;
+
+/// `godspeed <command>` as a record table (`item`, `value`, `note`) whose last row is `status`. Like `ask`, a
+/// FOREGROUND PROGRAM: started for one command, its answer read, then ended. Its peers are its supervisor
+/// row's (`fs`, `net-stack`, `time`, and this shell), never passed from here.
+/// The marker that begins a progress frame from `godspeed-pm` (`services/godspeed-pm/src/main.rs`, `PROGRESS`).
+const PROGRESS_FRAME: &[u8] = b"\x01GSPROG1";
+
+fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>) -> Option<Table> {
+    let line = arg.trim();
+    let mut cap = Cap::new();
+    let keep = |b: u8| ctx.keep_key(b);
+    // Piped, progress is not drawn, but its frames are still taken out of the answer.
+    let quiet = |_: &[u8]| {};
+    let progress: &dyn Fn(&[u8]) = show.unwrap_or(&quiet);
+    match drain_service_with(ctx, "godspeed-pm", &[], Some(line.as_bytes()), &mut cap, GODSPEED_WAIT_SECS, Some(&keep), Some(progress)) {
+        Drained::Failed | Drained::Aborted => return None,
+        Drained::Eot | Drained::Overflow | Drained::NoEot => {}
+    }
+    match Table::decode(cap.bytes()) {
+        Ok(t) => Some(t),
+        Err(why) => {
+            // Which way it failed to read, and how much came: an answer that does not decode is a defect in one of
+            // the two sides, and the reason is the first thing anybody chasing it needs.
+            if cap.bytes().is_empty() {
+                gs::io::println(ctx, "godspeed: no answer came, so the shell ended it");
+            } else {
+                gs::io::println_fmt(ctx, format_args!("godspeed: what came back does not read as an answer ({}, {} bytes{})",
+                    why, cap.bytes().len(), if cap.overflow { ", more than the shell holds" } else { "" }));
+            }
+            None
+        }
+    }
+}
+
+/// `download <link> [to <file>]` (`utilities/65_download.md`): the link and an absolute path to the program that
+/// does it - the package manager's, which holds the network, the disk, the clock and the trusted roots already. The
+/// path is resolved here, where the folder this was typed in is known.
+#[inline(never)]
+fn cmd_download(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    let mut words = arg.split_whitespace();
+    let (link, to) = match (words.next(), words.next(), words.next(), words.next()) {
+        (Some(l), None, None, None) => (l, None),
+        (Some(l), Some("to"), Some(f), None) => (l, Some(f)),
+        _ => {
+            gs::io::println(ctx, "usage: download <link> [to <file>] - `download help` says more");
+            return Err(ShellError::Unknown);
+        }
+    };
+    if !link.starts_with("http://") && !link.starts_with("https://") {
+        gs::io::println(ctx, "download: a link begins http:// or https://");
+        return Err(ShellError::Unknown);
+    }
+    // Named from the link when no file is: its last path part, without a query; `index.html` for a bare site.
+    let name = match to {
+        Some(f) => f,
+        None => {
+            let rest = link.splitn(2, "://").nth(1).unwrap_or("");
+            let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("/");
+            let path = path.split(['?', '#']).next().unwrap_or("/");
+            let last = path.rsplit('/').next().unwrap_or("");
+            if last.is_empty() { "index.html" } else { last }
+        }
+    };
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(path) = resolve_or_err(ctx, cwd, name, &mut pbuf) else { return Err(ShellError::Unknown) };
+    let path = core::str::from_utf8(path).unwrap_or("");
+    let mut q = [0u8; 512];
+    godspeed_show(ctx, fmt_into(&mut q, format_args!("download {} {}", link, path)))
+}
+
+/// `godspeed registry [add | use | remove]`, `godspeed config [set]`, `godspeed check`
+/// (`utilities/61_godspeed.md`). The table without its `status` row, as a grid; the command fails when
+/// the status says so.
+#[inline(never)]
+fn cmd_godspeed(ctx: &ShellCtx, cwd: &Cwd, arg: &str) -> Result<(), ShellError> {
+    if arg.trim().is_empty() {
+        gs::io::println(ctx, "usage: godspeed search | info | fetch | install | upgrade | uninstall | list | verify | remove | trust | registry | config | check - `godspeed help` says what each does");
+        return Err(ShellError::Unknown);
+    }
+    // TRUSTING A NEW ROOT IS ASKED FIRST, here where the console is: the package manager answers in a
+    // table and cannot read a key. `yes` as a last word answers it, as for `seal`, so a script can.
+    let mut words: [&str; 8] = [""; 8];
+    let mut nw = 0usize;
+    for w in arg.split_whitespace() {
+        if nw == words.len() { break; }
+        words[nw] = w;
+        nw += 1;
+    }
+    let mut line_buf = [0u8; 512];
+    let mut line = arg.trim();
+    if nw >= 5 && words[0] == "registry" && words[1] == "add" {
+        let yes = nw == 6 && words[5] == "yes";
+        if nw > 6 || (nw == 6 && !yes) {
+            gs::io::println(ctx, "usage: godspeed registry add <name> <url> <root> [yes]");
+            return Err(ShellError::Unknown);
+        }
+        gs::io::println_fmt(ctx, format_args!(
+            "registry {} at {} - anything signed by {} will be trusted as coming from it.", words[2], words[3], words[4]));
+        if !yes {
+            gs::io::print(ctx, " Trust this root? [y/N]: ");
+            if !read_confirm(ctx) {
+                gs::io::println(ctx, "godspeed: cancelled - nothing was added");
+                return Ok(());
+            }
+        }
+        // The request without the `yes`: the package manager is never told a person agreed, only what to add.
+        let mut n = 0usize;
+        for (i, w) in words[..5].iter().enumerate() {
+            let b = w.as_bytes();
+            if n + b.len() + 1 > line_buf.len() { break; }
+            if i > 0 { line_buf[n] = b' '; n += 1; }
+            line_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
+    }
+    // TRUSTING A KEY DIRECTLY is asked first, with what it means: no registry vouches for what it signs, and nothing
+    // but this machine's operator can withdraw it.
+    if nw >= 4 && words[0] == "trust" && words[1] == "add" {
+        let yes = nw == 5 && words[4] == "yes";
+        if nw > 5 || (nw == 5 && !yes) {
+            gs::io::println(ctx, "usage: godspeed trust add <publisher> <key> [yes]");
+            return Err(ShellError::Unknown);
+        }
+        gs::io::println_fmt(ctx, format_args!(
+            "anything signed by {} will be trusted as coming from {}/, with no registry vouching for it.", words[3], words[2]));
+        gs::io::println(ctx, "  Nothing tells this machine if that key leaks; only `godspeed trust remove` ends it.");
+        if !yes {
+            gs::io::print(ctx, " Trust this key? [y/N]: ");
+            if !read_confirm(ctx) {
+                gs::io::println(ctx, "godspeed: cancelled - nothing was trusted");
+                return Ok(());
+            }
+        }
+        let mut n = 0usize;
+        for (i, w) in words[..4].iter().enumerate() {
+            let b = w.as_bytes();
+            if n + b.len() + 1 > line_buf.len() { break; }
+            if i > 0 { line_buf[n] = b' '; n += 1; }
+            line_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
+    }
+    // FORGETTING A REGISTRY'S TRUST is asked first too: the next command trusts whatever root 1 matches the pin.
+    if nw >= 3 && words[0] == "trust" && words[1] == "reset" {
+        let yes = nw == 4 && words[3] == "yes";
+        if nw > 4 || (nw == 4 && !yes) {
+            gs::io::println(ctx, "usage: godspeed trust reset <registry> [yes]");
+            return Err(ShellError::Unknown);
+        }
+        gs::io::println_fmt(ctx, format_args!(
+            "forget what this machine accepted from {} - its next command trusts the root 1 that matches its pin again.", words[2]));
+        if !yes {
+            gs::io::print(ctx, " Forget it? [y/N]: ");
+            if !read_confirm(ctx) {
+                gs::io::println(ctx, "godspeed: cancelled - nothing was forgotten");
+                return Ok(());
+            }
+        }
+        let mut n = 0usize;
+        for (i, w) in words[..3].iter().enumerate() {
+            let b = w.as_bytes();
+            if n + b.len() + 1 > line_buf.len() { break; }
+            if i > 0 { line_buf[n] = b' '; n += 1; }
+            line_buf[n..n + b.len()].copy_from_slice(b);
+            n += b.len();
+        }
+        line = core::str::from_utf8(&line_buf[..n]).unwrap_or("");
+    }
+    // FOR A MACHINE WITH NO NETWORK: the file goes in the folder this was typed in, named from the release.
+    if nw == 3 && words[0] == "fetch" && words[2] == "offline" {
+        let mut q = [0u8; 512];
+        return godspeed_show(ctx, fmt_into(&mut q, format_args!("fetch {} save {}", words[1], cwd.as_str())));
+    }
+    // A PACKAGE FILE is named by a path the shell resolves, so `hello.gsp` is the one in this folder.
+    if nw == 2 && words[0] == "inspect" && words[1].ends_with(".gsp") {
+        let mut pbuf = [0u8; PATH_MAX];
+        let Some(path) = resolve_or_err(ctx, cwd, words[1], &mut pbuf) else { return Err(ShellError::Unknown) };
+        let mut q = [0u8; 512];
+        let path = core::str::from_utf8(path).unwrap_or("");
+        return godspeed_show(ctx, fmt_into(&mut q, format_args!("inspect {}", path)));
+    }
+    // CLEANUP lists first and asks; the package manager deletes only on the answer, which it is never told came
+    // from a person - only what to do.
+    if words[0] == "cleanup" {
+        return godspeed_cleanup(ctx, &words[..nw]);
+    }
+    // A PACKAGE FILE installs in two steps: checked and unpacked, then installed as any fetched package.
+    if nw >= 2 && words[0] == "install" && words[1].ends_with(".gsp") {
+        return godspeed_install_file(ctx, cwd, &words[1..nw]);
+    }
+    // INSTALL AND UNINSTALL are asked first too, one package at a time: `grant` names the answer outright.
+    if nw >= 2 && (words[0] == "install" || words[0] == "uninstall" || words[0] == "upgrade") && !(nw >= 3 && words[2] == "grant") {
+        return godspeed_lifecycle(ctx, &words[..nw]);
+    }
+    godspeed_show(ctx, line)
+}
+
+/// `godspeed install|uninstall|upgrade <pkg>[,<pkg>...] [yes]`, and `upgrade all`: each package asked about once,
+/// [y/N], unless `yes`.
+///
+/// Install asks with everything the package would be given in the question - the send peers its contract requests
+/// (the package manager answers them, checked from the disk) and that it gets no privilege - so `yes` approves only
+/// what was shown. `grant <peer>,...` instead of the question gives some of them; that form is passed straight on.
+/// Upgrade is fetch-then-install of the newest release of something installed, with the version change in the
+/// question, since a new release may ask for more. Every package gets its own answer and one that fails does not
+/// stop the rest; the command fails if any did.
+#[inline(never)]
+fn godspeed_lifecycle(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> {
+    let verb = words[0];
+    // `purge`, for `uninstall` alone, before the `yes`: its fetched copies go too.
+    let purge = verb == "uninstall" && words.get(2) == Some(&"purge");
+    let rest = &words[2 + purge as usize..];
+    let yes = rest == ["yes"];
+    if rest.len() > 1 || (rest.len() == 1 && !yes) {
+        gs::io::println_fmt(ctx, format_args!("usage: godspeed {} <publisher/name>[,<publisher/name>...]{} [yes]", verb,
+            if verb == "upgrade" { " | all" } else if verb == "uninstall" { " [purge]" } else { "" }));
+        return Err(ShellError::Unknown);
+    }
+    let mut failed = false;
+    let mut q = [0u8; 512];
+    // An upgrade asks two things once, before any package: what is installed, and what the registry has newest -
+    // read into a small plan, so neither answer table is on the stack while the packages are fetched and installed.
+    let all = verb == "upgrade" && words[1] == "all";
+    let plan = if verb == "upgrade" {
+        match upgrade_plan(ctx, if all { None } else { Some(words[1]) }) {
+            Some(p) => p,
+            None => {
+                gs::io::println(ctx, "godspeed: the package manager did not answer");
+                return Err(ShellError::Unknown);
+            }
+        }
+    } else { UpgradePlan::EMPTY };
+    if all && plan.n == 0 { gs::io::println(ctx, "  nothing is installed, so nothing to upgrade"); return Ok(()); }
+    let listed = if all { None } else { Some(words[1]) };
+    let names = listed.into_iter().flat_map(|l| l.split(',')).map(str::trim).filter(|p| !p.is_empty())
+        .chain((0..if all { plan.n } else { 0 }).map(|i| plan.pkg(i)));
+    for pkg in names {
+        match verb {
+            "install" => { if !install_one(ctx, pkg, None, yes, &mut q) { failed = true; } }
+            "upgrade" => {
+                let Some(i) = plan.find(pkg) else {
+                    gs::io::println_fmt(ctx, format_args!("godspeed: {} is not installed: `godspeed install` it", pkg));
+                    failed = true;
+                    continue;
+                };
+                let have = plan.have(i);
+                let latest = plan.latest(i);
+                if latest == "-" || latest.is_empty() {
+                    let why = plan.why(i);
+                    gs::io::println_fmt(ctx, format_args!("godspeed: no newer {} can be found: {}", pkg,
+                        if why.is_empty() { "the registry did not list it" } else { why }));
+                    failed = true;
+                    continue;
+                }
+                if semver(latest) <= semver(have) {
+                    gs::io::println_fmt(ctx, format_args!("  {} {} is up to date", pkg, have));
+                    continue;
+                }
+                let mut sb = [0u8; 128];
+                let n = {
+                    let spec = fmt_into(&mut q, format_args!("{}@{}", pkg, latest));
+                    let n = spec.len().min(sb.len());
+                    sb[..n].copy_from_slice(&spec.as_bytes()[..n]);
+                    n
+                };
+                let spec = core::str::from_utf8(&sb[..n]).unwrap_or("");
+                if godspeed_show(ctx, fmt_into(&mut q, format_args!("fetch {}", spec))).is_err() { failed = true; continue; }
+                if !install_one(ctx, spec, Some(have), yes, &mut q) { failed = true; }
+            }
+            _ => {
+                if purge {
+                    gs::io::print_fmt(ctx, format_args!("uninstall {} and delete it? It stops, no longer starts at boot or runs when typed, and every fetched version of it is deleted; a package file you keep is not touched. [y/N]: ", pkg));
+                } else {
+                    gs::io::print_fmt(ctx, format_args!("uninstall {}? It stops, and no longer starts at boot or runs when typed; its fetched copy stays. [y/N]: ", pkg));
+                }
+                if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+                else if !read_confirm(ctx) {
+                    gs::io::println_fmt(ctx, format_args!("godspeed: {} left installed", pkg));
+                    continue;
+                }
+                if godspeed_show(ctx, fmt_into(&mut q, format_args!("uninstall {}{}", pkg, if purge { " purge" } else { "" }))).is_err() { failed = true; }
+            }
+        }
+    }
+    if failed { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// What an upgrade needs of the two lists, held small: each installed package (all of them for `upgrade all`, else
+/// the ones named), the version installed, the newest the registry has, and why not where it has none.
+struct UpgradePlan {
+    n: usize,
+    pkgs: [[u8; 80]; 8], pl: [usize; 8],
+    haves: [[u8; 24]; 8], hl: [usize; 8],
+    latests: [[u8; 24]; 8], ll: [usize; 8],
+    whys: [[u8; 120]; 8], wl: [usize; 8],
+}
+
+impl UpgradePlan {
+    const EMPTY: UpgradePlan = UpgradePlan {
+        n: 0, pkgs: [[0; 80]; 8], pl: [0; 8], haves: [[0; 24]; 8], hl: [0; 8],
+        latests: [[0; 24]; 8], ll: [0; 8], whys: [[0; 120]; 8], wl: [0; 8],
+    };
+    fn s(b: &[u8]) -> &str { core::str::from_utf8(b).unwrap_or("") }
+    fn pkg(&self, i: usize) -> &str { Self::s(&self.pkgs[i][..self.pl[i]]) }
+    fn have(&self, i: usize) -> &str { Self::s(&self.haves[i][..self.hl[i]]) }
+    fn latest(&self, i: usize) -> &str { Self::s(&self.latests[i][..self.ll[i]]) }
+    fn why(&self, i: usize) -> &str { Self::s(&self.whys[i][..self.wl[i]]) }
+    fn find(&self, pkg: &str) -> Option<usize> { (0..self.n).find(|&i| self.pkg(i) == pkg) }
+}
+
+/// The installed list and the update list, asked once and read into an [`UpgradePlan`]: every installed package, or
+/// those `named` (comma-separated) that are. `None` when the package manager did not answer either.
+#[inline(never)]
+fn upgrade_plan(ctx: &ShellCtx, named: Option<&str>) -> Option<UpgradePlan> {
+    let installed = build_godspeed_table(ctx, "list installed", None);
+    let updates = build_godspeed_table(ctx, "list updates", None);
+    if installed.is_none() || updates.is_none() { return None; }
+    let mut plan = UpgradePlan::EMPTY;
+    let put = |dst: &mut [u8], b: &[u8]| { let n = b.len().min(dst.len()); dst[..n].copy_from_slice(&b[..n]); n };
+    if let Some(t) = installed.as_ref() {
+        if let (Some(k), Some(v)) = (table_col(t, b"package"), table_col(t, b"version")) {
+            for r in 0..t.nrows() {
+                let b = t.cell_bytes(r, k);
+                if b == b"status" || plan.n == plan.pkgs.len() || b.len() > 80 { continue; }
+                let p = core::str::from_utf8(b).unwrap_or("");
+                if let Some(list) = named {
+                    if !list.split(',').map(str::trim).any(|x| x == p) { continue; }
+                }
+                let i = plan.n;
+                plan.pl[i] = put(&mut plan.pkgs[i], b);
+                plan.hl[i] = put(&mut plan.haves[i], t.cell_bytes(r, v));
+                if let Some(l) = table_lookup(&updates, p, b"latest") { plan.ll[i] = put(&mut plan.latests[i], l.as_bytes()); }
+                if let Some(w) = table_lookup(&updates, p, b"status") { plan.wl[i] = put(&mut plan.whys[i], w.as_bytes()); }
+                plan.n += 1;
+            }
+        }
+    }
+    Some(plan)
+}
+
+/// `MAJOR.MINOR.PATCH` as numbers, for ordering; anything else orders first.
+fn semver(v: &str) -> (u64, u64, u64) {
+    let mut it = v.split('.').map(|p| p.parse::<u64>().unwrap_or(0));
+    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+}
+
+/// The column of `t` called `name`.
+fn table_col(t: &Table, name: &[u8]) -> Option<usize> { (0..t.ncols()).find(|&c| t.col_name(c) == name) }
+
+/// The `field` of the row of `t` whose `package` is `key`.
+fn table_lookup(t: &Option<Table>, key: &str, field: &[u8]) -> Option<String8L> {
+    let t = t.as_ref()?;
+    let (k, f) = (table_col(t, b"package")?, table_col(t, field)?);
+    let r = (0..t.nrows()).find(|&r| t.cell_bytes(r, k) == key.as_bytes())?;
+    let mut out = String8L::new();
+    out.set(t.cell_bytes(r, f));
+    Some(out)
+}
+
+/// `godspeed cleanup [yes]`: the listing, then the question, then the delete. Its own frame, so the answer table it
+/// reads is on the stack only while it does (SHELL STACK, below).
+#[inline(never)]
+fn godspeed_cleanup(ctx: &ShellCtx, words: &[&str]) -> Result<(), ShellError> {
+    let yes = words.len() == 2 && words[1] == "yes";
+    if words.len() > 2 || (words.len() == 2 && !yes) {
+        gs::io::println(ctx, "usage: godspeed cleanup [yes]");
+        return Err(ShellError::Unknown);
+    }
+    let (found, failed) = {
+        let t = godspeed_answer(ctx, "cleanup").ok_or(ShellError::Unknown)?;
+        let found = (0..t.nrows()).filter(|&r| t.cell_bytes(r, 0) != b"status").count();
+        let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
+        godspeed_present(ctx, t)?;
+        (found, failed)
+    };
+    if found == 0 || failed { return Ok(()); }
+    gs::io::print(ctx, "Delete them? [y/N]: ");
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+    else if !read_confirm(ctx) {
+        gs::io::println(ctx, "godspeed: nothing was deleted");
+        return Ok(());
+    }
+    godspeed_show(ctx, "cleanup delete")
+}
+
+/// SHELL STACK: every `godspeed` path below holds an answer `Table` (about 12 KiB) only inside a small function that
+/// reads what it needs from it and returns, before the next request goes deeper. Folded together, `cmd_godspeed` was
+/// one 64 KiB frame and `godspeed_lifecycle` 53 KiB; inside a script (`selfcheck packages`, under the script runner's
+/// own 44 KiB) that ran the shell off the end of its 256 KiB stack on the VisionFive, 2026-10-18.
+///
+/// `godspeed install <file>.gsp [yes] [accept-old]` (`docs/developer-services-design.md` 15): the package manager
+/// checks the file through the registry's whole chain, offline, and unpacks it where a fetch would have left it;
+/// then it is installed exactly as a fetched package is, with the same question.
+///
+/// A file whose registry check is older than `offline-max-age-days`, or any file while the clock is not set, is a
+/// SECOND question, asked first: the operator may accept that a key revoked since would not show. `yes` does not
+/// answer it - so a script that says `yes` never accepts that risk by accident - and `accept-old` does. Anything
+/// else wrong with the file is refused with no question.
+#[inline(never)]
+fn godspeed_install_file(ctx: &ShellCtx, cwd: &Cwd, words: &[&str]) -> Result<(), ShellError> {
+    let (mut yes, mut accept) = (false, false);
+    for w in &words[1..] {
+        match *w {
+            "yes" => yes = true,
+            "accept-old" => accept = true,
+            _ => {
+                gs::io::println(ctx, "usage: godspeed install <file>.gsp [yes] [accept-old]");
+                return Err(ShellError::Unknown);
+            }
+        }
+    }
+    let mut pbuf = [0u8; PATH_MAX];
+    let Some(path) = resolve_or_err(ctx, cwd, words[0], &mut pbuf) else { return Err(ShellError::Unknown) };
+    let path = core::str::from_utf8(path).unwrap_or("");
+    let Some(title) = unpack_file(ctx, path, words[0], yes, accept)? else { return Ok(()) };
+    let title = core::str::from_utf8(title.as_bytes()).unwrap_or("");
+    let Some((pkg, version)) = title.split_once(' ') else { return Err(ShellError::Unknown) };
+    let mut q = [0u8; 512];
+    let mut sb = [0u8; 512];
+    let spec = fmt_into(&mut sb, format_args!("{}@{}", pkg, version));
+    if install_one(ctx, spec, None, yes, &mut q) { Ok(()) } else { Err(ShellError::Unknown) }
+}
+
+/// The package file checked and unpacked, its age asked about first when it must be: the release it holds
+/// (`<publisher/name> <version>`), or `None` when the operator said no. The answer tables live in this frame only.
+#[inline(never)]
+fn unpack_file(ctx: &ShellCtx, path: &str, shown: &str, yes: bool, accept: bool) -> Result<Option<String8L>, ShellError> {
+    let mut q = [0u8; 512];
+    let mut t = godspeed_answer(ctx, fmt_into(&mut q, format_args!("unpack {}{}", path, if accept { " accept-old" } else { "" })))
+        .ok_or(ShellError::Unknown)?;
+    let row = |t: &Table, key: &[u8], col: usize| (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == key)
+        .map(|r| { let mut c = String8L::new(); c.set(t.cell_bytes(r, col)); c });
+    if let Some(question) = row(&t, b"question", 2) {
+        let title = row(&t, b"title", 1).unwrap_or_else(String8L::new);
+        // Said BEFORE the question, so the answer is the next thing on its line.
+        if yes { gs::io::println(ctx, "  (`yes` on the line does not answer the question below; `accept-old` does)"); }
+        gs::io::print_fmt(ctx, format_args!("{} {}. Install it anyway? [y/N]: ",
+            core::str::from_utf8(title.as_bytes()).unwrap_or(""), core::str::from_utf8(question.as_bytes()).unwrap_or("")));
+        if !read_confirm(ctx) {
+            gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed - nothing of it was kept", shown));
+            return Ok(None);
+        }
+        t = godspeed_answer(ctx, fmt_into(&mut q, format_args!("unpack {} accept-old", path))).ok_or(ShellError::Unknown)?;
+    }
+    // The release it unpacked, from the card's title: `<publisher/name> <version>`.
+    let title = row(&t, b"title", 1).unwrap_or_else(String8L::new);
+    godspeed_present(ctx, t)?;
+    Ok(Some(title))
+}
+
+/// One `install`: what the release asks for, the question, then the install with the answer. False when it failed;
+/// a "no" is not a failure. `from`, for an upgrade, is the version installed now.
+#[inline(never)]
+/// What a release asks for, read from the package manager's answer: its status note and the peers its contract
+/// requests. `None` when the answer failed or did not come. The table is in this frame alone.
+#[inline(never)]
+fn install_asks(ctx: &ShellCtx, spec: &str, q: &mut [u8; 512]) -> Option<([u8; 512], usize, [u8; 256], usize)> {
+    let t = build_godspeed_table(ctx, fmt_into(q, format_args!("install {}", spec)), None)?;
+    let status = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status")?;
+    if t.cell_bytes(status, 1) == b"failed" { return None; }
+    let mut note = [0u8; 512];
+    let nb = t.cell_bytes(status, 2);
+    let nl = nb.len().min(note.len());
+    note[..nl].copy_from_slice(&nb[..nl]);
+    let mut peers = [0u8; 256];
+    let mut pn = 0usize;
+    for r in 0..t.nrows() {
+        if r == status { continue; }
+        let p = t.cell_bytes(r, 0);
+        if pn + p.len() + 2 > peers.len() { break; }
+        if pn > 0 { peers[pn] = b','; pn += 1; }
+        peers[pn..pn + p.len()].copy_from_slice(p);
+        pn += p.len();
+    }
+    Some((note, nl, peers, pn))
+}
+
+fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> bool {
+    let Some((note_b, nl, peers_b, pn)) = install_asks(ctx, spec, q) else {
+        // Not fetched, or the copy did not check out: the answer says which.
+        let _ = godspeed_show(ctx, fmt_into(q, format_args!("install {}", spec)));
+        return false;
+    };
+    // `<pkg> <version> requests these; ...`: the release the question is about.
+    let note = core::str::from_utf8(&note_b[..nl]).unwrap_or("");
+    let release = note.split(" requests").next().unwrap_or(spec);
+    let peers = core::str::from_utf8(&peers_b[..pn]).unwrap_or("");
+    // What installing it does, from the note's kind: a service starts at every boot, a utility becomes a command.
+    let when = if note.contains("; a driver;") { "starts at every boot, driving that device" }
+        else if note.contains("; an app;") { "becomes a command that has the screen and keyboard while it runs" }
+        else if note.contains("; a utility;") { "becomes a command, run when typed" } else { "starts at every boot" };
+    // What it replaces, from the note (`; installed <version>`): an upgrade, a downgrade, or nothing.
+    let now_installed = note.split("; installed ").nth(1).and_then(|r| r.split(';').next()).unwrap_or("");
+    let this = release.rsplit(' ').next().unwrap_or("");
+    let mut head = [0u8; 512];
+    let head = match from {
+        Some(h) => fmt_into(&mut head, format_args!("{} (upgrade from {})", release, h)),
+        None if !now_installed.is_empty() && now_installed != this && semver(this) < semver(now_installed) =>
+            fmt_into(&mut head, format_args!("{} (a DOWNGRADE from the installed {}, whose data stays as that version left it)", release, now_installed)),
+        None if !now_installed.is_empty() && now_installed != this =>
+            fmt_into(&mut head, format_args!("{} (in place of the installed {})", release, now_installed)),
+        None => fmt_into(&mut head, format_args!("{}", release)),
+    };
+    let act = if from.is_some() { "Upgrade it" } else { "Install it" };
+    if peers.is_empty() {
+        gs::io::print_fmt(ctx, format_args!("{} asks for nothing (no peers, no privilege) and {}. {}? [y/N]: ", head, when, act));
+    } else {
+        gs::io::print_fmt(ctx, format_args!("{} asks for: {} (no privilege) and {}. {} and grant them? [y/N]: ",
+            head, Commas(peers), when, act));
+    }
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+    else if !read_confirm(ctx) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} not {}", spec, if from.is_some() { "upgraded" } else { "installed" }));
+        return true;
+    }
+    let grant = if peers.is_empty() { "none" } else { peers };
+    let mut line = [0u8; 512];
+    let cmd = fmt_into(&mut line, format_args!("install {} grant {}", spec, grant));
+    godspeed_show(ctx, cmd).is_ok()
+}
+
+/// `a,b,c` shown as `a, b, c`.
+struct Commas<'a>(&'a str);
+impl core::fmt::Display for Commas<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        for (i, p) in self.0.split(',').enumerate() { if i > 0 { f.write_str(", ")?; } f.write_str(p)?; }
+        Ok(())
+    }
+}
+
+/// `args` written into `buf`, as text (cut short at its length).
+fn fmt_into<'b>(buf: &'b mut [u8; 512], args: core::fmt::Arguments<'_>) -> &'b str {
+    struct W<'a>(&'a mut [u8; 512], usize);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let take = s.len().min(self.0.len() - self.1);
+            self.0[self.1..self.1 + take].copy_from_slice(&s.as_bytes()[..take]);
+            self.1 += take;
+            Ok(())
+        }
+    }
+    let mut w = W(buf, 0);
+    let _ = core::fmt::Write::write_fmt(&mut w, args);
+    let n = w.1;
+    core::str::from_utf8(&buf[..n]).unwrap_or("")
+}
+
+/// Run one `godspeed` command and show its answer: progress while it works, then the card or the list.
+#[inline(never)]
+fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
+    match godspeed_answer(ctx, line) {
+        Some(t) => godspeed_present(ctx, t),
+        None => Err(ShellError::Unknown),
+    }
+}
+
+/// One `godspeed` command's answer, its progress drawn in place on one line until it comes, then cleared.
+#[inline(never)]
+fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
+    // PROGRESS, drawn in place on one line until the answer comes, then cleared.
+    let drawn = core::cell::Cell::new(false);
+    // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
+    // the line does not offer it a second time.
+    let noticed_first = core::cell::Cell::new(None::<bool>);
+    // CLIPPED TO THE SCREEN, as the pager clips (`help_browser`). `\r` and clear-line reach only the row the
+    // cursor is on, so a line wider than the console wraps and every redraw adds rows: the Wyse's console
+    // drew the bar down the screen where the Pis' wider ones held it on one line (2026-10-19). Asked once
+    // per command; 0 means no console answered, and serial keeps the whole line.
+    let clip = match ctx.console_dims() { (_, 0) => usize::MAX, (_, c) => (c as usize).saturating_sub(1) };
+    let show = |line: &[u8]| {
+        let already = match noticed_first.get() {
+            Some(a) => a,
+            None => { let a = ctx.cmd_noticed.get(); noticed_first.set(Some(a)); a }
+        };
+        let text = core::str::from_utf8(line).unwrap_or("");
+        let text = if already { text.trim_end().trim_end_matches("[q] quit").trim_end() } else { text };
+        let mut fit = [0u8; 192];
+        let text = fit::fit_progress(text, clip, &mut fit);
+        gs::io::print(ctx, "\r\x1b[2K");
+        gs::io::print(ctx, text);
+        drawn.set(true);
+        // The line offers `q` itself, so the watch does not print a second notice under it - unless the clip
+        // cut the offer off, when the watch's own notice is what tells the reader.
+        if !already && text.contains("[q] quit") { ctx.quit_shown(); }
+    };
+    let built = build_godspeed_table(ctx, line, Some(&show));
+    if drawn.get() { gs::io::print(ctx, "\r\x1b[2K"); }
+    built
+}
+
+/// An answer shown: the card or the list, then its status note. Err when it failed.
+#[inline(never)]
+fn godspeed_present(ctx: &ShellCtx, mut t: Table) -> Result<(), ShellError> {
+    let failed = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status" && t.cell_bytes(r, 1) == b"failed");
+    let answered = (0..t.nrows()).any(|r| t.cell_bytes(r, 0) == b"status");
+    // The status row's note is what a list's rows do not say about themselves (the chain it was verified
+    // by, a count, why it is empty), so it is printed under the answer rather than dropped with the row.
+    let mut note = String8L::new();
+    if let Some(r) = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status") {
+        note.set(t.cell_bytes(r, 2));
+    }
+    let first = String8L::from(t.col_name(0));
+    t.filter(core::str::from_utf8(first.as_bytes()).unwrap_or("item"), "!=", "status");
+    godspeed_render(ctx, &t, failed);
+    if note.n > 0 && note.as_bytes() != b"-" {
+        gs::io::println_fmt(ctx, format_args!("  {}", core::str::from_utf8(note.as_bytes()).unwrap_or("")));
+    }
+    if !answered {
+        gs::io::println(ctx, "godspeed: the answer had no status - treat it as incomplete");
+        return Err(ShellError::Unknown);
+    }
+    if failed { Err(ShellError::Unknown) } else { Ok(()) }
+}
+
+/// How `godspeed` answers look on the console, in the style `dir` set: two spaces in, upper-case headers, a
+/// footer line. A `key value note` answer is a CARD about one thing (`info`, `fetch`, `trust`): a `title` row
+/// heads each, `about` is a line of its own, and the rest are aligned under it. Anything else is a LIST: a
+/// header and one line a row, a `size` column in readable units. An empty list says `0 packages`. Piped, the
+/// same answer is records, unchanged.
+fn godspeed_render(ctx: &ShellCtx, t: &Table, failed: bool) {
+    let nc = t.ncols();
+    let is_card = nc == 3 && t.col_name(0) == b"key" && t.col_name(1) == b"value" && t.col_name(2) == b"note";
+    let text = |r: usize, c: usize| core::str::from_utf8(t.cell_bytes(r, c)).unwrap_or("?");
+    if t.nrows() == 0 && !failed {
+        gs::io::println(ctx, "  0 packages");
+        return;
+    }
+    if is_card {
+        let (mut kw, mut vw) = (0usize, 0usize);
+        for r in 0..t.nrows() {
+            let k = text(r, 0);
+            if k != "title" && k != "about" { kw = kw.max(k.len()); vw = vw.max(text(r, 1).chars().count().min(44)); }
+        }
+        for r in 0..t.nrows() {
+            let (k, v, n) = (text(r, 0), text(r, 1), text(r, 2));
+            match k {
+                "title" => {
+                    if r > 0 { gs::io::println(ctx, ""); }
+                    if n.is_empty() { gs::io::println_fmt(ctx, format_args!("  {}", v)); }
+                    else { gs::io::println_fmt(ctx, format_args!("  {}   ({})", v, n)); }
+                }
+                "about" => {
+                    if n.is_empty() { gs::io::println_fmt(ctx, format_args!("  {}", v)); }
+                    else { gs::io::println_fmt(ctx, format_args!("  {}   {}", v, n)); }
+                    gs::io::println(ctx, "");
+                }
+                _ => {
+                    let pad_v = vw.saturating_sub(v.chars().count());
+                    gs::io::print_fmt(ctx, format_args!("    {:<kw$}  {}", k, v, kw = kw));
+                    if n.is_empty() { gs::io::println(ctx, ""); }
+                    else { gs::io::println_fmt(ctx, format_args!("{:pad$}  {}", "", n, pad = pad_v)); }
+                }
+            }
+        }
+        return;
+    }
+    // A LIST.
+    let size_col = (0..nc).find(|&c| t.col_name(c) == b"size");
+    let cellv = |r: usize, c: usize| -> String8L {
+        if Some(c) == size_col {
+            if let Some(n) = t.cell_int(r, c) {
+                let mut s = String8L::new();
+                let k = if n < 1024 { format_args_to(&mut s, format_args!("{} B", n)) }
+                    else if n < 1024 * 1024 { format_args_to(&mut s, format_args!("{}.{} KiB", n / 1024, n % 1024 * 10 / 1024)) }
+                    else { format_args_to(&mut s, format_args!("{}.{} MiB", n >> 20, (n & 0xfffff) * 10 >> 20)) };
+                let _ = k;
+                return s;
+            }
+        }
+        if let Some(n) = t.cell_int(r, c) {
+            let mut s = String8L::new();
+            format_args_to(&mut s, format_args!("{}", n));
+            return s;
+        }
+        String8L::from(t.cell_bytes(r, c))
+    };
+    let mut w = [0usize; 8];
+    for c in 0..nc { w[c] = t.col_name(c).len(); }
+    for r in 0..t.nrows() {
+        for c in 0..nc { w[c] = w[c].max(core::str::from_utf8(cellv(r, c).as_bytes()).unwrap_or("").chars().count()); }
+    }
+    gs::io::print(ctx, " ");
+    for c in 0..nc {
+        let mut up = [0u8; 24];
+        let name = t.col_name(c);
+        for (i, b) in name.iter().enumerate().take(24) { up[i] = b.to_ascii_uppercase(); }
+        let h = core::str::from_utf8(&up[..name.len().min(24)]).unwrap_or("");
+        if c + 1 == nc { gs::io::print_fmt(ctx, format_args!(" {}", h)); }
+        else { gs::io::print_fmt(ctx, format_args!(" {:<w$} ", h, w = w[c])); }
+    }
+    gs::io::println(ctx, "");
+    for r in 0..t.nrows() {
+        gs::io::print(ctx, " ");
+        for c in 0..nc {
+            let v = cellv(r, c);
+            let s = core::str::from_utf8(v.as_bytes()).unwrap_or("");
+            if c + 1 == nc { gs::io::print_fmt(ctx, format_args!(" {}", s)); }
+            else { gs::io::print_fmt(ctx, format_args!(" {:<w$} ", s, w = w[c])); }
+        }
+        gs::io::println(ctx, "");
+    }
+    if t.overflow() {
+        gs::io::println(ctx, "  (the answer was cut: more than one answer holds)");
+    }
+}
+
+/// Format into a [`String8L`], cut at its size.
+fn format_args_to(s: &mut String8L, args: core::fmt::Arguments<'_>) {
+    struct W<'a>(&'a mut String8L);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, x: &str) -> core::fmt::Result {
+            let room = self.0.b.len() - self.0.n;
+            let take = x.len().min(room);
+            self.0.b[self.0.n..self.0.n + take].copy_from_slice(&x.as_bytes()[..take]);
+            self.0.n += take;
+            Ok(())
+        }
+    }
+    let _ = core::fmt::write(&mut W(s), args);
+}
+
+/// A fixed-size copy of a cell up to a line long, for the status note `cmd_godspeed` prints under its table.
+struct String8L { b: [u8; 240], n: usize }
+impl String8L {
+    fn new() -> String8L { String8L { b: [0; 240], n: 0 } }
+    fn from(s: &[u8]) -> String8L { let mut x = String8L::new(); x.set(s); x }
+    fn set(&mut self, s: &[u8]) { let n = s.len().min(self.b.len()); self.b[..n].copy_from_slice(&s[..n]); self.n = n; }
+    fn as_bytes(&self) -> &[u8] { &self.b[..self.n] }
 }
 
 /// A fixed-size copy of a short cell, so a status can outlive the table it was read from.
@@ -17576,7 +18517,7 @@ fn cmd_observe_now(ctx: &ShellCtx) -> Result<(), ShellError> {
             waited += PARK_POLL_MS;
             if !noticed && waited >= notice_ms {
                 noticed = true;
-                gs::io::println(ctx, "  [q] quit");
+                say_quit(ctx);
             }
             if noticed {
                 if let Some(b) = ctx.inner.try_console_read() {
@@ -17916,7 +18857,7 @@ const MAX_STAGES: usize = 8;
 /// shell's endpoint until the service sends an EOT (0x04), then the service is reaped. Whole-
 /// buffer messaging (≤ one message each way) keeps the bounded queues deadlock-free (§8.9).
 fn drain_service(ctx: &ShellCtx, svc: &str, input: Option<&[u8]>, out: &mut Cap) -> bool {
-    !matches!(drain_service_with(ctx, svc, &["shell"], input, out, FILTER_WAIT_SECS, None), Drained::Failed)
+    !matches!(drain_service_with(ctx, svc, &["shell"], input, out, FILTER_WAIT_SECS, None, None), Drained::Failed)
 }
 
 /// How a [`drain_service_with`] ended. Each way but `Eot` has already been said on the console; the
@@ -17943,7 +18884,16 @@ enum Drained {
 /// while the stage runs reaches the prompt instead of vanishing. `None` keeps a plain pipe stage's
 /// behaviour, which still drops type-ahead (recorded, `backlog/fixed/80` H16's receive side).
 fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
-                      wait_secs: i64, keep: Option<&dyn Fn(u8)>) -> Drained {
+                      wait_secs: i64, keep: Option<&dyn Fn(u8)>, progress: Option<&dyn Fn(&[u8])>) -> Drained {
+    drain_stage(ctx, svc, peers, input, out, wait_secs, keep, progress, 0)
+}
+
+/// [`drain_service_with`], and for a program that ENDS ITSELF after its output (an installed utility,
+/// `gs::program`), up to `grace_ms` for it to do so before it is ended: then its death says the status it
+/// chose, not that the shell killed it. Zero is the plain stage, ended as soon as its output is in.
+#[allow(clippy::too_many_arguments)]
+fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, out: &mut Cap,
+               wait_secs: i64, keep: Option<&dyn Fn(u8)>, progress: Option<&dyn Fn(&[u8])>, grace_ms: u64) -> Drained {
     // A stage crossing a service boundary is one IPC message until streaming chunks across
     // many. Refuse a larger buffer LOUDLY rather than silently clipping it to 4 KiB (§3.12).
     if let Some(inp) = input {
@@ -17962,12 +18912,19 @@ fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&
     // leaked one table slot per stage: about sixty `ask`s and pipe stages into a boot, the shell's table
     // was full and every later lookup failed (found by `selfcheck ask` run twice in one boot; the same
     // leak `spawn_on` closed for `backlog/fixed/80`).
-    match ctx.spawn_via_supervisor(svc, 0xFFFF, peers) {
-        Ok(cap) => { if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } }
-        Err(_) => {
-            gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
-            return Drained::Failed;
+    // A program that ends itself is an INSTALLED UTILITY, which the supervisor checks from the disk before it
+    // starts it: that takes longer than the 2 s a built-in stage's spawn is given, so it is asked with a longer
+    // wait that watches for `q` (`spawn_watched`). Asked with 2 s, the shell gave up on a utility that then
+    // started, and every later run of it was refused as already running.
+    let spawned = if grace_ms > 0 { spawn_watched(ctx, svc, peers, UTILITY_START_SECS) } else {
+        match ctx.spawn_via_supervisor(svc, 0xFFFF, peers) {
+            Ok(cap) => { if let Some(c) = cap { gs::cap::remove(ctx, gs::cap::Cap::from(c)); } true }
+            Err(_) => false,
         }
+    };
+    if !spawned {
+        gs::io::println_fmt(ctx, format_args!("pipe: failed to spawn '{}'", svc));
+        return Drained::Failed;
     }
     // One `[q] quit` for the whole stage: the registration wait below and the drain after it share it.
     let noticed = core::cell::Cell::new(false);
@@ -18014,12 +18971,23 @@ fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&
     // Aborted => the user pressed q. Both stop the drain loudly (§26.7) rather than blocking.
     // A stage that sends 512 messages and no EOT ends as `NoEot` too: the shell stopped it.
     let mut how = Drained::NoEot;
+    // PROGRESS FRAMES come first, if the stage sends any (`godspeed fetch`): each is `PROGRESS_FRAME` and a
+    // line, handed to `progress`. They are read only until the answer's first byte, so nothing in an answer
+    // can be taken for one.
+    let mut answering = progress.is_none();
     for _ in 0..512 {
         let got = recv_quittable(ctx, wait_secs, &noticed, keep.unwrap_or(&|_| {}));
         match got {
             ReqOutcome::Reply(msg) => {
                 let p = msg.payload_bytes();
                 if p == [PIPE_EOT] { how = Drained::Eot; break; }
+                if !answering {
+                    if let (Some(show), Some(line)) = (progress, p.strip_prefix(PROGRESS_FRAME)) {
+                        show(line);
+                        continue;
+                    }
+                    answering = true;
+                }
                 out.push(p);
                 if out.overflow { how = Drained::Overflow; break; }
             }
@@ -18032,9 +19000,190 @@ fn drain_service_with(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&
             }
         }
     }
+    if grace_ms > 0 && matches!(how, Drained::Eot) {
+        // Bounded by grace_ms, a second at most, and only after the program has sent its end byte.
+        let mut waited = 0u64;
+        while waited < grace_ms && task_running(ctx, svc) {
+            gs::task::sleep_ms(ctx, 20);
+            waited += 20;
+        }
+    }
     let _ = ctx.kill(svc);
     if out.overflow { gs::io::println(ctx, "pipe: pipe output exceeded the buffer (truncated)"); }
     how
+}
+
+/// How long the supervisor is given to check an installed utility from the disk and start it.
+const UTILITY_START_SECS: i64 = 30;
+
+/// Ask the supervisor to start `svc` wired to `peers`, waiting up to `secs` with `[q]` watched. True when it said
+/// it started; the capability it hands back is released, since the stage is reached by name.
+fn spawn_watched(ctx: &ShellCtx, svc: &str, peers: &[&str], secs: i64) -> bool {
+    use godspeed_sdk::service_context::supcmd;
+    let mut buf = [0u8; supcmd::MAX];
+    let Some(n) = supcmd::encode(&mut buf, supcmd::SPAWN, 0xFFFF, svc, peers) else { return false };
+    let reply = gs::call::request_watched(ctx, "supervisor", &Message::from_bytes(&buf[..n]), secs, ctx);
+    if let Some(c) = gs::ipc::take_sent_cap(ctx) { gs::cap::remove(ctx, c); }
+    match reply {
+        Ok(r) if r.payload_bytes().first() == Some(&supcmd::OK) => true,
+        Ok(r) => {
+            // WHY the supervisor refused an installed program: its check from the disk said, after the status.
+            let why = r.payload_bytes().get(1..).and_then(|w| core::str::from_utf8(w).ok()).filter(|w| !w.is_empty());
+            if let Some(why) = why { gs::io::println_fmt(ctx, format_args!("{}: not run - {}", svc, why)); }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Is a task called `name` running?
+fn task_running(ctx: &ShellCtx, name: &str) -> bool {
+    (0..256u32).any(|slot| {
+        let st = ctx.task_stat(slot);
+        st.valid && st.state != 4 && st.name_str() == name
+    })
+}
+
+/// The installed UTILITY or APP a typed command names - `hello-utility` for `godspeed/hello-utility` - as its task
+/// name and whether it is an app, asked of the supervisor (`supcmd::INSTALLED`). `None` when nothing installed has
+/// that name, or when two publishers' do, which is said, since guessing between them would run code the operator
+/// did not choose.
+fn installed_utility(ctx: &ShellCtx, cmd: &str) -> Option<(String8L, bool)> {
+    use godspeed_sdk::service_context::supcmd;
+    if cmd.is_empty() || cmd.contains('/') && cmd.split('/').count() != 2 { return None; }
+    let reply = hw_ask(ctx, "supervisor", &[supcmd::MARKER, supcmd::INSTALLED])?;
+    let b = reply.payload_bytes();
+    if b.first() != Some(&supcmd::OK) || b.len() < 2 { return None; }
+    let mut found: Option<(String8L, bool)> = None;
+    let mut many = false;
+    let mut i = 2usize;
+    for _ in 0..b[1] {
+        let l = *b.get(i)? as usize;
+        let name = b.get(i + 1..i + 1 + l)?;
+        let state = *b.get(i + 1 + l)?;
+        i += 2 + l;
+        if state != installed_state::UTILITY && state != installed_state::APP { continue; }
+        let n = core::str::from_utf8(name).unwrap_or("");
+        let short = n.rsplit('/').next().unwrap_or(n);
+        if n == cmd || short == cmd {
+            if found.is_some() { many = true; }
+            let mut s = String8L::new();
+            s.set(name);
+            found = Some((s, state == installed_state::APP));
+        }
+    }
+    if many {
+        gs::io::println_fmt(ctx, format_args!("{}: two installed utilities have that name - type it as publisher/name", cmd));
+        return None;
+    }
+    found
+}
+
+/// The `INSTALLED` answer's state byte (`services/supervisor/src/installed.rs`).
+mod installed_state {
+    pub const UTILITY: u8 = 2;
+    pub const APP: u8 = 3;
+}
+
+/// Run the installed APP `task` with `args`: started by the supervisor, handed its arguments, and then left to
+/// own the console until it gives it back - by ending, or by dying, since the kernel releases a dead holder's. The
+/// command lasts as long as the app does: returned any sooner, the shell drew its prompt under the app's screen and
+/// the app's keys and the next command fought over one ring.
+fn run_app(ctx: &ShellCtx, task: &str, args: &str) -> Result<(), ShellError> {
+    use godspeed_sdk::service_context::{death, supcmd};
+    if !spawn_watched(ctx, task, &["shell"], UTILITY_START_SECS) {
+        gs::io::println_fmt(ctx, format_args!("{}: could not be started", task));
+        return Err(ShellError::Unknown);
+    }
+    let noticed = core::cell::Cell::new(false);
+    match lookup_sink(ctx, task, &noticed, &|_| {}) {
+        Sink::Found(h) => {
+            let fed = gs::ipc::send_to(ctx, h, &Message::from_bytes(args.as_bytes())).is_ok()
+                && gs::ipc::send_to(ctx, h, &Message::from_bytes(&[PIPE_EOT])).is_ok();
+            gs::cap::remove(ctx, h);
+            if !fed {
+                gs::io::println_fmt(ctx, format_args!("{}: its arguments could not be sent - ended", task));
+                let _ = ctx.kill(task);
+                return Err(ShellError::Unknown);
+            }
+        }
+        _ => {
+            gs::io::println_fmt(ctx, format_args!("{}: never became ready - ended", task));
+            let _ = ctx.kill(task);
+            return Err(ShellError::Unknown);
+        }
+    }
+    // Until it has the console: a second at most, since an app takes it as its first act.
+    let mut waited = 0u64;
+    while waited < 1000 && ctx.is_console_foreground() && task_running(ctx, task) {
+        gs::task::sleep_ms(ctx, 20);
+        waited += 20;
+    }
+    // Then for as long as it holds it. This reads no key - they are the app's, and the kernel gives this shell none
+    // while it holds the console - so it is the app's own quit that ends it, as `chaos`'s `q` ends a storm; the
+    // operator channel's `kill` is the way out of an app that will not. One poll every 50 ms.
+    while !ctx.is_console_foreground() && task_running(ctx, task) {
+        gs::task::sleep_ms(ctx, 50);
+    }
+    // The console is back. The kernel pushed a newline to wake a reader; take it, and anything typed at the app after
+    // it stopped reading, so neither runs as a command.
+    for _ in 0..512 {
+        if ctx.try_console_read().is_none() { break; }
+    }
+    // A moment for it to end, if it gave the console back and is still finishing.
+    let mut waited = 0u64;
+    while waited < 1000 && task_running(ctx, task) {
+        gs::task::sleep_ms(ctx, 20);
+        waited += 20;
+    }
+    // How it ended, as for a utility: the supervisor's death record.
+    let mut q = [0u8; 2 + 80];
+    let n = task.len().min(80);
+    q[0] = supcmd::MARKER;
+    q[1] = supcmd::DEATH;
+    q[2..2 + n].copy_from_slice(&task.as_bytes()[..n]);
+    if let Some(r) = hw_ask(ctx, "supervisor", &q[..2 + n]) {
+        let b = r.payload_bytes();
+        if b.len() >= 23 && b[13] == death::EXITED {
+            let status = u64::from_le_bytes([b[15], b[16], b[17], b[18], b[19], b[20], b[21], b[22]]);
+            if status != 0 {
+                gs::io::println_fmt(ctx, format_args!("{}: ended with status {}", task, status));
+                return Err(ShellError::Unknown);
+            }
+        } else if b.len() >= 14 && b[13] == death::FAULT {
+            gs::io::println_fmt(ctx, format_args!("{}: ended by a fault - the console is the shell's again", task));
+            return Err(ShellError::Unknown);
+        }
+    }
+    Ok(())
+}
+
+/// Run the installed utility `task` with `args`, as `ask` runs: started by the supervisor wired to send to this
+/// shell, handed its arguments, its output read until its end byte and written to `out` - the console, or the
+/// next stage of a pipe - and its status said when it is not 0.
+fn run_utility(ctx: &ShellCtx, task: &str, args: &str, out: &mut Out) -> Result<(), ShellError> {
+    use godspeed_sdk::service_context::{death, supcmd};
+    let mut cap = Cap::new();
+    let how = drain_stage(ctx, task, &["shell"], Some(args.as_bytes()), &mut cap, FILTER_WAIT_SECS, None, None, 1000);
+    out.put_bytes(ctx, &cap.buf[..cap.len]);
+    if !matches!(how, Drained::Eot) { return Err(ShellError::Unknown); }
+    // How it ended: the supervisor keeps the newest death per name (`supcmd::DEATH`).
+    let mut q = [0u8; 2 + 80];
+    let n = task.len().min(80);
+    q[0] = supcmd::MARKER;
+    q[1] = supcmd::DEATH;
+    q[2..2 + n].copy_from_slice(&task.as_bytes()[..n]);
+    let Some(r) = hw_ask(ctx, "supervisor", &q[..2 + n]) else { return Ok(()) };
+    let b = r.payload_bytes();
+    if b.len() >= 23 && b[13] == death::EXITED {
+        let status = u64::from_le_bytes([b[15], b[16], b[17], b[18], b[19], b[20], b[21], b[22]]);
+        if status == 0 { return Ok(()); }
+        gs::io::println_fmt(ctx, format_args!("{}: ended with status {}", task, status));
+        return Err(ShellError::Unknown);
+    }
+    // It did not end itself within the grace the drain gave it, so the shell ended it.
+    gs::io::println_fmt(ctx, format_args!("{}: did not end by itself after its output - ended", task));
+    Err(ShellError::Unknown)
 }
 
 /// Split `s` into (first word, rest-trimmed).
@@ -18090,6 +19239,19 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
     match cmd {
         "wifi" => wifi_pipe_refusal(arg),
         "audio" => audio_pipe_refusal(arg),
+        "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
+            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
+            (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
+            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset" | "add" | "remove")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade', 'trust reset', 'trust add' and 'trust remove' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, inspect, list, verify, trust, registry, config and check"),
+            (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) | (Some("search"), _) | (Some("info"), _) | (Some("list"), _)
+                | (Some("verify"), _) | (Some("trust"), None) => None,
+            // A report; a file named by a full path, because a pipe stage is not given the folder it was typed in.
+            (Some("inspect"), Some(x)) if !x.ends_with(".gsp") || x.starts_with('/') => None,
+            // Piped, `cleanup` is the listing alone: nothing is asked, so nothing is deleted.
+            (Some("cleanup"), None) => None,
+            (Some("inspect"), _) => Some("pipe: in a pipe, name the package file by its full path, as in godspeed inspect /users/default/hello-0.3.0.gsp"),
+            _ => Some("pipe: pipe a report: godspeed search, info, inspect, list, registry, config or check"),
+        },
         "churn" if arg.split_whitespace().next() == Some("verify") => None,
         "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),
         _ => None,
@@ -18895,7 +20057,7 @@ fn chaos_link_flap(ctx: &ShellCtx, tok: &[&str], ntok: usize) -> Result<(), Shel
     let clr  = Message::from_bytes(&[8]);
     for cycle in 1..=cycles {
         gs::io::println_fmt(ctx, format_args!(
-            "chaos link-flap: cycle {}/{} - forcing link DOWN  [q] quit", cycle, cycles));
+            "chaos link-flap: cycle {}/{} - forcing link DOWN", cycle, cycles));
         match net_query(ctx, "nic-driver", &down, 3, None) {
             NetQ::Aborted => {
                 let _ = net_query(ctx, "nic-driver", &clr, 2, None);
@@ -19012,7 +20174,7 @@ fn chaos_launch(
         None if target_all => {
             let dt = gs::task::datetime(ctx);
             let s = ((dt.minute as u64) << 24) ^ ((dt.second as u64) << 40)
-                ^ ((ctx.hw_random().unwrap_or(0) as u64) << 8)
+                ^ ((gs::task::hw_random(ctx).unwrap_or(0) as u64) << 8)
                 ^ ((gs::task::epoch_secs_monotonic(ctx) as u64) << 17)
                 ^ (gs::task::uptime_secs(ctx) as u64);
             (Some(if s == 0 { 1 } else { s }), 2u8)
@@ -19806,18 +20968,6 @@ fn time_floor(ctx: &ShellCtx) -> Option<i64> {
     Some(i64::from_le_bytes(b))
 }
 
-/// Raise the clock floor, via the `time` service. Returns false when it could not be reached or did
-/// not confirm: `time` keeps the higher of the two floors and confirms either way, so it never refuses.
-fn time_floor_set(ctx: &ShellCtx, epoch: i64) -> bool {
-    let mut body = [0u8; 9];
-    body[0] = 4;                                     // OP_FLOOR_SET
-    body[1..9].copy_from_slice(&epoch.to_le_bytes());
-    match time_rpc(ctx, &body) {
-        Some(r) => r.payload_bytes().first() == Some(&1),
-        None => false,
-    }
-}
-
 /// The wall clock's current reading, per the `time` service. `None` when it could not be asked - the
 /// caller must not substitute a guess, because a rendered date is indistinguishable from a known one.
 fn time_now(ctx: &ShellCtx) -> Option<i64> {
@@ -19827,6 +20977,18 @@ fn time_now(ctx: &ShellCtx) -> Option<i64> {
     let mut b = [0u8; 8];
     b.copy_from_slice(&p[1..9]);
     Some(i64::from_le_bytes(b))
+}
+
+/// For `date sync`, from ONE `OP_NOW`: seconds since the network last set the clock (`None` if it never
+/// did this boot), and whether `time` has refused its NTP setting with no re-read pending (byte 18).
+fn time_sync_state(ctx: &ShellCtx) -> (Option<i64>, bool) {
+    let Some(r) = time_rpc(ctx, &[1]) else { return (None, false) };
+    let p = r.payload_bytes();
+    if p.len() < 18 || p[0] == 0 { return (None, false); }
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&p[10..18]);
+    let age = match i64::from_le_bytes(b) { a if a < 0 => None, a => Some(a) };
+    (age, p.len() > 18 && p[18] == 1)
 }
 
 /// Seconds since the network last set the clock, or `None` if it never did this boot. Rides on OP_NOW
@@ -20415,8 +21577,10 @@ fn drain_stale_fs_replies(ctx: &ServiceContext) {
 #[inline(always)]
 fn ask_watched(ctx: &ShellCtx, peer: &str, msg: &Message, secs: i64) -> Option<Message> {
     if !ctx.cmd_active.get() {
-        // quit-ok: between commands, where there is no command to quit; inside one, the watch below
-        return ctx.request_with_reply_deadline(peer, msg, secs);
+        // quit-ok: between commands, where there is no command to quit; inside one, the watch below.
+        // Through the reply mailbox, so an answer that comes after the deadline cannot become the next
+        // command's (`net_query` says how it did).
+        return gs::call::request_within(ctx, peer, msg, secs).ok();
     }
     gs::call::request_watched(ctx, peer, msg, secs, ctx).ok()
 }
@@ -20428,7 +21592,7 @@ fn ask_watched(ctx: &ShellCtx, peer: &str, msg: &Message, secs: i64) -> Option<M
 /// its own frame that would be another 4 KiB of the shell's stack.
 #[inline(always)]
 fn ask_with_quit_notice(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64) -> ReqOutcome {
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // type-ahead read during the wait is kept (H16)
     // Inside a command the command's watch is the observer; between commands, the request's own notice.
     let r = if ctx.cmd_active.get() {
@@ -20479,7 +21643,7 @@ fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
 fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
     // `q` quits the wait, as `dir`'s does, and a key typed meanwhile is KEPT for the prompt
     // (`backlog/fixed/80` H16): without a notice the callers' `Cancelled` arms could never fire.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.stat(path);
@@ -20490,7 +21654,7 @@ fn fs_stat_r(ctx: &ShellCtx, path: &[u8]) -> Result<gs::fs::Stat, gs::Error> {
 /// Stat a path: `Some((size, is_dir))` if it exists, `None` otherwise (absent and unanswered alike).
 /// Used by the streaming read/copy paths to learn a file's size before chunking through it.
 fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits; type-ahead kept (H16)
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.stat(path);
@@ -20503,7 +21667,7 @@ fn fs_stat(ctx: &ShellCtx, path: &[u8]) -> Option<(u64, bool)> {
 fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Option<usize> {
     // q quits the wait and type-ahead is kept (H16). `None` is then "no answer", as a failure is - so
     // every caller must treat `None` as a failure, never as the end of the file (EOF is Some(0)).
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.read_at(path, offset, out);
@@ -20750,7 +21914,7 @@ fn cmd_dir(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], out: &mut Out) -> Result<()
     let mut truncated = false;
     // The PAGING, the entry layout, the page cap and the did-it-finish answer are the library's.
     // What stays here is what `dir` means by a row.
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     // A key typed while the listing waits is the NEXT command, and is kept for it (H16): the notice
     // reads the console to see `q`, and used to discard everything else it read.
     let keep = |b: u8| ctx.keep_key(b);
@@ -20904,7 +22068,7 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     let mut gfs = ctx.fs();
     let _ = gfs.create_dir_all(DIR);
     out.line_fmt(ctx, format_args!(
-        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT  [q] quit", secs));
+        "churn: writing continuously for {}s - CUT THE POWER AT ANY POINT", secs));
 
     let mut buf = [0u8; 3000];
     let mut path = [0u8; 32];
@@ -21343,7 +22507,7 @@ fn recv_quittable(ctx: &ShellCtx, secs: i64, noticed: &core::cell::Cell<bool>, k
     let after = if noticed.get() { i64::MAX } else { gs::call::NOTICE_AFTER_SECS };
     ctx.recv_abortable_deadline_noticing(secs, after, &|| {
         noticed.set(true);
-        gs::io::println(ctx, "  [q] quit");
+        say_quit(ctx);
     }, keep)
 }
 
@@ -24063,6 +25227,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
     }
 
     gs::io::println(ctx, "[q] quit   [b] background");
+    ctx.quit_shown();
     let mut shown = 101u32; // impossible, so the first sample always prints
     loop {
         // A `q` the status wait below read is the command's quit, set on `ctx.quit` rather than left for this
@@ -24346,7 +25511,7 @@ fn cmd_find(ctx: &ShellCtx, cwd: &Cwd, target: &str, start: &str, out: &mut Out)
     let mut first = true;
     let mut dir = [0u8; PATH_MAX];
     let mut cancelled = false;
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits the walk; type-ahead kept (H16)
     while let Some(dlen) = stack.pop(&mut dir) {
         let is_start = first;
@@ -24467,7 +25632,7 @@ fn cmd_tree(ctx: &ShellCtx, cwd: &Cwd, arg: &str, out: &mut Out) -> Result<(), S
         // second buffer: the entries are already on the stack.
         let base = stack.top;
         let mut nc = 0usize;
-        let notice = || gs::io::println(ctx, "  [q] quit");   // q quits the walk; type-ahead kept (H16)
+        let notice = || say_quit(ctx);   // q quits the walk; type-ahead kept (H16)
         let keep = |b: u8| ctx.keep_key(b);
         let mut g = ctx.fs_waiting(&notice, &keep);
         let walked = g.list_dir(&buf[..plen], |e| {
@@ -24682,7 +25847,7 @@ const FILTER_READ_MAX: usize = 8192;
 /// matters is the one the old path could not make: a file that is ABSENT versus one that is merely
 /// bigger than the buffer. Both used to print "not found".
 fn filter_read(ctx: &ShellCtx, verb: &str, path: &[u8], buf: &mut [u8]) -> Result<usize, ()> {
-    let notice = || gs::io::println(ctx, "  [q] quit");
+    let notice = || say_quit(ctx);
     let keep = |b: u8| ctx.keep_key(b);   // q quits the read (match, count, sort, first, last); type-ahead kept (H16)
     let mut g = ctx.fs_waiting(&notice, &keep);
     let r = g.read_into(path, buf);
@@ -25059,15 +26224,19 @@ fn cmd_drives(ctx: &ShellCtx, args: &[&str], argc: usize) -> Result<(), ShellErr
             // well as `drives flash data force`, and requiring a fixed position silently dropped the
             // override in the selector form - which then refused a disk the operator had just forced.
             let force = args[2..argc].iter().any(|a| *a == "force");
+            // `yes` answers the `[y/N]` in advance, as it does for `seal` and `chaos max-carnage`: the
+            // warning still prints, and a script or a person who has already decided is not asked twice.
+            // Recognised anywhere, like `force`, so neither word can be a drive's label.
+            let yes = args[2..argc].iter().any(|a| *a == "yes");
             let mut kept = [""; MAX_ARGS];
             let mut n = 0usize;
             for a in args[..argc].iter() {
-                if *a == "force" { continue; }
+                if *a == "force" || *a == "yes" { continue; }
                 kept[n] = a;
                 n += 1;
             }
             let (sel, label) = split_drive_value(&kept, n);
-            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label, force) } else { Err(ShellError::Unknown) }
+            if drive_sel_ok(ctx, sel) { drives_flash(ctx, label, force, yes) } else { Err(ShellError::Unknown) }
         }
         "label"   => {
             // `drives label [drive] <name>` - selector optional; name required.
@@ -25232,15 +26401,19 @@ fn drives_list(ctx: &ShellCtx) -> Result<(), ShellError> {
 /// be the GSFS target), and a confirmation prompt cannot convey that - `drives` shows it as an
 /// unformatted raw disk either way. So the danger is named explicitly and the override is a word the
 /// operator has to type.
-fn drives_flash(ctx: &ShellCtx, label: &str, force: bool) -> Result<(), ShellError> {
+fn drives_flash(ctx: &ShellCtx, label: &str, force: bool, yes: bool) -> Result<(), ShellError> {
     if label.len() > LABEL_MAX {
         gs::io::println_fmt(ctx, format_args!("drives: label too long (max {})", LABEL_MAX));
         return Err(ShellError::Unknown);
     }
-    gs::io::print(ctx, "This ERASES the drive. Continue? [y/N] ");
-    if !read_confirm(ctx) {
-        gs::io::println(ctx, "drives: aborted");
-        return Err(ShellError::Unknown); // the requested format did not happen
+    if yes {
+        gs::io::println(ctx, "This ERASES the drive. Continue? [y/N] yes (given on the command line)");
+    } else {
+        gs::io::print(ctx, "This ERASES the drive. Continue? [y/N] ");
+        if !read_confirm(ctx) {
+            gs::io::println(ctx, "drives: aborted");
+            return Err(ShellError::Unknown); // the requested format did not happen
+        }
     }
     let lb = label.as_bytes();
     let ll = lb.len().min(LABEL_MAX);
@@ -25313,7 +26486,7 @@ fn drives_check(ctx: &ShellCtx) -> Result<(), ShellError> {
     // running state to hand to a service. Typed at the prompt, `drives check` runs as a job instead and its
     // notice offers `[b]` (`run_typed_as_job`); this is the form a script or a pipe runs, or when a job is
     // already running.
-    gs::io::println(ctx, "drives check - walking the tree   [q] quit");
+    gs::io::println(ctx, "drives check - walking the tree");
     // q-abortable: a tree walk on a slow stick takes seconds (bounded by FS_FSCK_SECS), and a shell
     // parked in a request it cannot leave cannot see the keystroke that asks it to stop (conventions rule 9).
     match fs_op_q(ctx, OP_CHECK) {

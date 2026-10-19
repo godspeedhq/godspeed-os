@@ -15,10 +15,13 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{}", ld.display());
     println!("cargo:rerun-if-changed={}", ld.display());
     println!("cargo:rustc-link-arg=--entry=service_main");
+    // This machine's architecture, for the installed-package check (`installed.rs`): a package's binary for another
+    // cannot run here. Asked once, here, rather than by `target_arch` at the site.
+    println!("cargo:rustc-env=SUPERVISOR_TARGET={}", std::env::var("TARGET").unwrap());
 
     // The images this supervisor carries.
     const EMBEDDED: &[&str] = &["pong", "roster", "reply-server", "holder", "upper", "mem-pressure",
-        "ping", "time", "events", "recorder", "copier", "ask", "asker", "resource-server", "chaos", "control", "observe", "greet",
+        "ping", "time", "events", "recorder", "copier", "ask", "godspeed-pm", "asker", "resource-server", "chaos", "control", "observe", "greet",
         "counter", "shell", "fs", "net-stack", "block-driver", "console", "nic-driver", "power"];
 
     // The USB host drivers exist only where their controller does, so they are embedded PER ARCH -
@@ -212,7 +215,54 @@ fn main() {
                     supervisor (osdev does this; a bare `cargo build -p supervisor` does not)",
                    name, elf.display());
         }
-        println!("cargo:rustc-env=SVC_{}_ELF={}", name.to_uppercase().replace('-', "_"), elf.display());
+        // EMBEDDED TRIMMED: the loader reads the ELF header, the program headers and the bytes they load
+        // (`kernel/src/loader.rs`), and nothing else, so a service's symbol table and section headers are a fifth
+        // of its file carried for nobody. On the Pi 2 the whole kernel, this supervisor and every image in it
+        // must end below the service context page at 0x3ff000 (`kernel/kernel-arm.ld`), and on 2026-10-19 it
+        // stopped fitting. The copy in `target/` is left whole: `scripts/stack_fit_check.py` reads its symbols.
+        let bytes = std::fs::read(&elf).unwrap_or_else(|e| panic!("supervisor/build.rs: '{}' unreadable: {e}", elf.display()));
+        let slim = trim_elf(&bytes).unwrap_or_else(|why| panic!("supervisor/build.rs: '{}' is not an ELF this can trim: {why}", name));
+        let out_elf = std::path::Path::new(&out).join(format!("{name}.elf"));
+        std::fs::write(&out_elf, &slim).unwrap_or_else(|e| panic!("supervisor/build.rs: cannot write {}: {e}", out_elf.display()));
+        println!("cargo:rustc-env=SVC_{}_ELF={}", name.to_uppercase().replace('-', "_"), out_elf.display());
         println!("cargo:rerun-if-changed={}", elf.display());
     }
+}
+
+/// The ELF with only what a loader reads: the header, the program headers and every segment's file bytes,
+/// cut after the last of them, with the section header table forgotten (its offset, count and name index set to 0).
+/// Little-endian ELF32 or ELF64, the only kinds built here. Anything it does not recognise is refused, never
+/// passed through half understood.
+fn trim_elf(b: &[u8]) -> Result<Vec<u8>, &'static str> {
+    if b.len() < 52 || b[..4] != [0x7f, b'E', b'L', b'F'] { return Err("no ELF magic"); }
+    if b[5] != 1 { return Err("not little-endian"); }
+    let u16_at = |o: usize| -> Result<u64, &'static str> {
+        b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]) as u64).ok_or("truncated header")
+    };
+    let u32_at = |o: usize| -> Result<u64, &'static str> {
+        b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as u64).ok_or("truncated header")
+    };
+    let u64_at = |o: usize| -> Result<u64, &'static str> {
+        b.get(o..o + 8).map(|s| u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]])).ok_or("truncated header")
+    };
+    // (phoff, shoff field, phentsize, phnum, shnum field, shstrndx field, p_offset at, p_filesz at, word)
+    let (phoff, shoff_at, phentsize, phnum, shnum_at, shstrndx_at, off_at, filesz_at, wide) = match b[4] {
+        1 => (u32_at(0x1C)?, 0x20, u16_at(0x2A)?, u16_at(0x2C)?, 0x30, 0x32, 4, 0x10, false),
+        2 => (u64_at(0x20)?, 0x28, u16_at(0x36)?, u16_at(0x38)?, 0x3C, 0x3E, 8, 0x20, true),
+        _ => return Err("neither ELF32 nor ELF64"),
+    };
+    let mut end = phoff + phentsize * phnum;
+    for i in 0..phnum {
+        let ph = (phoff + i * phentsize) as usize;
+        let (off, size) = if wide { (u64_at(ph + off_at)?, u64_at(ph + filesz_at)?) } else { (u32_at(ph + off_at)?, u32_at(ph + filesz_at)?) };
+        end = end.max(off + size);
+    }
+    let end = end as usize;
+    if end > b.len() { return Err("a segment runs past the file"); }
+    let mut out = b[..end].to_vec();
+    let zero = if wide { 8 } else { 4 };
+    out[shoff_at..shoff_at + zero].fill(0);
+    out[shnum_at..shnum_at + 2].fill(0);
+    out[shstrndx_at..shstrndx_at + 2].fill(0);
+    Ok(out)
 }

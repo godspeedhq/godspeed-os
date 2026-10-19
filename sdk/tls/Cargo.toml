@@ -1,0 +1,34 @@
+[package]
+name = "godspeed-tls"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+# A TLS 1.3 client, written here from RFC 8446, for the native `godspeed` package manager
+# (`docs/developer-services-design.md` 10.3). A library, not a service: no entry point, nothing spawned.
+# `no_std` and heap-free (CLAUDE.md 26.6.1): every buffer is the caller's.
+[lib]
+name = "godspeed_tls"
+path = "src/lib.rs"
+
+# The primitives are RustCrypto's (MIT OR Apache-2.0, taken as MIT) and dalek's X25519 (BSD-3-Clause), both
+# compatible with GPL-2.0-only. Every default feature is off: no `std`, no `alloc`, no `getrandom` (the
+# caller supplies the randomness, from InspectKernel query 19). The protocol on top of them is ours.
+#
+# They must not choose a SIMD path at run time on a device target: the x86 kernel saves no SSE or AVX state
+# across a context switch. `.cargo/config.toml` forces their portable code on every device target for that
+# reason; read it before changing these.
+[dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+hmac = { version = "0.12", default-features = false }
+hkdf = { version = "0.12", default-features = false }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
+# Certificate chains (`verify`). rustls-webpki is ISC and its `untrusted` dependency ISC; pki-types, p256, p384
+# and ecdsa are MIT OR Apache-2.0. webpki is built without `alloc` and without a crypto provider: the ECDSA
+# checks it asks for are the p256/p384 ones in `verify`.
+rustls-webpki = { version = "0.103", default-features = false }
+rustls-pki-types = { version = "1.12", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+ecdsa = { version = "0.16", default-features = false, features = ["der", "verifying"] }

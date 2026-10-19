@@ -1458,3 +1458,54 @@ amendment with a rationale):
 the entries the corrected comments no longer need (four in all) - the ratchets tightened. `facts_check`
 fell from 47 statements to 46 mid-pass, when a rewrite of `CONTRIBUTING.md` dropped the sentence it
 verified; it was restored, and the check reads 48. Every documentation gate is green.
+
+## Audit 16 - documents and code comments, `feat/tls` since it left `main` (2026-10-16)
+
+Scope: the branch that added the TLS client (`sdk/tls`), the package manager (`services/godspeed-pm`,
+`utilities/61_godspeed.md`), `net-stack`'s op 23, x86 RDRAND, the RTL8168 receive fix, the noticing
+wait's retry and the `SpawnImage` already-running code - 56 files, every document the branch changed
+and the comments it added or touched. One reader, the session that wrote the code (the operator asked
+for a smaller effort), so this is a self-audit and weaker evidence than an independent one; every claim
+below was checked against the code before it was changed.
+
+**Overtaken by the day's own hardware cards.** Four places still said what was true that morning:
+`utilities/61_godspeed.md` ("QEMU only, no board yet"), `docs/developer-services-design.md` 10.1 ("Built
+... (QEMU only)", and it named three commands where the registries had since made seven), the RDRAND
+comment in `arch/x86_64/mod.rs` ("which of the PCs here have it is not yet checked") and its entry in
+`audits/unsafe-audit.md`. The T630 and the Wyse 5070 both have RDRAND, and `godspeed check` verified the
+registry on both. `docs/driver-library.md` 1j gained the Wyse's result beside the T630's.
+
+**A comment contradicted by the change it sat on.** `gs::call::request_within_notice`'s documentation
+kept its first bullet, "No retry. A stale capability is not reacquired", directly above the new bullet
+saying a request that never left IS retried after reacquiring the peer; and the module header still said
+the noticing wait "cannot draw" the retry diagram. Both now say what the code does, with the date the
+behaviour changed.
+
+**Comments that claimed more than the code does:**
+- `https.rs` said every wait is bounded by `timeout-secs`. The name lookup and the connection keep
+  `gs::net`'s own bounds (10 s and 20 s); `timeout-secs` bounds the rest, counted from the start, so a
+  value under 30 does not shorten those two. Said so there and in the utility's settings table. The
+  shell's 120 s wait still covers the worst case.
+- `sdk/tls`'s crate header said certificate checking is "the caller's"; since slice 3 the crate holds
+  `WebPkiVerifier`, and its list of what is not ours left out `rustls-webpki`, `p256` and `p384`.
+  `verify.rs` said "a pinned root" of a verifier that takes up to eight.
+- `godspeed-pm`'s `load` described an `Ok(None)` it cannot return, and the default roots it does not write.
+- The shell's `cmd_godspeed` listed `config` and `check` and not `registry`.
+- `docs/developer-services-design.md` 10.3 proposed roots "built into the service"; as built they are files
+  in `tls-roots`. Marked as built, the proposal left standing.
+- `utilities/61_godspeed.md` 4: the `registry` row's note is the name and `(in use)`.
+
+**Checked and found right:** `docs/tcp-design.md`'s op 23 section (`MAX_CONNS = 2`, the 8 s budget and the
+10 s handshake deadline, ARP asked once); `nic-driver`'s quotation of its own e1000 comment; `config.rs`'s
+comments against its parser; the shell's `help`, `version` and `registry help` for `godspeed`, which the
+spec lists and the program leaves to the shell, as every utility does.
+
+**Code, recorded and not changed (an audit changes documents only):**
+- `arch/x86_64/mod.rs`: rustc reports `unsafe { __cpuid(1) }` as `unused_unsafe` - the intrinsic is a safe
+  function on this toolchain - so `audits/unsafe-audit.md`'s 38 -> 40 holds one block the code does not
+  need. Noted in that entry.
+- `stdlib/rust/src/call.rs`: an `#[inline]` sits between two halves of `request_within_notice`'s doc
+  comment. Harmless (the doc still attaches) and older than this branch.
+
+**Gates:** every documentation checker green (dash, doc refs, doc and comment symbols, line refs, facts,
+site, unsafe). `osdev test shell` 273 passed, 0 failed, 2 skipped, on `551f0c2d`.

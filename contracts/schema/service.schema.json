@@ -51,7 +51,11 @@
    "type": "boolean",
    "description": "Authority to push bytes into the console INPUT ring the shell reads as typed commands (privbits::CONSOLE_PUSH; 6.4 SEC-2) - the keyboard drivers' job. It is NOT needed to print: `godspeed::io` prints through ConsoleWrite, which the kernel gates on LOG_WRITE. Granted from the spawn request, like every other privilege; declared here because 13.6 makes the contract the reviewable statement of what a service may do. `scripts/contract_check.py` fails a declaration the crate's code never uses (no `console_push(` call), because an unused grant of keystroke authority is an over-grant."
   },
-  "log_write": {
+  "handover": {
+          "type": "boolean",
+          "description": "This service can hand its state to a newer version of itself and end, so an upgrade replaces it without stopping it (`gs::handover`, CLAUDE.md 2.5 amendment 2026-10-17). A declaration, not a grant: it asks for nothing. Without it, an upgrade stops the old version and starts the new one. A service's only: an app, a utility or a driver that declares it is refused (a driver because two drivers would program one device)."
+        },
+        "log_write": {
           "type": "boolean",
           "description": "Permission to write the kernel log: syscall 5, straight to the 16 KiB ring buffer and the serial console. NOT routed through any service - CLAUDE.md 11.4 (amendment 2026-09-04) exists to deny exactly that, so that observing a failure never depends on a service that can fail."
         },
