@@ -2,7 +2,9 @@
 
 **Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
-converted to the first three across all four ports, and AHCI, GENET, `nic-driver`'s e1000 and RTL8168, and `audio-driver` on the grants and their layout, and `xhci`, `dwc2` and `ehci` on the grants (step 3). "Current state" below says what exists; the
+converted to the first three across all four ports; and since 2026-10-19 every compiled driver on the grants
+(step 3) - AHCI, GENET, `nic-driver`'s e1000 and RTL8168 and `audio-driver` with their arena laid out by name,
+the rest at their offsets, and the one-way ratchet holding a new driver to them. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -89,7 +91,9 @@ and why; read them for the reasoning, not to find out what the library contains.
   (`Layout::take(name, len, align)`), each aligned on its PHYSICAL address, never overlapping, every access
   bounded to the part and a part that does not fit refused with its name (`NoRoom`). The placement is a
   pure function pinned by host tests (`cargo test --lib` in `stdlib/rust`). Both wrap the SDK's audited
-  `Mmio` and `Dma`, so no `unsafe` moved.
+  `Mmio` and `Dma`, so no `unsafe` moved. **Every compiled driver takes its grants this way** (2026-10-19),
+  and `scripts/one_way_check.py` counts `ctx.mmio()`, `xhci_mmio`, `ehci_mmio` and `dma_region()`, so a new
+  driver is held to zero of them from its first line.
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
 (1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
@@ -101,7 +105,8 @@ verified on hardware**). `audio-driver` and `pwm-audio` were written on the libr
 |---|---|---|---|
 | `dwc2`'s complete-split NYET retry | Pi 2 | a retry count of sleeps on the keyboard path | 1g |
 | `dwmac`'s `rgmii_loopback_sweep` | VisionFive | compiled but never run | 1i |
-| `block-driver` `sdhci.rs` | none | not compiled | 1b |
+| `block-driver` `sdhci.rs` | none | not compiled; its window is still the SDK's `Mmio`, handed in by a caller that does not exist | 1b, 3 |
+| the arena LAYOUT of `xhci`, `dwc2`, `ehci`, `dwmac` and `pwm-audio` | all | on the grants, still at offset constants; `xhci`'s is the largest (six device slices, the scratchpad, the disk's region, the hub probe inside the ERST page) | 3 |
 
 **Open gaps, recorded rather than hidden.**
 
@@ -728,3 +733,9 @@ and the control transfers through the arena (the device descriptor, the address,
 the log matched the code before the change line for line, both stopping at `Get_Hub_Descriptor failed`
 because the driver takes the high-speed device for the hub the T630 has. QEMU cannot model that hub: its
 `usb-hub` is full speed and will not attach to EHCI. Owed: a card on the T630, with step 1l's.
+
+**`pwm-audio`, `dwmac` and `wifi-driver` last, their grants only.** The same type change; none of them runs
+in QEMU (no jack, no dwmac, no radio is granted there), so each is built for its boards - the Pis, the
+VisionFive, the Pi 4 and the VisionFive - and owes its card. With them no compiled service or example takes a
+grant from the SDK, and `one_way_check.py` counts the four grant calls, shown to fail on a `ctx.mmio()`
+planted in `examples/e1000` and pass once it was removed.

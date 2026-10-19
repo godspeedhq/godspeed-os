@@ -73,6 +73,9 @@ the 2026-10-11 survey:
   (`docs/driver-library.md` step 3).
 - **Taking the grants.** Nine drivers each handle "no window or arena granted" in their own words. The
   shared part is taking both and saying plainly what is missing; what to do then stays the driver's.
+  **Built 2026-10-19:** every compiled driver takes them through `gs::driver::registers` and `arena`, and
+  the one-way ratchet counts the SDK's four grant calls, so a new driver starts at zero
+  (`docs/driver-library.md` step 3). Five arenas are still at offset constants.
 
 **The principle that decides what goes in `gs` (settled 2026-10-11).** The SDK answers *what can this
 kernel do, and how is it reached safely*: the syscall ABI and the audited `unsafe` (CLAUDE.md 18.1),

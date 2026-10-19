@@ -15,9 +15,10 @@ crate missing from the baseline - a new service - is held to zero, so new code i
 from its first line, and the old code converges as it is touched (the stdlib-dogfood work).
 
 WHAT IT DOES NOT COUNT, on purpose:
-  - SDK methods with no `gs` equivalent (spawning, the hardware accessors `Mmio`/`Dma`, the raw syscall
-    seam). Asking for a replacement that does not exist would make the gate a wall instead of a ratchet;
-    those are `gs::driver`'s gaps to close (`docs/driver-library.md`), recorded there, not here.
+  - SDK methods with no `gs` equivalent (spawning, the raw syscall seam). Asking for a replacement that
+    does not exist would make the gate a wall instead of a ratchet; those are `gs`'s gaps to close
+    (`docs/driver-library.md` for a driver's), recorded there, not here. The hardware GRANTS were one
+    until 2026-10-19 and are counted since (below).
   - `ctx.log` / `ctx.log_fmt`: logging is the kernel floor every service writes to directly, by design
     (CLAUDE.md 11.4), and there is no second way to do it.
   - Anything after `//` on a line, which is every line comment and doc comment. Two edges, both
@@ -93,6 +94,12 @@ REPLACEMENT = {
     "resource_mint": "gs::resource::mint",
     "last_recv_badge": "gs::resource::last_badge",
     "send_peer_handle": "gs::ipc::peer",
+    # Added 2026-10-19, when every compiled driver had moved its grants onto `gs::driver`
+    # (`docs/driver-library.md` step 3): a NEW driver takes them the one way from its first line.
+    "mmio": "gs::driver::registers",
+    "xhci_mmio": "gs::driver::registers",
+    "ehci_mmio": "gs::driver::registers",
+    "dma_region": "gs::driver::arena",
 }
 CALL = re.compile(r"(?:\bctx|\.ctx)\s*\.\s*(" + "|".join(sorted(REPLACEMENT, key=len, reverse=True)) + r")\s*\(")
 COMMENT = re.compile(r"//[^\n]*")
