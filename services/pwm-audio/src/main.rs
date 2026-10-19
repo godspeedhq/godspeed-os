@@ -37,8 +37,9 @@ use godspeed_audio::settings::{self, Settings};
 use godspeed_audio::sine::Sine;
 use godspeed_audio::sounds::{self, Chime};
 use godspeed_audio::wire;
-use godspeed_sdk::mmio::Mmio;
-use godspeed_sdk::{Dma, Message, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed::driver::Arena;
+use godspeed_sdk::{Message, ServiceContext};
 
 // ---- The window: the PWM page at +0, the DMA engine's page at +0x1000 ------------------------------
 const WINDOW: usize = 0x2000;
@@ -169,8 +170,8 @@ struct Feed {
 
 struct Pwm<'a> {
     ctx: &'a ServiceContext,
-    m: &'a Mmio,
-    d: &'a Dma,
+    m: &'a Registers,
+    d: &'a Arena,
     b: Board,
     rate: u32,
     range: u32,
@@ -847,14 +848,14 @@ fn bad(out: &mut [u8]) -> usize {
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "pwm-audio");
-    let mmio = ctx.mmio();
-    let dma = ctx.dma_region();
+    let mmio = godspeed::driver::registers(&ctx);
+    let dma = godspeed::driver::arena(&ctx);
     let irq = Irq::granted(&ctx);
     let dev = bring_up(&ctx, mmio.as_ref(), dma.as_ref());
     serve(&ctx, &irq, dev)
 }
 
-fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Mmio>, d: Option<&'a Dma>) -> Device<'a> {
+fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Registers>, d: Option<&'a Arena>) -> Device<'a> {
     let b = match ctx.probe_mode() {
         2 => PI2,
         4 => PI4,
