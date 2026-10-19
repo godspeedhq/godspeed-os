@@ -60,20 +60,21 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    bar on its own line, `1e282e7b`) and the fin-wait-2
    bound (`d4ed712c`). Their last cards passed on `a496e4de`.
 
-10. **Found by the docs and comments audit of 2026-10-19, in code, not fixed** (an audit changes documents
-   only):
-   - `net-stack` op 21 logs `tcp X did not answer ARP - routing via the gateway` for an address off the
-     subnet, where since `3ec99a27` no ARP is sent. Op 23 says `off the subnet, via the gateway`; op 21
-     should tell the two cases apart the same way.
-   - `RxQueue::push` (`sdk/wifi/src/rxq.rs`) turns away a frame over `FRAME_MAX` without counting it
-     (`too_big` counts only what `pop` drops), and the AIC8800's pull (`aic_station.rs`) counts every
-     refused push as `no_room`, so a full queue is counted twice, in `full` and there, and an oversize frame
-     is called no room.
-   - The CYW43455's join and control waits (`join.rs`, `ctrl.rs`) still read through the 4 KiB
-     `read_frame`, so a superframe over 4 KiB that arrives then is still lost; only the data and scan paths
-     read into the 64 KiB region.
-   - `wifi-driver`'s `the 64 KiB receive region could not be had` names the size by hand; it should come
-     from `ctrl::RX_REGION`.
+10. **Found by the docs and comments audit of 2026-10-19 (Audit 17), and fixed the same day** in the commit
+   after it:
+   - `net-stack` op 21 said `did not answer ARP` for an address off the subnet, where since `3ec99a27` no ARP
+     is sent; it says `is off the subnet` now, as op 23 does.
+   - `RxQueue::push` (`sdk/wifi/src/rxq.rs`) turned away a frame over `FRAME_MAX` without counting it; it
+     counts in `too_big` now. The AIC8800's `data_dropped` counts a frame the full queue refused as well as
+     `full` does, which is two reports of one loss, now said on the field.
+   - The CYW43455's join read 4 KiB, so an association event or a handshake message in a larger superframe
+     was lost; it reads into the 64 KiB region now, as the pull and the sweep do. **Not changed, and why:**
+     the control waits (`query_raw`, `set_cmd`) still read 4 KiB, and the size costs them nothing: they skip
+     every frame not on the control channel, a superframe included whatever its size, as the reference's
+     control path drops glommed frames (`docs/wifi.md` 39). A data frame read during a control wait is lost
+     either way, which is older than this and not a size question.
+   - `wifi-driver`'s log line takes the region's size from `ctrl::RX_REGION` rather than by hand.
+   - Built for the Pi 4 and the VisionFive; neither radio is in QEMU, so a Pi 4 join is owed a card.
 
 ## Where to start
 

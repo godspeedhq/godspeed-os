@@ -98,6 +98,8 @@ struct Stats {
     msgs: u32,
     inds: u32,
     data: u32,
+    /// Data packets this driver read and did not hand on: those that came while it waited for something else,
+    /// and those the receive queue refused (`RxQueue::full` counts the latter too, for the serve loop's line).
     data_dropped: u32,
     /// Data packets on the running link that `data_to_eth` turned away, and whether the first since the
     /// join has been shown (`refusal`).

@@ -116,7 +116,9 @@ impl godspeed_wifi::supplicant::KeyPath for BcmPath<'_> {
     }
 }
 
-/// Join `ssid`, run the handshake if there is one, install the keys, and say how it went.
+/// Join `ssid`, run the handshake if there is one, install the keys, and say how it went. Frames are read into
+/// `rx`, the station's receive region (`ctrl::RX_REGION`), so an association event or a handshake message in a
+/// superframe over 4 KiB is read whole, as the pull and the sweep read it.
 pub fn join(
     h: &dyn SdioHost,
     w: &mut Window,
@@ -124,6 +126,7 @@ pub fn join(
     ssid: &[u8],
     secret: Secret,
     keys: &mut Option<Keys>,
+    rx: &mut godspeed::memory::Region,
     ctx: &ServiceContext,
 ) -> Outcome {
     // Whatever the last association left is gone before the next one starts.
@@ -182,7 +185,6 @@ pub fn join(
     // order of ten seconds, inside the shell's thirty. An access point retries message 1 a few times over
     // several seconds before it deauthenticates, and this must outlast that to report it.
     const JOIN_EMPTY_POLLS: u32 = 10_000;
-    let mut frame = [0u8; ctrl::FRAME];
     let mut link_up = false;
     let mut empty = 0u32;
     let mut events = 0u32;
@@ -197,7 +199,7 @@ pub fn join(
     };
 
     while empty < JOIN_EMPTY_POLLS {
-        let f = match ctrl::read_frame(h, w, &mut frame, ctx) {
+        let f = match ctrl::read_frame_region(h, w, rx, ctx) {
             Some(f) => f,
             None => {
                 empty += 1;
@@ -205,11 +207,12 @@ pub fn join(
                 continue;
             }
         };
-        s.note_frame(ctx, &f, &frame, false);
+        let frame = rx.bytes();
+        s.note_frame(ctx, &f, frame, false);
         // Every frame inside the frame: a superframe's sub-frames are handled one by one (docs/wifi.md 38 -
         // the association events arrive glommed, and the handshake's messages may too).
         let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
-        let nsubs = ctrl::subframes(&f, &frame, s.glom_descriptor(), &mut subs, ctx);
+        let nsubs = ctrl::subframes(&f, frame, s.glom_descriptor(), &mut subs, ctx);
         for sub in subs.iter().take(nsubs) {
             let channel = sub.chanflag & CHANNEL_MASK;
             let body = &frame[sub.off..sub.off + sub.len];

@@ -19,7 +19,8 @@ pub struct RxQueue {
     /// by the serve loop (`note_full`); `queued` is reported nowhere yet, and `wifi debug stats` reads neither.
     pub queued: u32,
     pub handed: u32,
-    /// Frames dropped because the buffer they were asked into could not hold them.
+    /// Frames dropped for size: one larger than a slot (`FRAME_MAX`) offered to `push`, or a queued one larger
+    /// than the buffer `pop` was given.
     pub too_big: u32,
     /// Frames turned away because every slot was taken. A radio that reads a burst at once - a Broadcom
     /// superframe, the AIC8800's whole queue - can hold more than this queue does, and those frames are
@@ -53,6 +54,7 @@ impl RxQueue {
             return false;
         }
         if frame.len() > FRAME_MAX {
+            self.too_big = self.too_big.wrapping_add(1);
             return false;
         }
         let i = (self.head + self.count) % RX_SLOTS;

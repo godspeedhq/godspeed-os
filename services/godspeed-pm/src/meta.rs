@@ -267,6 +267,7 @@ pub fn manifest<'a>(text: &'a str, arts: &'a mut Artifacts) -> Result<Read<'a>, 
     if !m.validate(|p| { first.get_or_insert(p.field); }) {
         return Err(bad(0, match first {
             Some("format") if arts.nreq > 0 && format == Some(1) => "a manifest with requirements must be format 2",
+            Some("format") if arts.nreq == 0 && format == Some(2) => "a format 2 manifest must have requirements; one with none is format 1",
             Some("format") => "a manifest format this machine does not read",
             Some("requires") => "more requirements than a manifest may have",
             Some("requires.name") => "a package required twice, or a package that requires itself",

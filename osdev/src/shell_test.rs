@@ -12149,6 +12149,11 @@ pub fn run_deps(image_path: &Path, persist_path: &str, smp: u32) {
                    "and the dependent reaches it: dep-store logs the line dep-user sent");
             let listed = run!(b"godspeed list installed\r", 60);
             check!(listed.contains("godspeed/dep-store") && listed.contains("godspeed/dep-user"), "both are on the installed list");
+            // `plan` is a REPORT, so it pipes; with its requirement installed in range it is kept, and the one
+            // row left to install is the package asked for.
+            let planned = run!(b"godspeed plan godspeed/dep-user | where state=install\r", 120);
+            check!(planned.contains("godspeed/dep-user") && !planned.contains("pipe:"),
+                   "`godspeed plan` pipes as records, its installed requirement kept");
 
             // NOT WHILE SOMETHING NEEDS IT.
             let kept = run!(b"godspeed uninstall godspeed/dep-store yes\r", 60);

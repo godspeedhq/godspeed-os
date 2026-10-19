@@ -1436,7 +1436,7 @@ record (12); the residual there is unchanged.
 `godspeed inspect` reads an unpublished file too, on the machine and in the CLI, and says that no registry vouches
 for it.
 
-## 16. Dependencies: a package that needs another (approved 2026-10-19; built on `feat/gs-driver` except 16.7, QEMU-verified: `osdev test deps` 18/0)
+## 16. Dependencies: a package that needs another (approved 2026-10-19; built on `feat/gs-driver` except 16.7, QEMU-verified: `osdev test deps` 19/0)
 
 The operator asked for this: a service that needs a driver, an app that needs a service, and the package manager
 and the CLI both knowing it. Until now a contract named the PEERS a package talks to, and the operator approved

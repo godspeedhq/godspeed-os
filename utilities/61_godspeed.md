@@ -372,7 +372,7 @@ and the package asked for is last, `install`.
 
 ## 5. Pipes
 
-`godspeed search`, `info`, `list available | fetched | installed | updates`, `verify`, `trust`, `registry`, `config` and `check` are reports, so they pipe as records
+`godspeed search`, `info`, `list available | fetched | installed | updates`, `plan`, `resolve`, `verify`, `trust`, `registry`, `config` and `check` are reports, so they pipe as records
 (`item`, `value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```

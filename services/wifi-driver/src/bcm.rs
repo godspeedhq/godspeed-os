@@ -18,7 +18,7 @@ pub struct Bcm<'a> {
     /// The keys a WPA2 join keeps for the rekeys to come; `None` on an open network and after any end of
     /// the association.
     keys: Option<join::Keys>,
-    /// The region the sweep and the pulls read into (`ctrl::RX_REGION`), asked for once at start: a
+    /// The region the sweep, the join and the pulls read into (`ctrl::RX_REGION`), asked for once at start: a
     /// superframe may be as large as its 16-bit length allows, more than the stack holds (`backlog/93`).
     rx: godspeed::memory::Region,
 }
@@ -43,7 +43,7 @@ impl Station for Bcm<'_> {
         scan::MAX_EMPTY_POLLS
     }
     fn join(&mut self, ssid: &[u8], secret: Secret, ctx: &ServiceContext) -> Outcome {
-        join::join(self.h, &mut *self.w, &mut self.s, ssid, secret, &mut self.keys, ctx)
+        join::join(self.h, &mut *self.w, &mut self.s, ssid, secret, &mut self.keys, &mut self.rx, ctx)
     }
     fn forget_keys(&mut self) {
         join::forget(&mut self.keys);

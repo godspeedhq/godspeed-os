@@ -851,7 +851,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // reads into it and the station then owns it. A region is never given back, so one serves both. Without
     // it a superframe over 4 KiB is lost, and with a large window the link with it, so no radio is served.
     let Ok(mut rx) = godspeed::memory::Region::alloc(&ctx, ctrl::RX_REGION) else {
-        ctx.log("wifi-driver: the 64 KiB receive region could not be had, so the radio is not served");
+        ctx.log_fmt(format_args!("wifi-driver: the {} KiB receive region could not be had, so the radio is not served", ctrl::RX_REGION / 1024));
         clock_release(&ctx, lease);
         serve_unavailable(&ctx, Some(&h))
     };

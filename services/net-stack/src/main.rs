@@ -3750,7 +3750,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // address, never an assumed /24 - nothing is asked: the gateway is the answer
                 // (`on_link_by_mask`), as op 23 does. With no mask, ARP decides: no answer means it is not a
                 // neighbour, so the gateway is right and we fall back to it.
-                let peer_mac = match if on_link_by_mask(&our_ip, &netmask, &dip) == Some(false) { None }
+                let off_subnet = on_link_by_mask(&our_ip, &netmask, &dip) == Some(false);
+                let peer_mac = match if off_subnet { None }
                                      else { arp_resolve(&ctx, pending, &our_ip, &our_mac, &dip, None) } {
                     Some(mac) => {
                         ctx.log_fmt(format_args!(
@@ -3760,9 +3761,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         mac
                     }
                     None => {
-                        ctx.log_fmt(format_args!(
-                            "net-stack: tcp {}.{}.{}.{} did not answer ARP - routing via the gateway",
-                            dip[0], dip[1], dip[2], dip[3]));
+                        // Said apart, as op 23 does: no ARP is asked for an address off the subnet.
+                        ctx.log_fmt(format_args!("net-stack: tcp {}.{}.{}.{} {} - routing via the gateway",
+                            dip[0], dip[1], dip[2], dip[3],
+                            if off_subnet { "is off the subnet" } else { "did not answer ARP" }));
                         gw_mac
                     }
                 };

@@ -1216,7 +1216,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("selfcheck", &SELFCHECK_WORDS),
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
-    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "cleanup", "trust", "registry", "config", "check"]),
+    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "plan", "resolve", "uninstall", "upgrade", "cleanup", "trust", "registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -6176,6 +6176,15 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("godspeed resolve <publisher/name> <range>", "the newest release on the registry in a range, such as ^1.2.0", "godspeed resolve godspeed/hello ^0.3.0"),
             ("what is checked", "the copy on disk, again, by the supervisor, before every start: signature, key, contract, binary", ""),
             ("if it dies", "restarted from the disk, up to 5 times a boot, then left down and said so", ""),
+        ], false),
+        ("godspeed", "plan") => help_block(ctx, "godspeed plan", "what installing a package takes, without installing it", &[
+            ("godspeed plan <publisher/name>[@version]", "one row per package, in the order to install them: package, version, kind, asks and state", "godspeed plan godspeed/hello"),
+            ("state", "`install, needed by ...` (fetched and checked), `fetch, needed by ...` (not here yet; version is the range), and `install` for the package asked for, last", ""),
+            ("a report", "it pipes, as records", "godspeed plan godspeed/hello | where state=install"),
+        ], false),
+        ("godspeed", "resolve") => help_block(ctx, "godspeed resolve", "the newest release on the registry in a range", &[
+            ("godspeed resolve <publisher/name> <range>", "a range is ^, = or >= and a whole version", "godspeed resolve godspeed/hello ^0.3.0"),
+            ("a report", "it pipes, as records", "godspeed resolve godspeed/hello ^0.3.0 | where item=version"),
         ], false),
         ("godspeed", "upgrade") => help_block(ctx, "godspeed upgrade", "the newest release of what is installed, in its place", &[
             ("godspeed upgrade <publisher/name>[,...] [yes]", "fetch and verify the newest release, then install it; asks [y/N], naming the version change and what it asks for", "godspeed upgrade godspeed/hello"),
@@ -19403,17 +19412,17 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
         "wifi" => wifi_pipe_refusal(arg),
         "audio" => audio_pipe_refusal(arg),
         "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
-            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset" | "add" | "remove")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade', 'trust reset', 'trust add' and 'trust remove' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, inspect, list, verify, trust, registry, config and check"),
+            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, plan, resolve, registry, config and check"),
+            (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, plan, resolve, registry, config and check"),
+            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset" | "add" | "remove")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade', 'trust reset', 'trust add' and 'trust remove' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, inspect, list, plan, resolve, verify, trust, registry, config and check"),
             (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) | (Some("search"), _) | (Some("info"), _) | (Some("list"), _)
-                | (Some("verify"), _) | (Some("trust"), None) => None,
+                | (Some("verify"), _) | (Some("trust"), None) | (Some("plan" | "resolve"), Some(_)) => None,
             // A report; a file named by a full path, because a pipe stage is not given the folder it was typed in.
             (Some("inspect"), Some(x)) if !x.ends_with(".gsp") || x.starts_with('/') => None,
             // Piped, `cleanup` is the listing alone: nothing is asked, so nothing is deleted.
             (Some("cleanup"), None) => None,
             (Some("inspect"), _) => Some("pipe: in a pipe, name the package file by its full path, as in godspeed inspect /users/default/hello-0.3.0.gsp"),
-            _ => Some("pipe: pipe a report: godspeed search, info, inspect, list, registry, config or check"),
+            _ => Some("pipe: pipe a report: godspeed search, info, inspect, list, plan, resolve, registry, config or check"),
         },
         "churn" if arg.split_whitespace().next() == Some("verify") => None,
         "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),

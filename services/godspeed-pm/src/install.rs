@@ -130,7 +130,10 @@ fn installed_requiring(ctx: &ServiceContext, pkg: &str, each: &mut dyn FnMut(&st
         let mut it = l.split_whitespace();
         let (Some(p), Some(v)) = (it.next(), it.next()) else { continue };
         if p == pkg { continue; }
-        let (reqs, n, _) = manifest_of(ctx, p, v)?;
+        // Refused, not skipped: a package whose manifest cannot be read cannot be shown NOT to need `pkg`, and
+        // skipping it could take its dependency from under it. Said with the package's name, so it can be mended.
+        let (reqs, n, _) = manifest_of(ctx, p, v).map_err(|why| cell(format_args!(
+            "{} {} is installed and its manifest cannot be read, so whether it needs {} cannot be known: {}", p, v, pkg, why.as_str())))?;
         for r in &reqs[..n] {
             if cell(format_args!("{}", r.name())).as_str() == pkg && each(p, v, r.range) { return Ok(()); }
         }
@@ -208,7 +211,16 @@ impl Plan {
             return Err(cell(format_args!("{} and {} require each other, which cannot be installed in any order", by, name.as_str())));
         }
         if let Some(v) = installed(ctx, name.as_str()) {
-            if req.range.matches(&v) { self.kept += 1; return Ok(()); }
+            if req.range.matches(&v) {
+                // Kept, but only what runs to be needed: the same kind check a fetched one gets below.
+                let (_, _, kind) = manifest_of(ctx, name.as_str(), cell(format_args!("{}", v)).as_str())?;
+                if kind != Kind::Service && kind != Kind::Driver {
+                    return Err(cell(format_args!("{} needs {}, which is {} - only a service or a driver runs to be needed",
+                        by, name.as_str(), if kind == Kind::App { "an app" } else { "a utility" })));
+                }
+                self.kept += 1;
+                return Ok(());
+            }
             return Err(cell(format_args!("{} needs {} {}, and {} is installed - `godspeed upgrade {}` first, or install a {} that needs that version",
                 by, name.as_str(), req.range, v, name.as_str(), by)));
         }
@@ -216,7 +228,7 @@ impl Plan {
             return Err(cell(format_args!("requirements nest deeper than {} packages at {}", PLAN_DEPTH, name.as_str())));
         }
         if self.n == PLAN_MAX {
-            return Err(cell(format_args!("this needs more than {} packages installed at once", PLAN_MAX)));
+            return Err(cell(format_args!("this needs more than {} packages besides the one asked for", PLAN_MAX)));
         }
         let Some(v) = fetched_in(ctx, name.as_str(), req.range) else {
             // Fetched first, then planned again: the shell fetches the newest release in range.
@@ -238,7 +250,7 @@ impl Plan {
         for r in c.requires() { self.resolve(ctx, r, name.as_str())?; }
         self.depth -= 1;
         if self.n == PLAN_MAX {
-            return Err(cell(format_args!("this needs more than {} packages installed at once", PLAN_MAX)));
+            return Err(cell(format_args!("this needs more than {} packages besides the one asked for", PLAN_MAX)));
         }
         self.steps[self.n] = Some(Step { pkg: name, version: Some(v), range: Some(req.range), kind: c.kind,
                                          asks: asks_of(&c), by: cell(format_args!("{}", by)) });
