@@ -517,6 +517,10 @@ struct Fs {
     /// stamping happens on `&self` paths, and owned by `Fs` rather than a static (invariant 9).
     /// See `now_epoch` and `CLOCK_MAX_AGE_S`.
     clock: core::cell::Cell<(u32, i64)>,
+    /// The last path `walk` resolved and what it found (`WalkCache`): a download writes one file in about
+    /// 2,800 chunks, and each walked the path from the root, about three directory reads before seven
+    /// data writes (`backlog/93` item 12).
+    walk_cache: core::cell::Cell<WalkCache>,
     /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
     /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
     /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
@@ -572,6 +576,26 @@ const _: () = assert!(
 );
 
 /// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
+/// The one path `Fs::walk` last resolved, and its entry.
+///
+/// **A derived view, and subordinate (26.4, Commandment III):** the directory tree on the disk is the truth,
+/// and this is a copy of one lookup in it. It is forgotten at every metadata write (`tb_write`, through which
+/// every directory, bitmap and superblock block goes), at every transaction's commit and abort, and with the
+/// `Fs` itself at every mount; and it is neither read nor filled while a transaction is open, so it never holds
+/// a lookup of staged, uncommitted blocks. A file's data writes (`write_at`) change no directory block, which is
+/// why a streamed file keeps its entry from one chunk to the next. A miss is a walk, so the worst a stale entry
+/// could do is what these rules exist to rule out; a path longer than `WALK_CACHE_PATH` is never cached.
+#[derive(Clone, Copy)]
+struct WalkCache {
+    len: usize,
+    path: [u8; WALK_CACHE_PATH],
+    entry: Option<Entry>,
+}
+const WALK_CACHE_PATH: usize = 256;
+impl WalkCache {
+    const EMPTY: WalkCache = WalkCache { len: 0, path: [0; WALK_CACHE_PATH], entry: None };
+}
+
 /// means the root directory (its extent lives in the superblock, it has no parent entry).
 #[derive(Clone, Copy)]
 struct Entry {
@@ -2238,6 +2262,7 @@ impl Fs {
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
             clock: core::cell::Cell::new((0, 0)),
+            walk_cache: core::cell::Cell::new(WalkCache::EMPTY),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -2290,6 +2315,8 @@ impl Fs {
     /// Write a block: stage it in the active transaction (de-duplicating by `lba`), else write
     /// through to disk. Staging overflow is recorded and surfaces as a loud commit failure.
     fn tb_write(&mut self, ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
+        // Any metadata block changing ends the lookup `walk` kept (`WalkCache`).
+        self.walk_cache.set(WalkCache::EMPTY);
         if self.txn_active {
             for i in 0..self.txn_n {
                 if self.txn_lba[i] == lba { self.txn_blk[i] = *data; return true; }
@@ -2449,12 +2476,14 @@ impl Fs {
     }
 
     fn begin_txn(&mut self) {
+        self.walk_cache.set(WalkCache::EMPTY);
         self.txn_active = true;
         self.txn_n = 0;
         self.txn_overflow = false;
     }
 
     fn abort_txn(&mut self) {
+        self.walk_cache.set(WalkCache::EMPTY);
         self.txn_active = false;
         self.txn_n = 0;
         self.txn_overflow = false;
@@ -2898,6 +2927,7 @@ fn replay_window(_ctx: &ServiceContext) {}
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
             clock: core::cell::Cell::new((0, 0)),
+            walk_cache: core::cell::Cell::new(WalkCache::EMPTY),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -3244,10 +3274,22 @@ fn replay_window(_ctx: &ServiceContext) {}
     }
 
     fn walk(&self, ctx: &ServiceContext, path: &[u8]) -> Option<Entry> {
+        let cacheable = !self.txn_active && path.len() <= WALK_CACHE_PATH;
+        if cacheable {
+            let c = self.walk_cache.get();
+            if let Some(e) = c.entry {
+                if c.len == path.len() && &c.path[..c.len] == path { return Some(e); }
+            }
+        }
         let mut cur = self.root_entry();
         for comp in components(path) {
             if cur.itype != ITYPE_DIR { return None; }
             cur = self.dir_find(ctx, &cur, comp)?;
+        }
+        if cacheable {
+            let mut c = WalkCache { len: path.len(), path: [0; WALK_CACHE_PATH], entry: Some(cur) };
+            c.path[..path.len()].copy_from_slice(path);
+            self.walk_cache.set(c);
         }
         Some(cur)
     }
