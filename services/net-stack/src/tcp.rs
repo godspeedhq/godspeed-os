@@ -573,14 +573,25 @@ pub fn parse(f: &[u8]) -> Option<Seg<'_>> {
 /// above, as a TLS record that would not decrypt (seen on the Wyse, `backlog/93`). Dropping it instead leaves the
 /// sender's retransmission to repair it, which is what the checksum is for. The lengths are the ones
 /// `parse` already checked; a header claiming more bytes than arrived fails here, as it should.
-fn checksums_ok(f: &[u8]) -> bool {
+/// `None` is a sound segment; `Some` names which check it failed, for the log line.
+fn checksum_fault(f: &[u8]) -> Option<&'static str> {
     let ihl = ((f[ETH_LEN] & 0x0f) as usize) * 4;
-    if super::checksum(&f[ETH_LEN..ETH_LEN + ihl]) != 0 { return false; }
+    if super::checksum(&f[ETH_LEN..ETH_LEN + ihl]) != 0 { return Some("the IP header checksum is wrong"); }
     let ip_total = be16(&f[ETH_LEN + 2..ETH_LEN + 4]) as usize;
-    if ip_total < ihl || ETH_LEN + ip_total > f.len() { return false; }
+    if ip_total < ihl || ETH_LEN + ip_total > f.len() { return Some("the IP length is more than arrived"); }
     let mut src = [0u8; 4]; src.copy_from_slice(&f[ETH_LEN + 12..ETH_LEN + 16]);
     let mut dst = [0u8; 4]; dst.copy_from_slice(&f[ETH_LEN + 16..ETH_LEN + 20]);
-    tcp_checksum(&src, &dst, &f[ETH_LEN + ihl..ETH_LEN + ip_total]) == 0
+    if tcp_checksum(&src, &dst, &f[ETH_LEN + ihl..ETH_LEN + ip_total]) != 0 { return Some("the TCP checksum is wrong"); }
+    None
+}
+
+/// The IPv4 flags-and-offset word when the datagram is a FRAGMENT (more to follow, or an offset), else
+/// `None`. This stack does not reassemble: `parse` reads the first fragment's leading bytes as a whole
+/// segment, which before the checksum check was taken as truncated data. Told apart from damage so the
+/// log says which it is (`backlog/93` item 11).
+fn fragment_word(f: &[u8]) -> Option<u16> {
+    let w = be16(&f[ETH_LEN + 6..ETH_LEN + 8]);
+    if w & 0x3fff != 0 { Some(w) } else { None }
 }
 
 /// The TCP checksum: one's-complement sum over the pseudo-header, the TCP header and the payload
@@ -795,9 +806,12 @@ pub struct Tcp {
     /// still only the SYN count, the acknowledgement was never built - which is a different fault
     /// from one that was built and lost.
     pub stat_sent: u16,
-    /// Segments for this machine dropped because a checksum was wrong (`checksums_ok`), since the table
+    /// Segments for this machine dropped because a checksum was wrong (`checksum_fault`), since the table
     /// was made. Each is one the peer resends; logged at the first eight and every 64th.
     pub bad_checksum: u32,
+    /// IPv4 fragments of a TCP segment for this machine, dropped because this stack does not reassemble
+    /// (`fragment_word`), since the table was made; logged at the first eight and every 64th.
+    pub fragments: u32,
     /// One character per frame this transaction handed to the driver, in order, so the log can show
     /// WHICH frames were built rather than only how many.
     ///
@@ -822,7 +836,7 @@ impl Tcp {
             last_state: State::Closed,
             last_retx: 0,
             poll_tx_slow: 0,
-            stat_seen: 0, stat_matched: 0, stat_sent: 0, bad_checksum: 0,
+            stat_seen: 0, stat_matched: 0, stat_sent: 0, bad_checksum: 0, fragments: 0,
             tx_log: [0u8; 24], tx_n: 0,
         }
     }
@@ -1239,6 +1253,19 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
             t2.on_frame(ctx, &net, &buf[..n], &mut sink);
             check(t2.bad_checksum == bad0 + 1 && t2.conns[j].rcv_nxt == rn.wrapping_add(7),
                   "the same segment with its checksum intact is taken", &mut pass, &mut fail);
+            // The same bytes marked as the first IP fragment of a larger datagram (more to follow, its
+            // header checksum made good) are counted as a fragment and not taken: this stack does not
+            // reassemble, and a first fragment read as a whole segment is truncated data.
+            let (rn2, frag0) = (t2.conns[j].rcv_nxt, t2.fragments);
+            let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                         80, lp2, rn2, ack2, ACK, 8000, b"fragment");
+            buf[ETH_LEN + 6] |= 0x20;
+            buf[ETH_LEN + 10] = 0; buf[ETH_LEN + 11] = 0;
+            let ck = super::checksum(&buf[ETH_LEN..ETH_LEN + IP_LEN]);
+            buf[ETH_LEN + 10] = (ck >> 8) as u8; buf[ETH_LEN + 11] = ck as u8;
+            t2.on_frame(ctx, &net, &buf[..n], &mut sink);
+            check(t2.fragments == frag0 + 1 && t2.conns[j].rcv_nxt == rn2,
+                  "an IP fragment is counted as one and not taken as data", &mut pass, &mut fail);
         }
     }
 
@@ -1609,14 +1636,31 @@ impl Tcp {
         self.stat_seen = self.stat_seen.saturating_add(1);
         let seg = match parse(f) { Some(s) => s, None => return 0 };
         if seg.dst_ip != net.our_ip { return 0; }
-        if !checksums_ok(f) {
+        // What a dropped segment's line says beside its reason: the IP length against the bytes that
+        // arrived, the flags-and-offset word, and the sequence number and payload length as parsed.
+        let ip_total = be16(&f[ETH_LEN + 2..ETH_LEN + 4]);
+        let frag_word = be16(&f[ETH_LEN + 6..ETH_LEN + 8]);
+        if let Some(w) = fragment_word(f) {
+            self.fragments = self.fragments.saturating_add(1);
+            let n = self.fragments;
+            if n <= 8 || n % 64 == 0 {
+                let ip = seg.src_ip;
+                ctx.log_fmt(format_args!(
+                    "net-stack: dropped an IP fragment of a TCP segment from {}.{}.{}.{} (#{}) - offset {} bytes, {}, IP length {} of {} arrived; fragments are not reassembled",
+                    ip[0], ip[1], ip[2], ip[3], n, (w & 0x1fff) as usize * 8,
+                    if w & 0x2000 != 0 { "more to follow" } else { "the last" }, ip_total, f.len() - ETH_LEN));
+            }
+            return 0;
+        }
+        if let Some(why) = checksum_fault(f) {
             self.bad_checksum = self.bad_checksum.saturating_add(1);
             let n = self.bad_checksum;
             if n <= 8 || n % 64 == 0 {
                 let ip = seg.src_ip;
                 ctx.log_fmt(format_args!(
-                    "net-stack: dropped a TCP segment from {}.{}.{}.{}:{} with a bad checksum (#{}) - the peer resends it",
-                    ip[0], ip[1], ip[2], ip[3], seg.src_port, n));
+                    "net-stack: dropped a TCP segment from {}.{}.{}.{}:{} (#{}) - {}; IP length {} of {} arrived, flags {:#06x}, seq {}, {} payload bytes; the peer resends it",
+                    ip[0], ip[1], ip[2], ip[3], seg.src_port, n, why, ip_total, f.len() - ETH_LEN,
+                    frag_word, seg.seq, seg.payload.len()));
             }
             return 0;
         }
