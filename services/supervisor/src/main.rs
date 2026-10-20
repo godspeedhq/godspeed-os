@@ -996,8 +996,9 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         "block-driver" => 16,
         // 32 rings + a 256-buffer scratchpad + 4 - the size `XHCI_DMA_PAGES` held in the kernel.
         "xhci" => 32 + 256 + 4,
-        // 64 KiB - the `_ => EHCI_DMA_PAGES` default the NIC used to fall through to.
-        "nic-driver" => 16,
+        // The rings and a receive ring of 256 x 2 KiB, to hold a whole 256 KiB receive window as it arrives
+        // (`services/nic-driver`, `RX_RING_COUNT`; `backlog/93`). It was 16, the EHCI default the NIC fell to.
+        "nic-driver" => 132,
         // 68 KiB used, rounded up: the command rings (CORB 1 KiB, RIRB 2 KiB), the buffer descriptor
         // list, and a 64 KiB ring of sound - about a third of a second at 48 kHz stereo (docs/audio.md).
         "audio-driver" => 24,

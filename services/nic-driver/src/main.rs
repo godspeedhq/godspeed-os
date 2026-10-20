@@ -96,8 +96,8 @@ const TXD_STA_DD:   u8 = 1 << 0; // (TX) descriptor done
 // RX descriptor (16 B): addr@0, length(u16)@8, status(u8)@12, errors(u8)@13.
 const RXD_STA_DD:   u8 = 1 << 0; // (RX) descriptor done - a frame landed in this buffer
 
-// DMA-arena layout (64 KiB, `Parts` below): the TX ring at 0x0, one TX frame buffer at 0x1000, the RX ring at
-// 0x2000, 24 x 2 KiB RX buffers from 0x3000, then the tally at 0xF000.
+// DMA-arena layout (132 pages, `Parts` below): the TX ring at 0x0, one TX frame buffer at 0x1000, the RX ring at
+// 0x2000, 256 x 2 KiB RX buffers from 0x3000, then the tally at 0x83000.
 const TX_RING_COUNT: usize = 8;
 const TX_RING_BYTES: u32   = (TX_RING_COUNT * 16) as u32;
 // EIGHT, BECAUSE THE DEVICE REQUIRES IT - not because eight buffers felt better than four.
@@ -119,12 +119,19 @@ const TX_RING_BYTES: u32   = (TX_RING_COUNT * 16) as u32;
 // (2026-10-18). A sender puts a window's worth on the wire at once, and the ring is all that holds a
 // burst until net-stack takes it: past eight frames the rest were dropped, the sender saw loss, and a
 // download in QEMU never had more than 12.7 KiB in flight against a 64 KiB window, with three to five
-// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too. It is what the
-// 64 KiB arena holds: 24 x 2 KiB from 0x3000 ends at 0xF000, and the tally goes after it.
-const RX_RING_COUNT: usize = 24;
+// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too.
+//
+// TWO HUNDRED AND FIFTY-SIX (2026-10-20), because twenty-four was the CABLE's limit as eight had been QEMU's.
+// The receive window is 256 KiB, and a sender puts that on the wire at line rate - about 180 full frames in
+// under 2 ms on a gigabit link - while the ring was all that held them until net-stack drained it. The RTL8168
+// on the T630 stopped and was restarted 412 times in six 10 MB downloads, each stop a burst lost, and the
+// downloads spent most of their time with nothing yet to read (`backlog/93` items 1 and 12). 256 holds a whole
+// window with room over; 4096 bytes of ring is a multiple of 128 for the e1000, and under the RTL8168's 1024.
+// The arena is sized for it in the supervisor (`dma_pages`, 132 pages: 0x3000 + 256 x 2 KiB, then the tally).
+const RX_RING_COUNT: usize = 256;
 const RX_RING_BYTES: u32   = (RX_RING_COUNT * 16) as u32;
 const RX_BUF_SIZE:   usize = 2048;
-// After the RX buffers (24 x 2 KiB, so they end at 0xF000), the tally: a 64-byte, 64-byte-aligned buffer the
+// After the RX buffers (256 x 2 KiB, so they end at 0x83000), the tally: a 64-byte, 64-byte-aligned buffer the
 // NIC DMAs its hardware tally counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error
 // counts, read straight off silicon and INDEPENDENT of net-stack.
 
