@@ -217,6 +217,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         per_10ms.saturating_mul(PAINT_DEADLINE_MAX_MS) / 10
     };
     let mut paint_ewma: u64 = 0;
+    // THE CURSOR BLINKS WHILE NOTHING ARRIVES, so a live console looks live: an operator asked, because
+    // a still underline cannot be told from a frozen machine. Half a second each way. The wait for the
+    // first message is bounded by that instead of blocking, and an empty one toggles the cursor; output
+    // draws it solid, so typing shows it steady. Not where the clock is uncalibrated, where the bound
+    // would be one quantum: there the wait blocks as before.
+    const BLINK_MS: u64 = 500;
+    let mut blink_on = true;
     loop {
         // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
         //
@@ -256,7 +263,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // (Two diagnostics that once sat here are gone: cumulative paint and busy CYCLES, reported as
         // a percentage of the window. What remains is the per-paint timing and the adaptive deadline
         // below, which is what those measurements were used to choose.)
-        let mut msg = gs::ipc::recv(&ctx);
+        let mut msg = if per_10ms == 0 {
+            gs::ipc::recv(&ctx)
+        } else {
+            match gs::ipc::recv_within_ms(&ctx, BLINK_MS) {
+                Some(m) => { blink_on = true; m }
+                None => {
+                    blink_on = !blink_on;
+                    term.blink(blink_on);
+                    continue;
+                }
+            }
+        };
         // Pass start, for the paint deadline below. Not diagnostics: this is what bounds the drain.
         let t_pass0 = gs::driver::wait::Since::now(&ctx);
         let mut drained: usize = 0;
