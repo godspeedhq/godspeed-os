@@ -1109,15 +1109,23 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
         b'~' => match param {    // navigation cluster: ESC[<n>~
             1 | 7 => line.home(ctx),   // Home
             4 | 8 => line.end(ctx),    // End
-            3     => line.delete(ctx), // Delete (forward delete)
+            // Delete (forward delete). Said in the log, with where the cursor was, because the operator
+            // reports the key doing nothing on the T630 while it works in QEMU (2026-10-20): the line
+            // shows whether the shell received it and whether there was a character to delete.
+            3     => {
+                ctx.log_fmt(format_args!("shell: Delete key at {} of {} characters", line.cur, line.len));
+                line.delete(ctx)
+            }
             // PageUp OPENS `scrollback`, one page back - the key does what it was pressed for.
             // PageDown from a live prompt stays inert: you are already at the bottom, and opening a
             // viewer already scrolled to the end is a no-op dressed as an action.
             5     => { let _ = scrollback_view(ctx, 0, true); line.reprint(ctx); }
             // 2 = Insert, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
-            _ => { let _ = have_param; }
+            2 | 6 | 11..=24 => { let _ = have_param; }
+            n => ctx.log_fmt(format_args!("shell: key sequence ESC[{}~ not recognised", n)),
         },
-        _ => {} // unknown final byte - already consumed, do nothing
+        // An unknown final byte, already consumed: nothing is done, and the log says what it was.
+        f => ctx.log_fmt(format_args!("shell: key sequence ESC[{}{} not recognised", param, f as char)),
     }
 }
 
