@@ -122,6 +122,15 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    1472, a length from another frame. **The first suspect, then:** `rtl_restart_rx` re-armed the ring while
    a frame was still landing. It now holds 1 ms between RX off and the re-arm, as the bring-up already
    holds `RTL_QUIESCE_MS`; a card owes the count of damaged segments falling to none.
+   **It did not (`672ba255`, T630):** three damaged segments in six downloads, and a new shape, a 108-byte
+   frame whose IP header said 1468. All three again came within 25 ms after a restart or a TX-timeout
+   recovery, two of them the latter, while only 4% of download time lies that close to one (one per 476 ms
+   during the downloads; the "one in a million" above was taken against the average over four minutes and is
+   too strong, though four in a hundred, ten times running, still is not chance). So the pause is not the
+   whole of it. **Next, on `nic-driver`'s own side:** a received descriptor is now taken only when the chip's
+   error summary (`RxRES`, bit 21) is clear and the frame is first AND last segment, as r8169 checks; one
+   that fails is given back unread, counted and said with its status word. Whether the damaged frames carry
+   those marks is what the next card shows.
 
 12. **The target, set by the operator 2026-10-20: a download at the speed of the link, 1 Gbit/s (about 119
    MiB/s).** The best today is 718 KiB/s. The same card's `time` rows (`download`, `utilities/65_download.md`)

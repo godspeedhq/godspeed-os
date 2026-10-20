@@ -276,7 +276,9 @@ const RX_SILENCE_STALLED: u32 = 20_000;
 const RTL_DESC_OWN: u32 = 1 << 31; // owned by the NIC (set = NIC's; it clears the bit when done)
 const RTL_DESC_EOR: u32 = 1 << 30; // end of ring (the last descriptor - the NIC wraps here)
 const RTL_DESC_FS:  u32 = 1 << 29; // first segment (TX)
-const RTL_DESC_LS:  u32 = 1 << 28; // last segment (TX)
+const RTL_DESC_LS:  u32 = 1 << 28; // last segment (TX); on RX, with FS, a frame whole in one buffer
+/// RX: the chip's error summary - a CRC error, a runt, a frame too long - beside the length (r8169 `RxRES`).
+const RTL_RX_RES:   u32 = 1 << 21;
 
 // RCR: AB (broadcast) | AM (multicast) | APM (physical match) | AAP (all = promiscuous), MXDMA=7
 // (unlimited burst), RXFTH=7 (no FIFO threshold - DMA on whole-frame). Promiscuous so a reply lands
@@ -424,6 +426,15 @@ fn rtl_arm_rx(arena: &Parts, i: usize) {
 /// taken as a frame: its first 128 bytes (one DMA write) were the right frame and the rest another's, or its
 /// length was another frame's. Every one of seven such segments on the T630 came within 0 to 76 ms of a
 /// restart. The bring-up quiesces the same way, for the same reason (`RTL_QUIESCE_MS`).
+/// Whether a received descriptor the chip handed back holds a whole, sound frame: no error summary
+/// (`RTL_RX_RES`), and first AND last segment, so the frame is all in this one buffer. What r8169 checks before
+/// it takes a frame, and this driver did not until 2026-10-20: `net-stack` was dropping segments whose bytes past
+/// the first 128 were another frame's, each within 25 ms of a receiver restart or a TX recovery (`backlog/93`
+/// item 11). A descriptor that fails is given back and counted, never handed up.
+fn rtl_rx_sound(o1: u32) -> bool {
+    o1 & RTL_RX_RES == 0 && o1 & (RTL_DESC_FS | RTL_DESC_LS) == (RTL_DESC_FS | RTL_DESC_LS)
+}
+
 fn rtl_restart_rx(ctx: &ServiceContext, mmio: &Registers, arena: &Parts) {
     mmio.write8(RTL_CR, RTL_CR_TE);
     delay::hold(ctx, Budget::ms(RTL_RX_QUIESCE_MS));
@@ -432,6 +443,18 @@ fn rtl_restart_rx(ctx: &ServiceContext, mmio: &Registers, arena: &Parts) {
     mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
     mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
     mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);
+}
+
+/// Say an unsound descriptor: its status word, where it was, and how many restarts there had been, at the
+/// first eight and every 64th.
+fn note_unsound(ctx: &ServiceContext, n: u32, o1: u32, idx: usize, restarts: u32) {
+    if n <= 8 || n % 64 == 0 {
+        ctx.log_fmt(format_args!(
+            "nic-driver: RTL8168 receive descriptor {} handed back unsound (#{}) - status {:#010x}: {}{}, length {}; given back unread ({} restarts so far)",
+            idx, n, o1, if o1 & RTL_RX_RES != 0 { "error summary set" } else { "no error" },
+            if o1 & (RTL_DESC_FS | RTL_DESC_LS) != (RTL_DESC_FS | RTL_DESC_LS) { ", not whole in one buffer" } else { "" },
+            o1 & 0x3FFF, restarts));
+    }
 }
 
 /// Answer a request on `reply_cap` and give the capability back - both halves, every time, so a reply
@@ -528,6 +551,9 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
     let mut collected_at = wait::Since::now(ctx);
     // For the restart's line: how many there have been, and the ISR bits latched since the last.
     let mut rx_restarts = 0u32;
+    // Descriptors handed back with an error summary or not whole in one buffer (`rtl_rx_sound`), given back
+    // unread. Said at the first eight and every 64th (`note_unsound`).
+    let mut rx_unsound = 0u32;
     let mut isr_seen = 0u16;
 
     // THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi-usb.md` 39): the USB WiFi dongle's service,
@@ -689,7 +715,12 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
             let mut n = 0usize;
             let rd = rx_idx * 16;
             let o1 = arena.rx_ring.read32(rd);
-            if o1 & RTL_DESC_OWN == 0 {
+            if o1 & RTL_DESC_OWN == 0 && !rtl_rx_sound(o1) {
+                rx_unsound = rx_unsound.saturating_add(1);
+                note_unsound(ctx, rx_unsound, o1, rx_idx, rx_restarts);
+                rtl_arm_rx(arena, rx_idx);
+                rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+            } else if o1 & RTL_DESC_OWN == 0 {
                 n = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
                 for i in 0..n { rxbuf[i] = arena.rx_bufs.read8(rx_idx * RX_BUF_SIZE + i); }
                 rtl_arm_rx(arena, rx_idx);
@@ -731,7 +762,12 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
             while (nfr as usize) < BATCH_MAX {
                 let rd = rx_idx * 16;
                 let o1 = arena.rx_ring.read32(rd);
-                if o1 & RTL_DESC_OWN == 0 {
+                if o1 & RTL_DESC_OWN == 0 && !rtl_rx_sound(o1) {
+                    rx_unsound = rx_unsound.saturating_add(1);
+                    note_unsound(ctx, rx_unsound, o1, rx_idx, rx_restarts);
+                    rtl_arm_rx(arena, rx_idx);
+                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+                } else if o1 & RTL_DESC_OWN == 0 {
                     let flen = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
                     if opos + 2 + flen > out.len() { break; }   // reply full - stop cleanly
                     out[opos..opos + 2].copy_from_slice(&(flen as u16).to_le_bytes());
