@@ -224,13 +224,14 @@ pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU6
 /// that class of bug being unrepresentable.
 const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
 /// Pages of contiguous DMA memory for the **EHCI** driver - 64 KiB, as on main.
-/// EHCI has no scratchpad concept, and its driver zeroes the whole arena on every
-/// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
+/// EHCI has no scratchpad concept, and its driver zeroes its arena's two parts (the control
+/// transfer and the poll slots) on every control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
 /// one constant) regressed back-port enumeration. Keep it small and separate.
 const EHCI_DMA_PAGES:      u64 = 16;
 /// `pwm-audio`: a page of DMA control blocks and a 128 KiB ring of PWM words - 16 periods of 8 KiB,
 /// about 370 ms at 44.1 kHz, which is the margin a POLLED refill needs (no interrupt is routed). That is
-/// 33 pages (`ARENA_NEEDED` in `services/pwm-audio`); 36 leaves three spare, and nothing records why.
+/// 33 pages (`services/pwm-audio`'s two parts, the control blocks and the ring, `lay_out`); 36 leaves three
+/// spare, and nothing records why.
 const AUDIO_PWM_DMA_PAGES: u64 = 36;
 
 /// Maximum named send peers per service.

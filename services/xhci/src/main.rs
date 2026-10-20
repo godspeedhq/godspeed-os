@@ -10,7 +10,7 @@
 //! connected port and binds up to `MAX_HID` boot-protocol HID devices (a
 //! keyboard AND a mouse) on the SAME controller at once, then polls all of them
 //! from one loop, demultiplexing transfer events by slot id. All hardware access
-//! is through `gs::driver`'s `Registers` and `Arena` (§18); no `unsafe` here.
+//! is through `gs::driver`'s `Registers` and the arena's named parts (`Parts`, §18); no `unsafe` here.
 
 #![no_std]
 #![no_main]
@@ -3787,8 +3787,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "xhci");
     ctx.log("xhci: driver starting");
 
-    // Both grants through `gs::driver` (`docs/driver-library.md` step 3). The arena is reached at the
-    // offsets below, as before: a layout by name is the step after this one.
+    // Both grants through `gs::driver` (`docs/driver-library.md` step 3), the arena laid out by name in
+    // `lay_out` and reached only through its parts.
     let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
         None => {

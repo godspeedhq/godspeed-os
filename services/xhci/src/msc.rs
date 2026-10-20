@@ -40,7 +40,7 @@
 //!   endpoint that recovery then repaired. The budget here is a real duration and it is generous.
 //! - **One shared DMA page with three owners aliases.** An armed interrupt endpoint DMAs into its
 //!   buffer on any keypress, regardless of which driver code thinks it holds the device. The disk's
-//!   CBW/CSW page here is the disk's alone - see `DISK_REGION_BYTES`.
+//!   CBW/CSW page here is the disk's alone - its own part of the arena (`Parts::disk`), noted below.
 
 use godspeed::driver::wait::{self, Budget};
 use godspeed::driver::{Part, Registers};

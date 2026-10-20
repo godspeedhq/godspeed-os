@@ -16,7 +16,7 @@
 //!
 //! It began as a skeleton that drove nothing and asked one question - *does a device interrupt arrive
 //! in userspace on arm32?* (`docs/arm32-usb-userspace.md`). The answer was yes; the loop at the end of
-//! `service_main`, entered only when no register window or arena was granted, is what is left of that
+//! `service_main`, entered only when no register window, or no arena the layout fits, was granted, is what is left of that
 //! skeleton.
 
 #![no_std]

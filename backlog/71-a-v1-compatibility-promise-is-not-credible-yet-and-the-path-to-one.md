@@ -65,8 +65,8 @@ That moves the driver gap into step 2: before the freeze, `gs::driver` gains the
 reach the SDK for, found repeated in real drivers as `docs/driver-library.md` requires. Two were found in
 the 2026-10-11 survey:
 
-- **An arena layout.** 107 `phys_at` calls across 17 files carve DMA arenas by hand-kept offset constants
-  (every compiled driver's offsets, until 2026-10-19 and 2026-10-20), with
+- **An arena layout.** 107 `phys_at` calls across 17 files carved DMA arenas by hand-kept offset constants
+  (every compiled driver's, until 2026-10-19 and 2026-10-20), with
   nothing checking that the pieces do not overlap or fit the granted arena. A layout of named, aligned,
   bounds-checked regions, fixed at start, fails loudly at spawn instead. **Built 2026-10-19** as
   `gs::driver::arena` (`Layout::take`, `Part`), with `gs::driver::registers`; AHCI, GENET, `nic-driver` and `audio-driver` converted first

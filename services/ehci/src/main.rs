@@ -836,7 +836,7 @@ fn setup_hid(
 }
 
 /// Arm an interrupt IN qTD (8-byte report, IOC, given data toggle) for the QH at
-/// DMA offset `qh`, and point the QH overlay at it so the controller re-fetches.
+/// offset `qh` within the poll part (`Parts::poll`), and point the QH overlay at it so the controller re-fetches.
 /// The qTD lives at `qh + 0x40`, its report buffer at `qh + 0x80`.
 fn arm_int(dma: &Parts, qh: usize, toggle: u32) {
     let qtd = qh + 0x40;

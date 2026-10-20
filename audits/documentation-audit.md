@@ -1598,3 +1598,46 @@ layout line, the disk mounted, and `connect 188.114.96.1:443 - off the subnet, v
 
 **Gates:** every documentation checker green (dash, doc refs, docs index, facts, foreign words, line refs,
 site, backlog, doc commands, doc and comment symbols).
+
+## Audit 18 - documents and code comments, the arena layouts (2026-10-20)
+
+Scope: the day's commits after `b9365a1d` that laid out by name the arenas of `pwm-audio`, `dwmac`, `ehci`,
+`dwc2` and `xhci`, moved `sdhci.rs` onto `Registers`, and updated `docs/driver-library.md` and `backlog/71` -
+23 files at `269c86f3`. One read-only reviewer read the diff and the comments around it, and swept the
+current-tense docs; every finding was re-read against the code by the session that made the change, so this is
+closer to a self-audit than an independent one.
+
+**Result.** 12 corrections, 7 in code comments and 5 in documents, the ratchet's note included. Two defects are
+in code, recorded and not changed.
+
+**Comments still describing the offsets the parts replaced:**
+- `kernel/src/task/mod.rs` gave `pwm-audio`'s 33 pages as `ARENA_NEEDED`, which is gone, and said `ehci` zeroes
+  "the whole arena" on every control transfer; it zeroes its two parts.
+- `xhci`'s module doc said its access is through `Arena`, and the comment above its grants said the arena is
+  "reached at the offsets below, as before: a layout by name is the step after this one" - above the call that
+  lays it out. Its `msc.rs` pointed at `DISK_REGION_BYTES` for an explanation that is in the note beside it.
+- `ehci`'s `arm_int` called `qh` a "DMA offset"; it is an offset within the poll part.
+- `dwc2`'s module doc said the fallback loop runs only when no window or arena was granted; it also runs when
+  the layout refuses the arena granted.
+
+**A number:** `COMMANDMENTS.baseline.toml` kept "29 are one fact stored twice" from 2026-09-14; 25 entries remain.
+
+**Overclaims and current-tense text the work made false:**
+- `docs/driver-library.md`'s status said no driver reaches its arena "at a hand-kept offset any more". Offsets
+  remain, within parts (`ehci`'s control transfer, `xhci`'s slices and `msc`'s region); it says that now.
+- `backlog/71` said 107 `phys_at` calls "carve" arenas by hand, beside "until 2026-10-20".
+- `docs/audio.md` listed five drivers that each write an arena layout; they each wrote one.
+- `docs/CLAUDE.md`'s `driver-library.md` row said step 3 converted AHCI and GENET; it covers every driver.
+
+**Left as history:** `docs/usb-hub.md`'s "two device slices" at `DEV_BASE (0x7000)` and `docs/audio.md`'s
+"the SIXTH such table" are dated design and record text, and the first was stale before this work.
+`dwmac_ring.rs`'s "Sixteen because" sits under a note saying those paragraphs were written at sixteen.
+
+**Code defects, recorded and not changed (an audit changes documents and comments only):**
+- `nic-driver`'s `dwmac_main`: when the layout refuses a granted arena it logs why, and then the `else` branch
+  logs a second, wrong line - "no dwmac register window or DMA arena granted" - though neither was missing.
+- `pwm-audio`'s `bring_up` now zeroes an arena that is too small before the layout refuses it, and checks the
+  1 GiB reach on it first; harmless, but the order differs from the size check it replaced.
+
+**Gates:** every documentation checker green (dash, doc refs, docs index, facts, line refs, doc and comment
+symbols), and the commandments selftest 78/78.

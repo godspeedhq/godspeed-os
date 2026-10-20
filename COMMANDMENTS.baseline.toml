@@ -326,7 +326,8 @@ peer_reacquire_debt = ["console", "ehci", "hw-enumerator"]
 # Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
 # `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
 #
-# 29 are one fact stored twice with the SAME value - a `use` away from being one. Two were the other
+# Of the 31 recorded then, 29 were one fact stored twice with the SAME value - a `use` away from being
+# one; 25 entries remain. Two were the other
 # shape, the same name carrying DIFFERENT facts in one crate: nic-driver's RX_RING_OFF (0x100 in the
 # dwmac arena, 0x2000 in the RTL8168's) and dwc2's DATA_OFF (0x40 and 0x400). Nothing was wrong at
 # either site, which is what made that shape worth a name: a reader could not tell which arena or

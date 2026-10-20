@@ -4,7 +4,8 @@
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
 converted to the first three across all four ports; and since 2026-10-19 every compiled driver on the grants
 (step 3), the one-way ratchet holding a new driver to them, and since 2026-10-20 every compiled driver's
-arena laid out by name - no driver reaches its arena at a hand-kept offset any more. "Current state" below says what exists; the
+arena laid out by name - no driver reaches its arena at an offset from the arena's start any more; the
+offsets that remain are within a named, bounds-checked part. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
