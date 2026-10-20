@@ -100,6 +100,22 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    known; that the Ethernet FCS would have caught damage on the wire points at the second. Six clean
    downloads against the earlier failure rates is evidence, not yet proof: a few more cards will say.
    `chaos max-carnage all-services 1000` and `selfcheck` (666 ran, 0 failed) on the same image, clean.
+   **The T630, three more cards (2026-10-20).** `d830652d`: 5 of 6 downloads, the sixth stalled after six
+   drops in eight seconds and 64 or more drops in the run; `chaos max-carnage all-services 1000` and
+   `selfcheck` (603 ran, 0 failed) clean. `596c37b6` (says what a drop was): 7 of 7, three drops, every one
+   a full-size segment with Don't Fragment set and its IP length matching the frame (1468 of 1472, the
+   four being the FCS the chip leaves on), so **not fragmentation** - the bytes were damaged. `2b07c406`
+   (compares a damaged segment with its intact resend): 5 of 5, two drops, one compared:
+   `1349 of 1428 payload bytes differ, 5410 bits, offsets 74..1427 (frame at 54)`. The first 128 bytes of
+   the frame were the right frame and everything after them was other data, which is not bit damage on a
+   wire: it is the shape of a receive buffer read when only the first 128-byte DMA write of the frame had
+   landed (128 bytes is a usual PCIe maximum payload), or of a buffer reused under the reader. The other
+   drop came 0.5 s after three receiver restarts and a TX-timeout recovery in 0.7 s. Two suspects in
+   `nic-driver`, neither shown: `rtl_restart_rx` turns the receiver off and re-arms every descriptor
+   without waiting for a frame the chip is still writing, and nothing in the system sets or clears the
+   RTL8168's PCIe Relaxed Ordering, which would let the descriptor's write overtake the data's. The
+   restarts are logged only at the first eight and every 64th, so their timing against the drops is not
+   yet known.
 
 ## Where to start
 
