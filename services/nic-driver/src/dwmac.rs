@@ -29,9 +29,9 @@
 //! Synopsys release 5.20, exactly what the tree claims. A 3.x part would have put that register at
 //! 0x20 instead and read here as absent.
 
-use crate::dwmac_ring::Dwmac;
+use crate::dwmac_ring::{Dwmac, Parts};
 use godspeed::driver::wait::{self, Budget};
-use godspeed::driver::{Arena, Registers};
+use godspeed::driver::Registers;
 use godspeed_sdk::{Message, ServiceContext};
 
 // The radio as the link's second backend (`radio.rs`), shared with the Pi 4's GENET - see the note where
@@ -293,7 +293,8 @@ pub fn link(ctx: &ServiceContext, m: &Registers, phy: u32) -> (bool, u32, bool) 
 
 /// Drive the DesignWare MAC. Never returns.
 pub fn dwmac_main(ctx: ServiceContext) -> ! {
-    let (Some(m), Some(a)) = (godspeed::driver::registers(&ctx), godspeed::driver::arena(&ctx)) else {
+    let (Some(m), Some(a)) = (godspeed::driver::registers(&ctx),
+                              godspeed::driver::arena(&ctx).and_then(|a| Parts::lay_out(&ctx, a))) else {
         ctx.log("nic-driver: no dwmac register window or DMA arena granted - serving empty replies");
         crate::serve_status(&ctx, &[0u8; 8]);
     };
@@ -363,7 +364,7 @@ pub fn dwmac_main(ctx: ServiceContext) -> ! {
 /// The MAC, up or not. Down keeps the grant, so a cable can bring it up later without a respawn.
 enum Wire {
     Up(Dwmac),
-    Down(Registers, Arena),
+    Down(Registers, Parts),
 }
 
 impl Wire {
