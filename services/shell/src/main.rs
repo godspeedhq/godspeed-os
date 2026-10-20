@@ -915,6 +915,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // /users/default/history (§8 secret taint): a password recovered on up-arrow would defeat the
                     // whole point of invisible entry. It still EXECUTES below; it just isn't remembered.
                     if !line_reads_secret(line.bytes()) {
+                        // The file is merged in BEFORE the first save, or that save would replace the
+                        // whole file with this boot's one line: every boot's first command used to wipe
+                        // the history it was meant to add to (`History::load`).
+                        if !hist.loaded { hist.load(&ctx); }
                         hist.push(line.bytes());
                         // Write-through to the fs (best-effort). Not while a job holds `fs` inside one
                         // request (a check, a scrub, a tree delete): the save would wait its 2 s for
@@ -1915,10 +1919,10 @@ impl History {
     /// is blocked by fs's single-endpoint block-driver multiplexing - see `save`). A rug-pulled fs is then a
     /// non-event - no recall this session, shell fully usable - and both resume when fs heals.
     ///
-    /// LAZY + one-shot + merge-behind. Not called at startup, and not merely on the first up-arrow - only
-    /// when the user navigates PAST their last session command (up-arrow at the oldest in-memory entry) AND
-    /// there is room (len < HIST_MAX), so a session that already fills the ring never touches fs at all. Runs
-    /// at most once (the `loaded` gate, set even on a bounded miss so later up-arrows never re-touch fs).
+    /// LAZY + one-shot + merge-behind. Not called at startup. It runs at whichever comes first: the first
+    /// command entered (before its write-through, which saves the ring WHOLE - unmerged, that save replaced
+    /// the file with this boot's lines alone and lost every earlier one, 2026-10-20), or an up-arrow PAST the
+    /// session's commands while there is room (len < HIST_MAX). Runs at most once (the `loaded` gate, set even on a bounded miss so later up-arrows never re-touch fs).
     /// Bounded: a wedged/absent fs just leaves the session's own commands. The file's lines are OLDER than
     /// anything typed this session, so they merge BEHIND the session commands (newest, kept); `push` drops
     /// the oldest - a file line - if the merge exceeds HIST_MAX. `#[inline(never)]` keeps its ~4 KiB frame
