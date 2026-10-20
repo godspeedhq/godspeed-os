@@ -594,6 +594,18 @@ fn fragment_word(f: &[u8]) -> Option<u16> {
     if w & 0x3fff != 0 { Some(w) } else { None }
 }
 
+/// Up to six differing bytes, as `offset:damaged/intact` in hex, for `Tcp::compare_resend`.
+struct DiffList<'a>(&'a [(usize, u8, u8)]);
+impl core::fmt::Display for DiffList<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (i, (o, b, g)) in self.0.iter().enumerate() {
+            if i > 0 { f.write_str(" ")?; }
+            write!(f, "{:#x}:{:02x}/{:02x}", o, b, g)?;
+        }
+        Ok(())
+    }
+}
+
 /// The TCP checksum: one's-complement sum over the pseudo-header, the TCP header and the payload
 /// (RFC 793 §3.1). The pseudo-header is why this cannot reuse the plain IP `checksum` in `main.rs`:
 /// it covers addresses that are not inside the segment, which is precisely what makes a TCP segment
@@ -812,6 +824,18 @@ pub struct Tcp {
     /// IPv4 fragments of a TCP segment for this machine, dropped because this stack does not reassemble
     /// (`fragment_word`), since the table was made; logged at the first eight and every 64th.
     pub fragments: u32,
+    /// The payload of the last segment dropped for a wrong TCP checksum, kept so that when the sender's
+    /// resend of it arrives intact the two are compared byte by byte (`compare_resend`): where the
+    /// damage sits says where it was made (`backlog/93` item 11). One page, asked for at the first such
+    /// drop; `damaged_len` 0 means nothing is held.
+    damaged: Option<godspeed::memory::Region>,
+    damaged_len: usize,
+    damaged_seq: u32,
+    damaged_from: ([u8; 4], u16),
+    /// Where the kept payload began in its frame, which is where it began in the driver's receive buffer.
+    damaged_at: usize,
+    /// The drop's number (`bad_checksum` then), so the comparison names the line it answers.
+    damaged_n: u32,
     /// One character per frame this transaction handed to the driver, in order, so the log can show
     /// WHICH frames were built rather than only how many.
     ///
@@ -837,6 +861,7 @@ impl Tcp {
             last_retx: 0,
             poll_tx_slow: 0,
             stat_seen: 0, stat_matched: 0, stat_sent: 0, bad_checksum: 0, fragments: 0,
+            damaged: None, damaged_len: 0, damaged_seq: 0, damaged_from: ([0; 4], 0), damaged_at: 0, damaged_n: 0,
             tx_log: [0u8; 24], tx_n: 0,
         }
     }
@@ -851,6 +876,55 @@ impl Tcp {
     }
 
     pub fn have_clock(&self) -> bool { self.cyc_per_ms != 0 }
+
+    /// Keep a damaged segment's payload until its resend arrives (`damaged`). A page is asked for once;
+    /// if none is given, nothing is kept and the comparison is simply never made.
+    fn keep_damaged(&mut self, ctx: &ServiceContext, f: &[u8], seg: &Seg<'_>, n: u32) {
+        if self.damaged.is_none() {
+            self.damaged = godspeed::memory::Region::alloc(ctx, 4096).ok();
+        }
+        let Some(r) = self.damaged.as_mut() else { return };
+        let len = seg.payload.len().min(r.len());
+        r.bytes_mut()[..len].copy_from_slice(&seg.payload[..len]);
+        self.damaged_len = len;
+        self.damaged_seq = seg.seq;
+        self.damaged_from = (seg.src_ip, seg.src_port);
+        self.damaged_at = (seg.payload.as_ptr() as usize).wrapping_sub(f.as_ptr() as usize);
+        self.damaged_n = n;
+    }
+
+    /// The resend of the kept segment arrived intact: say which bytes differ, at which offsets, and how
+    /// many bits, then let the copy go. Offsets are in the payload; add `frame at` for the driver's
+    /// buffer. Up to six differing bytes are listed as `offset:damaged/intact`.
+    fn compare_resend(&mut self, ctx: &ServiceContext, good: &[u8]) {
+        let Some(r) = self.damaged.as_ref() else { self.damaged_len = 0; return };
+        let bad = &r.bytes()[..self.damaged_len];
+        let len = bad.len().min(good.len());
+        let (mut diffs, mut bits, mut first, mut last) = (0usize, 0u32, usize::MAX, 0usize);
+        let mut shown = [(0usize, 0u8, 0u8); 6];
+        for i in 0..len {
+            if bad[i] != good[i] {
+                if diffs < shown.len() { shown[diffs] = (i, bad[i], good[i]); }
+                diffs += 1;
+                bits += (bad[i] ^ good[i]).count_ones();
+                if first == usize::MAX { first = i; }
+                last = i;
+            }
+        }
+        if diffs == 0 {
+            ctx.log_fmt(format_args!(
+                "net-stack: the resend of damaged segment #{} arrived intact and its first {} payload bytes match the damaged copy - the damage was outside them (lengths {} and {}), frame at {}",
+                self.damaged_n, len, bad.len(), good.len(), self.damaged_at));
+        } else {
+            let k = diffs.min(shown.len());
+            let mut list = [(0usize, 0u8, 0u8); 6];
+            list[..k].copy_from_slice(&shown[..k]);
+            ctx.log_fmt(format_args!(
+                "net-stack: the resend of damaged segment #{} arrived intact - {} of {} payload bytes differ, {} bits, offsets {}..{} (frame at {}); {}",
+                self.damaged_n, diffs, len, bits, first, last, self.damaged_at, DiffList(&list[..k])));
+        }
+        self.damaged_len = 0;
+    }
 
     /// Give every slot its large receive arena ([`RCV_BIG`]), asked of the kernel once. How many slots got
     /// one: a slot that did not keeps the small arena and works, slower, and the caller says so (26.7).
@@ -1249,10 +1323,13 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
             t2.on_frame(ctx, &net, &buf[..n], &mut sink);
             check(t2.bad_checksum == bad0 + 1 && t2.conns[j].rcv_nxt == rn,
                   "a segment with a bad checksum is dropped and counted, not taken as data", &mut pass, &mut fail);
+            check(t2.damaged_len == 7 && t2.damaged_seq == rn,
+                  "the damaged segment's payload is kept for its resend", &mut pass, &mut fail);
             buf[n - 1] ^= 0x01;
             t2.on_frame(ctx, &net, &buf[..n], &mut sink);
             check(t2.bad_checksum == bad0 + 1 && t2.conns[j].rcv_nxt == rn.wrapping_add(7),
                   "the same segment with its checksum intact is taken", &mut pass, &mut fail);
+            check(t2.damaged_len == 0, "its intact resend is compared and the kept copy let go", &mut pass, &mut fail);
             // The same bytes marked as the first IP fragment of a larger datagram (more to follow, its
             // header checksum made good) are counted as a fragment and not taken: this stack does not
             // reassemble, and a first fragment read as a whole segment is truncated data.
@@ -1662,7 +1739,14 @@ impl Tcp {
                     ip[0], ip[1], ip[2], ip[3], seg.src_port, n, why, ip_total, f.len() - ETH_LEN,
                     frag_word, seg.seq, seg.payload.len()));
             }
+            if why == "the TCP checksum is wrong" && !seg.payload.is_empty() {
+                self.keep_damaged(ctx, f, &seg, n);
+            }
             return 0;
+        }
+        if self.damaged_len != 0 && seg.seq == self.damaged_seq
+            && self.damaged_from == (seg.src_ip, seg.src_port) && !seg.payload.is_empty() {
+            self.compare_resend(ctx, seg.payload);
         }
         let now = self.now_ms(ctx).unwrap_or(0);
 
