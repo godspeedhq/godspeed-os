@@ -3,8 +3,8 @@
 **Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
 `delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
 converted to the first three across all four ports; and since 2026-10-19 every compiled driver on the grants
-(step 3) - AHCI, GENET, `nic-driver`'s e1000 and RTL8168 and `audio-driver` with their arena laid out by name,
-the rest at their offsets, and the one-way ratchet holding a new driver to them. "Current state" below says what exists; the
+(step 3), the one-way ratchet holding a new driver to them, and since 2026-10-20 every compiled driver's
+arena laid out by name - no driver reaches its arena at a hand-kept offset any more. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -105,8 +105,7 @@ verified on hardware**). `audio-driver` and `pwm-audio` were written on the libr
 |---|---|---|---|
 | `dwc2`'s complete-split NYET retry | Pi 2 | a retry count of sleeps on the keyboard path | 1g |
 | `dwmac`'s `rgmii_loopback_sweep` | VisionFive | compiled but never run | 1i |
-| `block-driver` `sdhci.rs` | none | not compiled; its window is still the SDK's `Mmio`, handed in by a caller that does not exist | 1b, 3 |
-| the arena LAYOUT of `xhci`, `dwc2`, `ehci`, `dwmac` and `pwm-audio` | all | on the grants, still at offset constants; `xhci`'s is the largest (six device slices, the scratchpad, the disk's region, the hub probe inside the ERST page) | 3 |
+| `block-driver` `sdhci.rs` | none | not compiled, so its count-bounded loops stay (1b); its window type moved to `Registers` on 2026-10-20, checked by compiling it once for the Pi 2 and taking the `mod` line back out | 1b, 3 |
 
 **Open gaps, recorded rather than hidden.**
 
@@ -739,3 +738,28 @@ in QEMU (no jack, no dwmac, no radio is granted there), so each is built for its
 VisionFive, the Pi 4 and the VisionFive - and owes its card. With them no compiled service or example takes a
 grant from the SDK, and `one_way_check.py` counts the four grant calls, shown to fail on a `ctx.mmio()`
 planted in `examples/e1000` and pass once it was removed.
+
+**The remaining five arenas laid out by name (2026-10-20).** Each logs its layout once at start, and each
+part landed where its constant was, with one exception, said below.
+
+- **`pwm-audio`**: two parts, the control blocks at 0x0 and the ring at 0x1000. Its size check (`ARENA_NEEDED`)
+  is the layout's refusal; the bus address the DMA engine is given is computed from a part's physical address.
+  QEMU `raspi2b`: the layout line, then the pacing check refusing QEMU's unpaced DMA model as before.
+- **`dwmac`**: four parts, the rings at 0x0 and 0x100, the buffers from 0x1000 and 0x3000. A MAC that will not
+  come up hands its grant back to try again on a cable; the parts are `Copy`, so it hands the parts back.
+  Built only: QEMU has no dwmac.
+- **`ehci`**: two parts, one control transfer's structures (its QH, three qTDs, the setup packet and the
+  data buffer, at their offsets within the part) at 0x0, and the poll slots at 0x400. Booted by hand as
+  before: the same lines, stopping at the same `Get_Hub_Descriptor failed`.
+- **`dwc2`**: eleven parts in a new `parts.rs`, one per buffer the controller is pointed at, so the pairwise
+  const asserts between them are gone. **The exception:** the hub's status buffer sat at 0x300, on the
+  mass-storage CBW, which none of those asserts covered; it is at 0x280 now, since two parts cannot share
+  bytes. QEMU `raspi2b`: the keyboard, a USB disk written and read back, `drives check` ok.
+- **`xhci`**: twelve parts - the DCBAA, the command and event rings, the ERST with the hub probe in its own
+  part at the tail of the ERST's page (0x3f00, where it was), the input context, the data and config buffers,
+  the six device slices as one part (the slice helpers address within it), the scratchpad array and its
+  256 pages, and the disk's region, which `msc` reaches as its own part. They fill the 292-page arena
+  exactly. QEMU: `osdev test iommu` 1/1, the keyboard bound; RISC-V `virt` with a USB disk, `drives flash
+  data`, a write read back, `drives check` 0 bad.
+
+Each owes the card its grants step already owed; none adds one.

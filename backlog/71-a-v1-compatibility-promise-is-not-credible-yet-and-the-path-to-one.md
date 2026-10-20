@@ -66,7 +66,7 @@ reach the SDK for, found repeated in real drivers as `docs/driver-library.md` re
 the 2026-10-11 survey:
 
 - **An arena layout.** 107 `phys_at` calls across 17 files carve DMA arenas by hand-kept offset constants
-  (`xhci`'s `DCBAA_OFF` and its neighbours, and every other driver's offsets until 2026-10-19 and 2026-10-20), with
+  (every compiled driver's offsets, until 2026-10-19 and 2026-10-20), with
   nothing checking that the pieces do not overlap or fit the granted arena. A layout of named, aligned,
   bounds-checked regions, fixed at start, fails loudly at spawn instead. **Built 2026-10-19** as
   `gs::driver::arena` (`Layout::take`, `Part`), with `gs::driver::registers`; AHCI, GENET, `nic-driver` and `audio-driver` converted first
@@ -75,7 +75,8 @@ the 2026-10-11 survey:
   shared part is taking both and saying plainly what is missing; what to do then stays the driver's.
   **Built 2026-10-19:** every compiled driver takes them through `gs::driver::registers` and `arena`, and
   the one-way ratchet counts the SDK's four grant calls, so a new driver starts at zero
-  (`docs/driver-library.md` step 3). Five arenas are still at offset constants.
+  (`docs/driver-library.md` step 3). Since 2026-10-20 every compiled driver's arena is laid out by name too:
+  `pwm-audio`, `dwmac`, `ehci`, `dwc2` and `xhci` followed the first four.
 
 **The principle that decides what goes in `gs` (settled 2026-10-11).** The SDK answers *what can this
 kernel do, and how is it reached safely*: the syscall ABI and the audited `unsafe` (CLAUDE.md 18.1),
