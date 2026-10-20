@@ -75,7 +75,8 @@ fn dev_flush(ctx: &ServiceContext) -> super::xhciblk::Flush { super::xhciblk::fl
 /// Serve one block-IPC request. Same wire protocol as the AHCI backend - `fs` is unaware of which one
 /// it is talking to.
 fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
-    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, OP_WRITE_ZEROS,
+                STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
     let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
     if p.is_empty() { return err(ctx); }
     if p[0] == OP_FLUSH {
@@ -138,6 +139,20 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
             buf.copy_from_slice(&p[9..521]);
             let status = if request(ctx, "write", lba, || dev_write(ctx, lba, &buf)) { STATUS_OK } else { STATUS_ERR };
             reply.send(ctx, &[status]);
+        }
+        OP_WRITE_BLOCKS => {
+            // A run, written block by block through the USB host: one request from `fs` rather than
+            // `count`, the host still asked per block.
+            let count = p.get(9).copied().unwrap_or(0) as usize;
+            if count == 0 || count > WRITE_RUN_MAX || p.len() < 10 + count * 512 { return err(ctx); }
+            let mut ok = true;
+            for s in 0..count {
+                let mut buf = [0u8; 512];
+                buf.copy_from_slice(&p[10 + s * 512..10 + (s + 1) * 512]);
+                let at = lba + s as u64;
+                if !request(ctx, "write", at, || dev_write(ctx, at, &buf)) { ok = false; break; }
+            }
+            reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
         }
         OP_WRITE_ZEROS => {
             if p.len() < 17 { return err(ctx); }

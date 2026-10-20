@@ -166,8 +166,10 @@ not filesystem faults**. That is not reassuring, it is the point. A suite that f
 reasons is the one nobody investigates, and it trains exactly the reflex the entry names - discount
 red, re-run, move on.
 
-**A fifth, found 2026-10-20 (`fs-check`, 8 of 9).** Its setup prints `drifted free count 156147 -> 156147 (both
-copies), correct value is 32691`: the drift no longer changes the count it is meant to drift, so the check
-`fsck stopped believing the drifted superblock count` cannot pass, while the eight that do not depend on the
-drift still do. The same 8 of 9 with and without the change being tested that day (the `fs` walk cache), so it
-is the fixture's, not the filesystem's - the shape this entry names. Not fixed.
+**A fifth, found and fixed 2026-10-20 (`fs-check`, 8 of 9).** `drives check` now reports a repaired count by
+naming the lie - "the superblock claimed N free, the tree says M" - and the check `fsck stopped believing the
+drifted superblock count` failed on ANY mention of "N free", so the report that is right tripped it. It now looks
+at the rebuilt count on the summary line. (Its setup line also printed the drifted value twice, `156147 ->
+156147`, which first read as a drift that changed nothing; that was the print, also fixed.) The same 8 of 9 with
+and without the change being tested that day (the `fs` walk cache): the fixture's, not the filesystem's - the
+shape this entry names.

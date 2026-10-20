@@ -5836,7 +5836,10 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     // What the test is FOR is preserved exactly - that fsck rebuilds the count from the tree instead
     // of believing the superblock. The value must no longer be the bogus one, and must land within a
     // few blocks of the truth: a window boot-time writes fit in and a 123,456-block lie does not.
-    let bogus_free = format!("{} free", expect_free.wrapping_add(123_456));
+    // THE REBUILT COUNT, on the summary line, is what must not be the lie. The report now NAMES the lie
+    // ("the superblock claimed N free, the tree says M"), which is right and which an any-mention check
+    // read as fsck still believing it: 8 of 9, with nothing wrong in `fs` (2026-10-20, `backlog/32`).
+    let bogus_free = format!("{} free (bitmap", expect_free.wrapping_add(123_456));
     match run!(b"drives check\r", 15) {
         Some(r) => {
             check!(!r.contains(&bogus_free), "fsck stopped believing the drifted superblock count");

@@ -220,7 +220,7 @@ mod usbdisk;
 mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
-//   Request : [tag:u8, op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
+//   Request : [tag:u8, op:u8, lba:u64 LE, (WriteBlock: 512 data bytes; WriteBlocks: count:u8, count x 512)]
 //   Reply   : [tag:u8, status:u8, (ReadBlock only: 512 data bytes)]
 // `tag` is the caller's correlation byte, echoed unread (`Reply`); the op lines below omit it.
 // The LBA is u64 (persistence §6.3): GSFS capacity fields are u64, so the block
@@ -240,6 +240,14 @@ const OP_WRITE_ZEROS: u8 = 4;
 // the points where it promises it (format, journal commit). Backends that cannot flush say so
 // once at startup rather than quietly implying the data is safe (§26.7).
 const OP_FLUSH: u8 = 5;
+// Write a run: [OP_WRITE_BLOCKS, lba:u64, count:u8, count x 512 data] -> [status]. `count` consecutive
+// blocks from `lba`, 1 to `WRITE_RUN_MAX`, in one request: what a file's chunk is (seven blocks), which
+// was seven requests (`backlog/93` item 12). AHCI issues it as one multi-sector command; the USB backend
+// writes its blocks in turn. All or an error: a reply of `STATUS_ERR` says the run did not complete.
+const OP_WRITE_BLOCKS: u8 = 6;
+/// The most blocks one `OP_WRITE_BLOCKS` carries: 7 x 512 + 10, with the tag, is 3,595 bytes, inside one
+/// 4 KiB message. `fs` sends no more (its own `WRITE_RUN_MAX`).
+const WRITE_RUN_MAX: usize = 7;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 // A flush that reached NO device: the USB host service did not answer, or had no disk bound. `fs`

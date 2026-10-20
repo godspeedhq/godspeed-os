@@ -524,6 +524,24 @@ impl<'a> Ahci<'a> {
         Ok(())
     }
 
+    /// Write `count` consecutive sectors from `lba` (`data`, `count` x 512 bytes) in ONE WRITE DMA EXT, with
+    /// `write_block`'s bounded retry and, for its reason, no flush (`OP_WRITE_BLOCKS`). `count` is at most
+    /// `WRITE_RUN_MAX`, well inside the `data` part (`MAX_PER` sectors).
+    #[cfg_attr(feature = "volatile-cache-test", allow(dead_code))]
+    fn write_blocks(&self, ctx: &ServiceContext, lba: u64, data: &[u8], count: usize) -> Result<(), &'static str> {
+        for i in 0..count * 128 {
+            let w = u32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]);
+            self.data.write32(i * 4, w);
+        }
+        self.issue_io(ctx, "write", ATA_WRITE_DMA_EXT, lba, count as u16, true, (count * 512) as u32)?;
+        for s in 0..count {
+            let mut sec = [0u8; 512];
+            sec.copy_from_slice(&data[s * 512..(s + 1) * 512]);
+            self.write_tap(ctx, lba + s as u64, &sec);
+        }
+        Ok(())
+    }
+
     /// Write `count` zeroed sectors from `lba`, batched into multi-sector WRITE DMA EXT
     /// commands (up to MAX_PER sectors each - bounded by the arena's `data` part, `DATA_LEN`). One
     /// IPC call zeros a whole run, so `fs` can clear a big bitmap without per-block traffic.
@@ -642,7 +660,8 @@ impl<'a> Ahci<'a> {
     }
 
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
-        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, OP_WRITE_ZEROS,
+                    STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
         let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
         if p.is_empty() {
             err(ctx);
@@ -733,6 +752,38 @@ impl<'a> Ahci<'a> {
                     Err(_) => STATUS_ERR,
                 };
                 reply.send(ctx, &[status]);
+            }
+            OP_WRITE_BLOCKS => {
+                // [op, lba:u64, count:u8, count x 512] - a run of consecutive blocks, one command.
+                let count = p.get(9).copied().unwrap_or(0) as usize;
+                if count == 0 || count > WRITE_RUN_MAX || p.len() < 10 + count * 512 {
+                    err(ctx);
+                    return;
+                }
+                let data = &p[10..10 + count * 512];
+                // The cache model takes blocks one at a time, as `OP_WRITE_BLOCK` gives them to it.
+                #[cfg(feature = "volatile-cache-test")]
+                {
+                    let mut ok = true;
+                    for s in 0..count {
+                        let at = lba + s as u64;
+                        let mut sec = [0u8; 512];
+                        sec.copy_from_slice(&data[s * 512..(s + 1) * 512]);
+                        if !self.cache_write(ctx, at, &sec) && self.write_block(ctx, at, &sec).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
+                }
+                #[cfg(not(feature = "volatile-cache-test"))]
+                {
+                    let status = match self.write_blocks(ctx, lba, data, count) {
+                        Ok(()) => STATUS_OK,
+                        Err(_) => STATUS_ERR,
+                    };
+                    reply.send(ctx, &[status]);
+                }
             }
             OP_WRITE_ZEROS => {
                 // [op, lba:u64, count:u64] - zero `count` blocks from `lba`.

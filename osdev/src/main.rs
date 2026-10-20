@@ -3195,7 +3195,7 @@ fn run_fs_check_test() {
     stamp(&mut data, 0);                                   // primary @ LBA 0
     stamp(&mut data, ((total - 1) as usize) * 512);        // backup @ last LBA
     std::fs::write(persist, &data).unwrap();
-    println!("fs-check: drifted free count {} -> {} (both copies), correct value is {}", bogus, bogus, correct_free);
+    println!("fs-check: drifted free count {} -> {} (both copies), correct value is {}", correct_free, bogus, correct_free);
 
     crate::shell_test::run_fs_check(&image_path, persist, correct_free, 4);
 }
