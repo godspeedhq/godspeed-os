@@ -28,7 +28,7 @@
 #![no_main]
 
 use godspeed as gs;
-use godspeed::driver::delay;
+use godspeed::driver::{delay, Part};
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 use core::cell::Cell;
@@ -203,13 +203,15 @@ const CMD_IAAD:         u32   = 1 << 6;  // USBCMD: Interrupt on Async Advance D
 const STS_ASS:          u32   = 1 << 15; // USBSTS: Async Schedule Status
 const STS_IAA:          u32   = 1 << 5;  // USBSTS: Interrupt on Async Advance
 
-// Offsets within the granted DMA arena (32-byte aligned where a QH/qTD lives).
+// Offsets within the CONTROL part of the arena (`Parts`), 32-byte aligned where a QH/qTD lives.
 const QH_OFF:     usize = 0x000; // Queue Head (48 bytes)
 const QTD_SETUP:  usize = 0x040; // SETUP-stage qTD
 const QTD_DATA:   usize = 0x060; // DATA-stage qTD
 const QTD_STATUS: usize = 0x080; // STATUS-stage qTD
 const SETUP_PKT:  usize = 0x100; // 8-byte USB setup packet
-const DATA_BUF:   usize = 0x200; // control-transfer data buffer
+const DATA_BUF:   usize = 0x200; // control-transfer data buffer, to the part's end
+/// The control part: one transfer's QH, qTDs, setup packet and data buffer.
+const CONTROL_BYTES: usize = 0x400;
 
 /// C8-1: how long a control transfer may take before we stop waiting. A DURATION, not a read count.
 ///
@@ -247,10 +249,47 @@ struct HidDev { addr: u8, port: u8, ep_num: u8, is_mouse: bool }
 /// Maximum HID devices polled together (keyboard + mouse covers the cases we have).
 const MAX_HID: usize = 2;
 /// Poll-phase DMA layout: one QH + qTD + report buffer per device, `POLL_STRIDE`
-/// apart, starting at `POLL_BASE` - clear of the config-phase region (QH_OFF 0x0 …
-/// DATA_BUF 0x200) so enumeration and polling never alias.
-const POLL_BASE:   usize = 0x400;
+/// apart, in the POLL part (`Parts`) - its own part, after the control part, so
+/// enumeration and polling never alias.
 const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
+
+/// The arena in its two parts, taken by name through `gs::driver::arena` (`docs/driver-library.md`
+/// step 3): the control transfer's structures at 0x0 and the poll slots at 0x400, where the offset
+/// constants put them. An access past a part ends the driver naming it.
+#[derive(Clone, Copy)]
+struct Parts {
+    ctl: Part,
+    poll: Part,
+}
+
+impl Parts {
+    /// Both parts, as the whole arena was zeroed before.
+    fn zero(&self) {
+        self.ctl.zero();
+        self.poll.zero();
+    }
+}
+
+/// Lay the arena out, said once; `None`, said with the part that did not fit, is no arena.
+fn lay_out(ctx: &ServiceContext, a: godspeed::driver::Arena) -> Option<Parts> {
+    let mut l = a.layout();
+    let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>(Parts {
+        ctl: l.take("control transfer", CONTROL_BYTES, 4096)?,
+        poll: l.take("poll slots", MAX_HID * POLL_STRIDE, POLL_STRIDE)?,
+    }))();
+    match laid {
+        Ok(p) => {
+            ctx.log_fmt(format_args!(
+                "ehci: arena laid out - control transfer at {:#x}, poll slots at {:#x} ({} of {} bytes)",
+                p.ctl.offset(), p.poll.offset(), l.used(), l.len()));
+            Some(p)
+        }
+        Err(e) => {
+            ctx.log_fmt(format_args!("ehci: {} - cannot enumerate; idling", e));
+            None
+        }
+    }
+}
 
 /// Run one control transfer on EP0 of `ep`. For a low-speed `ep` the controller
 /// wraps each transaction as a split through the hub TT (hub addr + port in the
@@ -259,66 +298,66 @@ const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 /// error/timeout (with the qTD tokens logged). The async schedule stays enabled
 /// across calls; the single QH is idle between them.
 fn control(
-    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
     op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
     dma.zero();
 
-    let qh_phys     = dma.phys_at(QH_OFF) as u32;
-    let setup_phys  = dma.phys_at(QTD_SETUP) as u32;
-    let data_phys   = dma.phys_at(QTD_DATA) as u32;
-    let status_phys = dma.phys_at(QTD_STATUS) as u32;
-    let pkt_phys    = dma.phys_at(SETUP_PKT) as u32;
-    let buf_phys    = dma.phys_at(DATA_BUF) as u32;
+    let qh_phys     = dma.ctl.phys_at(QH_OFF) as u32;
+    let setup_phys  = dma.ctl.phys_at(QTD_SETUP) as u32;
+    let data_phys   = dma.ctl.phys_at(QTD_DATA) as u32;
+    let status_phys = dma.ctl.phys_at(QTD_STATUS) as u32;
+    let pkt_phys    = dma.ctl.phys_at(SETUP_PKT) as u32;
+    let buf_phys    = dma.ctl.phys_at(DATA_BUF) as u32;
 
     // QH for EP0 @ ep.addr. Control Endpoint flag (C, bit 27) is set for non-HS
     // endpoints behind a TT; the hub address + port (dword 2) drive the split.
     let c = if ep.speed != 2 { 1u32 << 27 } else { 0 };
-    dma.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1));
-    dma.write32(QH_OFF + 0x04,
+    dma.ctl.write32(QH_OFF + 0x00, (qh_phys & !0x1F) | (1 << 1));
+    dma.ctl.write32(QH_OFF + 0x04,
         (ep.addr as u32 & 0x7F) | (ep.speed << 12) | (1 << 14) | (1 << 15)
             | (ep.max_packet << 16) | c);
     // Endpoint capabilities: Mult [31:30], Port Number [29:23], Hub Address [22:16] (EHCI 1.0
     // 3.6.2; Linux's ehci.h masks QH_HUBPORT 0x3f800000 and QH_HUBADDR 0x007f0000, and its
     // qh_make writes ttport << 23). This was `<< 22` until 2026-10-10, which put an odd port's low bit into the
     // hub address's top bit and read every port one low (backlog/fixed/80 D1).
-    dma.write32(QH_OFF + 0x08,
+    dma.ctl.write32(QH_OFF + 0x08,
         (1 << 30) | ((ep.hub_addr as u32 & 0x7F) << 16) | ((ep.port as u32 & 0x7F) << 23));
-    dma.write32(QH_OFF + 0x0C, 0);
-    dma.write32(QH_OFF + 0x10, setup_phys & !0x1F);
-    dma.write32(QH_OFF + 0x14, 1);
-    dma.write32(QH_OFF + 0x18, 0);
+    dma.ctl.write32(QH_OFF + 0x0C, 0);
+    dma.ctl.write32(QH_OFF + 0x10, setup_phys & !0x1F);
+    dma.ctl.write32(QH_OFF + 0x14, 1);
+    dma.ctl.write32(QH_OFF + 0x18, 0);
 
     // 8-byte setup packet → two little-endian dwords.
     let s0 = setup[0] as u32 | (setup[1] as u32) << 8 | (setup[2] as u32) << 16 | (setup[3] as u32) << 24;
     let s1 = setup[4] as u32 | (setup[5] as u32) << 8 | (setup[6] as u32) << 16 | (setup[7] as u32) << 24;
-    dma.write32(SETUP_PKT + 0x00, s0);
-    dma.write32(SETUP_PKT + 0x04, s1);
+    dma.ctl.write32(SETUP_PKT + 0x00, s0);
+    dma.ctl.write32(SETUP_PKT + 0x04, s1);
 
     // SETUP qTD (DATA0). Chains to DATA if there is a data stage, else STATUS.
     let after_setup = if data_len > 0 { data_phys } else { status_phys };
-    dma.write32(QTD_SETUP + 0x00, after_setup & !0x1F);
-    dma.write32(QTD_SETUP + 0x04, 1);
-    dma.write32(QTD_SETUP + 0x08, QTD_ACTIVE | (2 << 8) | (3 << 10) | (8 << 16));
-    dma.write32(QTD_SETUP + 0x0C, pkt_phys);
+    dma.ctl.write32(QTD_SETUP + 0x00, after_setup & !0x1F);
+    dma.ctl.write32(QTD_SETUP + 0x04, 1);
+    dma.ctl.write32(QTD_SETUP + 0x08, QTD_ACTIVE | (2 << 8) | (3 << 10) | (8 << 16));
+    dma.ctl.write32(QTD_SETUP + 0x0C, pkt_phys);
 
     // DATA qTD (DATA1), if any. PID IN=01 / OUT=00.
     if data_len > 0 {
         let pid = if in_dir { 1u32 } else { 0u32 };
-        dma.write32(QTD_DATA + 0x00, status_phys & !0x1F);
-        dma.write32(QTD_DATA + 0x04, 1);
-        dma.write32(QTD_DATA + 0x08,
+        dma.ctl.write32(QTD_DATA + 0x00, status_phys & !0x1F);
+        dma.ctl.write32(QTD_DATA + 0x04, 1);
+        dma.ctl.write32(QTD_DATA + 0x08,
             QTD_ACTIVE | (pid << 8) | (3 << 10) | ((data_len as u32) << 16) | (1 << 31));
-        dma.write32(QTD_DATA + 0x0C, buf_phys);
+        dma.ctl.write32(QTD_DATA + 0x0C, buf_phys);
     }
 
     // STATUS qTD (DATA1, IOC). Opposite direction: IN unless the data stage was IN.
     let status_pid = if in_dir && data_len > 0 { 0u32 } else { 1u32 };
-    dma.write32(QTD_STATUS + 0x00, 1);
-    dma.write32(QTD_STATUS + 0x04, 1);
-    dma.write32(QTD_STATUS + 0x08,
+    dma.ctl.write32(QTD_STATUS + 0x00, 1);
+    dma.ctl.write32(QTD_STATUS + 0x04, 1);
+    dma.ctl.write32(QTD_STATUS + 0x08,
         QTD_ACTIVE | (status_pid << 8) | (3 << 10) | (1 << 15) | (1 << 31));
-    dma.write32(QTD_STATUS + 0x0C, 0);
+    dma.ctl.write32(QTD_STATUS + 0x0C, 0);
 
     // Refresh the async schedule cleanly and flush the controller's internal
     // pointer cache. On `main` the firmware's ongoing activity keeps the EHCI
@@ -363,7 +402,7 @@ fn control(
     // (`AWAIT_SPIN`) are yielded rather than parked and the fast path is unchanged. Past that it is
     // either slow or never coming, and 10 ms of park costs nothing that matters against a one-second
     // budget.
-    let done = await_hw(ctx, CTRL_XFER_WAIT, || dma.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0);
+    let done = await_hw(ctx, CTRL_XFER_WAIT, || dma.ctl.read32(QTD_STATUS + 0x08) & QTD_ACTIVE == 0);
     // Say so ONCE. A transfer that burns the full budget is the difference between a driver that is
     // waiting and one that is eating the machine, and nothing in the log distinguished them - which
     // is why this took three attempts to place. Bounded to one line so an unplugged hub cannot
@@ -371,9 +410,9 @@ fn control(
     if !done && !said.replace(true) {
         ctx.log("ehci: a control transfer ran out its full budget (device gone?) - parking between polls");
     }
-    let t_setup  = dma.read32(QTD_SETUP + 0x08);
-    let t_data   = if data_len > 0 { dma.read32(QTD_DATA + 0x08) } else { 0 };
-    let t_status = dma.read32(QTD_STATUS + 0x08);
+    let t_setup  = dma.ctl.read32(QTD_SETUP + 0x08);
+    let t_data   = if data_len > 0 { dma.ctl.read32(QTD_DATA + 0x08) } else { 0 };
+    let t_status = dma.ctl.read32(QTD_STATUS + 0x08);
     let toks = t_setup | t_data | t_status;
     if !done || toks & (QTD_HALTED | QTD_ERRMASK) != 0 {
         // A failed control transfer is normal on a faulty/dead low-speed port; the
@@ -385,7 +424,7 @@ fn control(
     }
     // Bytes actually moved = requested - (DATA token's remaining-bytes field).
     let moved = if data_len > 0 {
-        data_len - ((dma.read32(QTD_DATA + 0x08) >> 16) & 0x7FFF) as usize
+        data_len - ((dma.ctl.read32(QTD_DATA + 0x08) >> 16) & 0x7FFF) as usize
     } else { 0 };
     Some(moved)
 }
@@ -396,7 +435,7 @@ fn control(
 /// bring-up fails.
 fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize) {
     let dma = match godspeed::driver::arena(&ctx) {
-        Some(d) => d,
+        Some(a) => match lay_out(ctx, a) { Some(p) => p, None => return },
         None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); return; }
     };
     // Whether the control-transfer timeout has been said. Owned here, by the function that runs for
@@ -408,11 +447,11 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
     // E3b: device descriptor at the default address 0.
     let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
     if control(ctx, mmio, &dma, op, said, &Ep::hs(0, 64), &setup, 18, true).is_none() { return; }
-    let class = dma.read8(DATA_BUF + 4);
-    let proto = dma.read8(DATA_BUF + 6); // hub: 0/1 = single-TT, 2 = multi-TT
-    let mps0  = dma.read8(DATA_BUF + 7) as u32;
-    let vid   = dma.read16(DATA_BUF + 8);
-    let pid   = dma.read16(DATA_BUF + 10);
+    let class = dma.ctl.read8(DATA_BUF + 4);
+    let proto = dma.ctl.read8(DATA_BUF + 6); // hub: 0/1 = single-TT, 2 = multi-TT
+    let mps0  = dma.ctl.read8(DATA_BUF + 7) as u32;
+    let vid   = dma.ctl.read16(DATA_BUF + 8);
+    let pid   = dma.ctl.read16(DATA_BUF + 10);
     ctx.log_fmt(format_args!(
         "ehci: DEVICE DESCRIPTOR class={:#04x} proto={} (TT type) mps0={} VID={:#06x} PID={:#06x}",
         class, proto, mps0, vid, pid));
@@ -430,7 +469,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
     if control(ctx, mmio, &dma, op, said, &Ep::hs(1, mps0), &setup, 9, true).is_none() {
         ctx.log("ehci: Get_Config failed"); return;
     }
-    let cfgval = dma.read8(DATA_BUF + 5);
+    let cfgval = dma.ctl.read8(DATA_BUF + 5);
 
     // Set configuration.
     let setup = [0x00, 0x09, cfgval, 0x00, 0x00, 0x00, 0x00, 0x00]; // Set_Configuration
@@ -446,8 +485,8 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
         None => { ctx.log("ehci: Get_Hub_Descriptor failed"); return; }
     };
     if n < 4 { ctx.log("ehci: short hub descriptor"); return; }
-    let nports  = dma.read8(DATA_BUF + 2);
-    let hubchar = dma.read16(DATA_BUF + 3);
+    let nports  = dma.ctl.read8(DATA_BUF + 2);
+    let hubchar = dma.ctl.read16(DATA_BUF + 3);
     ctx.log_fmt(format_args!(
         "ehci: HUB DESCRIPTOR ports={} characteristics={:#06x}", nports, hubchar));
 
@@ -514,7 +553,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
 /// loop - addressing each device (Set_Address moves it off the default address 0)
 /// before resetting the next port is what lets two devices coexist.
 fn scan_devices(
-    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
     op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
 ) -> ([HidDev; MAX_HID], usize, bool) {
     // Power every downstream port (the hub does individual power switching), let
@@ -533,7 +572,7 @@ fn scan_devices(
         // Status before reset.
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
         if control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &setup, 4, true).is_none() { continue; }
-        let status = dma.read16(DATA_BUF + 0);
+        let status = dma.ctl.read16(DATA_BUF + 0);
         ctx.log_fmt(format_args!(
             "ehci: hub port {}: status={:#06x} connected={} low_speed={}",
             port, status, (status & 1) as u8, ((status >> 9) & 1) as u8));
@@ -571,7 +610,7 @@ fn scan_devices(
 
             let s = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
             let _ = control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &s, 4, true);
-            let pstat = dma.read16(DATA_BUF + 0);
+            let pstat = dma.ctl.read16(DATA_BUF + 0);
 
             // A device that enables at high speed (status bit 10) after reset is
             // mass storage or a nested hub, not a boot HID. The speed bits aren't
@@ -600,8 +639,8 @@ fn scan_devices(
             any_failed = true;
             continue;
         }
-        let vid = dma.read16(DATA_BUF + 8);
-        let pid = dma.read16(DATA_BUF + 10);
+        let vid = dma.ctl.read16(DATA_BUF + 8);
+        let pid = dma.ctl.read16(DATA_BUF + 10);
         ctx.log_fmt(format_args!(
             "ehci: SPLIT device (hub port {}): VID={:#06x} PID={:#06x}", port, vid, pid));
 
@@ -632,22 +671,22 @@ fn scan_devices(
             any_failed = true;
             continue;
         }
-        let cfg_val = dma.read8(DATA_BUF + 5);
+        let cfg_val = dma.ctl.read8(DATA_BUF + 5);
         let mut o = 0usize;
         let (mut iface, mut iclass, mut iproto, mut ep_addr, mut ep_int) = (0u8, 0u8, 0u8, 0u8, 0u8);
         while o + 2 <= 64 {
-            let blen = dma.read8(DATA_BUF + o) as usize;
+            let blen = dma.ctl.read8(DATA_BUF + o) as usize;
             if blen == 0 { break; }
-            match dma.read8(DATA_BUF + o + 1) {
+            match dma.ctl.read8(DATA_BUF + o + 1) {
                 0x04 if o + 8 <= 64 && iclass == 0 => {       // interface
-                    iface  = dma.read8(DATA_BUF + o + 2);
-                    iclass = dma.read8(DATA_BUF + o + 5);
-                    iproto = dma.read8(DATA_BUF + o + 7);
+                    iface  = dma.ctl.read8(DATA_BUF + o + 2);
+                    iclass = dma.ctl.read8(DATA_BUF + o + 5);
+                    iproto = dma.ctl.read8(DATA_BUF + o + 7);
                 }
                 0x05 if o + 7 <= 64 && ep_addr == 0 => {      // endpoint
-                    if dma.read8(DATA_BUF + o + 3) & 0x03 == 0x03 { // interrupt
-                        ep_addr = dma.read8(DATA_BUF + o + 2);
-                        ep_int  = dma.read8(DATA_BUF + o + 6);
+                    if dma.ctl.read8(DATA_BUF + o + 3) & 0x03 == 0x03 { // interrupt
+                        ep_addr = dma.ctl.read8(DATA_BUF + o + 2);
+                        ep_int  = dma.ctl.read8(DATA_BUF + o + 6);
                     }
                 }
                 _ => {}
@@ -699,7 +738,7 @@ fn scan_devices(
 /// connected → re-scan …). The async schedule is free for these hub control
 /// transfers while nothing usable is attached.
 fn wait_for_connection(
-    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
     op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
 ) {
     // Returns Some(true/false) on a successful status read, None if the read
@@ -711,7 +750,7 @@ fn wait_for_connection(
     let status = |port: u8| -> Option<bool> {
         let setup = [0xA3, 0x00, 0x00, 0x00, port, 0x00, 0x04, 0x00]; // Get_Status
         if control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &setup, 4, true).is_some() {
-            Some(dma.read16(DATA_BUF + 0) & 1 != 0)
+            Some(dma.ctl.read16(DATA_BUF + 0) & 1 != 0)
         } else {
             None
         }
@@ -754,7 +793,7 @@ fn wait_for_connection(
 /// short settle between) reliably gets it through. Used for the configuration
 /// transfers, which must all succeed before the keyboard is usable.
 fn control_retry(
-    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
     op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool, tries: u32,
 ) -> Option<usize> {
     for _ in 0..tries {
@@ -772,7 +811,7 @@ fn control_retry(
 /// because this hub's split control endpoint is intermittently flaky - one failed
 /// SETUP must not abandon the device.
 fn setup_hid(
-    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
     op: usize, said: &Cell<bool>, port: u8, addr: u8, cfg_val: u8, iface: u8, is_mouse: bool,
 ) -> bool {
     let what = if is_mouse { "mouse" } else { "keyboard" };
@@ -799,18 +838,18 @@ fn setup_hid(
 /// Arm an interrupt IN qTD (8-byte report, IOC, given data toggle) for the QH at
 /// DMA offset `qh`, and point the QH overlay at it so the controller re-fetches.
 /// The qTD lives at `qh + 0x40`, its report buffer at `qh + 0x80`.
-fn arm_int(dma: &godspeed::driver::Arena, qh: usize, toggle: u32) {
+fn arm_int(dma: &Parts, qh: usize, toggle: u32) {
     let qtd = qh + 0x40;
-    let qtd_phys = dma.phys_at(qtd) as u32;
-    let buf_phys = dma.phys_at(qh + 0x80) as u32;
-    dma.write32(qtd + 0x00, 1);                          // next qTD = T (terminate)
-    dma.write32(qtd + 0x04, 1);                          // alt next  = T
-    dma.write32(qtd + 0x08,
+    let qtd_phys = dma.poll.phys_at(qtd) as u32;
+    let buf_phys = dma.poll.phys_at(qh + 0x80) as u32;
+    dma.poll.write32(qtd + 0x00, 1);                          // next qTD = T (terminate)
+    dma.poll.write32(qtd + 0x04, 1);                          // alt next  = T
+    dma.poll.write32(qtd + 0x08,
         QTD_ACTIVE | (1 << 8) | (3 << 10) | (1 << 15) | (8 << 16) | (toggle << 31));
-    dma.write32(qtd + 0x0C, buf_phys);                   // report buffer
-    dma.write32(qh + 0x10, qtd_phys & !0x1F);            // QH overlay → this qTD
-    dma.write32(qh + 0x14, 1);
-    dma.write32(qh + 0x18, 0);                           // clear overlay token
+    dma.poll.write32(qtd + 0x0C, buf_phys);                   // report buffer
+    dma.poll.write32(qh + 0x10, qtd_phys & !0x1F);            // QH overlay → this qTD
+    dma.poll.write32(qh + 0x14, 1);
+    dma.poll.write32(qh + 0x18, 0);                           // clear overlay token
 }
 
 /// E5b/E6 - poll every configured HID device's interrupt-IN endpoint over split
@@ -829,7 +868,7 @@ fn arm_int(dma: &godspeed::driver::Arena, qh: usize, toggle: u32) {
 /// (the device NAKs between events) until a report arrives, then the qTD retires,
 /// we act on it, and re-arm with the data toggle flipped.
 fn poll_devices(
-    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &godspeed::driver::Arena,
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
     op: usize, devs: &[HidDev],
 ) -> usize {
     let n = devs.len();
@@ -838,17 +877,17 @@ fn poll_devices(
 
     // Build a ring of one QH per device, each with an interrupt-IN qTD armed.
     for i in 0..n {
-        let qh = POLL_BASE + i * POLL_STRIDE;
-        let next_qh = POLL_BASE + ((i + 1) % n) * POLL_STRIDE;
-        let next_phys = dma.phys_at(next_qh) as u32;
+        let qh = i * POLL_STRIDE;
+        let next_qh = ((i + 1) % n) * POLL_STRIDE;
+        let next_phys = dma.poll.phys_at(next_qh) as u32;
         let h = if i == 0 { 1u32 << 15 } else { 0 }; // sole head of reclamation list
-        dma.write32(qh + 0x00, (next_phys & !0x1F) | (1 << 1)); // horiz link → next QH, typ=QH
-        dma.write32(qh + 0x04,
+        dma.poll.write32(qh + 0x00, (next_phys & !0x1F) | (1 << 1)); // horiz link → next QH, typ=QH
+        dma.poll.write32(qh + 0x04,
             (devs[i].addr as u32 & 0x7F) | ((devs[i].ep_num as u32) << 8)
                 | (1 << 12) | (1 << 14) | h | (8 << 16)); // low speed, DTC, [head], mps 8, C=0
-        dma.write32(qh + 0x08,
+        dma.poll.write32(qh + 0x08,
             (1 << 30) | ((1u32 & 0x7F) << 16) | ((devs[i].port as u32 & 0x7F) << 23)); // Mult, hub 1, port [29:23]
-        dma.write32(qh + 0x0C, 0);
+        dma.poll.write32(qh + 0x0C, 0);
         arm_int(dma, qh, 0);
     }
 
@@ -859,7 +898,7 @@ fn poll_devices(
         wait(ctx, mmio, op + OP_USBSTS, STS_ASS, false);
     }
     mmio.write32(op + OP_CTRLDSSEGMENT, 0);
-    mmio.write32(op + OP_ASYNCLISTADDR, dma.phys_at(POLL_BASE) as u32 & !0x1F);
+    mmio.write32(op + OP_ASYNCLISTADDR, dma.poll.phys() as u32 & !0x1F);
     mmio.write32(op + OP_USBCMD, mmio.read32(op + OP_USBCMD) | CMD_ASE);
     wait(ctx, mmio, op + OP_USBSTS, STS_ASS, true);
 
@@ -914,14 +953,14 @@ fn poll_devices(
     loop {
         let work_t0 = wait::Since::now(ctx);
         for i in 0..n {
-            let qh = POLL_BASE + i * POLL_STRIDE;
+            let qh = i * POLL_STRIDE;
             let qtd = qh + 0x40;
             let buf = qh + 0x80;
-            if dma.read32(qtd + 0x08) & QTD_ACTIVE != 0 { continue; } // still NAK'ing
-            let tok = dma.read32(qtd + 0x08);
+            if dma.poll.read32(qtd + 0x08) & QTD_ACTIVE != 0 { continue; } // still NAK'ing
+            let tok = dma.poll.read32(qtd + 0x08);
             if tok & (QTD_HALTED | QTD_ERRMASK) == 0 {
                 let mut rep = [0u8; 8];
-                for j in 0..8 { rep[j] = dma.read8(buf + j); }
+                for j in 0..8 { rep[j] = dma.poll.read8(buf + j); }
                 if devs[i].is_mouse {
                     mouse.feed(
                         &rep,
