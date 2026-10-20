@@ -38,6 +38,21 @@ pub(crate) const HEAD_MAX: usize = 4096;
 /// download nothing but a little latency; it is short so that latency stays small.
 pub(crate) const IDLE_MS: u64 = 2;
 
+/// Where a session's time went, in counter ticks: what a download reports so the stage that holds it back is
+/// measured rather than guessed (`backlog/93`). The handshake is in it. Single-threaded, so the parts do not
+/// overlap: what is left of a download's time beside them is the disk, the screen and the HTTP framing.
+#[derive(Clone, Copy, Default)]
+pub struct Timing {
+    /// In `net-stack` reads that brought bytes, and how many there were.
+    pub recv: u64,
+    pub recvs: u32,
+    /// Reads that found nothing yet, and the pauses after them (`IDLE_MS` each).
+    pub empty: u32,
+    pub idle: u64,
+    /// Opening records (TLS's `read_record`).
+    pub decrypt: u64,
+}
+
 /// Where it ended, when it did not succeed.
 #[derive(Clone, Copy, Debug)]
 pub enum Fail {
@@ -88,6 +103,7 @@ pub struct Session<'c, 'b, 'n, 's> {
     rec_len: usize,
     read_len: usize,
     broken: bool,
+    pub timing: Timing,
 }
 
 /// Open a session to `host:port`, the server checked against `roots` at `now_secs`, and run `f` on it.
@@ -110,7 +126,7 @@ pub fn session<T>(ctx: &ServiceContext, host: &str, port: u16, roots: &[&[u8]], 
         let (tls, n) = Client::start(hello, verifier, &mut handshake, &mut out).map_err(Fail::Tls)?;
         let mut s = Session {
             ctx, host, ip: ip.0, timeout_secs, moved_at: gs::task::uptime_secs(ctx), tls, stream: &mut stream, out: &mut out, rec: &mut rec,
-            answered: 0, broken: false, rec_len: 0, read_len: 0,
+            answered: 0, broken: false, rec_len: 0, read_len: 0, timing: Timing::default(),
         };
         s.send_out(n)?;
         // The handshake, to the point where application data may be sent.
@@ -176,25 +192,34 @@ impl Session<'_, '_, '_, '_> {
             // round trip for five bytes, for every 16 KiB of a download.
             let need = if have < 5 { 5 } else { record_len(&self.rec[..5]).map_err(Fail::Framing)? };
             if have < need {
+                let t = gs::driver::wait::ticks(self.ctx);
                 let got = match self.stream.recv(&mut self.rec[have..]) {
                     Ok(n) => n,
                     Err(_) if have == 0 => return Ok(None),
                     Err(_) => return Err(Fail::Transport),
                 };
+                let t2 = gs::driver::wait::ticks(self.ctx);
                 if got > 0 {
+                    self.timing.recv += t2.wrapping_sub(t);
+                    self.timing.recvs += 1;
                     self.moved();
                 } else {
                     if self.stalled() {
                         return Err(Fail::Timeout);
                     }
                     gs::task::sleep_ms(self.ctx, IDLE_MS);
+                    self.timing.empty += 1;
+                    self.timing.idle += gs::driver::wait::ticks(self.ctx).wrapping_sub(t);
                 }
                 have += got;
                 self.read_len = have;
                 continue;
             }
             self.rec_len = need;
-            let (event, n) = match self.tls.read_record(&mut self.rec[..need], self.out) {
+            let t = gs::driver::wait::ticks(self.ctx);
+            let opened = self.tls.read_record(&mut self.rec[..need], self.out);
+            self.timing.decrypt += gs::driver::wait::ticks(self.ctx).wrapping_sub(t);
+            let (event, n) = match opened {
                 Ok(r) => r,
                 Err(e) => {
                     // Tell the server why before going, as RFC 8446 6.2 asks; a courtesy, so a failure to
