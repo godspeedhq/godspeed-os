@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 //! The DMA arena, laid out by name (`docs/driver-library.md` step 3).
 //!
 //! One part per buffer the controller is pointed at, taken in order through `gs::driver::arena`, so no
