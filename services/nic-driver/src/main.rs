@@ -292,6 +292,9 @@ const RTL_MTPS_VALUE: u8 = 0x3B;
 /// How long to let the chip settle after Rx/Tx are switched off, before asking it to reset. Gives an
 /// in-flight DMA burst time to retire instead of being reset underneath itself.
 const RTL_QUIESCE_MS: u64 = 10;
+/// The same pause for a receiver restart (`rtl_restart_rx`), which runs during a download, so it is short:
+/// a full frame lands in about 12 us at 1 Gbit/s, so a millisecond retires any write in flight many times over.
+const RTL_RX_QUIESCE_MS: u64 = 1;
 /// How long nobody has collected a frame before the receiver is restarted with its ring emptied, whether
 /// or not the chip said it stopped. Frames that waited this long were waited for by nobody: the ring
 /// filled with broadcasts while `net-stack` was idle. A ring that filled DURING a download is collected
@@ -411,11 +414,19 @@ fn rtl_arm_rx(arena: &Parts, i: usize) {
     arena.rx_ring.write32(d, o1);
 }
 
-/// Restart the RTL8168's receiver on an empty ring: RX off, every descriptor armed, the ring base
-/// re-pointed (which puts the chip back at descriptor 0), RX on. Whatever the ring held is gone, so this
-/// runs only for a receiver the chip stopped, and only once its frames are taken or stale (`RTL_STALE_RX_MS`).
-fn rtl_restart_rx(mmio: &Registers, arena: &Parts) {
+/// Restart the RTL8168's receiver on an empty ring: RX off, a pause for a frame the chip is still
+/// writing, every descriptor armed, the ring base re-pointed (which puts the chip back at descriptor 0),
+/// RX on. Whatever the ring held is gone, so this runs only for a receiver the chip stopped, and only once
+/// its frames are taken or stale (`RTL_STALE_RX_MS`).
+///
+/// **The pause is the fix for damaged segments** (`backlog/93` item 11). Without it, a frame in flight when
+/// RX went off finished landing - its status written - after its descriptor had been armed again, and was
+/// taken as a frame: its first 128 bytes (one DMA write) were the right frame and the rest another's, or its
+/// length was another frame's. Every one of seven such segments on the T630 came within 0 to 76 ms of a
+/// restart. The bring-up quiesces the same way, for the same reason (`RTL_QUIESCE_MS`).
+fn rtl_restart_rx(ctx: &ServiceContext, mmio: &Registers, arena: &Parts) {
     mmio.write8(RTL_CR, RTL_CR_TE);
+    delay::hold(ctx, Budget::ms(RTL_RX_QUIESCE_MS));
     for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
     let rx_ring = arena.rx_ring.phys();
     mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
@@ -581,7 +592,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
             None
         };
         if let Some(why) = why {
-            rtl_restart_rx(mmio, arena);
+            rtl_restart_rx(ctx, mmio, arena);
             rx_restarts = rx_restarts.saturating_add(1);
             // EVERY restart is said, for now, not the first eight and every 64th: `net-stack` drops
             // segments whose bytes past the first 128 belong to another frame, and whether each follows a

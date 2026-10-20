@@ -116,6 +116,27 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    RTL8168's PCIe Relaxed Ordering, which would let the descriptor's write overtake the data's. The
    restarts are logged only at the first eight and every 64th, so their timing against the drops is not
    yet known.
+   **Answered on `6cda1d65` (T630, every restart logged):** all seven damaged segments came 0 to 76 ms after
+   a receiver restart, six of them within 24 ms, against restarts about 2 a second - by chance about one in
+   a million. One more shape showed: a segment whose IP length was 136 in a frame whose descriptor said
+   1472, a length from another frame. **The first suspect, then:** `rtl_restart_rx` re-armed the ring while
+   a frame was still landing. It now holds 1 ms between RX off and the re-arm, as the bring-up already
+   holds `RTL_QUIESCE_MS`; a card owes the count of damaged segments falling to none.
+
+12. **The target, set by the operator 2026-10-20: a download at the speed of the link, 1 Gbit/s (about 119
+   MiB/s).** The best today is 718 KiB/s. The same card's `time` rows (`download`, `utilities/65_download.md`)
+   say where it goes, over six 10 MB downloads on the T630: **the network 9.7 to 20.3 s, almost all of it
+   reads of `net-stack` that found nothing and waited** (1,004 to 2,098 per download, 8.6 to 19.2 s), the reads
+   that brought bytes about 1.1 s, decrypting 0.4 s, the disk 3.2 to 4.1 s, the screen nothing. So the data is
+   not arriving: the RTL8168's ring of 24 overflowing (item 1, 471 restarts in four minutes) is first, the disk
+   second. QEMU reverses the two (disk 30 s, network 4 s), so its order is not this board's. The disk's cost is
+   structural: each 3,556-byte `write_at` walks the path from the root (about three directory reads) and
+   writes seven blocks as seven block-driver requests, about ten round trips per chunk. **What is not
+   reachable as the constitution stands, recorded rather than hidden (26.7):** every frame crosses services by
+   copy in messages of at most 4 KiB (2.5, 8.5), and a same-core round trip is about 51 us on the T630 (BP1),
+   so the cable's hop alone tops out near 55 MB/s with perfect batching, before TLS and `fs` take theirs. An
+   estimate of 15 to 30 MB/s is what this design can reach; beyond that is a constitutional question for the
+   operator, not a change to make quietly.
 
 ## Where to start
 
