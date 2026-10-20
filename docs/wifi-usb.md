@@ -292,7 +292,7 @@ host its board has.
 from its mass-storage path rather than assumed: a bulk IN there is an endpoint added by Configure Endpoint
 with the DIRECTIONAL type (bulk IN is 6, xHCI 6.2.3 - `bind_msc` records that the wrong type configures a
 pipe that never completes), with a transfer ring and data page in a region of its own (`msc.rs`'s
-`DISK_BASE`, separate because one shared page let an armed interrupt endpoint overwrite a disk command on
+disk region, a part of the arena of its own since 2026-10-20, separate because one shared page let an armed interrupt endpoint overwrite a disk command on
 the Pi 4). The radio needs the same: its own ring and a `BULK_IN_MAX` buffer, one Normal TRB queued as the
 "armed" IN, and its Transfer Event taken where the interrupt already drains the event ring - matched to the
 radio's slot and endpoint, which is point 3 above again. `dwc2`'s stand-aside is a fact about `dwc2`'s
@@ -1875,7 +1875,7 @@ still tests one change.
 - **Where the rings live.** Up to three OUT rings of 28 TRBs, in the slice's report page between EP0's
   data stage and the IN ring, each followed by a 64-byte gap. The VL805 reads the 64 bytes after any TRB
   it fetches, and past a ring's Link that lands in the gap rather than in the next ring.
-- **Where the frame lives.** In `DATA_BUF_OFF`, the arena page enumeration uses for its control data,
+- **Where the frame lives.** In the data buffer (`Parts::data_buf`), the arena page enumeration uses for its control data,
   borrowed for one synchronous send at a time. Nothing else touches it inside the poll loop, and a send
   never overlaps an enumeration, since both run on one task. That needs no kernel change. A dedicated page
   would (`XHCI_DMA_PAGES`), which is the cleaner answer if this one is ever contended.

@@ -217,7 +217,7 @@ pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU6
 /// downstream devices at once (docs/usb-hub.md). Confined identity-mapped, so the
 /// device reaches all of it (§12, H1).
 /// Plus 4 pages at the tail for the USB MASS-STORAGE region (`services/xhci/src/msc.rs`
-/// `DISK_BASE`): the two bulk transfer rings, the CBW/CSW page, and one data page. They sit past the
+/// `DISK_REGION_BYTES`, the driver's `disk` part): the two bulk transfer rings, the CBW/CSW page, and one data page. They sit past the
 /// scratchpad rather than sharing any earlier page ON PURPOSE - the Pi 4 port lost days to one DMA
 /// page owned by a keyboard report, a hub's port status AND the disk's CBW at once, where an armed
 /// interrupt endpoint overwrote a command mid-flight on every keypress. Four pages of arena buys

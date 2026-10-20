@@ -40,33 +40,35 @@
 //!   endpoint that recovery then repaired. The budget here is a real duration and it is generous.
 //! - **One shared DMA page with three owners aliases.** An armed interrupt endpoint DMAs into its
 //!   buffer on any keypress, regardless of which driver code thinks it holds the device. The disk's
-//!   CBW/CSW page here is the disk's alone - see `DISK_BASE`.
+//!   CBW/CSW page here is the disk's alone - see `DISK_REGION_BYTES`.
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed::driver::{Arena, Registers};
+use godspeed::driver::{Part, Registers};
+use crate::Parts;
 use godspeed_sdk::ServiceContext;
 
 use crate::{EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
 
-/// The disk's own DMA region, past the scratchpad tail (`SCRATCHPAD_BUF_BASE + MAX_SCRATCHPAD`).
-///
-/// Four pages, fixed, never allocated from anything (§26.6 - the bound is readable off this file).
-/// It is the disk's ALONE: the aliasing bug that cost the Pi 4 port days was one page shared by a
-/// keyboard report, a hub's port status and the disk's CBW, where an armed interrupt endpoint
-/// overwrote a command mid-flight on every keypress. Separate regions make that unrepresentable
-/// rather than merely avoided.
-pub const DISK_BASE: usize = 0x12_0000;
+// The disk's own DMA region: its own part of the arena (`Parts::disk`), past the scratchpad, and the
+// offsets below are within it.
+//
+// Four pages, fixed, never allocated from anything (§26.6 - the bound is readable off this file).
+// It is the disk's ALONE: the aliasing bug that cost the Pi 4 port days was one page shared by a
+// keyboard report, a hub's port status and the disk's CBW, where an armed interrupt endpoint
+// overwrote a command mid-flight on every keypress. Separate parts make that unrepresentable
+// rather than merely avoided.
+
 /// Bulk-OUT transfer ring (one page).
-const OUT_RING: usize = DISK_BASE;
+const OUT_RING: usize = 0;
 /// Bulk-IN transfer ring (one page).
-const IN_RING: usize = DISK_BASE + 0x1000;
+const IN_RING: usize = 0x1000;
 /// CBW at +0, CSW at +64. Kept 64 bytes apart so a device that writes a longer-than-expected CSW
 /// cannot land on the next command's CBW signature.
-const CMD_PAGE: usize = DISK_BASE + 0x2000;
+const CMD_PAGE: usize = 0x2000;
 const CSW_OFF: usize = CMD_PAGE + 64;
 /// Data buffer (one page). Caps a single transfer at 8 sectors of 512 B.
-const DATA_BUF: usize = DISK_BASE + 0x3000;
-/// Total size of the region, for the arena bound check at startup.
+const DATA_BUF: usize = 0x3000;
+/// Total size of the region: the size of its part (`lay_out`).
 pub const DISK_REGION_BYTES: usize = 0x4000;
 
 /// Largest data payload one BOT command may carry - the data page.
@@ -131,17 +133,17 @@ impl Ring {
     /// Post one Normal TRB pointing at `buf_phys` for `len` bytes, with Interrupt On Completion.
     /// Returns the TRB's physical address: the pointer its transfer event will carry, which is how
     /// the wait knows the completion is this TD's (`await_on_slot`).
-    fn push(&mut self, dma: &Arena, buf_phys: u64, len: u32) -> u64 {
+    fn push(&mut self, dma: &Parts, buf_phys: u64, len: u32) -> u64 {
         // Wrap if this TRB plus the Link that would follow it do not both fit. The Link is written
         // AT the cursor (where the controller's dequeue pointer sits), so there is no stale gap in
         // front of it for the controller to stop on.
         if self.cur + 2 * TRB_SIZE > Self::BYTES {
-            let bp = dma.phys_at(self.base);
-            dma.write32(self.base + self.cur, bp as u32);
-            dma.write32(self.base + self.cur + 4, (bp >> 32) as u32);
-            dma.write32(self.base + self.cur + 8, 0);
+            let bp = dma.disk.phys_at(self.base);
+            dma.disk.write32(self.base + self.cur, bp as u32);
+            dma.disk.write32(self.base + self.cur + 4, (bp >> 32) as u32);
+            dma.disk.write32(self.base + self.cur + 8, 0);
             // Toggle Cycle (bit 1) tells the controller to flip ITS cycle when it follows the link.
-            dma.write32(
+            dma.disk.write32(
                 self.base + self.cur + 12,
                 (crate::TRB_LINK << 10) | (1 << 1) | self.pcs,
             );
@@ -149,14 +151,14 @@ impl Ring {
             self.pcs ^= 1;
         }
         let t = self.base + self.cur;
-        dma.write32(t, buf_phys as u32);
-        dma.write32(t + 4, (buf_phys >> 32) as u32);
+        dma.disk.write32(t, buf_phys as u32);
+        dma.disk.write32(t + 4, (buf_phys >> 32) as u32);
         // TD Transfer Size in 21:0. Interrupter target 0.
-        dma.write32(t + 8, len & 0x1F_FFFF);
+        dma.disk.write32(t + 8, len & 0x1F_FFFF);
         // Cycle | IOC (bit 5) | type. IOC is what makes the transfer produce the event we await.
-        dma.write32(t + 12, self.pcs | (1 << 5) | (TRB_NORMAL << 10));
+        dma.disk.write32(t + 12, self.pcs | (1 << 5) | (TRB_NORMAL << 10));
         self.cur += TRB_SIZE;
-        dma.phys_at(t)
+        dma.disk.phys_at(t)
     }
 }
 
@@ -224,11 +226,11 @@ impl Disk {
     }
 
     /// Physical address of the bulk-OUT ring, for the Configure Endpoint input context.
-    pub fn out_ring_phys(&self, dma: &Arena) -> u64 {
-        dma.phys_at(OUT_RING)
+    pub fn out_ring_phys(&self, dma: &Parts) -> u64 {
+        dma.disk.phys_at(OUT_RING)
     }
-    pub fn in_ring_phys(&self, dma: &Arena) -> u64 {
-        dma.phys_at(IN_RING)
+    pub fn in_ring_phys(&self, dma: &Parts) -> u64 {
+        dma.disk.phys_at(IN_RING)
     }
     pub fn out_dci(&self) -> u32 {
         self.out_dci
@@ -262,7 +264,7 @@ impl Disk {
 #[allow(clippy::too_many_arguments)]
 fn await_on_slot(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     ir0: usize,
     slot: u32,
@@ -339,7 +341,7 @@ fn await_on_slot(
 #[allow(clippy::too_many_arguments)]
 pub fn bot(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     dboff: usize,
     ir0: usize,
@@ -359,19 +361,19 @@ pub fn bot(
 
     // Command Block Wrapper: 31 bytes, little-endian, signature 'USBC'.
     for i in 0..31 {
-        dma.write8(CMD_PAGE + i, 0);
+        dma.disk.write8(CMD_PAGE + i, 0);
     }
-    dma.write32(CMD_PAGE, 0x4342_5355); // 'USBC' little-endian
-    dma.write32(CMD_PAGE + 4, tag);
-    dma.write32(CMD_PAGE + 8, data_len);
-    dma.write8(CMD_PAGE + 12, if data_in { 0x80 } else { 0x00 });
-    dma.write8(CMD_PAGE + 13, 0); // LUN 0
-    dma.write8(CMD_PAGE + 14, cmd.len() as u8);
+    dma.disk.write32(CMD_PAGE, 0x4342_5355); // 'USBC' little-endian
+    dma.disk.write32(CMD_PAGE + 4, tag);
+    dma.disk.write32(CMD_PAGE + 8, data_len);
+    dma.disk.write8(CMD_PAGE + 12, if data_in { 0x80 } else { 0x00 });
+    dma.disk.write8(CMD_PAGE + 13, 0); // LUN 0
+    dma.disk.write8(CMD_PAGE + 14, cmd.len() as u8);
     for (i, b) in cmd.iter().take(16).enumerate() {
-        dma.write8(CMD_PAGE + 15 + i, *b);
+        dma.disk.write8(CMD_PAGE + 15 + i, *b);
     }
 
-    let trb = d.out_ring.push(dma, dma.phys_at(CMD_PAGE), 31);
+    let trb = d.out_ring.push(dma, dma.disk.phys_at(CMD_PAGE), 31);
     mmio.write32(dboff + d.slot as usize * 4, d.out_dci);
     let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, trb, &mut d.stale, ev_idx, ev_cycle, eaten)?;
     if cc != 1 && cc != 13 {
@@ -385,7 +387,7 @@ pub fn bot(
         } else {
             &mut d.out_ring
         };
-        let trb = ring.push(dma, dma.phys_at(DATA_BUF), data_len);
+        let trb = ring.push(dma, dma.disk.phys_at(DATA_BUF), data_len);
         mmio.write32(dboff + d.slot as usize * 4, dci);
         let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, trb, &mut d.stale, ev_idx, ev_cycle, eaten)?;
         // 13 is Short Packet: the device sent less than asked, which for a data stage is normal.
@@ -394,7 +396,7 @@ pub fn bot(
         }
     }
 
-    let trb = d.in_ring.push(dma, dma.phys_at(CSW_OFF), 13);
+    let trb = d.in_ring.push(dma, dma.disk.phys_at(CSW_OFF), 13);
     mmio.write32(dboff + d.slot as usize * 4, d.in_dci);
     let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, trb, &mut d.stale, ev_idx, ev_cycle, eaten)?;
     if cc != 1 && cc != 13 {
@@ -402,17 +404,17 @@ pub fn bot(
     }
     // A CSW whose tag is not ours answers an EARLIER command - what a device hands you after a
     // stall. Reporting its status as this command's would attribute one result to another.
-    if dma.read32(CSW_OFF + 4) != tag {
+    if dma.disk.read32(CSW_OFF + 4) != tag {
         return None;
     }
-    Some(dma.read8(CSW_OFF + 12))
+    Some(dma.disk.read8(CSW_OFF + 12))
 }
 
 /// SCSI TEST UNIT READY - is the medium present and the device willing?
 #[allow(clippy::too_many_arguments)]
 pub fn test_unit_ready(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     dboff: usize,
     ir0: usize,
@@ -436,7 +438,7 @@ pub fn test_unit_ready(
 #[allow(clippy::too_many_arguments)]
 pub fn read_capacity(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     dboff: usize,
     ir0: usize,
@@ -454,8 +456,8 @@ pub fn read_capacity(
         return None;
     }
     // Both fields are BIG-endian, unlike everything else in BOT.
-    let last_lba = u32::from_be(dma.read32(DATA_BUF)) as u64;
-    let blen = u32::from_be(dma.read32(DATA_BUF + 4));
+    let last_lba = u32::from_be(dma.disk.read32(DATA_BUF)) as u64;
+    let blen = u32::from_be(dma.disk.read32(DATA_BUF + 4));
     if blen != SECTOR {
         return None; // reported by the caller, which has the context to say which device
     }
@@ -466,7 +468,7 @@ pub fn read_capacity(
 #[allow(clippy::too_many_arguments)]
 pub fn read10(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     dboff: usize,
     ir0: usize,
@@ -517,7 +519,7 @@ pub fn read10(
 #[allow(clippy::too_many_arguments)]
 pub fn write10(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     dboff: usize,
     ir0: usize,
@@ -574,7 +576,7 @@ pub fn write10(
 #[allow(clippy::too_many_arguments)]
 pub fn sync_cache(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     dboff: usize,
     ir0: usize,
@@ -591,13 +593,13 @@ pub fn sync_cache(
 }
 
 /// Read one byte out of the data buffer (after a `read10`).
-pub fn data_read8(dma: &Arena, off: usize) -> u8 {
-    dma.read8(DATA_BUF + off)
+pub fn data_read8(dma: &Parts, off: usize) -> u8 {
+    dma.disk.read8(DATA_BUF + off)
 }
 
 /// Write one byte into the data buffer (before a `write10`).
-pub fn data_write8(dma: &Arena, off: usize, val: u8) {
-    dma.write8(DATA_BUF + off, val);
+pub fn data_write8(dma: &Parts, off: usize, val: u8) {
+    dma.disk.write8(DATA_BUF + off, val);
 }
 
 /// A mass-storage interface found in a configuration descriptor.
@@ -626,7 +628,7 @@ fn ep_num_ok(addr: u8) -> bool {
 /// combination this driver speaks. A UAS-only device or a CBI device is left alone rather than
 /// half-driven: storage driven by a protocol it does not implement returns plausible garbage exactly
 /// where a filesystem expects blocks.
-pub fn parse_msc(dma: &Arena, buf_off: usize, buf_len: usize) -> Option<MscInfo> {
+pub fn parse_msc(dma: &Part, buf_off: usize, buf_len: usize) -> Option<MscInfo> {
     let total = (dma.read16(buf_off + 2) as usize).min(buf_len);
     let cfg_value = dma.read8(buf_off + 5);
 
@@ -719,7 +721,7 @@ pub const STATUS_NO_DISK: u8 = 2;
 #[allow(clippy::too_many_arguments)]
 pub fn serve_block(
     ctx: &ServiceContext,
-    dma: &Arena,
+    dma: &Parts,
     mmio: &Registers,
     dboff: usize,
     ir0: usize,
