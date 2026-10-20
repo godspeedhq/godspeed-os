@@ -73,3 +73,45 @@ confirmed.
 
 **Workaround until then:** on the Wyse, leave the dongle plugged in, or after unplugging it plug it back
 in (or reboot) before relying on keyboard hot-plug.
+
+## 2026-10-20: why a device plugged in at the BACK is not seen, found in the code (Wyse, `d4c5a750`)
+
+The operator: on the Wyse, unplugging and replugging the keyboard works at the FRONT and not at the BACK -
+the back sees the unplug and never the replug. The T630, on ehci and xhci, does both.
+
+The front ports are root ports (3 and 4): a plug there changes a root PORTSC and raises an event, so it is
+seen whatever is bound. The back ports sit behind the USB2 hub on root port 1 (0bda:5411), and a plug behind a
+hub changes no root register: `xhci` sees it only by asking the hub (`hub_port_status`). It asks two kinds of
+hub: those with a HID bound behind them (the loop over `devs[..ndev]`), and, when no HID is bound
+(`ndev == 0`), the DISK's hub alone - written for the Pi 4, where the keyboard and the disk share one. On the
+Wyse they do not: the stick is behind the SuperSpeed hub on root port 15. So once the keyboard is unplugged
+from the back, `ndev` is 0, the back hub is probed by nobody, and the replug is invisible - though the log says
+"hub on port 1 has nothing behind it yet - KEEPING it so an arrival can be seen" at every re-enumeration. The
+log agrees: after the last unplug (21:46:49) the next minute shows 155 hub probes and no event, all of them on
+the disk's hub.
+
+This is very likely the "keyboard is lost until a root port changes" this entry opened with: the change at a
+root port is what re-enumerated and found it. **The fix:** keep every configured hub - its slot, its slice, its
+port count and its EP0 cursor - and probe the unbound ports of each on the hub tick, whatever is bound; not only
+hubs that a HID or the disk happens to be behind. QEMU can show it (`usb-hub` with a keyboard behind it and a
+stick behind a second hub, then removing and re-adding the keyboard from the QEMU monitor).
+
+**Built 2026-10-20, QEMU-verified, a Wyse card owed.** Enumeration records every hub it keeps (`KeptHub`), and
+the poll loop watches each one no other scan covers - no HID behind it, not the disk's, not the dongle's -
+from an EP0 ring made coherent at loop entry as the HID hubs' rings are. QEMU, `q35`, a keyboard behind one
+`usb-hub` and a stick behind another: without the change the replugged keyboard was never found; with it,
+"device arrived on hub slot 1 port 1 (a hub nothing was bound behind) - re-enumerating" and the keyboard back.
+
+**Found on the way, and left as it is:** the confirmation state the older scans share (`hub_seen`, `hub_tried`)
+is kept by PORT NUMBER alone, not by hub and port. The first build of the watch used it too and never
+confirmed: on that layout the keyboard and the stick are both on port 1 of their hubs, and every unanswered
+probe of the stick's port reset the keyboard's count ("reads connected (1/2)", for ever). The watch keeps its
+own state per hub now. The HID-driven scan and the disk scan still share theirs, so a device on port N of one
+hub and another on port N of a second can disturb each other's confirmation there too; not fixed.
+
+**And one more, older than the watch, found the same day:** the other QEMU layout - the keyboard and the stick
+behind the SAME hub, the Pi 4's shape, which the disk scan is meant to cover - does not see the keyboard's replug
+either, with and without the watch (`HEAD` and the change both: "keyboard found again: False"). The watch leaves
+that hub to the disk scan, as it must (two cursors on one EP0 ring desync it), so the fault is in the disk scan's
+arrival arm, not yet located. The Pi 4 card of 2026-08 that showed hot-plug both ways predates the current
+scans; whether it still holds there is not known.

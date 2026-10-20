@@ -683,6 +683,23 @@ struct Hid {
     hub_nports: u32, // parent hub's downstream port count (0 = root device); for the new-device re-scan
 }
 
+/// A hub this enumeration pass configured: its slot, its DMA slice (its EP0 ring) and its port count.
+///
+/// Kept so the poll loop can ask EVERY hub about its empty ports, whatever is bound behind it
+/// (`backlog/78`, 2026-10-20). A device plugged in behind a hub changes no root register, so it is seen only
+/// by asking the hub; the loop asked the hubs a HID was behind, and with no HID the disk's hub alone - on
+/// the Wyse the back ports' hub was neither once the keyboard left it, and a replug there was never seen,
+/// though enumeration had said it was KEEPING the hub "so an arrival can be seen".
+#[derive(Clone, Copy)]
+struct KeptHub {
+    slot: u32,
+    dev: usize,
+    nports: u32,
+}
+const KEPT_HUB_NONE: KeptHub = KeptHub { slot: 0, dev: 0, nports: 0 };
+/// Hubs recorded per pass: one per slice at most, since every hub holds one.
+const MAX_HUBS: usize = MAX_SLICES;
+
 /// A position signature unique per PHYSICAL device location, for telling a genuinely new plug from a
 /// survivor the re-init merely re-bound. A root device keys on its root port; a device behind a hub also
 /// keys on (hub slot, hub downstream port), so two devices behind the SAME hub (a keyboard on hub port 3,
@@ -2832,6 +2849,9 @@ fn enumerate_one(
     // Whether the fixed command-failure hint has been said (`hc_wedged_now`). Owned above `'reenum`
     // with `diag_dumped`, not a static (Invariant 9, backlog/fixed/80 D9).
     hint_said: &mut bool,
+    // Every hub this pass keeps (`KeptHub`), for the poll loop's arrival watch.
+    hubs: &mut [KeptHub; MAX_HUBS],
+    nhubs: &mut usize,
 ) {
     *hc_wedged = false;
     *enum_failed = false;
@@ -3737,6 +3757,11 @@ fn enumerate_one(
     //
     // The slice cost is one, bounded and constant - a hub is infrastructure, not a device that comes
     // and goes, and the pool exists to bound growth rather than to reclaim the machine's own wiring.
+    // Recorded, whatever is behind it: the poll loop watches each kept hub's empty ports (`KeptHub`).
+    if *nhubs < MAX_HUBS {
+        hubs[*nhubs] = KeptHub { slot, dev: dev_idx, nports: nports as u32 };
+        *nhubs += 1;
+    }
     if *ndev == ndev_before && disk.is_some() == disk_before {
         ctx.log_fmt(format_args!(
             "xhci: hub on port {} has nothing behind it yet - KEEPING it so an arrival can be seen",
@@ -4240,6 +4265,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut ndev = 0usize;
         let mut sa = SliceAlloc::new();
         let mut saw_hub = false;
+        // The hubs this pass keeps (`KeptHub`), re-made per pass for the reason the HIDs are.
+        let mut hubs = [KEPT_HUB_NONE; MAX_HUBS];
+        let mut nhubs = 0usize;
         // Re-declared per enumeration pass, alongside the HID array and the slice allocator, for the
         // same reason they are: a pass re-inits the controller, so every slot, ring and context from
         // the previous one is gone. Carrying a Disk across would leave it pointing at a slot the
@@ -4306,6 +4334,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut enum_failed,
                     &mut hub_cut,
                     &mut diag_hint_said,
+                    &mut hubs,
+                    &mut nhubs,
                 );
                 // BOUND THE RETRY, AND SPEND THE ATTEMPTS IN THIS PASS.
                 //
@@ -4331,7 +4361,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &ctx, &dma, &mmio, dboff, ir0, op, ctx_size, p, &mut sa, &mut devs,
                             &mut ndev, &mut saw_hub, &mut disk, &mut radio, &mut ev_idx, &mut ev_cycle,
                             &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed, &mut hub_cut,
-                            &mut diag_hint_said,
+                            &mut diag_hint_said, &mut hubs, &mut nhubs,
                         );
                         if !enum_failed { break; }
                         strikes += 1;
@@ -4750,6 +4780,44 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             // On failure the seeded `hub_off` value stands - no worse than before, and the probe
             // failure path still repairs. Never silently assume the re-point happened (§26.7).
+        }
+        // THE HUBS NOBODY ELSE WATCHES (`KeptHub`). A hub with a HID behind it is probed by the HID-driven
+        // scan, the disk's hub by the disk scan when no HID is bound, and the WiFi dongle's by its own
+        // watch; each of those keeps its own cursor on that hub's one EP0 ring, so a second scanner there
+        // would desync it. Every OTHER kept hub is watched below, from a ring made coherent here exactly
+        // as the HID hubs' rings are above: cleared, its dequeue re-pointed at the base, its cursor at 0.
+        let mut watch = [false; MAX_HUBS];
+        let mut kh_cur = [0usize; MAX_HUBS];
+        let mut kh_pcs = [1u32; MAX_HUBS];
+        // Each watched hub's OWN confirmation state, by hub and port. The shared `hub_seen` and
+        // `hub_tried` are kept by port NUMBER alone, so on the Wyse layout - the keyboard on port 1 of
+        // one hub, the stick on port 1 of another - the disk scan's every unanswered probe of its port 1
+        // reset the keyboard's count too, and the arrival read "connected (1/2)" for ever (QEMU,
+        // 2026-10-20). These persist across passes as theirs do not need to: a pass re-makes the hubs.
+        let mut kh_seen = [[0u8; 64]; MAX_HUBS];
+        let mut kh_tried = [0u64; MAX_HUBS];
+        for h in 0..nhubs {
+            let hs = hubs[h].slot;
+            let by_hid = devs[..ndev].iter().any(|d| d.hub_slot == hs);
+            let by_disk = disk.as_ref().is_some_and(|dk| dk.hub_slot == hs);
+            let by_radio = radio.as_ref().is_some_and(|r| r.hub_slot == hs);
+            if hs == 0 || by_hid || by_disk || by_radio { continue; }
+            let hd = hubs[h].dev;
+            for off in (0..0x1000).step_by(4) {
+                dma.slices.write32(ep0_tr_off(hd) + off, 0);
+            }
+            if reset_endpoint(
+                &ctx, &dma, &mmio, dboff, ir0, hs, 1,
+                ep0_tr_off(hd), device_ctx_off(hd), ctx_size,
+                &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+            ) {
+                watch[h] = true;
+            } else {
+                // Not watched, and said: a hub nobody asks is the bug this record exists to end.
+                ctx.log_fmt(format_args!(
+                    "xhci: the hub on slot {} could not be readied for watching - a device plugged in behind it will not be seen until a root port changes",
+                    hs));
+            }
         }
         let mut last_hub_poll = wait::Since::now(&ctx);
         // LIVENESS HEARTBEAT. The driver must be able to say "I am still running".
@@ -5870,6 +5938,67 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                     disk_hub_cur = cur;
                     disk_hub_pcs = pcs;
+                }
+            }
+            // EVERY OTHER KEPT HUB, on the hub tick (`watch`, above): a connected port on a hub with nothing
+            // bound behind it is a device plugged in there. Two consecutive connected reads and not already
+            // tried, the confirmation every arrival arm uses, kept per hub here (`kh_seen`, `kh_tried`).
+            if hub_due {
+                'hubs: for h in 0..nhubs {
+                    if !watch[h] { continue; }
+                    let (hs, hd, hn) = (hubs[h].slot, hubs[h].dev, hubs[h].nports);
+                    let (mut cur, mut pcs) = (kh_cur[h], kh_pcs[h]);
+                    for hp in 1..=hn {
+                        let mut abandoned = false;
+                        let st = hub_port_status(
+                            &ctx,
+                            &dma, &mmio, dboff, ir0, hs, hd, hp,
+                            &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
+                            &mut hub_cc_logged, &mut probe_fails,
+                        );
+                        hub_posted = hub_posted.wrapping_add(1);
+                        if st.is_some() && !abandoned {
+                            hub_ok = hub_ok.wrapping_add(1);
+                        }
+                        topo.note(&ctx, hs, hp, st);
+                        // Each connected read on an untried port is said, as the disk's port says each
+                        // disconnected one: an arrival that never confirms is then visible, not silent.
+                        if st == Some(true) && hp < 64 && kh_tried[h] & (1u64 << hp) == 0 {
+                            ctx.log_fmt(format_args!(
+                                "xhci: hub slot {} port {} reads connected ({}/2)",
+                                hs, hp, kh_seen[h][hp as usize].saturating_add(1).min(2)));
+                        }
+                        if st.is_none() && hp < 64 && kh_seen[h][hp as usize] > 0 {
+                            ctx.log_fmt(format_args!(
+                                "xhci: hub slot {} port {} gave no answer{} - its arrival count starts again",
+                                hs, hp, if abandoned { " (the probe was abandoned)" } else { "" }));
+                        }
+                        match st {
+                            Some(true) if hp < 64 && kh_tried[h] & (1u64 << hp) == 0
+                                && { kh_seen[h][hp as usize] = kh_seen[h][hp as usize].saturating_add(1);
+                                     kh_seen[h][hp as usize] >= 2 } => {
+                                kh_tried[h] |= 1u64 << hp;
+                                ctx.log_fmt(format_args!(
+                                    "xhci: device arrived on hub slot {} port {} (a hub nothing was bound behind) - re-enumerating",
+                                    hs, hp));
+                                announce = true;
+                                kh_cur[h] = cur;
+                                kh_pcs[h] = pcs;
+                                break 'poll;
+                            }
+                            Some(false) if hp < 64 => {
+                                kh_seen[h][hp as usize] = 0;
+                                kh_tried[h] &= !(1u64 << hp);
+                            }
+                            None if hp < 64 => {
+                                kh_seen[h][hp as usize] = 0;
+                                if abandoned { kh_cur[h] = cur; kh_pcs[h] = pcs; continue 'hubs; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    kh_cur[h] = cur;
+                    kh_pcs[h] = pcs;
                 }
             }
             // The dongle's bulk IN: a completion another consumer dequeued and filed this pass, and a
