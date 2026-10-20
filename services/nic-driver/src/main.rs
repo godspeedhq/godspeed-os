@@ -501,7 +501,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
     // = report the forced state. Cleared ([8]) after a flap so a REAL later unplug is never masked.
     let mut force_link: Option<bool> = None;
     let mut tally_wedged_logged = false;   // one-shot loud note if the DMA counter dump ever times out
-    let mut tx_fail_logged = 0u32;         // diagnose the first few TX timeouts to guide the root-cause fix
+    let mut tx_fail_logged = 0u32;         // TX timeouts recovered, each said (see the recovery below)
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
     // RX GROUND TRUTH. Added after a T630 chaos run left this NIC with link UP and TX working
@@ -583,11 +583,13 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
         if let Some(why) = why {
             rtl_restart_rx(mmio, arena);
             rx_restarts = rx_restarts.saturating_add(1);
-            if rx_restarts <= 8 || rx_restarts % 64 == 0 {
-                ctx.log_fmt(format_args!(
-                    "nic-driver: RTL8168 receiver restarted (#{}) - {}; ISR since the last 0x{:04x}, rx_idx was {}, {} frames taken",
-                    rx_restarts, why, isr_seen, rx_idx, rx_count));
-            }
+            // EVERY restart is said, for now, not the first eight and every 64th: `net-stack` drops
+            // segments whose bytes past the first 128 belong to another frame, and whether each follows a
+            // restart is a question of timestamps (`backlog/93` item 11, 2026-10-20). Thinned again
+            // once that is answered.
+            ctx.log_fmt(format_args!(
+                "nic-driver: RTL8168 receiver restarted (#{}) - {}; ISR since the last 0x{:04x}, rx_idx was {}, {} frames taken",
+                rx_restarts, why, isr_seen, rx_idx, rx_count));
             rx_idx = 0;
             rx_stopped = false;
             isr_seen = 0;
@@ -891,12 +893,12 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
             // drop the stuck OWN. RE stays on, so RX is undisturbed (VIII bounded+loud, IX recover).
             let isr = mmio.read16(RTL_ISR);
             let cr  = mmio.read8(RTL_CR);
-            if tx_fail_logged < 6 {
-                ctx.log_fmt(format_args!(
-                    "nic-driver: RTL8168 TX timeout - desc={:#010x} isr={:#06x} cr={:#04x} len={} - recovering",
-                    arena.tx_ring.read32(td), isr, cr, flen));
-                tx_fail_logged += 1;
-            }
+            // Every one, numbered, for the same timing question as the receiver restarts above (its
+            // recovery clears the receive status bits too); it was the first six only.
+            tx_fail_logged = tx_fail_logged.saturating_add(1);
+            ctx.log_fmt(format_args!(
+                "nic-driver: RTL8168 TX timeout (#{}) - desc={:#010x} isr={:#06x} cr={:#04x} len={} - recovering",
+                tx_fail_logged, arena.tx_ring.read32(td), isr, cr, flen));
             mmio.write8(RTL_CR, RTL_CR_RE);             // TE off: reset the TX engine (RX stays up)
             mmio.write16(RTL_ISR, 0xFFFF);             // clear any latched TX error/status
             arena.tx_ring.write32(td, 0);                       // drop the stuck descriptor's OWN
