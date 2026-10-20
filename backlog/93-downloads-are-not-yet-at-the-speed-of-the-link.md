@@ -76,6 +76,23 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    - `wifi-driver`'s log line takes the region's size from `ctrl::RX_REGION` rather than by hand.
    - Built for the Pi 4 and the VisionFive; neither radio is in QEMU, so a Pi 4 join is owed a card.
 
+11. **A download on the Wyse fails with TLS `DecryptFailed`, on `main` as well (2026-10-20).** The same
+   10 MB download, the same RTL8168 and cable: `269c86f3` (`feat/gs-driver`) finished 5 of 6, the one
+   failure about 30% in, the four after it clean. `main` at `bd0973bf` finished 3 of 9: the fourth failed at
+   about 90%, and the next five each failed within a second of connecting, at 0% or a few hundred bytes, so
+   on `main` a failure was followed by nothing but failures and on the branch it was not. Why is not
+   known. An earlier bisect of the day (`82a0d73b` 2 of 5, `b9365a1d` 1 of 4, `4e0c733d` a stalled first
+   download) is consistent with the bug being older than every commit it tested. The RTL8168's receiver
+   restarts (item 1) run at the same rate in the downloads that pass as in those that fail, so they do
+   not tell the two apart.
+   **The suspect, and the change made for it:** `net-stack` did not check an inbound segment's IPv4 or
+   TCP checksum, so a segment damaged before it reached `net-stack` was taken as data and acknowledged, and
+   only TLS noticed. Since 2026-10-20 it drops such a segment, counts it (`Tcp::bad_checksum`) and logs
+   the first eight and every 64th, and the sender's retransmission repairs it. **The prediction a Wyse
+   card tests:** if damaged segments are the cause, the count rises during a download and `DecryptFailed`
+   stops; if the count stays at 0 and `DecryptFailed` persists, they are not, and what a failure leaves
+   behind for the next connection is the next question.
+
 ## Where to start
 
 Item 4 is small and helps every board. Item 1 is the cable's ceiling on the PCs, item 2 the Pi 4's, and each

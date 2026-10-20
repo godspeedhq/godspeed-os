@@ -566,6 +566,23 @@ pub fn parse(f: &[u8]) -> Option<Seg<'_>> {
     })
 }
 
+/// Whether a frame `parse` accepted carries a correct IPv4 header checksum AND a correct TCP checksum.
+///
+/// Until 2026-10-20 neither was checked on the way in, so a segment damaged between the wire and this
+/// task was taken as data: TCP acknowledged it, the peer never resent it, and the damage surfaced only
+/// above, as a TLS record that would not decrypt (seen on the Wyse, `backlog/93`). Dropping it instead leaves the
+/// sender's retransmission to repair it, which is what the checksum is for. The lengths are the ones
+/// `parse` already checked; a header claiming more bytes than arrived fails here, as it should.
+fn checksums_ok(f: &[u8]) -> bool {
+    let ihl = ((f[ETH_LEN] & 0x0f) as usize) * 4;
+    if super::checksum(&f[ETH_LEN..ETH_LEN + ihl]) != 0 { return false; }
+    let ip_total = be16(&f[ETH_LEN + 2..ETH_LEN + 4]) as usize;
+    if ip_total < ihl || ETH_LEN + ip_total > f.len() { return false; }
+    let mut src = [0u8; 4]; src.copy_from_slice(&f[ETH_LEN + 12..ETH_LEN + 16]);
+    let mut dst = [0u8; 4]; dst.copy_from_slice(&f[ETH_LEN + 16..ETH_LEN + 20]);
+    tcp_checksum(&src, &dst, &f[ETH_LEN + ihl..ETH_LEN + ip_total]) == 0
+}
+
 /// The TCP checksum: one's-complement sum over the pseudo-header, the TCP header and the payload
 /// (RFC 793 §3.1). The pseudo-header is why this cannot reuse the plain IP `checksum` in `main.rs`:
 /// it covers addresses that are not inside the segment, which is precisely what makes a TCP segment
@@ -778,6 +795,9 @@ pub struct Tcp {
     /// still only the SYN count, the acknowledgement was never built - which is a different fault
     /// from one that was built and lost.
     pub stat_sent: u16,
+    /// Segments for this machine dropped because a checksum was wrong (`checksums_ok`), since the table
+    /// was made. Each is one the peer resends; logged at the first eight and every 64th.
+    pub bad_checksum: u32,
     /// One character per frame this transaction handed to the driver, in order, so the log can show
     /// WHICH frames were built rather than only how many.
     ///
@@ -802,7 +822,7 @@ impl Tcp {
             last_state: State::Closed,
             last_retx: 0,
             poll_tx_slow: 0,
-            stat_seen: 0, stat_matched: 0, stat_sent: 0,
+            stat_seen: 0, stat_matched: 0, stat_sent: 0, bad_checksum: 0,
             tx_log: [0u8; 24], tx_n: 0,
         }
     }
@@ -1205,6 +1225,20 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
             check(t2.conns[j].state == State::Established, "a SYN-ACK with no options still establishes", &mut pass, &mut fail);
             check(t2.conns[j].snd_mss == MSS_DEFAULT,
                   "a peer that offers no MSS is assumed to accept 536, not our own 1460", &mut pass, &mut fail);
+
+            // A data segment damaged after its checksum was made is dropped and counted, never taken
+            // as data; the same segment intact is taken. Either half failing is the 2026-10-20 bug.
+            let (rn, bad0) = (t2.conns[j].rcv_nxt, t2.bad_checksum);
+            let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                         80, lp2, rn, ack2, ACK, 8000, b"damaged");
+            buf[n - 1] ^= 0x01;
+            t2.on_frame(ctx, &net, &buf[..n], &mut sink);
+            check(t2.bad_checksum == bad0 + 1 && t2.conns[j].rcv_nxt == rn,
+                  "a segment with a bad checksum is dropped and counted, not taken as data", &mut pass, &mut fail);
+            buf[n - 1] ^= 0x01;
+            t2.on_frame(ctx, &net, &buf[..n], &mut sink);
+            check(t2.bad_checksum == bad0 + 1 && t2.conns[j].rcv_nxt == rn.wrapping_add(7),
+                  "the same segment with its checksum intact is taken", &mut pass, &mut fail);
         }
     }
 
@@ -1575,6 +1609,17 @@ impl Tcp {
         self.stat_seen = self.stat_seen.saturating_add(1);
         let seg = match parse(f) { Some(s) => s, None => return 0 };
         if seg.dst_ip != net.our_ip { return 0; }
+        if !checksums_ok(f) {
+            self.bad_checksum = self.bad_checksum.saturating_add(1);
+            let n = self.bad_checksum;
+            if n <= 8 || n % 64 == 0 {
+                let ip = seg.src_ip;
+                ctx.log_fmt(format_args!(
+                    "net-stack: dropped a TCP segment from {}.{}.{}.{}:{} with a bad checksum (#{}) - the peer resends it",
+                    ip[0], ip[1], ip[2], ip[3], seg.src_port, n));
+            }
+            return 0;
+        }
         let now = self.now_ms(ctx).unwrap_or(0);
 
         let (lp, rip, rp) = (seg.dst_port, seg.src_ip, seg.src_port);
