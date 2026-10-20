@@ -29,6 +29,8 @@ mod hid;
 mod hub;
 mod msc;
 mod net;
+mod parts;
+use parts::Parts;
 mod regs;
 mod rtl;
 
@@ -91,7 +93,7 @@ fn is_usb_irq(msg: &godspeed_sdk::Message) -> bool {
 /// places an interrupt can be received, so none of them can forget it again.
 #[allow(clippy::too_many_arguments)]
 fn usb_irq(
-    ctx: &ServiceContext, m: &godspeed::driver::Registers, d: &godspeed::driver::Arena,
+    ctx: &ServiceContext, m: &godspeed::driver::Registers, d: &Parts,
     nic: Option<&mut (net::Nic, chan::Target)>, radio: Option<&mut rtl::Radio>,
     irq_count: &mut u64, irq_frames: &mut u64,
 ) {
@@ -219,7 +221,7 @@ fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: 
 /// it cannot be answered and silence would leave the client to time out against a clean log.
 #[allow(clippy::too_many_arguments)]
 fn dispatch(
-    ctx: &ServiceContext, m: &godspeed::driver::Registers, d: &godspeed::driver::Arena,
+    ctx: &ServiceContext, m: &godspeed::driver::Registers, d: &Parts,
     disk: Option<&mut (msc::Disk, chan::Target, u64)>, nic: Option<&mut (net::Nic, chan::Target)>,
     radio: Option<&mut rtl::Radio>,
     msg: &godspeed_sdk::Message, capless: &mut bool,
@@ -299,11 +301,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             "dwc2-svc: MMIO window granted - {} bytes (DWC2 core registers)", m.len())),
         None => ctx.log("dwc2-svc: NO MMIO window - the kernel granted none (hw_device mismatch?)"),
     }
-    match godspeed::driver::arena(&ctx) {
-        Some(d) => ctx.log_fmt(format_args!(
-            "dwc2-svc: DMA arena granted - {} bytes at phys {:#x}", d.len(), d.phys_at(0))),
-        None => ctx.log("dwc2-svc: NO DMA arena - the kernel granted none"),
-    }
+    // Laid out once, here, and the parts passed wherever the arena was (`parts.rs`).
+    let parts = match godspeed::driver::arena(&ctx) {
+        Some(a) => {
+            ctx.log_fmt(format_args!(
+                "dwc2-svc: DMA arena granted - {} bytes at phys {:#x}", a.len(), a.phys_at(0)));
+            parts::lay_out(&ctx, a)
+        }
+        None => {
+            ctx.log("dwc2-svc: NO DMA arena - the kernel granted none");
+            None
+        }
+    };
 
     // SLICE 1a: bring the controller up ourselves.
     //
@@ -376,7 +385,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // count had to match what the in-kernel driver reported for the same hardware (that
             // driver is deleted now). Anything else means the transfers worked and the parsing did
             // not, which a lone "looks like a hub" would hide.
-            if let Some(d) = godspeed::driver::arena(&ctx) {
+            if let Some(d) = parts {
                 match enumerate::root_device(&ctx, &m, &d) {
                     Some(dev) => {
                         hub_multi_tt = dev.hub_multi_tt;
@@ -517,10 +526,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                         // Provably safe today; a machine-halt the first
                                                         // time someone moves the assignment.
                                                         if msc::read_block(&ctx, &m, &d, &dt, &mut dk, 0, block) {
-                                                            let b0 = d.read8(msc::DATA_OFF);
-                                                            let b1 = d.read8(msc::DATA_OFF + 1);
-                                                            let b2 = d.read8(msc::DATA_OFF + 2);
-                                                            let b3 = d.read8(msc::DATA_OFF + 3);
+                                                            let b0 = d.disk.read8(0);
+                                                            let b1 = d.disk.read8(1);
+                                                            let b2 = d.disk.read8(2);
+                                                            let b3 = d.disk.read8(3);
                                                             ctx.log_fmt(format_args!(
                                                                 "dwc2-svc: sector 0 first bytes {:02x} {:02x} {:02x} {:02x}",
                                                                 b0, b1, b2, b3));
@@ -572,7 +581,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // Serving comes FIRST in the pass. A block request is a client blocked waiting on an answer,
     // where a keyboard poll that slips a period costs nothing a human can perceive.
-    if let (Some(m), Some(d)) = (godspeed::driver::registers(&ctx), godspeed::driver::arena(&ctx)) {
+    if let (Some(m), Some(d)) = (godspeed::driver::registers(&ctx), parts) {
         let mut state = hid::KeyState::new(&ctx);
         // Consecutive recoveries with no healthy polling in between, and whether we have already
         // announced giving up. Both reset the moment the keyboard actually works again.

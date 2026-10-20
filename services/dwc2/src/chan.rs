@@ -3,7 +3,7 @@
 //!
 //! Slice 1b of the port (`docs/arm32-usb-userspace.md`): program a host channel, run a DMA transfer,
 //! and compose the three of them into a USB control transfer. Everything here goes through
-//! `gs::driver`'s `Registers` and `Arena`, so the service still carries no `unsafe` (§18.2).
+//! `gs::driver`'s `Registers` and arena parts (`parts.rs`), so the service still carries no `unsafe` (§18.2).
 //!
 //! **No cache maintenance, and that is a property of the grant rather than an omission.** The
 //! in-kernel driver this replaced (`arch/arm/dwc2.rs`, since deleted) bracketed every transfer with a
@@ -15,7 +15,8 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed::driver::{Arena, Registers};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
 use godspeed_sdk::ServiceContext;
 
 use crate::regs::*;
@@ -61,13 +62,8 @@ pub const PID_DATA0: u32 = 0;
 pub const PID_DATA1: u32 = 2;
 pub const PID_SETUP: u32 = 3;
 
-/// Where in the DMA arena each control-transfer buffer lives.
-///
-/// Fixed offsets rather than an allocator: the arena is 64 KiB, this slice needs two small buffers,
-/// and a bump allocator would be machinery for a problem that does not exist yet (§26.2). Slice 3
-/// will need real sectors and can carve the rest then.
-pub const SETUP_OFF: usize = 0x0000; // 8 bytes
-pub const DATA_OFF: usize = 0x0040;  // scratch for descriptors
+/// The size of a control transfer's data stage, its own part of the arena (`parts.rs`), as the setup
+/// packet is.
 pub const DATA_LEN: usize = 256;
 
 /// The device this driver is currently talking to. Control transfers address whoever is selected.
@@ -817,7 +813,7 @@ fn stage_split(
 /// `data` is filled on an IN transfer and sent on an OUT one. Returns false if any stage failed, with
 /// the failing stage already reported.
 pub fn control(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target,
     setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize,
 ) -> bool {
     control_split(ctx, mmio, dma, t, setup, data, data_in, dlen, 0)
@@ -829,15 +825,15 @@ pub fn control(
 /// regression here cannot break what slices 1a-1c-ii proved.
 #[allow(clippy::too_many_arguments)]
 pub fn control_split(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target,
     setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize, splt: u32,
 ) -> bool {
     let ch = CH_BULK;
-    let setup_phys = dma.phys_at(SETUP_OFF) as u32;
-    let data_phys = dma.phys_at(DATA_OFF) as u32;
+    let setup_phys = dma.setup.phys() as u32;
+    let data_phys = dma.ctl_data.phys() as u32;
 
     for (i, b) in setup.iter().enumerate() {
-        dma.write8(SETUP_OFF + i, *b);
+        dma.setup.write8(i, *b);
     }
     let run = |ctx: &ServiceContext, dir_in, pid, phys, len, what| {
         if splt == 0 {
@@ -861,20 +857,20 @@ pub fn control_split(
             // this reply's data. Harmless while a reply is only logged; not harmless once one DECIDES
             // something, and a hub port-status short read decides connect or disconnect.
             for i in 0..want {
-                dma.write8(DATA_OFF + i, 0);
+                dma.ctl_data.write8(i, 0);
             }
             if !run(ctx, true, PID_DATA1, data_phys, want as u32, "DATA-IN") {
                 return false;
             }
             let n = want.min(data.len());
             for i in 0..n {
-                data[i] = dma.read8(DATA_OFF + i);
+                data[i] = dma.ctl_data.read8(i);
             }
         } else {
             // Send only what fits in BOTH the scratch buffer and the source slice.
             let n = dlen.min(DATA_LEN).min(data.len());
             for i in 0..n {
-                dma.write8(DATA_OFF + i, data[i]);
+                dma.ctl_data.write8(i, data[i]);
             }
             if !run(ctx, false, PID_DATA1, data_phys, n as u32, "DATA-OUT") {
                 return false;
@@ -896,7 +892,7 @@ pub fn control_split(
 
 /// GET_DESCRIPTOR, the first thing worth asking a device.
 pub fn get_descriptor(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target,
     dtype: u8, dindex: u8, buf: &mut [u8], len: usize,
 ) -> bool {
     let setup = [

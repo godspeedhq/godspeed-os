@@ -11,7 +11,8 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed::driver::{Arena, Registers};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
 use godspeed_sdk::ServiceContext;
 
 use crate::chan::{self, Target};
@@ -128,7 +129,7 @@ fn find_bulk_only(buf: &[u8], total: usize) -> Option<(u8, u8, u16, u8)> {
 ///
 /// Returns `None` for anything else, which is an ordinary outcome and not reported.
 pub fn bind(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, splt: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, splt: u32,
 ) -> Option<Disk> {
     let mut head = [0u8; 9];
     let get9 = [0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0];
@@ -168,16 +169,9 @@ pub fn bind(
         busy_cbw: 0, busy_data: 0, busy_csw: 0, commands: 0 })
 }
 
-/// Where a BOT command's buffers live in the DMA arena. Past the keyboard report, which is past the
-/// control scratch - the assertions below derive that rather than asserting it in prose, after a
-/// buffer overlap cost a boot in slice 2.
-pub const CBW_OFF: usize = 0x0300;
-pub const CSW_OFF: usize = 0x0340;
-pub const DATA_OFF: usize = 0x0400;
+/// The most one BOT command moves, the size of its data part of the arena. Its wrappers have parts of
+/// their own (`parts.rs`), so none of the three can land on another buffer.
 pub const DATA_MAX: usize = 4096;
-const _: () = assert!(CBW_OFF >= crate::hid::REPORT_OFF + 8);
-const _: () = assert!(CSW_OFF >= CBW_OFF + 31);
-const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
 
 /// Why a bulk transfer did not complete.
 ///
@@ -267,7 +261,7 @@ pub(crate) fn bulk_xfer(
 ///
 /// Returns the bytes moved by the data stage, or `None`.
 pub fn bot(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
     cdb: &[u8], data_in: bool, dlen: usize,
 ) -> Option<usize> {
     const TAG: u32 = 0x1234_5678;
@@ -275,22 +269,22 @@ pub fn bot(
     let (ep_in, ep_out, mps) = (disk.ep_in, disk.ep_out, disk.mps);
     // CBW: 31 bytes, "USBC".
     for i in 0..31 {
-        dma.write8(CBW_OFF + i, 0);
+        dma.cbw.write8(i, 0);
     }
     for (i, b) in 0x4342_5355u32.to_le_bytes().iter().enumerate() {
-        dma.write8(CBW_OFF + i, *b);
+        dma.cbw.write8(i, *b);
     }
     for (i, b) in TAG.to_le_bytes().iter().enumerate() {
-        dma.write8(CBW_OFF + 4 + i, *b);
+        dma.cbw.write8(4 + i, *b);
     }
     for (i, b) in (dlen as u32).to_le_bytes().iter().enumerate() {
-        dma.write8(CBW_OFF + 8 + i, *b);
+        dma.cbw.write8(8 + i, *b);
     }
-    dma.write8(CBW_OFF + 12, if data_in { 0x80 } else { 0x00 });
-    dma.write8(CBW_OFF + 13, 0); // LUN
-    dma.write8(CBW_OFF + 14, cdb.len().min(16) as u8);
+    dma.cbw.write8(12, if data_in { 0x80 } else { 0x00 });
+    dma.cbw.write8(13, 0); // LUN
+    dma.cbw.write8(14, cdb.len().min(16) as u8);
     for (i, b) in cdb.iter().take(16).enumerate() {
-        dma.write8(CBW_OFF + 15 + i, *b);
+        dma.cbw.write8(15 + i, *b);
     }
 
     // NAME THE STAGE THAT FAILED. `?` here discarded which of the three transfers died, and "READ
@@ -298,7 +292,7 @@ pub fn bot(
     // port a boot every time it has appeared. CBW-out failing means the device is not accepting
     // commands at all; a data-stage failure means it accepted the command and would not answer; a
     // CSW failure means it did the work and would not report. Three different faults.
-    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000, &mut disk.pid_out) {
+    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.cbw.phys() as u32, 31, 2_000, &mut disk.pid_out) {
         return stage_failed(ctx, mmio, dma, t, disk, e, "CBW-out", cdb[0]);
     }
 
@@ -307,13 +301,13 @@ pub fn bot(
         let want = dlen.min(DATA_MAX);
         if data_in {
             for i in 0..want {
-                dma.write8(DATA_OFF + i, 0);
+                dma.disk.write8(i, 0);
             }
         }
         moved = match bulk_xfer(
             ctx, mmio, t, mps, data_in,
             if data_in { ep_in } else { ep_out },
-            dma.phys_at(DATA_OFF) as u32, want as u32, 5_000,
+            dma.disk.phys() as u32, want as u32, 5_000,
             if data_in { &mut disk.pid_in } else { &mut disk.pid_out })
         {
             Ok(n) => n as usize,
@@ -323,15 +317,15 @@ pub fn bot(
 
     // CSW: 13 bytes, "USBS".
     for i in 0..13 {
-        dma.write8(CSW_OFF + i, 0);
+        dma.csw.write8(i, 0);
     }
-    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000, &mut disk.pid_in) {
+    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.csw.phys() as u32, 13, 2_000, &mut disk.pid_in) {
         return stage_failed(ctx, mmio, dma, t, disk, e, "CSW-in", cdb[0]);
     }
 
     let mut csw = [0u8; 13];
     for i in 0..13 {
-        csw[i] = dma.read8(CSW_OFF + i);
+        csw[i] = dma.csw.read8(i);
     }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
     let tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);
@@ -386,7 +380,7 @@ pub fn bot(
 /// split is the entire difference between a driver that survives this stick and one that resets it
 /// 564 times in a selfcheck.
 fn stage_failed(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
     e: XferErr, what: &str, cdb0: u8,
 ) -> Option<usize> {
     match e {
@@ -416,7 +410,7 @@ fn stage_failed(
 /// machine; clear-halt only unsticks the pipes. Without it a device that lost framing stays lost -
 /// both halts clear, it is still waiting for the rest of a transfer we abandoned, and every following
 /// command fails.
-pub fn recover(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk) {
+pub fn recover(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk) {
     // FRAME THESE WITH EP0'S PACKET SIZE, not the bulk endpoint's.
     //
     // A control transfer framed with 512 instead of EP0's 64 is malformed, so the clear-halt fails
@@ -453,13 +447,13 @@ pub fn recover(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, 
 
 /// READ CAPACITY(10): the device's last LBA and block size.
 pub fn read_capacity(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
 ) -> Option<(u64, u32)> {
     let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     bot(ctx, mmio, dma, t, disk, &cdb, true, 8)?;
     let mut b = [0u8; 8];
     for i in 0..8 {
-        b[i] = dma.read8(DATA_OFF + i);
+        b[i] = dma.disk.read8(i);
     }
     // Both fields are BIG endian - SCSI, not USB. Reading them little-endian gives a plausible but
     // wildly wrong capacity, which is the sort of error that surfaces as corruption much later.
@@ -470,7 +464,7 @@ pub fn read_capacity(
 
 /// READ(10): one block into the arena's data buffer.
 pub fn read_block(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, block: u32,
 ) -> bool {
     let cdb = [
         0x28u8, 0,
@@ -498,7 +492,7 @@ pub const STATUS_NO_DISK: u8 = 2;
 
 /// WRITE(10): one block from the arena's data buffer.
 pub fn write_block(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, block: u32,
 ) -> bool {
     let cdb = [
         0x2Au8, 0,
@@ -543,7 +537,7 @@ fn with_busy_retry(
 /// The reply cap is the ONLY authority to answer (§8.5). A reply that cannot be delivered is said
 /// once (`capless_logged` doubles as that latch) rather than dropped silently.
 pub fn serve(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
     msg: &godspeed_sdk::Message, sectors: u64, reply: gs::cap::Cap,
     capless_logged: &mut bool,
 ) -> bool {
@@ -567,7 +561,7 @@ pub fn serve(
             if with_busy_retry(ctx, 30_000, || read_block(ctx, mmio, dma, t, disk, lba, 512)) {
                 out[0] = STATUS_OK;
                 for i in 0..512 {
-                    out[1 + i] = dma.read8(DATA_OFF + i);
+                    out[1 + i] = dma.disk.read8(i);
                 }
                 513
             } else {
@@ -581,7 +575,7 @@ pub fn serve(
         }
         OP_WRITE_BLOCK if p.len() >= 521 => {
             for i in 0..512 {
-                dma.write8(DATA_OFF + i, p[9 + i]);
+                dma.disk.write8(i, p[9 + i]);
             }
             let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
             out[0] = if with_busy_retry(ctx, 30_000, || write_block(ctx, mmio, dma, t, disk, lba, 512)) {

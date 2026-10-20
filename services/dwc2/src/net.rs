@@ -11,7 +11,8 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed::driver::{Arena, Registers};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
 use godspeed_sdk::ServiceContext;
 
 use crate::chan::{self, Target};
@@ -250,7 +251,7 @@ fn hex_val(c: u8) -> u8 {
 }
 
 /// Read the station MAC from string descriptor `idx`, as twelve ASCII hex characters.
-fn read_mac(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, idx: u8) -> [u8; 6] {
+fn read_mac(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, idx: u8) -> [u8; 6] {
     let mut mac = [0u8; 6];
     if idx == 0 {
         return mac;
@@ -307,7 +308,7 @@ fn find_bulk(buf: &[u8], total: usize) -> Option<(u8, u8, u16)> {
 }
 
 /// Configure the NIC and return its bulk endpoints.
-pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target) -> Option<Nic> {
+pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> Option<Nic> {
     let mut head = [0u8; 9];
     let get9 = [0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0];
     if !chan::control(ctx, mmio, dma, t, &get9, &mut head, true, 9) {
@@ -489,7 +490,7 @@ const SMSC_MII_BMSR: u32 = 1;   // basic mode STATUS; bit 2 = link up, bit 5 = a
 /// therefore reports a freshly-connected cable as down, forever, until something happens to read twice.
 /// This is standard 802.3 clause-22 behaviour, not a quirk of this part, and it is why every driver
 /// reads this register twice.
-fn link_up(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, nic: &mut Nic) -> bool {
+fn link_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, nic: &mut Nic) -> bool {
     let _latched = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
     let read = mii_read(ctx, m, d, t, SMSC_MII_BMSR);
     // EVERY TRANSITION, not a 15-second sample. Bit 2 is link, bit 5 is autoneg-complete: 0x7809 is
@@ -532,7 +533,7 @@ fn link_up(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, nic: &mut
 /// Whether this is the transmit fault is NOT established - it is a missing step in the port, found by
 /// diffing against the vendor driver, and it happens at exactly the moment transmit dies. The device
 /// registers logged beside it are what will settle that, rather than another argument.
-fn link_reconfigure(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target) {
+fn link_reconfigure(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) {
     // Negotiated duplex = what both ends advertised. Linux reads it from the PHY layer; the raw form
     // is the intersection of our ADVERTISE (4) and the partner's LPA (5).
     let adv = mii_read(ctx, m, d, t, SMSC_MII_ADVERTISE).unwrap_or(0);
@@ -581,7 +582,7 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target) 
 /// The cache starts DOWN and un-stamped, so the very first transmit reads the PHY rather than
 /// trusting a default. An unreadable PHY counts as down, for the same reason `OP_NET_INFO` says so:
 /// an unanswerable question is not a yes.
-fn link_fresh(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, nic: &mut Nic) -> bool {
+fn link_fresh(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, nic: &mut Nic) -> bool {
     let now = wait::Since::now(ctx);
     if nic.link_at.map_or(true, |at| at.passed(ctx, Budget::ms(LINK_TTL_MS))) {
         let up = link_up(ctx, m, d, t, nic);
@@ -601,7 +602,7 @@ fn link_fresh(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, nic: &
 /// One writer, one place the edge is decided. Two callers updating the same cached state is how a
 /// transition goes missing.
 fn link_observed(
-    ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, nic: &mut Nic, up: bool, now: wait::Since,
+    ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, nic: &mut Nic, up: bool, now: wait::Since,
 ) {
     let was = nic.link_up;
     let first = nic.link_at.is_none();
@@ -627,7 +628,7 @@ const SMSC_BURST_PKTS: u32 = 8;
 /// bounded in time as well as in iterations. A healthy part clears in one or two.
 const SMSC_POLLS: u32 = 64;
 
-fn smsc_write(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, index: u16, value: u32) -> bool {
+fn smsc_write(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, index: u16, value: u32) -> bool {
     let setup = [0x40, 0xA0, 0x00, 0x00, index as u8, (index >> 8) as u8, 4, 0x00];
     let mut data = value.to_le_bytes();
     chan::control(ctx, m, d, t, &setup, &mut data, false, 4)
@@ -635,7 +636,7 @@ fn smsc_write(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, index:
 
 /// `None` if the control transfer itself failed - deliberately distinct from a register that genuinely
 /// reads zero. Fabricating a 0 there is what lets a dead USB link masquerade as a real reading.
-fn smsc_read(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, index: u16) -> Option<u32> {
+fn smsc_read(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, index: u16) -> Option<u32> {
     let setup = [0xC0, 0xA1, 0x00, 0x00, index as u8, (index >> 8) as u8, 4, 0x00];
     let mut data = [0u8; 4];
     if !chan::control(ctx, m, d, t, &setup, &mut data, true, 4) { return None; }
@@ -658,13 +659,13 @@ fn smsc_read(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, index: 
 /// Both of those call sites are gone; they use `smsc_read` and handle `None` (§26.7 - a failure is
 /// reported, never swallowed). What remains is the honest residual: a register dump prints 0 for a
 /// register it could not read, and `reg_read_fails` in the periodic report is how you know.
-fn smsc_read_for_log(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, index: u16) -> u32 {
+fn smsc_read_for_log(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, index: u16) -> u32 {
     smsc_read(ctx, m, d, t, index).unwrap_or(0)
 }
 
 /// Wait for the MDIO engine to drop BUSY. Bounded: a stuck engine leaves the PHY unconfigured (net
 /// degrades) rather than holding this service forever.
-fn mii_idle(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target) -> bool {
+fn mii_idle(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) -> bool {
     for _ in 0..SMSC_POLLS {
         match smsc_read(ctx, m, d, t, SMSC_MII_ADDR) {
             Some(v) if v & 1 == 0 => return true,
@@ -675,13 +676,13 @@ fn mii_idle(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target) -> bool 
     false
 }
 
-fn mii_write(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, reg: u32, val: u16) -> bool {
+fn mii_write(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, reg: u32, val: u16) -> bool {
     if !mii_idle(ctx, m, d, t) { return false; }
     if !smsc_write(ctx, m, d, t, SMSC_MII_DATA, val as u32) { return false; }
     smsc_write(ctx, m, d, t, SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | (1 << 1) | 1)
 }
 
-fn mii_read(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, reg: u32) -> Option<u16> {
+fn mii_read(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, reg: u32) -> Option<u16> {
     if !mii_idle(ctx, m, d, t) { return None; }
     if !smsc_write(ctx, m, d, t, SMSC_MII_ADDR, (SMSC_PHY_ID << 11) | (reg << 6) | 1) { return None; }
     if !mii_idle(ctx, m, d, t) { return None; }
@@ -713,7 +714,7 @@ fn mii_read(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, reg: u32
 ///
 /// Cheap: two control transfers, only on the periodic status poll, and only acted on when both come
 /// back zero. A chip that is genuinely working answers non-zero and this costs nothing else.
-pub fn health_check(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, nic: &mut Nic) {
+pub fn health_check(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, nic: &mut Nic) {
     // A read that FAILED is not a register that is zero (`smsc_read_for_log`'s warning, applied). Only
     // a successful read of zero counts as evidence here; `None` means "ask again later".
     let (Some(hw), Some(mac_cr)) = (
@@ -770,7 +771,7 @@ pub fn health_check(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target, 
 /// locally-administered address. Granting the mailbox window itself would be authority out of
 /// proportion to one identity fact. The log names which case happened - see "THREE SOURCES" in the
 /// body.
-fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target) -> Option<[u8; 6]> {
+fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) -> Option<[u8; 6]> {
     // Lite reset the chip.
     let hw = smsc_read(ctx, m, d, t, SMSC_HW_CFG)?;
     if !smsc_write(ctx, m, d, t, SMSC_HW_CFG, hw | SMSC_HW_CFG_LRST) {
@@ -971,15 +972,8 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Arena, t: &Target) -> 
     Some(mac)
 }
 
-/// Where frames live in the DMA arena, clear of everything else.
-///
-/// DERIVED, not asserted in prose. The first values here were `0x1000`/`0x2000` and the const
-/// assertion below rejected them at BUILD time: `msc`'s data buffer spans `0x400..0x1400`, so the TX
-/// frame would have been laid inside it. That is the identical overlap that cost a boot in slice 2 -
-/// where the comment claimed the buffer was clear of the scratch and nobody checked the arithmetic.
-/// The assertion is why this one cost a compile instead.
-pub const TX_OFF: usize = 0x2000;
-pub const RX_OFF: usize = 0x3000;
+// Frames live in two parts of the arena, `Parts::tx` and `Parts::rx` (`parts.rs`), which is where the
+// overlap with the disk buffer that a const assertion once caught at build time is told.
 // C3-1. This said 1514 while the kernel, nic-driver and genet all said 1600 - six definitions of one
 // fact, and mine was the one that disagreed. 1514 is a correct number (an ethernet frame without its
 // FCS) which is exactly why it looked right when written; but nic-driver ACCEPTS up to 1600, so a frame
@@ -1013,13 +1007,9 @@ pub const FRAME_MAX: usize = 1600;
 pub const RXQ_BYTES: usize = RX_BURST + 256;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
-const _: () = assert!(TX_OFF >= crate::msc::DATA_OFF + crate::msc::DATA_MAX);
-const _: () = assert!(RX_OFF >= TX_OFF + FRAME_MAX + 8);
-/// The RX burst must FIT the granted arena (64 KiB). Added when the burst doubled to 4096 to match the
-/// kernel driver: a buffer that runs off the end of the arena is a DMA write into whatever follows, and
-/// the device would do it silently. The sibling assertions above already caught one real overlap at
-/// build time, which is the argument for spending three lines on the next one.
-const _: () = assert!(RX_OFF + RX_BURST <= 64 * 1024);
+// The RX burst must FIT the granted arena (64 KiB): a buffer that ran off its end would be a DMA write
+// into whatever follows, made silently by the device. The layout refuses a part that does not fit, at
+// start, with the part named (`parts.rs`).
 
 /// Send one ethernet frame.
 ///
@@ -1027,7 +1017,7 @@ const _: () = assert!(RX_OFF + RX_BURST <= 64 * 1024);
 /// driver that sends the raw frame instead is not rejected - the device silently drops it, which on a
 /// NIC is the worst failure shape there is.
 pub fn tx(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, nic: &mut Nic, frame: &[u8],
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, nic: &mut Nic, frame: &[u8],
 ) -> bool {
     // REFUSE, CHEAPLY, WITH NO LINK.
     //
@@ -1149,19 +1139,19 @@ pub fn tx(
     // TX_CMD_A = len | FIRST_SEG | LAST_SEG, TX_CMD_B = len. Both little-endian.
     let a = (n as u32) | 0x0000_2000 | 0x0000_1000;
     for (i, b) in a.to_le_bytes().iter().enumerate() {
-        dma.write8(TX_OFF + i, *b);
+        dma.tx.write8(i, *b);
     }
     for (i, b) in (n as u32).to_le_bytes().iter().enumerate() {
-        dma.write8(TX_OFF + 4 + i, *b);
+        dma.tx.write8(4 + i, *b);
     }
     for i in 0..given {
-        dma.write8(TX_OFF + 8 + i, frame[i]);
+        dma.tx.write8(8 + i, frame[i]);
     }
     // The pad itself must be written, not merely counted. The DMA arena is reused between transmits, so
     // whatever the previous frame left in these bytes would otherwise go out on the wire as the tail of
     // this one - a leak of the last frame's contents, and not the zeros the padding is supposed to be.
     for i in given..n {
-        dma.write8(TX_OFF + 8 + i, 0);
+        dma.tx.write8(8 + i, 0);
     }
     // A ZLP IS NEEDED. The comment here used to say it was not - "the smsc95xx carries an explicit
     // length in its TX command, so it does not rely on a short packet to find the frame boundary the
@@ -1202,7 +1192,7 @@ pub fn tx(
     //
     // One short transfer therefore kills transmit permanently, which is why it always died abruptly
     // after a few hundred good frames and never came back.
-    let ok = match bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
+    let ok = match bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.tx.phys() as u32,
                         total, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why), Some(&mut ping)) {
         Some(got) if got == total => true,
         Some(got) => {
@@ -1217,7 +1207,7 @@ pub fn tx(
     // a normal OUT of length 0 on the same endpoint, so it advances the data toggle like any other
     // packet - which the toggle readback in `bulk` already handles.
     let ok = if ok && nic.mps != 0 && total % (nic.mps as u32) == 0 {
-        let zlp = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.phys_at(TX_OFF) as u32,
+        let zlp = bulk(ctx, mmio, t, nic.mps, false, nic.ep_out, dma.tx.phys() as u32,
                        0, TX_BUDGET_MS, &mut nic.pid_out, Some(&mut why), Some(&mut ping));
         if zlp.is_none() {
             ctx.log_fmt(format_args!(
@@ -1341,13 +1331,13 @@ impl Nic {
 ///
 /// Extracted so `tx` can call it the moment it finishes, rather than leaving the channel unarmed until
 /// the next receive poll - see the call there for what that gap cost.
-fn arm_in(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, nic: &mut Nic) {
+fn arm_in(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, nic: &mut Nic) {
     // Clear HCINT before arming: it is write-1-to-clear and holds whatever the LAST transfer on this
     // channel left behind. Arming without clearing means the first check reads a stale completion and
     // harvests a buffer the device has not written yet.
     mmio.write32(chan::hcint_at(CH_NET_RX), 0xFFFF_FFFF);
     chan::program(ctx, mmio, &Target { addr: t.addr, mps: nic.mps, low_speed: false }, CH_NET_RX,
-                  true, nic.pid_in, RX_BURST as u32, dma.phys_at(RX_OFF) as u32,
+                  true, nic.pid_in, RX_BURST as u32, dma.rx.phys() as u32,
                   nic.ep_in as u32, 2, 0);
     // Unmask this channel's terminal halt, exactly as the working kernel driver did before it armed its
     // background IN. `chan::program` zeroes HCINTMSK for every channel, which is invisible for a channel
@@ -1392,7 +1382,7 @@ fn arm_in(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, nic: 
 /// Returns the number of frames queued. Zero is the ordinary answer on a quiet network and is not
 /// a failure.
 pub fn rx(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, nic: &mut Nic,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, nic: &mut Nic,
 ) -> u32 {
     // ARM THE IN AND LEAVE IT ARMED.
     //
@@ -1473,8 +1463,8 @@ pub fn rx(
     let mut buf = [0u8; FRAME_MAX];
     while pos + 4 <= got {
         let status = u32::from_le_bytes([
-            dma.read8(RX_OFF + pos), dma.read8(RX_OFF + pos + 1),
-            dma.read8(RX_OFF + pos + 2), dma.read8(RX_OFF + pos + 3),
+            dma.rx.read8(pos), dma.rx.read8(pos + 1),
+            dma.rx.read8(pos + 2), dma.rx.read8(pos + 3),
         ]);
         pos += 4;
         let flen = ((status >> 16) & 0x3FFF) as usize; // length INCLUDING the 4-byte FCS
@@ -1496,17 +1486,17 @@ pub fn rx(
                     ctx.log_fmt(format_args!(
                         "dwc2-svc: RX burst {} bytes, unparsed at {}: status=0x{:08x} flen={} | first 12 bytes {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
                         got, pos - 4, status, flen,
-                        dma.read8(RX_OFF), dma.read8(RX_OFF + 1), dma.read8(RX_OFF + 2),
-                        dma.read8(RX_OFF + 3), dma.read8(RX_OFF + 4), dma.read8(RX_OFF + 5),
-                        dma.read8(RX_OFF + 6), dma.read8(RX_OFF + 7), dma.read8(RX_OFF + 8),
-                        dma.read8(RX_OFF + 9), dma.read8(RX_OFF + 10), dma.read8(RX_OFF + 11)));
+                        dma.rx.read8(0), dma.rx.read8(1), dma.rx.read8(2),
+                        dma.rx.read8(3), dma.rx.read8(4), dma.rx.read8(5),
+                        dma.rx.read8(6), dma.rx.read8(7), dma.rx.read8(8),
+                        dma.rx.read8(9), dma.rx.read8(10), dma.rx.read8(11)));
                 }
             }
             break; // invalid, or a frame split across the burst boundary - give up on this burst
         }
         let n = flen - 4; // strip the FCS; the stack does not want it
         for i in 0..n.min(FRAME_MAX) {
-            buf[i] = dma.read8(RX_OFF + pos + i);
+            buf[i] = dma.rx.read8(pos + i);
         }
         // Classify by destination address before the frame goes anywhere. See `Stats::rx_unicast`.
         if n >= 6 {
@@ -1661,7 +1651,7 @@ pub const OP_NET_RX: u8 = 0x12;
 
 /// Serve one frame request. Returns false if the message was not one.
 pub fn serve(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, nic: &mut Nic,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, nic: &mut Nic,
     msg: &godspeed_sdk::Message, reply: gs::cap::Cap,
 ) -> bool {
     let p = msg.payload_bytes();

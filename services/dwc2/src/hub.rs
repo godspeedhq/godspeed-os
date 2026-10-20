@@ -13,7 +13,8 @@
 use godspeed as gs;
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed::driver::{Arena, Registers};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
 use godspeed_sdk::ServiceContext;
 
 
@@ -110,7 +111,7 @@ impl PortStatus {
 }
 
 fn port_feature(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target,
     set: bool, feature: u16, port: u8,
 ) -> bool {
     let setup = [
@@ -144,7 +145,7 @@ fn port_feature(
 /// direction. `wIndex` is the hub port the TT serves. The request goes to the HUB (direct, high
 /// speed), never to the stuck device - which is the point, since the device is unreachable.
 pub fn clear_tt_buffer(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, hub: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, hub: &Target,
     dev_addr: u8, ep: u8, ep_type: u8, dir_in: bool, port: u8, multi_tt: bool,
 ) -> bool {
     let wvalue: u16 = ((ep as u16) & 0xF)
@@ -185,7 +186,7 @@ pub fn clear_tt_buffer(
 /// where it belongs in the ladder: after a clear has been tried and demonstrably not helped, and
 /// before the port reset that costs 0.31 s and cannot fix this fault at all.
 pub fn reset_tt(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, hub: &Target, port: u8, multi_tt: bool,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, hub: &Target, port: u8, multi_tt: bool,
 ) -> bool {
     let setup = [REQ_TYPE_PORT_OUT, REQ_RESET_TT, 0, 0, tt_windex(port, multi_tt), 0, 0, 0];
     let mut none: [u8; 0] = [];
@@ -211,15 +212,14 @@ pub fn reset_tt(
 /// The hub is directly attached at high speed, so this needs no split transaction - it is the plain
 /// interrupt IN that the keyboard cannot have.
 pub fn status_change(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, hub: &Target, ep: u8, mps: u16, pid: &mut u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, hub: &Target, ep: u8, mps: u16, pid: &mut u32,
 ) -> Option<u32> {
-    const STATUS_OFF: usize = 0x0300;          // clear of the control scratch and the HID report
     let len = (mps as u32).min(4);
     for i in 0..len as usize {
-        dma.write8(STATUS_OFF + i, 0);
+        dma.hub_status.write8(i, 0);
     }
     let hcint = chan::interrupt_in(
-        ctx, mmio, hub, chan::CH_HUB, *pid, dma.phys_at(STATUS_OFF) as u32, len, ep as u32);
+        ctx, mmio, hub, chan::CH_HUB, *pid, dma.hub_status.phys() as u32, len, ep as u32);
     if hcint & crate::regs::HCINT_XFERCOMPL == 0 {
         // NAK is the ordinary "nothing changed"; anything else is a transfer that did not land and is
         // not evidence of anything either way.
@@ -228,7 +228,7 @@ pub fn status_change(
     *pid = chan::pid_from_hctsiz(mmio, chan::CH_HUB);
     let mut bits = 0u32;
     for i in 0..len as usize {
-        bits |= (dma.read8(STATUS_OFF + i) as u32) << (i * 8);
+        bits |= (dma.hub_status.read8(i) as u32) << (i * 8);
     }
     Some(bits)
 }
@@ -252,7 +252,7 @@ const DEBOUNCE_TIMEOUT_MS: u64 = 2000;
 /// enabled` (0x0101) 200 ms later and was left unbound for as long as it stayed there (`docs/wifi-usb.md`
 /// 46). A connection change seen while waiting is acknowledged and restarts the count, as Linux does.
 pub fn debounce(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, port: u8,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, port: u8,
 ) -> Option<bool> {
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(DEBOUNCE_TIMEOUT_MS));
     let mut last: Option<bool> = None;
@@ -290,7 +290,7 @@ pub fn debounce(
 /// (`docs/wifi-usb.md` 45). The status returned is the one read BEFORE the clears, which is the one the
 /// change was about.
 pub fn clear_changes(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, hub: &Target, port: u8,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, hub: &Target, port: u8,
 ) -> Option<PortStatus> {
     let st = port_status(ctx, mmio, dma, hub, port)?;
     for bit in 0..5u16 {
@@ -303,7 +303,7 @@ pub fn clear_changes(
 
 /// Read one downstream port's status. `None` if the request failed.
 pub fn port_status(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, port: u8,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, port: u8,
 ) -> Option<PortStatus> {
     let setup = [REQ_TYPE_PORT_IN, REQ_GET_STATUS, 0, 0, port, 0, 4, 0];
     let mut buf = [0u8; 4];
@@ -320,7 +320,7 @@ pub fn port_status(
 ///
 /// A port with no power reports nothing connected, which is indistinguishable from an empty socket -
 /// so powering first is what makes the survey below mean anything.
-pub fn power_all(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, ports: u8) {
+pub fn power_all(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, ports: u8) {
     for p in 1..=ports {
         if !port_feature(ctx, mmio, dma, t, true, FEAT_PORT_POWER, p) {
             ctx.log_fmt(format_args!("dwc2-svc: hub port {} would not power on", p));
@@ -337,7 +337,7 @@ pub fn power_all(ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target
 /// The speed is only valid AFTER the reset completes - before it, the hub has not yet detected which
 /// bus speed the device chirped for.
 pub fn reset_port(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, port: u8,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, port: u8,
 ) -> Option<PortStatus> {
     if !port_feature(ctx, mmio, dma, t, true, FEAT_PORT_RESET, port) {
         ctx.log_fmt(format_args!("dwc2-svc: hub port {} reset request FAILED", port));
@@ -378,7 +378,7 @@ pub fn reset_port(
 /// actually drives a device. Separating them means a wrong topology is visible as a wrong topology
 /// instead of as a device that will not work.
 pub fn survey(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, t: &Target, ports: u8,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, ports: u8,
 ) -> ([u16; 8], usize) {
     power_all(ctx, mmio, dma, t, ports);
     let mut found = 0u8;
@@ -469,7 +469,7 @@ pub fn visit_order(status: &[u16; 8], n_status: usize) -> ([u8; 8], usize) {
 /// every stage rides the hub's transaction translator. A high-speed device is addressed directly (see
 /// the body: the survey's "all four need a split" was wrong, and only the keyboard does).
 pub fn enumerate_downstream(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Arena, hub: &Target, port: u8, next_addr: &mut u8,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, hub: &Target, port: u8, next_addr: &mut u8,
 ) -> Option<(u16, u16, u8, Target, u32)> {
     // THE SPEED IS ONLY VALID AFTER THE RESET, and it decides whether a split is needed at all.
     //

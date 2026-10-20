@@ -326,12 +326,12 @@ peer_reacquire_debt = ["console", "ehci", "hw-enumerator"]
 # Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
 # `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
 #
-# 29 are one fact stored twice with the SAME value - a `use` away from being one. Two are the other
-# shape, the same name carrying DIFFERENT facts in one crate:
-#   svc/nic-driver RX_RING_OFF   0x100 (the dwmac arena) and 0x2000 (the RTL8168 arena)
-#   svc/dwc2       DATA_OFF      0x40 and 0x400
-# Nothing is wrong at either site, which is what makes that shape worth a name: a reader of
-# `RX_RING_OFF` in nic-driver cannot tell which device arena they are holding.
+# 29 are one fact stored twice with the SAME value - a `use` away from being one. Two were the other
+# shape, the same name carrying DIFFERENT facts in one crate: nic-driver's RX_RING_OFF (0x100 in the
+# dwmac arena, 0x2000 in the RTL8168's) and dwc2's DATA_OFF (0x40 and 0x400). Nothing was wrong at
+# either site, which is what made that shape worth a name: a reader could not tell which arena or
+# buffer they held. Both left on 2026-10-19 and 2026-10-20, when those arenas were laid out by name -
+# a part's name says which buffer it is.
 #
 # Recorded rather than fixed because every fix is Rust in a shipping service, and this tree is
 # hardware-verified on five machines.
@@ -349,7 +349,6 @@ duplicate_const_debt = [
   "svc/dwc2:CH_KBD",
   "svc/dwc2:CH_NET",
   "svc/dwc2:CH_NET_RX",
-  "svc/dwc2:DATA_OFF",
   "svc/dwc2:DESC_CONFIG",
   "svc/dwc2:DESC_ENDPOINT",
   "svc/dwc2:DESC_INTERFACE",
