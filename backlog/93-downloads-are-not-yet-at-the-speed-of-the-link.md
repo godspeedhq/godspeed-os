@@ -92,6 +92,14 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    card tests:** if damaged segments are the cause, the count rises during a download and `DecryptFailed`
    stops; if the count stays at 0 and `DecryptFailed` persists, they are not, and what a failure leaves
    behind for the next connection is the next question.
+   **The first card, 2026-10-20 (`d830652d`, Wyse):** 6 of 6 downloads finished, and two real segments
+   from the registry were dropped for a bad checksum, each in a download that then completed; none was
+   dropped in QEMU. So damaged segments do reach `net-stack` on the Wyse, and the sender's retransmission
+   repairs them. The first drop came 160 ms after five RTL8168 TX-timeout recoveries in a row, the second
+   with nothing logged near it. Where the damage is made, the chip or the driver's receive path, is not
+   known; that the Ethernet FCS would have caught damage on the wire points at the second. Six clean
+   downloads against the earlier failure rates is evidence, not yet proof: a few more cards will say.
+   `chaos max-carnage all-services 1000` and `selfcheck` (666 ran, 0 failed) on the same image, clean.
 
 ## Where to start
 
