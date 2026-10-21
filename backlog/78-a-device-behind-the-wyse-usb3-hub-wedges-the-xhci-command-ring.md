@@ -96,11 +96,18 @@ port count and its EP0 cursor - and probe the unbound ports of each on the hub t
 hubs that a HID or the disk happens to be behind. QEMU can show it (`usb-hub` with a keyboard behind it and a
 stick behind a second hub, then removing and re-adding the keyboard from the QEMU monitor).
 
-**Built 2026-10-20, QEMU-verified, a Wyse card owed.** Enumeration records every hub it keeps (`KeptHub`), and
+**Built 2026-10-20 (`c095c1ed`), QEMU-verified, and the Wyse card PASSED 2026-10-21.** Enumeration records every hub it keeps (`KeptHub`), and
 the poll loop watches each one no other scan covers - no HID behind it, not the disk's, not the dongle's -
 from an EP0 ring made coherent at loop entry as the HID hubs' rings are. QEMU, `q35`, a keyboard behind one
 `usb-hub` and a stick behind another: without the change the replugged keyboard was never found; with it,
 "device arrived on hub slot 1 port 1 (a hub nothing was bound behind) - re-enumerating" and the keyboard back.
+
+The card (`build/serial_output.log`, Wyse, 2026-10-21 01:36-01:37, image `c095c1ed`): five unplugs and replugs of
+the keyboard, every one found again. Three at the back - back port 4 to 3, 3 to 4, and 4 to 3 again - each said
+"hub slot 1 port N reads connected (1/2)", then "(2/2)", then "device arrived on hub slot 1 port N (a hub nothing
+was bound behind) - re-enumerating", and "keyboard connected" 2.2 to 2.4 s after the first connected read. Two at
+the front (root ports 3 and 4), seen as root-port changes as before. No panic, no service death, and no hub that
+could not be readied or gave no answer.
 
 **Found on the way, and left as it is:** the confirmation state the older scans share (`hub_seen`, `hub_tried`)
 is kept by PORT NUMBER alone, not by hub and port. The first build of the watch used it too and never
