@@ -985,7 +985,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) -> 
 // these crates can both name. Recorded rather than pretended away.
 pub const FRAME_MAX: usize = 1600;
 
-/// Bytes held for the client to collect, sized to ONE BURST so it cannot overflow.
+/// Bytes held for the client to collect, sized in whole BURSTS so it cannot overflow.
 ///
 /// **Twice I sized this as a COUNT of frames and twice hardware disproved the count.** Four, on the
 /// reasoning that a burst carries "two or three": 62 frames arrived in 24 bursts and 32 were dropped.
@@ -1002,9 +1002,19 @@ pub const FRAME_MAX: usize = 1600;
 /// frames, ~60 of them) would be 93 KiB of a 256 KiB stack. This is 26.6.1 exactly - the fix for a
 /// working set that will not fit is to change its shape, not to grow the allocation.
 ///
-/// Still sized to one BURST, not to a backlog: a client that stops collecting must see loss, counted,
+/// Still sized to a bound, not to a backlog: a client that stops collecting must see loss, counted,
 /// rather than have the driver grow to hide it.
-pub const RXQ_BYTES: usize = RX_BURST + 256;
+///
+/// **Four bursts, and a burst is taken from the controller only when one more fits (`rx_room`).** One
+/// burst assumed `rx` ran only with nothing queued, and the interrupt broke that: it harvests whenever an
+/// IN completes, so a burst landing while `nic-driver` was still collecting the last one was refused, and
+/// on the Pi 2 a download lost 169 of 600 frames that way (2026-10-21, cable 4-13 KiB/s). Now a burst
+/// that does not fit is left in its DMA buffer, the IN not re-armed, until the client makes room - held
+/// by the device, never thrown away by us - and `rx_dropped` is again a counter that should not move.
+pub const RXQ_BURSTS: usize = 4;
+/// One burst's worst case in the queue: its bytes plus a two-byte length per frame (see above).
+pub const RXQ_PER_BURST: usize = RX_BURST + 256;
+pub const RXQ_BYTES: usize = RXQ_BURSTS * RXQ_PER_BURST;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
 // The RX burst must FIT the granted arena (64 KiB): a buffer that ran off its end would be a DMA write
@@ -1304,10 +1314,20 @@ impl Nic {
         self.rxq_count += 1;
     }
 
+    /// Is there room for one more whole burst? Moves the frames still queued to the front first, so the
+    /// space the client has already collected is reused. `rx` harvests only when this is true.
+    pub fn rx_room(&mut self) -> bool {
+        if self.rxbuf_pos > 0 {
+            self.rxbuf.copy_within(self.rxbuf_pos..self.rxbuf_fill, 0);
+            self.rxbuf_fill -= self.rxbuf_pos;
+            self.rxbuf_pos = 0;
+        }
+        RXQ_BYTES - self.rxbuf_fill >= RXQ_PER_BURST
+    }
+
     /// Copy the oldest queued frame into `out` and remove it. Returns its length, 0 if empty.
     ///
-    /// Emptying resets the cursor, which is what lets the next burst reuse the whole buffer - `rx` is
-    /// only called when nothing is queued, so exactly one burst is ever resident.
+    /// Emptying resets the cursor, so the next bursts start at the front of the buffer.
     pub fn rxq_pop(&mut self, out: &mut [u8]) -> usize {
         if self.rxq_count == 0 {
             self.rxbuf_pos = 0;
@@ -1401,6 +1421,12 @@ pub fn rx(
     if !nic.in_armed {
         arm_in(ctx, mmio, dma, t, nic);
         return 0;   // nothing yet - the device answers when it has something
+    }
+    // NO ROOM, NO HARVEST. A completed burst waits in its DMA buffer, and the IN is not re-armed, until
+    // the client has collected enough to take all of it (`RXQ_BURSTS`). Harvesting into a full queue
+    // is what threw frames away.
+    if !nic.rx_room() {
+        return 0;
     }
     // COMPLETION IS ChEna GOING CLEAR, not an HCINT bit.
     //
@@ -1724,8 +1750,8 @@ pub fn serve(
         OP_NET_RX => {
             // [n_lo, n_hi, frame...]. Zero length is "nothing received", which on a quiet network is
             // the ordinary answer and not a failure.
-            // Only touch the wire when nothing is already waiting: a burst can carry several frames
-            // and the client collects them one reply at a time.
+            // Touch the wire when nothing is waiting: a burst can carry several frames and the client
+            // collects them one reply at a time, while the interrupt keeps the queue filled (`rx_room`).
             if nic.rxq_count == 0 {
                 rx(ctx, mmio, dma, t, nic);
             }
