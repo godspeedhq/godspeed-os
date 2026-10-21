@@ -43,7 +43,7 @@
 use godspeed as gs;
 use godspeed_sdk::{Message, ServiceContext};
 
-use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, STATUS_OK};
+use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, STATUS_OK, WRITE_RUN_MAX};
 
 /// The USB host-controller SERVICE that owns the disk, by name - so a restart is transparent (§3.11).
 ///
@@ -307,6 +307,23 @@ pub fn write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> bool {
     req[1..9].copy_from_slice(&lba.to_le_bytes());
     req[9..521].copy_from_slice(buf);
     let Some(r) = rpc(ctx, &req) else { return false };
+    let p = r.payload_bytes();
+    !p.is_empty() && p[0] == STATUS_OK
+}
+
+/// Write a run of consecutive sectors from `lba`, `data` holding 1 to `WRITE_RUN_MAX` of them, in ONE
+/// request: the host writes it as one command (`xhci`) or block by block (`dwc2`), and answers once.
+pub fn write_run(ctx: &ServiceContext, lba: u64, data: &[u8]) -> bool {
+    let count = data.len() / 512;
+    if count == 0 || count > WRITE_RUN_MAX || data.len() != count * 512 {
+        return false;
+    }
+    let mut req = [0u8; 10 + WRITE_RUN_MAX * 512];
+    req[0] = OP_WRITE_BLOCKS;
+    req[1..9].copy_from_slice(&lba.to_le_bytes());
+    req[9] = count as u8;
+    req[10..10 + data.len()].copy_from_slice(data);
+    let Some(r) = rpc(ctx, &req[..10 + data.len()]) else { return false };
     let p = r.payload_bytes();
     !p.is_empty() && p[0] == STATUS_OK
 }

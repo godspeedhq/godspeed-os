@@ -704,6 +704,13 @@ pub const OP_WRITE_BLOCK: u8 = 2;
 pub const OP_CAPACITY: u8 = 3;
 pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
+/// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]`: a file's chunk, written as ONE
+/// WRITE(10) of `count` sectors rather than `count` commands of one (`block-driver`'s `OP_WRITE_BLOCKS`).
+pub const OP_WRITE_BLOCKS: u8 = 6;
+/// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
+pub const WRITE_RUN_MAX: usize = 7;
+// A run must fit the one data buffer a command transfers from.
+const _: () = assert!(WRITE_RUN_MAX as u32 * SECTOR <= MAX_XFER);
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device. Distinct from `STATUS_ERR`, which
@@ -848,6 +855,24 @@ pub fn serve_block(
                 data_write8(dma, i, req[9 + i]);
             }
             out[0] = if write10(ctx, dma, mmio, dboff, ir0, d, lba_of(req), 1, ev_idx, ev_cycle, eaten) {
+                STATUS_OK
+            } else {
+                STATUS_ERR
+            };
+            1
+        }
+        OP_WRITE_BLOCKS => {
+            // One Bulk-Only command for the whole run. Each command is three transfers (CBW, data, CSW)
+            // and the stick's own turnaround, so a chunk sent block by block paid that seven times: the
+            // Pi 4 spent 40 s of a 10 MB download's 78 on the stick (2026-10-21).
+            let count = req.get(9).copied().unwrap_or(0) as usize;
+            if count == 0 || count > WRITE_RUN_MAX || req.len() < 10 + count * SECTOR as usize {
+                return 1;
+            }
+            for i in 0..count * SECTOR as usize {
+                data_write8(dma, i, req[10 + i]);
+            }
+            out[0] = if write10(ctx, dma, mmio, dboff, ir0, d, lba_of(req), count as u32, ev_idx, ev_cycle, eaten) {
                 STATUS_OK
             } else {
                 STATUS_ERR

@@ -2393,6 +2393,7 @@ fn serve_if_block(
     let is_block_op = matches!(
         op,
         msc::OP_READ_BLOCK | msc::OP_WRITE_BLOCK | msc::OP_CAPACITY | msc::OP_WRITE_ZEROS | msc::OP_FLUSH
+            | msc::OP_WRITE_BLOCKS
     );
     if !is_block_op {
         return true; // not a block request; the disk is unaffected
@@ -2440,7 +2441,8 @@ fn serve_if_block(
     // OP_CAPACITY is NOT one: it does no device I/O (see `serve_block`), so it cannot report that
     // the device stopped answering, and treating its failure that way dropped a live disk.
     let was_data_op = matches!(msg.payload_bytes().first(),
-        Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS));
+        Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS)
+            | Some(&msc::OP_WRITE_BLOCKS));
     // ... AND only while a disk is still bound.
     //
     // Once it has been dropped, `serve_block` answers STATUS_NO_DISK for the honest reason "no disk" -

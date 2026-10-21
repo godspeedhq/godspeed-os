@@ -484,6 +484,12 @@ pub const OP_WRITE_BLOCK: u8 = 2;
 pub const OP_CAPACITY: u8 = 3;
 pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
+/// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]` (`block-driver`'s
+/// `OP_WRITE_BLOCKS`). Served here block by block, each as a single write is: one request instead of
+/// `count`, the stick still asked per block. The `xhci` host writes a run as one command.
+pub const OP_WRITE_BLOCKS: u8 = 6;
+/// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
+pub const WRITE_RUN_MAX: usize = 7;
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device - the same value and meaning as
@@ -583,6 +589,22 @@ pub fn serve(
             } else {
                 STATUS_ERR
             };
+            1
+        }
+        OP_WRITE_BLOCKS if p.len() >= 10 => {
+            let count = p[9] as usize;
+            let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
+            let mut ok = (1..=WRITE_RUN_MAX).contains(&count) && p.len() >= 10 + count * 512;
+            let mut s = 0;
+            while ok && s < count {
+                for i in 0..512 {
+                    dma.disk.write8(i, p[10 + s * 512 + i]);
+                }
+                let at = lba.wrapping_add(s as u32);
+                ok = with_busy_retry(ctx, 30_000, || write_block(ctx, mmio, dma, t, disk, at, 512));
+                s += 1;
+            }
+            out[0] = if ok { STATUS_OK } else { STATUS_ERR };
             1
         }
         OP_FLUSH => {
