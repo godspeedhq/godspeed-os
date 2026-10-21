@@ -215,6 +215,15 @@ impl EvMail {
         }
     }
 
+    /// Forget every filed completion but `keep`'s - the start of a pass, for all but the disk (its gather
+    /// write in flight finishes across passes).
+    pub(crate) fn keep_only(&mut self, keep: Option<u32>) {
+        let mask = match keep { Some(s) if s < 32 => 1u32 << s, _ => 0 };
+        self.have &= mask;
+        self.ep0_have &= mask;
+        self.bulk_have &= mask;
+    }
+
     /// Collect this slot's EP0 completion, if one was filed - never an endpoint's beside it.
     pub(crate) fn take_ep0(&mut self, sid: u32) -> Option<u32> {
         if sid < 32 && self.ep0_have & (1 << sid) != 0 {
@@ -4881,6 +4890,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 present |= 1 << p;
             }
         }
+        // The mailbox for completions one consumer dequeues on another's behalf (`EvMail`). Cleared at the
+        // top of every pass, EXCEPT the disk's entry: a gather write in flight (`msc`, OVERLAP) finishes
+        // while nothing waits for it, and its completion is collected on a later pass. Re-made each pass,
+        // as it was, it threw that completion away and the write was waited out for 30 s (QEMU, RISC-V,
+        // 2026-10-21).
+        let mut eaten = EvMail::new();
         'poll: loop {
             // THE PASS COUNTER, first statement of the pass and ahead of every exit from it.
             //
@@ -4968,8 +4983,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let base: u64 = 10;
             // HID slots whose transfer events something else consumed this pass. BOTH the block
             // server below and the hub status checks further down can swallow a keyboard completion,
-            // and either one owes the endpoint a re-arm - so the set spans them.
-            let mut eaten = EvMail::new();
+            // and either one owes the endpoint a re-arm - so the set spans them. Per pass, but the disk's
+            // entry is kept (above).
+            eaten.keep_only(disk.as_ref().map(|d| d.slot));
             // Set by the hub scan when the disk's own port reports DISCONNECTED. Acted on AFTER the
             // scan rather than inside it, so the scan's borrow of `disk` and the clearing of it do
             // not overlap.
