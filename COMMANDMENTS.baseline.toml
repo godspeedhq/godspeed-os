@@ -814,7 +814,10 @@ SpawnImage               = 52
 "observe-now" = ["priv:INTROSPECT"]
 "ping" = ["peer:pong"]
 # power: peer:fs and peer:copier (2026-10-14) - a shutdown's last-second tidy-up (docs/shutdown.md 4.3).
-"power" = ["peer:copier", "peer:fs", "priv:CPU_CLOCK"]
+# power: priv:INTROSPECT (2026-10-21, operator approved) - the governor reads each core's busy and total
+# ticks (InspectKernel queries 6 and 7) to set the clock by load, as Raspberry Pi OS's ondemand does
+# (docs/power.md 15.7). Read only: the counters `observe` shows.
+"power" = ["peer:copier", "peer:fs", "priv:CPU_CLOCK", "priv:INTROSPECT"]
 "recorder" = ["peer:events", "peer:fs"]
 "resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
 "shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:POWER_OFF", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]

@@ -588,7 +588,9 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // operator's, so the shell holds it, and `power` only reads the deadline the kernel keeps (docs/shutdown.md).
     // Peers for the shutdown's tidy-up alone, three seconds before it: `fs` to flush and stop writes, `copier` to stop a copy.
     ("power", POWER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "copier"],
-     godspeed_sdk::service_context::privbits::CPU_CLOCK, 0, 0),
+     // INTROSPECT (2026-10-21): the per-core busy ticks the governor reads (docs/power.md 15.7); the
+     // counters `observe` shows, and nothing it can act on.
+     godspeed_sdk::service_context::privbits::CPU_CLOCK | godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
     // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
     // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
     // config space at all - that would be write access to every BAR and command register of every
