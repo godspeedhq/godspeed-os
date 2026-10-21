@@ -38,6 +38,11 @@ pub struct Stats {
     pub rx_bytes:   u32,   // total bytes those bursts carried
     pub rx_frames:  u32,   // complete frames the parse handed up
     pub rx_bad:     u32,   // bursts whose first status word did not parse
+    /// Transmits that stood the receive down with bytes in it, which `resume` then took: each was a burst
+    /// thrown away before 2026-10-21.
+    pub rx_caught:  u32,
+    /// Frames finished from the start of the next transfer (`carry`).
+    pub rx_joined:  u32,
     /// Frames parsed out of a burst but never delivered because the receive queue was full. The honest
     /// name for packet loss inside this driver, and the reason the queue below is not a silent buffer.
     pub rx_dropped: u32,
@@ -138,6 +143,11 @@ pub struct Nic {
     pub rxq_count: usize,    // frames still waiting to be collected
     /// Is a bulk-IN currently armed on CH_NET, waiting for the device to have a frame?
     pub in_armed: bool,
+    /// Bytes a transmit's stand-down found in the receive buffer (`tx`), not yet taken (`resume`).
+    pub rx_held: usize,
+    /// The start of a frame the last transfer cut off, finished by the next one (`take`).
+    pub carry: [u8; CARRY_MAX],
+    pub carry_len: usize,
     /// Whether the controller has been told to RAISE the host-channel interrupt yet. Once-only, and
     /// tied to the channel actually being armed - there is nothing to interrupt about before that.
     pub irq_enabled: bool,
@@ -371,7 +381,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> 
     // cable is there. Assuming UP is how a driver spends a full budget per frame proving otherwise.
     Some(Nic { ep_in, ep_out, mps, mac, stats: Stats::default(),
                rxbuf: [0u8; RXQ_BYTES], rxbuf_fill: 0, rxbuf_pos: 0, rxq_count: 0, irq_enabled: false, rx0: [0; 4], last_bmsr: 0, bmsr_changes: 0,
-               in_armed: false,
+               in_armed: false, rx_held: 0, carry: [0u8; CARRY_MAX], carry_len: 0,
                pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0,
                link_up: false, link_at: None,
                tx_fail_run: 0, tx_backoff_at: None, tx_hcint: 0, tx_nohalt: 0, tx_nptxsts: 0,
@@ -896,12 +906,11 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) -> 
              & !SMSC_HW_CFG_RXDOFF;
     smsc_write(ctx, m, d, t, SMSC_HW_CFG, hw);
     smsc_write(ctx, m, d, t, SMSC_BURST_CAP, SMSC_BURST_PKTS);
-    // 0x800, the value Linux's `smsc95xx` uses (`DEFAULT_BULK_IN_DELAY`). This was 0x2000 - four times
-    // the reference - which makes the device hold a received frame longer while it waits to batch more
-    // behind it. That is invisible on bulk traffic and costly on sparse traffic, which is exactly the
-    // shape of a ping: one small frame, nothing behind it. The doctrine for this port is that the
-    // working driver tells us what the silicon wants; departing from it needs a reason, and there was
-    // none recorded for this one.
+    // 0x800. NOT Linux's value, which this said it was: `DEFAULT_BULK_IN_DELAY` is 0x2000 in v4.19, v5.10
+    // and v6.6 alike, with a burst cap of 37 and an 18,944-byte receive transfer (turbo mode), where this
+    // driver has 8 and 4096 (`SMSC_BURST_PKTS`). It was changed from 0x2000 to 0x800 on the reasoning that
+    // a shorter delay suits sparse traffic like a ping; that reasoning was recorded, the reference was not
+    // read (corrected 2026-10-21).
     smsc_write(ctx, m, d, t, SMSC_BULK_IN_DLY, 0x800);
     // Clear whatever interrupt status survived the reset, as `smsc95xx_reset` does before going on.
     smsc_write(ctx, m, d, t, SMSC_INT_STS, 0xFFFF_FFFF);
@@ -1041,8 +1050,13 @@ pub const FRAME_MAX: usize = 1600;
 /// that does not fit is left in its DMA buffer, the IN not re-armed, until the client makes room - held
 /// by the device, never thrown away by us - and `rx_dropped` is again a counter that should not move.
 pub const RXQ_BURSTS: usize = 4;
-/// One burst's worst case in the queue: its bytes plus a two-byte length per frame (see above).
-pub const RXQ_PER_BURST: usize = RX_BURST + 256;
+/// One harvest's worst case in the queue: a transfer and the frame carried in front of it (`take`). Each
+/// frame is stored as its length and its bytes, which is fewer than the status word, FCS and padding it
+/// arrived in, so the queue never needs more than it was given.
+pub const RXQ_PER_BURST: usize = RX_BURST + CARRY_MAX;
+/// The most a frame cut off at the end of one transfer can leave to carry: its status word, the largest
+/// frame with its FCS, and its padding.
+pub const CARRY_MAX: usize = 4 + FRAME_MAX + 4 + 4;
 pub const RXQ_BYTES: usize = RXQ_BURSTS * RXQ_PER_BURST;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
@@ -1152,6 +1166,18 @@ pub fn tx(
         // be carried across it rather than the halt being removed.
         nic.pid_in = chan::pid_from_hctsiz(mmio, CH_NET_RX);
         nic.in_armed = false;
+        // KEEP WHAT THE CHANNEL HAD. A halt retires the IN where it stands: the device may have been
+        // part way through a burst, or have finished one nobody had collected yet (`halt` leaves an
+        // idle channel alone). Those bytes are in the receive buffer, and the next arm reuses it, so
+        // they are held here for `resume` - which takes them before it arms. Re-arming over them was
+        // a silent loss on every transmit that met a burst: on the Pi 2 a download sends an ACK for
+        // every frame or two, and the rest of the cut burst then arrived mid-frame and was thrown away
+        // as unparsed (2026-10-21).
+        let left = mmio.read32(chan::hctsiz_at(CH_NET_RX)) & 0x7_FFFF;
+        nic.rx_held = (RX_BURST as u32).saturating_sub(left) as usize;
+        if nic.rx_held > 0 {
+            nic.stats.rx_caught = nic.stats.rx_caught.saturating_add(1);
+        }
     }
     let given = frame.len().min(FRAME_MAX);
     // PAD TO THE ETHERNET MINIMUM. IEEE 802.3 sets the smallest legal frame at 64 bytes including the
@@ -1321,7 +1347,7 @@ pub fn tx(
     // Arming here closes the gap to the length of the transmit itself.
     if !nic.in_armed {
         nic.rx0[0] = nic.rx0[0].saturating_add(1);
-        arm_in(ctx, mmio, dma, t, nic);
+        resume(ctx, mmio, dma, t, nic);
     }
     ok
 }
@@ -1448,8 +1474,9 @@ pub fn rx(
     // kernel driver's background-armed IN, in the shape this service can use: a non-blocking poll per
     // pass instead of an interrupt, because the frame path here is driven by the serve loop.
     if !nic.in_armed {
-        arm_in(ctx, mmio, dma, t, nic);
-        return 0;   // nothing yet - the device answers when it has something
+        // Nothing armed: take what a transmit's stand-down caught, if anything, and arm. Otherwise
+        // nothing yet - the device answers when it has something.
+        return resume(ctx, mmio, dma, t, nic);
     }
     // NO ROOM, NO HARVEST. A completed burst waits in its DMA buffer, and the IN is not re-armed, until
     // the client has collected enough to take all of it (`RXQ_BURSTS`). Harvesting into a full queue
@@ -1508,27 +1535,47 @@ pub fn rx(
         nic.rx0[3] = nic.rx0[3].saturating_add(1);
         return 0;
     }
+    // A transfer that ran to its full length did not end on a short packet, so the device's burst may
+    // go on into the next one: a frame cut off at its end is carried, never thrown away.
+    take(ctx, dma, nic, got, left == 0)
+}
+
+/// Parse a received transfer of `got` bytes into the receive queue (`rxq_push`), behind whatever the
+/// last transfer carried over. Returns the frames queued.
+///
+/// A burst is [4-byte RX status][frame incl FCS][DWORD pad], REPEATED - one transfer can carry several
+/// frames, so this is a parse rather than a copy. `may_continue` says the device's burst may go on in the
+/// next transfer (it was stood down by a transmit, or filled the transfer): a frame cut off at the end is
+/// then kept in `carry` and finished by the next transfer, as the device sends one stream of bytes
+/// however this host divides it into transfers.
+fn take(ctx: &ServiceContext, dma: &Parts, nic: &mut Nic, got: usize, may_continue: bool) -> u32 {
     nic.stats.rx_bursts += 1;
     nic.stats.rx_bytes = nic.stats.rx_bytes.wrapping_add(got as u32);
+    let carry = nic.carry;
+    let cl = nic.carry_len;
+    nic.carry_len = 0;
+    let total = cl + got;
+    let at = |i: usize| if i < cl { carry[i] } else { dma.rx.read8(i - cl) };
 
-    // A burst is [4-byte RX status][frame incl FCS][DWORD pad], REPEATED - one transfer can carry
-    // several frames, so this is a parse rather than a copy.
     let mut pos = 0usize;
     let mut frames = 0u32;
     let mut buf = [0u8; FRAME_MAX];
-    while pos + 4 <= got {
-        let status = u32::from_le_bytes([
-            dma.rx.read8(pos), dma.rx.read8(pos + 1),
-            dma.rx.read8(pos + 2), dma.rx.read8(pos + 3),
-        ]);
-        pos += 4;
+    while pos < total {
+        if pos + 4 > total {
+            // The status word itself was cut off.
+            if may_continue {
+                keep_tail(nic, &at, pos, total);
+            }
+            break;
+        }
+        let status = u32::from_le_bytes([at(pos), at(pos + 1), at(pos + 2), at(pos + 3)]);
         let flen = ((status >> 16) & 0x3FFF) as usize; // length INCLUDING the 4-byte FCS
 
         // The floor is a full ethernet header PLUS the FCS, not merely 4. A device-supplied `flen == 4`
         // would deliver a ZERO-length frame, and zero is the "nothing received" sentinel everywhere
         // above - so one malformed length would look like an empty network rather than a bad frame.
-        if flen < 4 + 14 || flen > FRAME_MAX + 4 || pos + flen > got {
-            // Count ONLY a burst whose FIRST status word is unparseable. A break after some frames
+        if flen < 4 + 14 || flen > FRAME_MAX + 4 {
+            // Count ONLY a transfer whose FIRST status word is unparseable. A break after some frames
             // were delivered is the ordinary end of a burst, not a fault, and counting it would bury
             // the signal this is here to find.
             if frames == 0 {
@@ -1539,19 +1586,28 @@ pub fn rx(
                 // three so a persistent mismatch cannot flood the console.
                 if nic.stats.rx_bad <= 3 {
                     ctx.log_fmt(format_args!(
-                        "dwc2-svc: RX burst {} bytes, unparsed at {}: status=0x{:08x} flen={} | first 12 bytes {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                        got, pos - 4, status, flen,
-                        dma.rx.read8(0), dma.rx.read8(1), dma.rx.read8(2),
-                        dma.rx.read8(3), dma.rx.read8(4), dma.rx.read8(5),
-                        dma.rx.read8(6), dma.rx.read8(7), dma.rx.read8(8),
-                        dma.rx.read8(9), dma.rx.read8(10), dma.rx.read8(11)));
+                        "dwc2-svc: RX burst {} bytes (+{} carried), unparsed at {}: status=0x{:08x} flen={} | first 12 bytes {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        got, cl, pos, status, flen,
+                        at(0), at(1), at(2), at(3), at(4), at(5),
+                        at(6), at(7), at(8), at(9), at(10), at(11)));
                 }
             }
-            break; // invalid, or a frame split across the burst boundary - give up on this burst
+            break; // invalid - give up on this transfer
         }
+        if pos + 4 + flen > total {
+            // The frame goes on in the next transfer.
+            if may_continue {
+                keep_tail(nic, &at, pos, total);
+            }
+            break;
+        }
+        pos += 4;
         let n = flen - 4; // strip the FCS; the stack does not want it
         for i in 0..n.min(FRAME_MAX) {
-            buf[i] = dma.rx.read8(pos + i);
+            buf[i] = at(pos + i);
+        }
+        if pos < cl {
+            nic.stats.rx_joined += 1;
         }
         // Classify by destination address before the frame goes anywhere. See `Stats::rx_unicast`.
         if n >= 6 {
@@ -1579,6 +1635,37 @@ pub fn rx(
         pos += flen;
         pos += (4 - (flen % 4)) % 4; // each frame is followed by DWORD padding
     }
+    frames
+}
+
+/// Keep the bytes from `from` to `total` - a frame, or its status word, the next transfer finishes - in
+/// `carry`. A tail longer than any frame cannot be one, and is counted as unparsed instead.
+fn keep_tail(nic: &mut Nic, at: &impl Fn(usize) -> u8, from: usize, total: usize) {
+    let n = total - from;
+    if n > CARRY_MAX {
+        nic.stats.rx_bad += 1;
+        return;
+    }
+    for i in 0..n {
+        nic.carry[i] = at(from + i);
+    }
+    nic.carry_len = n;
+}
+
+/// Take what a stood-down receive left in its buffer (`rx_held`, set by `tx`), then arm the IN again.
+/// The bytes are taken first because arming hands the same buffer back to the controller. With no room
+/// in the queue for them, nothing is armed: they wait, and the device holds what comes after.
+fn resume(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, nic: &mut Nic) -> u32 {
+    let mut frames = 0;
+    if nic.rx_held > 0 {
+        if !nic.rx_room() {
+            return 0;
+        }
+        let got = nic.rx_held;
+        nic.rx_held = 0;
+        frames = take(ctx, dma, nic, got, true);
+    }
+    arm_in(ctx, mmio, dma, t, nic);
     frames
 }
 
