@@ -316,7 +316,8 @@ pub extern "C" fn wake_ipi_taken() {
 /// perf-brutal's BP2 (a cross-core round trip) came out at 1.03 timer ticks on the Wyse and 68 us on
 /// the T630, so the question is where a cross-core wake waits. Three counts answer it, each split so
 /// that the halves can disagree:
-/// - wake IPIs SENT to each core by `wake_by_slot`, and TAKEN by that core's handler;
+/// - wake IPIs SENT to each core by `wake_by_slot`, and TAKEN by that core's handler (x86 only: only its
+///   wake stub calls `wake_ipi_taken`, so elsewhere `taken` and the delivery times read 0);
 /// - the time from the oldest untaken send to the handler (delivery), and from the wake of a BLOCKED
 ///   task to a core claiming it to run (the whole wait, scheduling included);
 /// - how far `MONOTONIC_TICKS` moved against the cycle counter, because on x86 the wake handler runs

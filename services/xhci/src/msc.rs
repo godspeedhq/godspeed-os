@@ -17,8 +17,9 @@
 //! 3. **CSW** (Command Status Wrapper, 13 bytes) in on the bulk-IN endpoint - the same tag back, and
 //!    a status byte.
 //!
-//! Deliberately literal. There is no queueing, no overlap and no pipelining: one command is in
-//! flight at a time and each of the three transfers is awaited before the next is posted. That is
+//! Deliberately literal. One command is in flight at a time, and a command's three transfers are
+//! awaited in turn - except a gathered WRITE(10), whose three are posted together and finished before
+//! the next command is posted (OVERLAP, below). That is
 //! what makes the endpoint rings provably un-fillable (see `Ring::push`) and it is what makes a
 //! failure attributable to one transfer rather than to "something in the pipe".
 //!
@@ -52,7 +53,8 @@ use crate::{EvMail, TRB_NORMAL, TRB_SIZE, TRB_TRANSFER_EVENT};
 // The disk's own DMA region: its own part of the arena (`Parts::disk`), past the scratchpad, and the
 // offsets below are within it.
 //
-// Four pages, fixed, never allocated from anything (§26.6 - the bound is readable off this file).
+// Thirty-two pages, fixed, never allocated from anything (§26.6 - the bound is readable off this file):
+// the two rings, the command page, the data page and the two 56 KiB gather buffers.
 // It is the disk's ALONE: the aliasing bug that cost the Pi 4 port days was one page shared by a
 // keyboard report, a hub's port status and the disk's CBW, where an armed interrupt endpoint
 // overwrote a command mid-flight on every keypress. Separate parts make that unrepresentable
@@ -89,8 +91,9 @@ pub const DISK_REGION_BYTES: usize = 0x4000 + 2 * GATHER_BYTES;
 /// a device's own write cache already makes. Only file data comes as runs (`fs`'s direct path); the
 /// journal and metadata are single writes and pass straight through, after what is held. A gathered
 /// write that fails is said, and the next FLUSH answers an error, so `fs` learns it at its barrier
-/// (6.1). What is held when the stick is pulled or this driver dies is lost, and that is said too; file
-/// data written direct was never promised across a power cut, and its CRC catches it on read.
+/// (6.1). What is held when the stick is pulled is lost and said (`note_drop`); a death of this driver
+/// says nothing, since nothing is left to say it. File data written direct was never promised across a
+/// power cut, and its CRC catches it on read.
 pub const GATHER_SECTORS: u32 = (GATHER_BYTES / SECTOR as usize) as u32;
 /// How long a held run waits for the next before it is written.
 pub const GATHER_IDLE_MS: u64 = 10;
@@ -788,8 +791,10 @@ pub fn try_finish(ctx: &ServiceContext, dma: &Parts, d: &mut Disk, eaten: &mut E
             d.pending = None;
             settle(ctx, dma, d, p, Some(cc));
         }
-        // A completion for another TRB on the disk's slot: an error on the CBW or the data, whose status
-        // will never come. Finished as failed now, rather than waiting out the transfer bound.
+        // A completion for another TRB on the disk's slot: a late answer to a stage an earlier wait gave up
+        // on, or an error on this write's CBW or data. Passed over, as `await_on_slot` passes it over: the
+        // write is left in flight, and `finish_pending` decides it within the transfer bound. Taking it as
+        // this write's failure would mark it lost while its CSW may still come.
         Some(Err(_)) => {
             d.pending = None;
             settle(ctx, dma, d, p, None);
@@ -989,8 +994,9 @@ pub const OP_WRITE_BLOCK: u8 = 2;
 pub const OP_CAPACITY: u8 = 3;
 pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
-/// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]`: a file's chunk, written as ONE
-/// WRITE(10) of `count` sectors rather than `count` commands of one (`block-driver`'s `OP_WRITE_BLOCKS`).
+/// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]`: a file's chunk, gathered with the
+/// runs it follows on from and written with them as one WRITE(10) (`GATHER_SECTORS`; `block-driver`'s
+/// `OP_WRITE_BLOCKS`).
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;

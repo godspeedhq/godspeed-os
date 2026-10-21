@@ -486,7 +486,7 @@ pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
 /// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]` (`block-driver`'s
 /// `OP_WRITE_BLOCKS`). Served here block by block, each as a single write is: one request instead of
-/// `count`, the stick still asked per block. The `xhci` host writes a run as one command.
+/// `count`, the stick still asked per block. The `xhci` host gathers runs and writes them as one command.
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;

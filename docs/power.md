@@ -454,9 +454,9 @@ A service that needs the cores fast asks for a lease of N seconds:
 Status: 0 OK, 1 every slot is open (8), 2 this machine has no clock control, 3 no such lease (already
 expired, already released, or from before this service restarted), 4 a malformed request.
 
-While any lease is open the clock is at its maximum. When none is, it is at its minimum. The `hz` in a
-HOLD reply is the rate the clock read back when that lease raised it, or 0 when it joined one already
-open.
+While any lease is open the clock is at its maximum; when none is, it is wherever the governor (15.7)
+has it. The `hz` in a HOLD reply is the rate the clock read back when that lease raised it, or 0 when the
+clock was already at its maximum, held by another lease or by the governor.
 
 **A lease that nobody releases expires.** That is the whole answer to "what if the holder dies or
 hangs while holding it": the clock comes back down within 30 seconds at most, and the expiry is said in

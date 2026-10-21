@@ -610,7 +610,7 @@ Five limits were stacked, each below the link:
 | one read | 2048 bytes | a whole message, 4095 bytes |
 | the TLS reader | asked for each record's 5-byte header on its own, a round trip for five bytes | reads ahead into its record buffer and keeps the rest for the next record |
 | a request's timeout | `timeout-secs` from the request's START, so a download longer than 30 s failed on a working link | measured from the last byte that moved: a stall, not a total |
-| the PC NIC's receive ring | 8 descriptors (e1000 and RTL8168): a burst past eight frames was dropped, so the sender saw loss, never had more than 12.7 KiB in flight against a 64 KiB window, and retransmitted three to five times a second | 24, as GENET and dwmac already had; what the 64 KiB DMA arena holds |
+| the PC NIC's receive ring | 8 descriptors (e1000 and RTL8168): a burst past eight frames was dropped, so the sender saw loss, never had more than 12.7 KiB in flight against a 64 KiB window, and retransmitted three to five times a second | 24, as GENET and dwmac already had; what the 64 KiB DMA arena holds (since 2026-10-20 and 21: 256 on the e1000, the RTL8168 and GENET, each in a 528 KiB arena; dwmac 24) |
 
 **Out-of-order data waits in the arena.** With a 256 KiB window one lost frame is followed by up to 180 more,
 and the four segments held aside before meant all but four of them were dropped - and with no selective

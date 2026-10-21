@@ -83,7 +83,7 @@ believed. The op constants live in `main.rs`, and `services/fs` must match them.
 The LBA is **u64** (persistence §6.3) so GSFS's u64 capacity fields reach the device at
 full width. A read moves one 512-byte block (= one sector); a write moves one, or a run of up to seven
 consecutive ones (`OP_WRITE_BLOCKS`, 2026-10-20: a file's chunk is seven blocks, which was seven requests),
-which AHCI issues as one multi-sector command and the USB backend block by block. `fs` owns file layout;
+which AHCI issues as one multi-sector command; through `xhci` it is gathered into WRITE(10)s of up to 56 KiB, and through `dwc2` it is written block by block. `fs` owns file layout;
 `block-driver` only moves sectors - policy above, mechanism below.
 
 ## Failure semantics (§6.2)

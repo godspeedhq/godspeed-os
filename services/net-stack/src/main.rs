@@ -1631,7 +1631,7 @@ fn tcp_open(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net
     }
     let deadline = t.now_ms(ctx).unwrap_or(0) + budget_ms;
     let i = match t.connect(ctx, rid, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
-    // OVER A RADIO, THE SMALL WINDOW (`Conn::small_window` says why), decided now, before the SYN settles it.
+    // OVER A RADIO, AT MOST `RCV_RADIO` (`Conn::small_window` says why), decided now, before the SYN settles it.
     if over_radio(ctx, pending) {
         t.conns[i].small_window();
         ctx.log("net-stack: connect - the radio carries the link, so this connection offers a 32 KiB window");

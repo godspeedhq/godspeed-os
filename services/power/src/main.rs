@@ -21,9 +21,11 @@
 //! may ask, for how long, and when to go back. The rule is a LEASE - see `docs/power.md`:
 //!
 //! - `OP_HOLD [1, secs]` opens a lease of `secs` seconds (0 means `DEFAULT_SECS`, capped at `MAX_SECS`)
-//!   and answers `[status, lease, hz:u32]` - `hz` is the rate this lease set, and 0 when another lease
-//!   already held the clock at its maximum. While any lease is open the clock is at its maximum.
-//! - `OP_RELEASE [2, lease]` closes it early and answers `[status]`. When none is open, the minimum.
+//!   and answers `[status, lease, hz:u32]` - `hz` is the rate this lease set, and 0 when the clock was
+//!   already at its maximum (another lease, or the governor). While any lease is open the clock is at its
+//!   maximum.
+//! - `OP_RELEASE [2, lease]` closes it early and answers `[status]`. When none is open, the clock is the
+//!   governor's (below).
 //! - A lease nobody releases EXPIRES. A holder that dies or hangs mid-way therefore cannot pin the
 //!   machine at full power: it lasts `MAX_SECS` at most, and the expiry is said (26.7). No death
 //!   notification is needed for that, which is why there is none.
@@ -387,8 +389,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     let mut no_cap: u32 = 0;
     loop {
-        // WAIT FOR THE EARLIEST EVENT - a lease expiry, or the shutdown's next warning or tidy-up - or block outright
-        // when there is none: an idle machine costs this service nothing at all.
+        // WAIT FOR THE EARLIEST EVENT - a lease expiry, the shutdown's next warning or tidy-up, or the governor's
+        // next look - or block outright when there is none, which is only on a board with no clock control:
+        // where the governor runs, it wakes every `SAMPLE_MS` to look at the load.
         let now = gs::driver::wait::ticks(&ctx);
         // Milliseconds, rounded UP: waking a fraction late is a lease running a fraction long, and waking
         // early would only loop back here. The governor's next look is one more deadline.

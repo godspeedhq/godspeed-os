@@ -992,9 +992,8 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     // address - the kernel still decides WHERE the arena lives; this says only how big. Zero for a
     // register-only driver.
     //
-    // Kept beside the table rather than as a tenth column: it applies to the handful of rows that
-    // name a PCI class code, and widening every row to carry a field that is 0 for twenty of them
-    // would be noise. Folds into the row if that stops being true.
+    // Kept beside the table rather than as a tenth column: it applies to the seven rows whose device
+    // DMAs, and widening every row to carry a field that is 0 for twenty of them would be noise. Folds into the row if that stops being true.
     req.dma_pages    = match name {
         // 64 KiB - the size `HwClass::Ahci` implied before the class had a name in the kernel.
         "block-driver" => 16,
@@ -1015,7 +1014,8 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         // laid out), and three spare.
         "pwm-audio" => 36,
         // The rings and a receive ring of 256 x 2 KiB, to hold a whole 256 KiB receive window as it arrives
-        // (`services/nic-driver`, `RX_RING_COUNT`; `backlog/93`). It was 16, the EHCI default the NIC fell to.
+        // (`RX_RING_COUNT` for the e1000 and the RTL8168, `RX_RING_DESCS` for GENET: 256 + 8 buffers of 2 KiB,
+        // 528 KiB exactly; `backlog/93`). It was 16, the EHCI default the NIC fell to.
         "nic-driver" => 132,
         // 68 KiB used, rounded up: the command rings (CORB 1 KiB, RIRB 2 KiB), the buffer descriptor
         // list, and a 64 KiB ring of sound - about a third of a second at 48 kHz stereo (docs/audio.md).

@@ -11,6 +11,8 @@ delayed ACKs, burst polling, NIC receive rings of 24, the AIC8800 read whole, th
 longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `download` utility
 (`utilities/65_download.md`, `docs/tcp-design.md` "Downloads at the speed of the link").
 
+On 2026-10-19 (item 12 has the figures since):
+
 | Board | Link | Measured |
 |-------|------|----------|
 | HP T630 | RTL8168, cable | 10 MB in 15 s, **629 KiB/s** |
@@ -32,11 +34,13 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    that change alone. Why the Wyse is slower is measured now, in item 12: the same work, a slower trip
    between cores.)*
 2. **The Pi 4's radio loses superframes over 4 KiB.** *(The region read is built on `feat/gs-driver`,
-   `1bcfb9cb`: the CYW43455's data and scan paths read into a 64 KiB region. A Pi 4 card is owed, and
-   `small_window` is not yet lifted. Item 10 names the paths that still read 4 KiB.)* `wifi-driver` reads the CYW43455 into a 4096-byte
+   `1bcfb9cb`: the CYW43455's data and scan paths read into a 64 KiB region. Item 10 names the paths that
+   still read 4 KiB. 2026-10-21: the region read works on the Pi 4 - a 15,648-byte superframe came through
+   whole - and a radio connection offers `RCV_RADIO`, 32 KiB, since `2bf32f56`; the cards showed the window
+   was not the radio's limit, item 12.)* `wifi-driver` reads the CYW43455 into a 4096-byte
    buffer, and a large window's bursts arrive as superframes of 4.2 to 8 KB, which are dropped and logged
    (`exceeds this driver's 4096 byte buffer`). Until the 2026-10-19 fix that also killed the radio; now a
-   connection over a radio offers the old 8 KiB window (`Conn::small_window`, `a496e4de`), which survives
+   connection over a radio offered the old 8 KiB window until `2bf32f56` (`Conn::small_window`, `a496e4de`), which survives
    but still sees them (15 in one `selfcheck packages`). The fix is to read the Broadcom frames into a
    region (as the AIC8800 now reads its queue, `receive_region`), then lift `small_window`.
 3. **The VisionFive's radio is slow on transmit.** About 8 KiB/s; the latency is in sending over the AIC8800,
@@ -59,7 +63,7 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    sending files to a server.
 8. **Two connections at most** (`MAX_CONNS`). Four overflowed net-stack's stack; raising it needs the frames
    measured first.
-9. **The Pis and the VisionFive have not run `d4ed712c`.** Two of the last changes run on every board and
+9. **The Pi 2 and the VisionFive have not run `d4ed712c`** (the Pi 4 has, in the download cards of 2026-10-21). Two of the last changes run on every board and
    were proved only on the two PCs: the progress line fitted to the console (`6e50b1f5`, since replaced by the
    bar on its own line, `1e282e7b`) and the fin-wait-2
    bound (`d4ed712c`). Their last cards passed on `a496e4de`.
@@ -211,18 +215,21 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    | `4d485192` | an empty read yields for 2 ms before it parks (a "2 ms" sleep was a 10 ms tick) | 778-786 KiB/s, 12 s | 381 and 413 KiB/s (23-25 s); one run 179 |
    | `440b8cd1` | xhci gathers consecutive runs, 56 KiB to a WRITE(10) | **1.2-1.3 MiB/s, 6-7 s** (disk 4.8-5.0 s) | 159 and 186 KiB/s (50-61 s; disk 1.8-3.4 s) |
 
-   The cable is the stick's now: 10 s of its 12 writing, a chunk of seven blocks per USB command, and more
-   than seven needs more than one 4 KiB message (2.5, 8.5). GENET's overflow and discard counters read 0
+   At `ec7e2bf0` the cable was the stick's: 10 s of its 12 writing, a chunk of seven blocks per USB command,
+   and more than seven needs more than one 4 KiB message (2.5, 8.5) - which the gather, next row, works
+   around inside xhci. GENET's overflow and discard counters read 0
    with the ring of 256; they were not read with 24. The radio is something else: its reads cost 606 us a
-   frame and 105 us empty at either clock, so it is not the CPU, and 33 s of its 51 are reads that found
-   nothing - the data is not arriving, for a reason not yet measured. The governor takes the clock to 1,500
+   frame and 105 us empty at either clock, so it is not the CPU, and at `ec7e2bf0` 33 s of its 51 were reads
+   that found nothing - the data is not arriving, for a reason not yet measured. The governor takes the clock to 1,500
    MHz within a look of a download starting and, once there, drops back for one look each 5 s when the
    load at full speed falls under half, as ondemand does with no step between the two ends.
 
    After the gather the cable's disk is about 28 ms per 56 KiB command, 2 MB/s: the stick's own writing
-   speed, not its per-command turnaround, so larger commands buy less now. What would still help is
-   overlap - writing one gather while the next fills, so a download takes the longer of the network and
-   the disk rather than their sum. The radio varies from card to card (23, 25, 54, 50 and 61 s over the
+   speed, not its per-command turnaround, so larger commands buy less now. Overlap - writing one gather
+   while the next fills, so a download takes the longer of the network and the disk rather than their
+   sum - is built since `4fb414f1` (with `02dd4fe8`, which keeps the write's completion across the driver's
+   passes); a Pi 4 card is owed. A plain `http://` download still parks for a tick after a read that found nothing
+   (`godspeed-pm/src/download.rs`); only `https://` busy-polls since `fb417544` (Audit 20). The radio varies from card to card (23, 25, 54, 50 and 61 s over the
    last five runs at nearly the same code), its reads cost the same each time (about 610 us a frame), and
    the time is data that has not arrived; the link itself (signal, band, rate - `wifi info`) has not
    been looked at.
@@ -235,5 +242,6 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
 
 ## Where to start
 
-Item 4 is small and helps every board. Item 1 is the cable's ceiling on the PCs, item 2 the Pi 4's, and each
-wants one card to show it.
+Item 4 is fixed and item 1 is (the ring of 256). As of 2026-10-21 the PCs' downloads are limited by data
+arriving (item 12); the Pi 4's cable by the stick's own writing speed, its radio by data not arriving, the
+link not yet looked at (`wifi info`).

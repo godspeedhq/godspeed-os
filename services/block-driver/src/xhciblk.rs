@@ -312,7 +312,8 @@ pub fn write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> bool {
 }
 
 /// Write a run of consecutive sectors from `lba`, `data` holding 1 to `WRITE_RUN_MAX` of them, in ONE
-/// request: the host writes it as one command (`xhci`) or block by block (`dwc2`), and answers once.
+/// request, answered once: `xhci` gathers it with the runs it follows on from and writes them as one
+/// command later, `dwc2` writes it block by block.
 pub fn write_run(ctx: &ServiceContext, lba: u64, data: &[u8]) -> bool {
     let count = data.len() / 512;
     if count == 0 || count > WRITE_RUN_MAX || data.len() != count * 512 {

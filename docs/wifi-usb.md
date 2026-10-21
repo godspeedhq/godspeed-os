@@ -2259,7 +2259,8 @@ waits for the transfer event whose TRB pointer is the one it posted (`Ring::push
 for the disk's slot that retires any other TRB is logged as `passed over` and not taken, from the ring and
 from `EvMail`, which now files the pointer too (`take_trb`). The mailbox half of the plan above was not
 needed: `EvMail` is built fresh on every pass and the whole arena is zeroed on a controller reset, so
-nothing filed survives one. The slot-only match predates this branch (it is unchanged since before the
+nothing filed survives one. (2026-10-21: no longer for the disk's slot - its entry is kept across passes for
+a gathered write in flight, `EvMail::keep_only`; a controller reset still clears it.) The slot-only match predates this branch (it is unchanged since before the
 dongle work began); what is new is a second device on the same controller whose faults make the disk's
 waits run out. `scripts/cross_isa.py`, whose riscv64 leg runs every disk read and write through `xhci`'s
 mass storage in QEMU, passes 12 of 12 with no completion passed over.

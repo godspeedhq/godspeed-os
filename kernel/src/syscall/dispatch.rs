@@ -820,7 +820,8 @@ struct SpawnRequest {
     /// Device MMIO window. REFUSED unless 0: the kernel resolves the window from the class.
     mmio_base:    u64,
     mmio_len:     u64,
-    /// DMA arena size in pages (honoured, at most `MAX_DMA_PAGES`), PCI BDF (honoured for a PCI
+    /// DMA arena size in pages (honoured for every class and required for a device that DMAs, at most
+    /// `MAX_DMA_PAGES`), PCI BDF (honoured for a PCI
     /// class), and IRQ lines (REFUSED unless `irq_count` is 0: vectors come from the class).
     dma_pages:    u32,
     bdf:          u32,
@@ -925,7 +926,7 @@ const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 /// (the endpoint-id guard in `ipc::names`). The kernel learns nothing about what is handed over.
 const SPAWN_FLAG_HANDOVER: u32 = 1 << 5;
 /// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
-/// largest real request (xHCI's scratchpad, 1168 KiB) and far below anything that could starve the
+/// largest real request (xHCI's, 1280 KiB) and far below anything that could starve the
 /// frame allocator.
 const MAX_DMA_PAGES: u32 = 2048;
 /// A task of that name is already running, and one name is one task. Its own code because it is the one
@@ -1008,7 +1009,7 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
             req.irq_count);
         return -1;
     }
-    // `dma_pages` is now HONOURED for a PCI descriptor: a SIZE is not an address, so a caller
+    // `dma_pages` is HONOURED for every class, and required for a device that DMAs: a SIZE is not an address, so a caller
     // naming one cannot reach memory it was not granted - the arena is still allocated by the
     // kernel, wherever the kernel decides. Bounded, because an unbounded size is a denial of
     // service (§26.6). The ADDRESS fields stay refused.

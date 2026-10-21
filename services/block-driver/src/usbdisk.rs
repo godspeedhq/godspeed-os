@@ -145,8 +145,9 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
             reply.send(ctx, &[status]);
         }
         OP_WRITE_BLOCKS => {
-            // A run, passed to the USB host as one request: `xhci` writes it as one WRITE(10) of `count`
-            // sectors, `dwc2` block by block. Split here, the host paid a whole Bulk-Only command per
+            // A run, passed to the USB host as one request: `xhci` gathers it with the runs it follows on
+            // from and answers once it is held, writing them as one WRITE(10); `dwc2` writes it block by
+            // block. Split here, the host paid a whole Bulk-Only command per
             // block - on the Pi 4, 40 s of a 10 MB download's 78 went to the stick (2026-10-21).
             let count = p.get(9).copied().unwrap_or(0) as usize;
             if count == 0 || count > WRITE_RUN_MAX || p.len() < 10 + count * 512 { return err(ctx); }

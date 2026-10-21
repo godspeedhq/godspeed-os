@@ -45,7 +45,7 @@ A card when it is done:
 | `from` | the link it came from | `as typed`, or how many redirects from the one typed |
 | `checked` | `https`, or `NOT checked` | what that means |
 | `speed` | KiB/s or MiB/s | the bytes and the time, the connection included |
-| `time` | where the time went: `network`, `decrypt`, `disk` and `screen`, in ms | how many reads of `net-stack` it took, and how many found nothing yet and waited. `https://` only; the network and decrypt figures include the handshake, and the name lookup, the connect and the sends are in none |
+| `time` | where the time went: `network`, `decrypt`, `disk` and `screen`, in ms | how many reads of `net-stack` it took, and how many found nothing yet, with the time they waited (a read that finds nothing yields and asks again, and parks for a tick once 2 ms of that has found nothing, so the count is of reads, not of pauses). `https://` only; the network and decrypt figures include the handshake, and the name lookup, the connect and the sends are in none |
 
 ## What it does not do, recorded rather than hidden
 

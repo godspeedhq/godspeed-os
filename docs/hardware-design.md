@@ -169,7 +169,7 @@ driver     xhci, on core 2, restarted 485 times
 devices    xhci 7 (WiFi, RTL8188CUS)
 authority  held by xhci only:
            registers   BAR0 0xfeb68000, 8 KiB, mapped at 0x100000000
-           dma         arena 0x34d9000..0x35fd000 (1168 KiB), confined by the IOMMU, domain 129
+           dma         arena 0x34d9000..0x35fd000 (1168 KiB), confined by the IOMMU, domain 129   (before 2026-10-21; 1280 KiB since)
            interrupt   MSI vector 0x30 -> core 2
            power       none (no power control for this device)
 granted by the kernel at spawn, from the supervisor's request for class 0x0c0330 (device confirmed by the kernel's own scan)

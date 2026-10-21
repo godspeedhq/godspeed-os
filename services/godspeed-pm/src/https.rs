@@ -33,7 +33,7 @@ const OUT_MAX: usize = 4096;
 /// The status line and headers of one answer. The registry's are about 900 bytes, most of it a reporting
 /// header; an answer whose head is larger is refused rather than cut.
 pub(crate) const HEAD_MAX: usize = 4096;
-/// A pause between reads that found nothing. `net-stack` keeps taking a download's frames in while this
+/// The pause after a read that found nothing, once `SPIN_US` of yielding has found nothing too. `net-stack` keeps taking a download's frames in while this
 /// waits (it polls every millisecond while frames arrive, into a 256 KiB window), so the pause costs the
 /// download nothing but a little latency; it is short so that latency stays small. Measured, it is longer than
 /// asked: the kernel ends a short sleep on the next scheduler tick, so each costs about 9 ms on the T630 (the

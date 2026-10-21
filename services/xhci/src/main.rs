@@ -278,9 +278,9 @@ impl EvMail {
 // and the buffers are parts after the device slices (`Parts`), sized in the arena's
 // size: the supervisor's `dma_pages` for `xhci`, which is the only statement of it.
 // Hub enumeration needs several slices live at once - the hub's own slice plus each downstream
-// device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). The arena is 292 pages:
+// device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). The arena is 320 pages:
 // the controller's 7 + 6 slices of 4 (24) + the SBA (1) = 32, then 256 of scratchpad, then the
-// disk's 4 (`msc::DISK_REGION_BYTES`); `lay_out` refuses, naming the part, an arena that is short.
+// disk's 32 (`msc::DISK_REGION_BYTES`); `lay_out` refuses, naming the part, an arena that is short.
 const MAX_SLICES: usize = 6; // per-device DMA slices (bound HIDs + transient hub/enum)
 const MAX_SCRATCHPAD: usize = 256; // arena room = 292 pages - 32 - the disk's 4
 

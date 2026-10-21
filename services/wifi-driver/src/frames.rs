@@ -152,10 +152,11 @@ pub fn pull(
     got
 }
 
-/// Once a minute while the chip is being pulled, say where the pulls' time went, then start again: how
-/// many pulls and their time, and the reads inside them that brought a frame and that found none, each
-/// with its time. Instrumentation for backlog/93 (an ask of the radio cost 9.8 ms on the Pi 4); it
-/// changes nothing it measures.
+/// Once a minute in which frames came, say where the pulls' time went, then start again: how many pulls
+/// and their time, and the reads inside them that brought a frame and that found none, each with its
+/// time. Instrumentation for backlog/93 (an ask of the radio cost 9.8 ms on the Pi 4); it changes nothing
+/// it measures. A minute with no frame - an idle radio, pulled every 250 ms - is not said, and nothing is
+/// said on a counter the kernel could not calibrate, where there is no minute to measure.
 fn report_pulls(s: &mut Session, ctx: &ServiceContext) {
     let now = s.now_ms(ctx);
     if s.stats.pull_report_ms == 0 {

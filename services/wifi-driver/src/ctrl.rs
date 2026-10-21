@@ -1104,8 +1104,8 @@ pub fn read_frame(
 ///
 /// **Why a region.** A large TCP window makes the access point send in bursts, and the chip hands a burst over
 /// as one glommed superframe. Over 4 KiB they were dropped, the events and data inside them lost, and
-/// under a 256 KiB window the radio died (2026-10-19, `backlog/93`); even on the small window that kept it
-/// alive, superframes of 4.2 to 8 KB arrived and were lost. The frame length in the hardware header is
+/// under a 256 KiB window the radio died (2026-10-19, `backlog/93`); even on the 8 KiB window that kept it
+/// alive then, superframes of 4.2 to 8 KB arrived and were lost. The frame length in the hardware header is
 /// 16 bits, so [`RX_REGION`] holds the largest one that can be described.
 pub fn read_frame_region(
     h: &dyn SdioHost,

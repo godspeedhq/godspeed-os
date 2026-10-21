@@ -1710,3 +1710,56 @@ blocks under `fs`'s one 30 s bound while a USB stick takes up to seven host call
 
 **Gates:** every documentation checker green (dash, doc refs, docs index, facts, line refs, doc and comment
 symbols, foreign words, doc commands, backlog).
+
+## Audit 20 - documents and code comments, the Pi 4 download work (2026-10-21)
+
+Scope: the 22 commits on `feat/gs-driver` after Audit 19 (`376e1595..02dd4fe8`), 25 files: the wake trace,
+the stick's runs as one WRITE(10), GENET's ring of 256, the SDIO host's gaps by the clock, the 32 KiB radio
+window, `power`'s governor, the busy-poll after an empty read, xhci's write gathering and its overlap, and
+the kernel giving up its per-class DMA arena sizes. Two read-only reviewers split the diff and swept the
+current-tense docs beside it; every finding was re-read against the code by the session that made the
+change, so this is closer to a self-audit than an independent one.
+
+**Result.** 35 corrections across 26 files. No finding was set aside. Five code defects, fixed in a separate
+commit; one observation recorded.
+
+**Text the work made false, in documents:**
+- `backlog/93`: item 2 still said `small_window` was not lifted and the radio offered 8 KiB; item 9 that the
+  Pis had not run `d4ed712c` (the Pi 4 has); the 2026-10-21 paragraphs spoke in the present of figures the
+  next table row replaced, and of overlap as still to do; "Where to start" named item 4, which is fixed. The
+  "Where it stands" table is dated now. The README row still said a read's time was mostly crossing cores.
+- `docs/power.md` 15.3, `services/CLAUDE.md`, `docs/CLAUDE.md`, `website/src/services.md`: the clock "at its
+  minimum when no lease is open", with no governor.
+- `utilities/65_download.md`: "found nothing yet and waited" is a count of reads, not of pauses, since the
+  busy-poll.
+- `services/block-driver/CLAUDE.md`: the USB backend "block by block"; through `xhci` a run is gathered.
+- Dated records given a dated note rather than rewritten: `docs/wifi-usb.md` (`EvMail` fresh every pass,
+  except the disk's slot now), `docs/tcp-design.md` (the rings), `docs/hardware-design.md` (an arena of
+  1168 KiB), `docs/service-ownership.md` (292 pages).
+
+**In comments:** xhci's arena (292 pages, the disk's 4) is 320 and 32; `msc.rs` said "no overlap" and
+"four pages" and that a dead driver's held writes are said; the run op's doc and its compile-time check
+named the one data page a run no longer goes through; block-driver's and dwc2's said xhci writes a run as
+one command; the kernel's `MAX_DMA_PAGES` and `SpawnImage` comments said `dma_pages` is for PCI only and
+xHCI's request is 1168 KiB; the wake trace did not say `taken` is x86's alone; GENET's counters were "eight
+lines" a download (one per 12 MB) and its short arena "a kernel change"; the supervisor's `dma_pages` named
+"the rows that name a PCI class code" and `RX_RING_COUNT` for GENET; `power`'s crate doc and its wait said
+the minimum with no lease and that an idle machine costs it nothing (the governor wakes it every 100 ms);
+`godspeed-pm`'s `IDLE_MS` and net-stack's radio-window comment and log line (a slot with no large arena
+still offers 8 KiB).
+
+**Code defects, fixed separately (an audit changes documents and comments only):**
+- **A re-scan of the USB bus dropped the disk with its gathered writes,** and the FLUSH after the rebind
+  passed: a keyboard unplug, a new device or a hub repair ends the poll loop and re-declares the disk, so
+  up to 112 sectors answered as written, a WRITE(10) in flight and a failure not yet reported were all lost
+  in silence - the journal's barrier passing over data that never reached the stick (6.1, invariant 12).
+- `msc::try_finish` took any other completion on the disk's slot as the write's failure, where
+  `await_on_slot` passes it over.
+- `power`'s lease paths recorded the clock as changed before knowing the change took.
+- The radio's pull line would say itself on every pull on a counter the kernel could not calibrate, and
+  said itself every minute on an idle radio.
+
+**Recorded, not changed:** a plain `http://` download still parks for a tick after an empty read
+(`godspeed-pm/src/download.rs`); only `https://` busy-polls (`backlog/93`).
+
+**Gates:** every documentation checker green.

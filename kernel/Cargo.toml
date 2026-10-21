@@ -42,7 +42,8 @@ panic = "abort"
 
 [features]
 kill-abandon-test = []
-# Diagnostic only, OFF by default. Counts cross-core wake IPIs sent and taken per core, times their
+# Diagnostic only, OFF by default. Counts cross-core wake IPIs sent and taken per core (taken, and so the
+# delivery time, on x86 only: only its wake stub reports the vector), times their
 # delivery and the woken task's wait to run, and how far the tick clock moves, printed by core 0 every
 # 500 ticks (`task::scheduler::wake_trace`, backlog/93). Built for a perf-brutal card with
 # `KERNEL_FEATURES=wake-trace`.

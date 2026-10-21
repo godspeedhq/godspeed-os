@@ -1136,8 +1136,8 @@ impl<'a> Genet<'a> {
             cons.wrapping_add(1) & 0xFFFF,
         );
         // Every 8,192th frame, the counters - the MAC's overflow and the ring's discard count say whether
-        // frames were lost for want of a buffer, which nothing else here can (backlog/93). Eight lines in
-        // a 10 MB download.
+        // frames were lost for want of a buffer, which nothing else here can (backlog/93). About one
+        // line in 12 MB received.
         if cons.wrapping_add(1) & 0x1FFF == 0 {
             self.report_counters();
         }
@@ -1228,7 +1228,8 @@ pub fn genet_main(ctx: ServiceContext) -> ! {
     // The arena in its two parts, page-aligned: the receive buffers at 0x0, the transmit buffers after
     // them at 0x80000. One that does not fit is said with its name and treated as no arena at all - which,
     // unlike a MAC that will not come up, also leaves the radio unserved; it can only happen if the spawn
-    // grants less than 528 KiB, and that is a kernel change, not a board state.
+    // grants less than 528 KiB, which is a change to the supervisor's `dma_pages` for nic-driver, not a board
+    // state.
     let mut parts = a.layout();
     let (rx, tx) = match (parts.take("rx buffers", RX_BUFS_LEN, 4096), parts.take("tx buffers", TX_BUFS_LEN, 4096)) {
         (Ok(rx), Ok(tx)) => (rx, tx),
