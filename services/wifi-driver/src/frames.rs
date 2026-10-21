@@ -63,10 +63,20 @@ pub fn pull(
 ) -> Pulled {
     let mut got = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None };
     let mut reads = 0u32;
+    let pull_t0 = godspeed::driver::wait::Since::now(ctx);
     while reads < PULL_MAX_READS && q.has_room() {
+        let read_t0 = godspeed::driver::wait::Since::now(ctx);
         let f = match ctrl::read_frame_region(h, w, rx, ctx) {
-            Some(f) => f,
-            None => break,
+            Some(f) => {
+                s.stats.reads_frame += 1;
+                s.stats.read_frame_us += read_t0.elapsed_us(ctx);
+                f
+            }
+            None => {
+                s.stats.reads_empty += 1;
+                s.stats.read_empty_us += read_t0.elapsed_us(ctx);
+                break;
+            }
         };
         let frame = rx.bytes();
         reads += 1;
@@ -136,7 +146,39 @@ pub fn pull(
             }
         }
     }
+    s.stats.pulls += 1;
+    s.stats.pull_us += pull_t0.elapsed_us(ctx);
+    report_pulls(s, ctx);
     got
+}
+
+/// Once a minute while the chip is being pulled, say where the pulls' time went, then start again: how
+/// many pulls and their time, and the reads inside them that brought a frame and that found none, each
+/// with its time. Instrumentation for backlog/93 (an ask of the radio cost 9.8 ms on the Pi 4); it
+/// changes nothing it measures.
+fn report_pulls(s: &mut Session, ctx: &ServiceContext) {
+    let now = s.now_ms(ctx);
+    if s.stats.pull_report_ms == 0 {
+        s.stats.pull_report_ms = now.max(1);
+        return;
+    }
+    if now.wrapping_sub(s.stats.pull_report_ms) < 60_000 {
+        return;
+    }
+    let st = &s.stats;
+    let per = |us: u64, n: u32| if n == 0 { 0 } else { us / n as u64 };
+    ctx.log_fmt(format_args!(
+        "wifi-driver: pulls this minute - {} in {} ms ({} us each); reads that brought a frame {} ({} us each), that found none {} ({} us each)",
+        st.pulls, st.pull_us / 1000, per(st.pull_us, st.pulls),
+        st.reads_frame, per(st.read_frame_us, st.reads_frame),
+        st.reads_empty, per(st.read_empty_us, st.reads_empty)));
+    s.stats.pulls = 0;
+    s.stats.pull_us = 0;
+    s.stats.reads_frame = 0;
+    s.stats.read_frame_us = 0;
+    s.stats.reads_empty = 0;
+    s.stats.read_empty_us = 0;
+    s.stats.pull_report_ms = now.max(1);
 }
 
 // The rekey itself is every radio's (`godspeed_wifi::supplicant::group_rekey`); the Broadcom supplies its

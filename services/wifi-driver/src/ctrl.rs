@@ -277,6 +277,16 @@ pub struct Stats {
     pub last_event_status: u32,
     pub last_refused_cmd: u32,
     pub last_refused_status: i32,
+    /// Where a pull's time goes (`frames::pull`, backlog/93): the pulls, and the chip reads inside them
+    /// split by whether one brought a frame, with the microseconds each spent. Reported once a minute
+    /// while frames are asked for, then started again.
+    pub pulls: u32,
+    pub pull_us: u64,
+    pub reads_frame: u32,
+    pub read_frame_us: u64,
+    pub reads_empty: u32,
+    pub read_empty_us: u64,
+    pub pull_report_ms: u32,
 }
 
 /// `code::index` maps an event code to one of these; the last is "other".
