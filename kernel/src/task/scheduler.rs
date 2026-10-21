@@ -84,6 +84,8 @@ fn core_still_using(cid: usize, slot: usize) -> bool {
 #[inline]
 fn core_release_current(cid: usize, to: usize) {
     let leaving = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
+    #[cfg(feature = "wake-trace")]
+    wake_trace::note_run(to);
     // ORDER MATTERS AND SO DOES SeqCst: the killer must not be able to observe the release without
     // also observing the claim, or it concludes nobody is using a task this core is still standing on.
     CORE_LEAVING.get(cid).0.store(leaving as u64, Ordering::SeqCst);
@@ -301,6 +303,123 @@ pub fn cycles_to_us(cycles: u64) -> u64 {
     let q = crate::arch::imp::boot::tsc_ticks_per_quantum(); // cycles per 10 ms
     if q == 0 { return 0; }                                  // uncalibrated: no honest conversion
     cycles.saturating_mul(10_000) / q
+}
+
+/// Called by x86's wake IPI stub before `timer_tick_from_irq`; empty unless `wake-trace` is built.
+pub extern "C" fn wake_ipi_taken() {
+    #[cfg(feature = "wake-trace")]
+    wake_trace::note_taken(current_core_id());
+}
+
+/// WAKE TRACE - feature `wake-trace`, OFF by default, a diagnostic for `backlog/93`.
+///
+/// perf-brutal's BP2 (a cross-core round trip) came out at 1.03 timer ticks on the Wyse and 68 us on
+/// the T630, so the question is where a cross-core wake waits. Three counts answer it, each split so
+/// that the halves can disagree:
+/// - wake IPIs SENT to each core by `wake_by_slot`, and TAKEN by that core's handler;
+/// - the time from the oldest untaken send to the handler (delivery), and from the wake of a BLOCKED
+///   task to a core claiming it to run (the whole wait, scheduling included);
+/// - how far `MONOTONIC_TICKS` moved against the cycle counter, because on x86 the wake handler runs
+///   `timer_tick_from_irq`, so a wake taken on core 0 may advance the tick clock as a tick does.
+///
+/// Fixed `[_; 8]` per-core arrays, a cores-beyond-8 blind spot this diagnostic accepts and states.
+/// Printed by core 0 every 500 of its ticks, only when something was sent since the last report.
+#[cfg(feature = "wake-trace")]
+pub mod wake_trace {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use portable_atomic::AtomicU64;
+    use super::MAX_TASKS;
+
+    const CORES: usize = 8;
+    /// Bucket upper bounds, microseconds; the last bucket is everything at or above 15 ms.
+    const BOUNDS_US: [u64; 5] = [50, 200, 1_000, 5_000, 15_000];
+
+    static SENT: [AtomicU32; CORES] = [const { AtomicU32::new(0) }; CORES];
+    static TAKEN: [AtomicU32; CORES] = [const { AtomicU32::new(0) }; CORES];
+    /// Cycle count of the oldest send the core has not yet taken; 0 = none pending.
+    static SENT_AT: [AtomicU64; CORES] = [const { AtomicU64::new(0) }; CORES];
+    /// Cycle count at which a BLOCKED task was woken cross-core; 0 = not waiting to run.
+    static WOKEN_AT: [AtomicU64; MAX_TASKS] = [const { AtomicU64::new(0) }; MAX_TASKS];
+
+    struct Histogram { buckets: [AtomicU32; 6], max_us: AtomicU64 }
+    impl Histogram {
+        const fn new() -> Self {
+            Histogram { buckets: [const { AtomicU32::new(0) }; 6], max_us: AtomicU64::new(0) }
+        }
+        fn note(&self, cycles: u64) {
+            let us = super::cycles_to_us(cycles);
+            let i = BOUNDS_US.iter().position(|&b| us < b).unwrap_or(BOUNDS_US.len());
+            self.buckets[i].fetch_add(1, Ordering::Relaxed);
+            self.max_us.fetch_max(us, Ordering::Relaxed);
+        }
+    }
+    static DELIVER: Histogram = Histogram::new();
+    static RUN: Histogram = Histogram::new();
+
+    static LAST_SENT_TOTAL: AtomicU32 = AtomicU32::new(0);
+    static LAST_REPORT_CYCLES: AtomicU64 = AtomicU64::new(0);
+    static LAST_REPORT_TICKS: AtomicU64 = AtomicU64::new(0);
+
+    /// `wake_by_slot` is about to send a wake IPI to `core` for `slot`; `was_blocked` says the task was
+    /// blocked, so its wait to run is worth timing (a task already running is not waiting).
+    pub fn note_send(core: usize, slot: usize, was_blocked: bool) {
+        let now = crate::arch::imp::read_cycle_counter();
+        if core < CORES {
+            SENT[core].fetch_add(1, Ordering::Relaxed);
+            let _ = SENT_AT[core].compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+        }
+        if was_blocked && slot < MAX_TASKS {
+            WOKEN_AT[slot].store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// The wake IPI's handler is running on `core`.
+    pub fn note_taken(core: usize) {
+        if core >= CORES { return; }
+        TAKEN[core].fetch_add(1, Ordering::Relaxed);
+        let at = SENT_AT[core].swap(0, Ordering::Relaxed);
+        if at != 0 {
+            DELIVER.note(crate::arch::imp::read_cycle_counter().saturating_sub(at));
+        }
+    }
+
+    /// A core is claiming `slot` to run it.
+    pub fn note_run(slot: usize) {
+        if slot >= MAX_TASKS { return; }
+        let at = WOKEN_AT[slot].swap(0, Ordering::Relaxed);
+        if at != 0 {
+            RUN.note(crate::arch::imp::read_cycle_counter().saturating_sub(at));
+        }
+    }
+
+    fn line(name: &str, h: &Histogram) {
+        let b: [u32; 6] = core::array::from_fn(|i| h.buckets[i].load(Ordering::Relaxed));
+        crate::kprintln!(
+            "wake-trace: {} us <50 {} | <200 {} | <1000 {} | <5000 {} | <15000 {} | more {} | max {}",
+            name, b[0], b[1], b[2], b[3], b[4], b[5], h.max_us.load(Ordering::Relaxed));
+    }
+
+    /// Core 0's tick. Reports every 500 of them, and only after a send since the last report.
+    pub fn maybe_report(ticks: u64) {
+        if ticks % 500 != 0 { return; }
+        let ncores = (crate::smp::core::ready_count() as usize).min(CORES);
+        let total: u32 = (0..ncores).map(|c| SENT[c].load(Ordering::Relaxed)).sum();
+        if total == LAST_SENT_TOTAL.swap(total, Ordering::Relaxed) { return; }
+        let now = crate::arch::imp::read_cycle_counter();
+        let then = LAST_REPORT_CYCLES.swap(now, Ordering::Relaxed);
+        let ticks_then = LAST_REPORT_TICKS.swap(ticks, Ordering::Relaxed);
+        if then != 0 {
+            crate::kprintln!(
+                "wake-trace: the tick clock moved {} ticks in {} ms (one tick is 10 ms)",
+                ticks.saturating_sub(ticks_then), super::cycles_to_us(now.saturating_sub(then)) / 1000);
+        }
+        for c in 0..ncores {
+            crate::kprintln!("wake-trace: core {} wake IPIs sent {} taken {}",
+                c, SENT[c].load(Ordering::Relaxed), TAKEN[c].load(Ordering::Relaxed));
+        }
+        line("send to handler", &DELIVER);
+        line("wake to run", &RUN);
+    }
 }
 
 /// Arm a timed wake for `slot` at absolute BSP-tick `deadline` (0 disarms).
@@ -1772,6 +1891,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // (§12 timed-wait). BSP-driven because the BSP ticks reliably while APs idle; the
             // wake is tick-clocked so it's valid cross-core. See scan_timed_wakes.
             scan_timed_wakes();
+            #[cfg(feature = "wake-trace")]
+            wake_trace::maybe_report(monotonic_ticks());
         }
 
         let prev = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
@@ -2417,6 +2538,9 @@ pub fn wake_by_slot(slot: usize, result: i64) {
                 CORE_WAKE_HINT.get(task_core)
                     .compare_exchange(MAX_TASKS, slot, Ordering::Release, Ordering::Relaxed)
                     .ok();
+                #[cfg(feature = "wake-trace")]
+                wake_trace::note_send(task_core, slot,
+                    first != TaskState::Ready as u8 && first != TaskState::Running as u8);
                 // APIC is initialised; task_core is a ready core (outer unsafe).
                 crate::smp::ipi::send_ipi(
                     task_core as u32,
