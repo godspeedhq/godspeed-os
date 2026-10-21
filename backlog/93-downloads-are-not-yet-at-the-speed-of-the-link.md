@@ -213,7 +213,8 @@ On 2026-10-19 (item 12 has the figures since):
    | `2bf32f56` | a 32 KiB window over a radio, not 8 | 673 KiB/s, 14 s | 191 KiB/s, 50 s: not the limit |
    | `ec7e2bf0` | `power`'s governor (Raspberry Pi OS's ondemand, `docs/power.md` 15.7) | 776 KiB/s, 12 s | 188 KiB/s, 51 s |
    | `4d485192` | an empty read yields for 2 ms before it parks (a "2 ms" sleep was a 10 ms tick) | 778-786 KiB/s, 12 s | 381 and 413 KiB/s (23-25 s); one run 179 |
-   | `440b8cd1` | xhci gathers consecutive runs, 56 KiB to a WRITE(10) | **1.2-1.3 MiB/s, 6-7 s** (disk 4.8-5.0 s) | 159 and 186 KiB/s (50-61 s; disk 1.8-3.4 s) |
+   | `440b8cd1` | xhci gathers consecutive runs, 56 KiB to a WRITE(10) | 1.2-1.3 MiB/s, 6-7 s (disk 4.8-5.0 s) | 159 and 186 KiB/s (50-61 s; disk 1.8-3.4 s) |
+   | `027c4ade` | one gather written while the next fills (`4fb414f1`, `02dd4fe8`, Audit 20's re-scan fix) | **1.5 MiB/s, 5-6 s** (disk 3.5 s); 1.3 MiB/s with the keyboard pulled mid-download, the controller re-scanned and nothing lost | - |
 
    At `ec7e2bf0` the cable was the stick's: 10 s of its 12 writing, a chunk of seven blocks per USB command,
    and more than seven needs more than one 4 KiB message (2.5, 8.5) - which the gather, next row, works
@@ -228,7 +229,7 @@ On 2026-10-19 (item 12 has the figures since):
    speed, not its per-command turnaround, so larger commands buy less now. Overlap - writing one gather
    while the next fills, so a download takes the longer of the network and the disk rather than their
    sum - is built since `4fb414f1` (with `02dd4fe8`, which keeps the write's completion across the driver's
-   passes); a Pi 4 card is owed. A plain `http://` download still parks for a tick after a read that found nothing
+   passes), and the Pi 4 card at `027c4ade` showed 5-6 s. A plain `http://` download still parks for a tick after a read that found nothing
    (`godspeed-pm/src/download.rs`); only `https://` busy-polls since `fb417544` (Audit 20). The radio varies from card to card (23, 25, 54, 50 and 61 s over the
    last five runs at nearly the same code), its reads cost the same each time (about 610 us a frame), and
    the time is data that has not arrived; the link itself (signal, band, rate - `wifi info`) has not
