@@ -297,6 +297,28 @@ fn log_failed(ctx: &ServiceContext, what: &str, hcint: u32) {
         if hcint & HCINT_NAK != 0 { " NAK" } else { "" }));
 }
 
+/// THE WHOLE CORE, said beside a channel that never halted: whether the AHB master (the core's DMA) is
+/// idle, and every host channel's HCCHAR, HCINT, HCTSIZ and HCDMA. On the Pi 2 a download at 180 KiB/s
+/// writing to the stick left every channel failing to halt, and the next instance found the AHB master
+/// not idle at its reset (2026-10-21); which channel's DMA was in flight, and where, is what these show.
+/// Three lines, because a log line is rendered into a fixed buffer.
+pub fn say_core(ctx: &ServiceContext, mmio: &Registers) {
+    let rst = mmio.read32(GRSTCTL);
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: core at the stall - GRSTCTL={:#010x} (AHB idle {}), GAHBCFG={:#010x}, GINTSTS={:#010x}, HAINT={:#06x}",
+        rst, rst & GRSTCTL_AHBIDLE != 0, mmio.read32(GAHBCFG), mmio.read32(GINTSTS), mmio.read32(HAINT)));
+    for half in 0..2u32 {
+        let c = |i: u32| {
+            let ch = half * 4 + i;
+            (ch, mmio.read32(hcchar_at(ch)), mmio.read32(hcint_at(ch)), mmio.read32(hctsiz_at(ch)), mmio.read32(hcdma_at(ch)))
+        };
+        let (a, b, d, e) = (c(0), c(1), c(2), c(3));
+        ctx.log_fmt(format_args!(
+            "dwc2-svc:   ch{} {:08x} {:08x} {:08x} {:08x} | ch{} {:08x} {:08x} {:08x} {:08x} | ch{} {:08x} {:08x} {:08x} {:08x} | ch{} {:08x} {:08x} {:08x} {:08x} (HCCHAR HCINT HCTSIZ HCDMA)",
+            a.0, a.1, a.2, a.3, a.4, b.0, b.1, b.2, b.3, b.4, d.0, d.1, d.2, d.3, d.4, e.0, e.1, e.2, e.3, e.4));
+    }
+}
+
 /// One attempt at a stage: `Ok` on transfer-complete, `Err(Some(hcint))` on a halt with anything else
 /// latched, `Err(None)` when the channel never halted (already logged, with the core's state).
 #[allow(clippy::too_many_arguments)]
@@ -333,6 +355,7 @@ fn stage_once(
                 nptx, (nptx >> 16) & 0xFF,
                 mmio.read32(crate::regs::GINTSTS),
                 mmio.read32(hcchar_at(ch))));
+            say_core(ctx, mmio);
             Err(None)
         }
         Some(hcint) if hcint & HCINT_XFERCOMPL != 0 => Ok(()),

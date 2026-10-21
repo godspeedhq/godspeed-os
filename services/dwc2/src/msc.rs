@@ -243,6 +243,7 @@ pub(crate) fn bulk_xfer(
             }
             None => {
                 ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} channel never halted", ep));
+                crate::chan::say_core(ctx, mmio);
                 return Err(XferErr::Failed);
             }
         }
