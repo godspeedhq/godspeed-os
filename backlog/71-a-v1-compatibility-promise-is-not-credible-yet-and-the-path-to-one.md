@@ -77,11 +77,13 @@ the 2026-10-11 survey:
   the one-way ratchet counts the SDK's four grant calls, so a new driver starts at zero
   (`docs/driver-library.md` step 3). Since 2026-10-20 every compiled driver's arena is laid out by name too:
   `pwm-audio`, `dwmac`, `ehci`, `dwc2` and `xhci` followed the first four.
-  **Two defects in that work, found by Audit 18 (`audits/documentation-audit.md`) and not yet fixed:**
+  **Two defects in that work, found by Audit 18 (`audits/documentation-audit.md`), fixed 2026-10-21 (built for
+  the three ports, neither path reachable in QEMU, so each owes its board's card):**
   `nic-driver`'s `dwmac_main`, when the layout refuses a granted arena, logs the reason and then a second,
   wrong line, "no dwmac register window or DMA arena granted", though neither was missing; and
   `pwm-audio`'s `bring_up` zeroes and reach-checks an arena that is too small before the layout refuses
-  it, where the size check it replaced came first. Neither changes what reaches the device. **Hardware:**
+  it, where the size check it replaced came first. Neither changes what reaches the device. Now `dwmac_main`
+  says which was missing, and `bring_up` lays the arena out, then checks the reach, then zeroes the two parts. **Hardware:**
   the Wyse card passed on 2026-10-20 (`269c86f3`: the AHCI, xhci, audio and RTL8168 layout lines, the
   keyboard, the disk, audio ready); the T630, the Pi 2, the Pi 4 and the VisionFive are owed theirs.
 

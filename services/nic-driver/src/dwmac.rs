@@ -293,9 +293,14 @@ pub fn link(ctx: &ServiceContext, m: &Registers, phy: u32) -> (bool, u32, bool) 
 
 /// Drive the DesignWare MAC. Never returns.
 pub fn dwmac_main(ctx: ServiceContext) -> ! {
-    let (Some(m), Some(a)) = (godspeed::driver::registers(&ctx),
-                              godspeed::driver::arena(&ctx).and_then(|a| Parts::lay_out(&ctx, a))) else {
+    // Three ways to have no MAC, each said once: no window, no arena, or an arena the layout refused
+    // (`Parts::lay_out` has said why, so only the consequence is said here).
+    let (Some(m), Some(arena)) = (godspeed::driver::registers(&ctx), godspeed::driver::arena(&ctx)) else {
         ctx.log("nic-driver: no dwmac register window or DMA arena granted - serving empty replies");
+        crate::serve_status(&ctx, &[0u8; 8]);
+    };
+    let Some(a) = Parts::lay_out(&ctx, arena) else {
+        ctx.log("nic-driver: the dwmac arena granted does not hold its rings - serving empty replies");
         crate::serve_status(&ctx, &[0u8; 8]);
     };
 

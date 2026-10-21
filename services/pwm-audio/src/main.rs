@@ -872,18 +872,21 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Registers>, d: Option<Are
         ctx.log("pwm-audio: no DMA arena was granted - nothing to play from");
         return Device::Absent(wire::no_device::NO_ARENA);
     };
-    // The engine reaches the first 1 GiB of RAM through its uncached alias, and no more.
+    // The engine reaches the first 1 GiB of RAM through its uncached alias, and no more. Read before the
+    // layout takes the arena, and acted on after it: an arena too small is refused first, as the size check
+    // the layout replaced was, and nothing is written to an arena that is refused.
     let top = d.phys_at(0) + d.len() as u64;
+    let Some((cbs, ring)) = lay_out(ctx, d) else {
+        return Device::Absent(wire::no_device::NO_ARENA);
+    };
     if top > DMA_REACH {
         ctx.log_fmt(format_args!(
             "pwm-audio: the DMA arena ends at {:#x}, past the 1 GiB the DMA engine can reach - refusing rather than playing someone else's memory",
             top));
         return Device::Absent(wire::no_device::NO_ARENA);
     }
-    d.zero();
-    let Some((cbs, ring)) = lay_out(ctx, d) else {
-        return Device::Absent(wire::no_device::NO_ARENA);
-    };
+    cbs.zero();
+    ring.zero();
     let mut p = Pwm {
         ctx, m, cbs, ring, b, rate: RATE_DEFAULT, range: 0, power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false,
         play: None, underruns_total: 0, last_silence_ms: 0, settings_dirty: false, settings_failing: false,
