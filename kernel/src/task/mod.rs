@@ -233,6 +233,12 @@ const EHCI_DMA_PAGES:      u64 = 16;
 /// 33 pages (`services/pwm-audio`'s two parts, the control blocks and the ring, `lay_out`); 36 leaves three
 /// spare, and nothing records why.
 const AUDIO_PWM_DMA_PAGES: u64 = 36;
+/// A NIC the kernel grants by its fixed window (the Pi 4's GENET, the VisionFive's dwmac): 528 KiB, a
+/// receive ring of 256 buffers of 2 KiB and eight to send from - the 132 pages the supervisor already
+/// asks for, which a PCI NIC is given. It was the 64 KiB every unnamed class falls to, so GENET's ring
+/// was 24 and filled while net-stack was busy (backlog/93, 2026-10-21). A fixed class takes the kernel's
+/// size, not the request's, because its arena is kept across respawns at the size first reserved.
+const NIC_DMA_PAGES:       u64 = 132;
 
 /// Maximum named send peers per service.
 /// Send peers a service may be wired with.
@@ -646,7 +652,7 @@ impl HwClass {
             && self != HwClass::WifiSdio && self.found()
     }
     /// Arena size: a PCI spawn states its own (xHCI's room for its 256-buffer scratchpad among them); the
-    /// PWM audio jack gets `AUDIO_PWM_DMA_PAGES`; every other named class 64 KiB.
+    /// PWM audio jack gets `AUDIO_PWM_DMA_PAGES`, a fixed NIC `NIC_DMA_PAGES`; every other named class 64 KiB.
     fn dma_pages(self) -> u64 {
         match self {
             // The CALLER states it: how much DMA a driver needs is the driver's fact, and the
@@ -654,6 +660,7 @@ impl HwClass {
             HwClass::Pci { dma_pages, .. } => dma_pages as u64,
             HwClass::Xhci => XHCI_DMA_PAGES,
             HwClass::AudioPwm => AUDIO_PWM_DMA_PAGES,
+            HwClass::Nic => NIC_DMA_PAGES,
             _ => EHCI_DMA_PAGES,
         }
     }

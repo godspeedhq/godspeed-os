@@ -25,7 +25,7 @@
 //! - **Registers** go through `gs::driver::registers` instead of raw volatile pointers, so this file
 //!   contains no `unsafe` at all (§18.2). Offsets are relative to the granted window rather than to an
 //!   absolute physical base; the numbers are otherwise identical.
-//! - **Packet buffers** live in the 64 KiB DMA arena instead of frames from the kernel's allocator,
+//! - **Packet buffers** live in the 528 KiB DMA arena instead of frames from the kernel's allocator,
 //!   which is what fixes the ring sizes below at something a reader can add up (§26.6.1). The arena is
 //!   laid out in two named parts, the receive and the transmit buffers (`gs::driver::arena`).
 //! - **Cache maintenance is gone**, because the arena is mapped Device-nGnRnE by the spawn path. The
@@ -345,22 +345,27 @@ const SHD_CLK_CTL_GTXCLK_EN: u16 = 1 << 9;
 // ---------------------------------------------------------------------------------------------
 // Ring geometry, and the arena it has to fit in.
 //
-// The DMA arena is 64 KiB, fixed by the spawn path, and it holds ONLY packet buffers - GENET keeps its
-// descriptors in the controller's own register file (that is what `RDMA_OFFSET`/`TDMA_OFFSET` address),
-// so none of the arena goes on descriptor storage. 24 receive buffers plus 8 transmit buffers of 2 KiB
-// each is exactly 64 KiB. They are two named parts of the arena (`genet_main`), so a number edited past
+// The DMA arena is 528 KiB (the kernel's `NIC_DMA_PAGES`), and it holds ONLY packet buffers - GENET keeps
+// its descriptors in the controller's own register file (that is what `RDMA_OFFSET`/`TDMA_OFFSET` address),
+// so none of the arena goes on descriptor storage. 256 receive buffers plus 8 transmit buffers of 2 KiB
+// each is exactly 528 KiB. They are two named parts of the arena (`genet_main`), so a number edited past
 // what the arena holds is refused at start, naming the part, before any ring is enabled.
 //
-// The in-kernel driver used 32 and 32, which is 128 KiB of frames from the general allocator. Fitting
-// the arena is not a regression: transmit here is strictly one frame at a time (net-stack sends, then
-// waits for the reply), so a deep transmit ring buys nothing, and 24 receive buffers still absorb a
-// burst between drains.
+// RECEIVE IS ALL 256 DESCRIPTORS. It was 24, all a 64 KiB arena held. A download's window of 256 KiB
+// can arrive faster than net-stack drains it, and a 10 MB download over the cable spent 33 s of its 50
+// waiting for data (backlog/93); the RTL8168's ring of 24 overflowed the same way, and 256 ended it.
+// 256 also divides the 16-bit producer and consumer indices, so `cons % RX_RING_DESCS` stays the
+// hardware's own slot when they wrap; at 24 it did not, and after 65,536 frames the driver would have
+// read the wrong buffer. Transmit stays at 8: it is strictly one frame at a time (net-stack sends, then
+// waits for the reply), so a deep transmit ring buys nothing.
 // ---------------------------------------------------------------------------------------------
 
 /// Bytes per buffer. Linux's `RX_BUF_LENGTH`; one 2 KiB buffer holds any Ethernet frame this MAC will
 /// accept, so a frame never spans descriptors and the driver never has to reassemble.
 const RX_BUF_LENGTH: usize = 2048;
-const RX_RING_DESCS: usize = 24;
+const RX_RING_DESCS: usize = 256;
+// A ring that does not divide 65,536 reads the wrong slot when the 16-bit indices wrap.
+const _: () = assert!(65_536 % RX_RING_DESCS == 0 && RX_RING_DESCS <= TOTAL_DESC);
 const TX_RING_DESCS: usize = 8;
 const RX_BUFS_LEN: usize = RX_RING_DESCS * RX_BUF_LENGTH;
 const TX_BUFS_LEN: usize = TX_RING_DESCS * RX_BUF_LENGTH;
@@ -1130,6 +1135,12 @@ impl<'a> Genet<'a> {
             ring_reg(RDMA_OFFSET, RING_INDEX, RDMA_CONS_INDEX),
             cons.wrapping_add(1) & 0xFFFF,
         );
+        // Every 8,192th frame, the counters - the MAC's overflow and the ring's discard count say whether
+        // frames were lost for want of a buffer, which nothing else here can (backlog/93). Eight lines in
+        // a 10 MB download.
+        if cons.wrapping_add(1) & 0x1FFF == 0 {
+            self.report_counters();
+        }
         n
     }
 
@@ -1214,10 +1225,10 @@ pub fn genet_main(ctx: ServiceContext) -> ! {
         ctx.log("nic-driver: no GENET register window or DMA arena granted - serving empty replies");
         crate::serve_status(&ctx, &[0u8; 8]);
     };
-    // The arena in its two parts, page-aligned, so they sit at 0x0 and 0xC000 as they always have. One
-    // that does not fit is said with its name and treated as no arena at all - which, unlike a MAC that
-    // will not come up, also leaves the radio unserved; it can only happen if the spawn grants less than
-    // 64 KiB, and that is a kernel change, not a board state.
+    // The arena in its two parts, page-aligned: the receive buffers at 0x0, the transmit buffers after
+    // them at 0x80000. One that does not fit is said with its name and treated as no arena at all - which,
+    // unlike a MAC that will not come up, also leaves the radio unserved; it can only happen if the spawn
+    // grants less than 528 KiB, and that is a kernel change, not a board state.
     let mut parts = a.layout();
     let (rx, tx) = match (parts.take("rx buffers", RX_BUFS_LEN, 4096), parts.take("tx buffers", TX_BUFS_LEN, 4096)) {
         (Ok(rx), Ok(tx)) => (rx, tx),
