@@ -97,6 +97,7 @@ hub_is_superspeed                  # Linux usbcore (drivers/usb/core/hub.c, hub.
 hub_port_connect                   # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/fixed/83) - external, 26.14
 hub_port_debounce                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
 hub_port_reset                     # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
+mii_resolve_flowctrl_fdx           # Linux include/linux/mii.h, the 802.3 pause resolution, cited by dwc2 for the smsc95xx flow control - external, 26.14
 rtl8xxxu_parse_usb                 # Linux rtl8xxxu_core.c, cited by dwc2 rtl::bulk_in for taking the one bulk IN endpoint (R3b) - external, 26.14
 rtl8xxxu_submit_rx_urb             # Linux rtl8xxxu_core.c, cited by usbfn::BULK_IN_MAX for how Linux sizes the receive buffer (R3b) - external, 26.14
 dwc2_release_channel
@@ -150,6 +151,7 @@ scroll_view
 setup_display
 setup_display_ex
 smsc95xx_mac_update_fullduplex
+smsc95xx_phy_initialize            # Linux smsc95xx (v4.19), where the PHY advertisement is written, cited by dwc2 - external, 26.14
 smsc95xx_phy_update_flowcontrol
 smsc95xx_reset
 smsc95xx_set_multicast
