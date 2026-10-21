@@ -1877,8 +1877,9 @@ still tests one change.
   it fetches, and past a ring's Link that lands in the gap rather than in the next ring.
 - **Where the frame lives.** In the data buffer (`Parts::data_buf`), the arena page enumeration uses for its control data,
   borrowed for one synchronous send at a time. Nothing else touches it inside the poll loop, and a send
-  never overlaps an enumeration, since both run on one task. That needs no kernel change. A dedicated page
-  would (`XHCI_DMA_PAGES`), which is the cleaner answer if this one is ever contended.
+  never overlaps an enumeration, since both run on one task. A dedicated page is the cleaner answer if this
+  one is ever contended, and it is xhci's and the supervisor's change alone: the arena's size is the spawn
+  request's (`dma_pages`), and the kernel holds none (2026-10-21).
 - **`OP_BULK_OUT`, as `dwc2` sends.** One Normal TRB, the Link written eagerly, the completion waited for
   up to 200 ms (`dwc2`'s budget), matched by slot AND endpoint. A completion for the IN or for another
   consumer met while waiting is handed on, not taken.

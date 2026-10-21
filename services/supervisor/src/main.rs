@@ -987,8 +987,10 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
             ask_bdf_for_class(ctx, hw & 0x00FF_FFFF)
         } else { 0 };
     }
-    // The DMA arena a PCI driver needs, in 4 KiB pages. A SIZE, not an address - the kernel still
-    // decides WHERE the arena lives; this says only how big. Zero for a register-only driver.
+    // The DMA arena a driver needs, in 4 KiB pages - for EVERY class, PCI or fixed: the kernel holds no
+    // size of its own (2026-10-21), and refuses a DMA device whose request names none. A SIZE, not an
+    // address - the kernel still decides WHERE the arena lives; this says only how big. Zero for a
+    // register-only driver.
     //
     // Kept beside the table rather than as a tenth column: it applies to the handful of rows that
     // name a PCI class code, and widening every row to carry a field that is 0 for twenty of them
@@ -996,9 +998,22 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     req.dma_pages    = match name {
         // 64 KiB - the size `HwClass::Ahci` implied before the class had a name in the kernel.
         "block-driver" => 16,
-        // 32 rings + a 256-buffer scratchpad + the disk's 18 pages (its rings, its command page, its data
-        // page and the 56 KiB gather buffer, `services/xhci/src/msc.rs`) - `XHCI_DMA_PAGES` in the kernel.
+        // 32 pages of control structures (command and event rings, DCBAA, ERST, six per-device slices so a
+        // hub and what is behind it can be addressed at once), 256 scratchpad buffers (the T630's AMD xHCI
+        // asks for 256 and malfunctions without them), and the disk's 18 pages (its rings, its command
+        // page, its data page and the 56 KiB gather buffer, `services/xhci/src/msc.rs`), kept apart ON
+        // PURPOSE: the Pi 4 lost days to one page shared by a keyboard report, a hub's port status and the
+        // disk's CBW. These sizes were the kernel's `XHCI_DMA_PAGES` until 2026-10-21.
         "xhci" => 32 + 256 + 18,
+        // 64 KiB: the control transfer and the poll slots (`services/ehci`), as main had it. Not more: the
+        // driver zeroes both parts on every control transfer, and the xHCI-sized 1 MiB it once shared a
+        // constant with regressed back-port enumeration.
+        "ehci" => 16,
+        // 64 KiB: the Pi 2's channels, descriptors and the disk's transfer buffer (`services/dwc2`).
+        "dwc2" => 16,
+        // A page of DMA control blocks and a 128 KiB ring of PWM words (`services/pwm-audio`, 33 pages
+        // laid out), and three spare.
+        "pwm-audio" => 36,
         // The rings and a receive ring of 256 x 2 KiB, to hold a whole 256 KiB receive window as it arrives
         // (`services/nic-driver`, `RX_RING_COUNT`; `backlog/93`). It was 16, the EHCI default the NIC fell to.
         "nic-driver" => 132,

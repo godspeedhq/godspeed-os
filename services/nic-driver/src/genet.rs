@@ -345,7 +345,7 @@ const SHD_CLK_CTL_GTXCLK_EN: u16 = 1 << 9;
 // ---------------------------------------------------------------------------------------------
 // Ring geometry, and the arena it has to fit in.
 //
-// The DMA arena is 528 KiB (the kernel's `NIC_DMA_PAGES`), and it holds ONLY packet buffers - GENET keeps
+// The DMA arena is 528 KiB (the supervisor's `dma_pages` for nic-driver), and it holds ONLY packet buffers - GENET keeps
 // its descriptors in the controller's own register file (that is what `RDMA_OFFSET`/`TDMA_OFFSET` address),
 // so none of the arena goes on descriptor storage. 256 receive buffers plus 8 transmit buffers of 2 KiB
 // each is exactly 528 KiB. They are two named parts of the arena (`genet_main`), so a number edited past
