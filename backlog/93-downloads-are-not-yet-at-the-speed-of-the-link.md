@@ -207,7 +207,9 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    | `3745c471` | GENET's ring 24 -> 256, the kernel's fixed-NIC arena 528 KiB | 655 KiB/s, 14 s | - |
    | `c772d2cc` | the SDIO host's settling gaps by the clock (a "2 us" spin was 137 us) | - | 208 KiB/s, 46 s |
    | `2bf32f56` | a 32 KiB window over a radio, not 8 | 673 KiB/s, 14 s | 191 KiB/s, 50 s: not the limit |
-   | `ec7e2bf0` | `power`'s governor (Raspberry Pi OS's ondemand, `docs/power.md` 15.7) | **776 KiB/s, 12 s** | 188 KiB/s, 51 s |
+   | `ec7e2bf0` | `power`'s governor (Raspberry Pi OS's ondemand, `docs/power.md` 15.7) | 776 KiB/s, 12 s | 188 KiB/s, 51 s |
+   | `4d485192` | an empty read yields for 2 ms before it parks (a "2 ms" sleep was a 10 ms tick) | 778-786 KiB/s, 12 s | 381 and 413 KiB/s (23-25 s); one run 179 |
+   | `440b8cd1` | xhci gathers consecutive runs, 56 KiB to a WRITE(10) | **1.2-1.3 MiB/s, 6-7 s** (disk 4.8-5.0 s) | 159 and 186 KiB/s (50-61 s; disk 1.8-3.4 s) |
 
    The cable is the stick's now: 10 s of its 12 writing, a chunk of seven blocks per USB command, and more
    than seven needs more than one 4 KiB message (2.5, 8.5). GENET's overflow and discard counters read 0
@@ -216,6 +218,14 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    nothing - the data is not arriving, for a reason not yet measured. The governor takes the clock to 1,500
    MHz within a look of a download starting and, once there, drops back for one look each 5 s when the
    load at full speed falls under half, as ondemand does with no step between the two ends.
+
+   After the gather the cable's disk is about 28 ms per 56 KiB command, 2 MB/s: the stick's own writing
+   speed, not its per-command turnaround, so larger commands buy less now. What would still help is
+   overlap - writing one gather while the next fills, so a download takes the longer of the network and
+   the disk rather than their sum. The radio varies from card to card (23, 25, 54, 50 and 61 s over the
+   last five runs at nearly the same code), its reads cost the same each time (about 610 us a frame), and
+   the time is data that has not arrived; the link itself (signal, band, rate - `wifi info`) has not
+   been looked at.
 
    Two code defects in the disk path, found by Audit 19: `fs`'s `BLOCK_RPC_SECS` (30 s) now
    bounds a whole run of seven blocks, while on USB `block-driver` makes seven host calls of up to
