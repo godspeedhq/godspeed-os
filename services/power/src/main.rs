@@ -415,10 +415,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     gov.fast = fast;
                     let want = fast || leases.open() > 0;
                     if want != clock_fast {
-                        clock_fast = want;
-                        let why = if fast { "a core is busy" } else { "no core is busy and no lease is open" };
-                        if apply(&ctx, want, why, &mut no_control_said).is_some() {
-                            ctx.log_fmt(format_args!("power: governor - the busiest core, {}, was {}% busy", core, load));
+                        // One line, with the load that decided it; `apply`'s says only why.
+                        match ctx.cpu_clock(want) {
+                            Some(hz) => {
+                                clock_fast = want;
+                                ctx.log_fmt(format_args!(
+                                    "power: Arm clock -> {} ({} MHz) - the governor: the busiest core, {}, was {}% busy",
+                                    if want { "maximum" } else { "minimum" }, hz / 1_000_000, core, load));
+                            }
+                            None => ctx.log("power: the governor's clock change was refused - the clock is where it was"),
                         }
                     }
                 }
