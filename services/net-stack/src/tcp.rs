@@ -846,6 +846,38 @@ pub struct Tcp {
     /// acknowledgement never leaves look identical in a count, and they are different bugs.
     pub tx_log: [u8; 24],
     pub tx_n: usize,
+    /// Where this service's time went while a connection was read (`Spent`), said when it is released.
+    pub spent: Spent,
+}
+
+/// Where `net-stack`'s time goes while a connection is being read, in counter ticks, from its first read
+/// to its release (`backlog/93` item 12). A read of 4 KiB costs a download 250 to 550 us on the T630, where
+/// a round trip and a 4 KiB copy should cost about 62 (BP1, BP9); this says which part of this service
+/// holds the rest. The parts do not overlap: a read's own time leaves out the polls it ran, which are
+/// counted with the polls.
+#[derive(Clone, Copy, Default)]
+pub struct Spent {
+    /// When the first read was answered, or 0 before it.
+    pub since: u64,
+    /// Reads answered, the bytes they carried, and the time answering them, the polls they ran left out.
+    pub reads: u32,
+    pub read_bytes: u64,
+    pub read_ticks: u64,
+    /// Polls run inside reads (`RECV_DRAIN_MS`), and reads that were served from the stash.
+    pub read_polls: u32,
+    pub stashed: u32,
+    /// Poll steps, and all the time in them.
+    pub polls: u32,
+    pub poll_ticks: u64,
+    /// Of the polls: asks of the driver for frames, the round trips, the frames they brought, and asks that
+    /// brought none.
+    pub drains: u32,
+    pub drain_ticks: u64,
+    pub frames: u32,
+    pub empty: u32,
+    /// Of the polls: frames handed to the driver to send, and the round trips.
+    pub sends: u32,
+    pub send_ticks: u64,
 }
 
 impl Tcp {
@@ -863,6 +895,8 @@ impl Tcp {
             stat_seen: 0, stat_matched: 0, stat_sent: 0, bad_checksum: 0, fragments: 0,
             damaged: None, damaged_len: 0, damaged_seq: 0, damaged_from: ([0; 4], 0), damaged_at: 0, damaged_n: 0,
             tx_log: [0u8; 24], tx_n: 0,
+            spent: Spent { since: 0, reads: 0, read_bytes: 0, read_ticks: 0, read_polls: 0, stashed: 0, polls: 0,
+                           poll_ticks: 0, drains: 0, drain_ticks: 0, frames: 0, empty: 0, sends: 0, send_ticks: 0 },
         }
     }
 

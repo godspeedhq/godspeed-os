@@ -1820,13 +1820,28 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     // outlast its own interval and starve the client the service exists to answer.
     let t0 = gs::driver::wait::ticks(ctx);
     let budget = ticks_ms(ctx, POLL_BUDGET_MS);
-    let spent = |ctx: &ServiceContext| gs::driver::wait::ticks(ctx).wrapping_sub(t0) >= budget;
-
     let batch = nic_drain_ms(ctx, pending, POLL_TX_MS);
+    let td = gs::driver::wait::ticks(ctx);
+    t.spent.polls += 1;
+    t.spent.drains += 1;
+    t.spent.drain_ticks += td.wrapping_sub(t0);
+    let any = poll_frames(ctx, pending, st, t, net, asks, batch.as_ref(), t0, budget);
+    t.spent.poll_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(t0);
+    any
+}
+
+/// The rest of [`poll_step`], on the batch the driver answered with: split out so the step's time is
+/// counted on every way out of it (`tcp::Spent`).
+#[allow(clippy::too_many_arguments)]
+fn poll_frames(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState, t: &mut tcp::Tcp, net: &tcp::Net,
+               asks: &mut UdpAsks, batch: Option<&Message>, t0: u64, budget: u64) -> bool {
+    let spent = |ctx: &ServiceContext| gs::driver::wait::ticks(ctx).wrapping_sub(t0) >= budget;
     let m = match batch { Some(m) => m, None => return false };
     let p = m.payload_bytes();
     if p.is_empty() { return false; }
     let count = p[0] as usize;
+    t.spent.frames += count as u32;
+    if count == 0 { t.spent.empty += 1; }
     let mut pos = 1usize;
     let mut any = false;
     let mut out = [0u8; 1600];
@@ -1898,6 +1913,7 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
             t.forget(rid);
             let _ = gs::resource::revoke(ctx, rid);
             ctx.log("net-stack: a finished connection was reaped and its slot released");
+            report_spent(ctx, &mut t.spent);
         }
     }
 
@@ -1914,7 +1930,11 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
             // `POLL_TX_MS` should be set from, and its absence is why the first value was a guess
             // that broke a working connection. A silent drop here looks exactly like a network
             // that lost the frame, which is the one thing it must not be confused with (§26.7).
-            if nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS).is_none() {
+            let ts = gs::driver::wait::ticks(ctx);
+            let taken = nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS);
+            t.spent.sends += 1;
+            t.spent.send_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(ts);
+            if taken.is_none() {
                 t.poll_tx_slow = t.poll_tx_slow.saturating_add(1);
                 if t.poll_tx_slow == 1 || t.poll_tx_slow % 64 == 0 {
                     ctx.log_fmt(format_args!(
@@ -2754,6 +2774,31 @@ fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: 
 /// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
 /// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
 /// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
+/// Say where this service's time went while the connection just released was read (`tcp::Spent`), and start
+/// the count again. Said only for a connection that was read, so a connect that carried nothing is quiet.
+/// What is left of the time beside the parts is this loop waiting for a client to ask.
+fn report_spent(ctx: &ServiceContext, sp: &mut tcp::Spent) {
+    if sp.reads > 0 {
+        let per_ms = ticks_ms(ctx, 1).max(1);
+        let ms = |t: u64| t / per_ms;
+        let us = |t: u64, n: u32| if n == 0 { 0 } else { t * 1000 / per_ms / n as u64 };
+        let wall = gs::driver::wait::ticks(ctx).wrapping_sub(sp.since);
+        let other = wall.saturating_sub(sp.read_ticks).saturating_sub(sp.poll_ticks);
+        // Three lines, each inside `log_fmt`'s 256 bytes: one line was cut short.
+        ctx.log_fmt(format_args!(
+            "net-stack: where the connection's {} ms went (1/3) - {} reads, {} KiB, {} ms answering them, {} us each with the polls they ran left out ({} polls inside reads, {} reads from the stash)",
+            ms(wall), sp.reads, sp.read_bytes / 1024, ms(sp.read_ticks), us(sp.read_ticks, sp.reads),
+            sp.read_polls, sp.stashed));
+        ctx.log_fmt(format_args!(
+            "net-stack: where the connection's time went (2/3) - {} polls, {} ms in all; {} asks of the driver for frames, {} ms, {} us each, {} frames brought, {} asks found none",
+            sp.polls, ms(sp.poll_ticks), sp.drains, ms(sp.drain_ticks), us(sp.drain_ticks, sp.drains), sp.frames, sp.empty));
+        ctx.log_fmt(format_args!(
+            "net-stack: where the connection's time went (3/3) - {} frames sent from the polls, {} ms, {} us each; {} ms not in a read or a poll (waiting to be asked)",
+            sp.sends, ms(sp.send_ticks), us(sp.send_ticks, sp.sends), ms(other)));
+    }
+    *sp = tcp::Spent::default();
+}
+
 fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Option<Message> {
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment
@@ -3564,6 +3609,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // at the next scheduled poll. One poll is one batch, two full frames at most (a
                         // message is 4 KiB), so one poll per read was a download paced by this loop.
                         let t0 = gs::driver::wait::ticks(&ctx);
+                        let polled0 = tcpst.spent.poll_ticks;
                         let budget = ticks_ms(&ctx, RECV_DRAIN_MS);
                         // A reader whose answer is already waiting is answered at once: the stream poll keeps
                         // taking frames in between reads, so draining here as well only adds a driver round trip.
@@ -3576,11 +3622,22 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status, netmask };
                             let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
                             streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                            tcpst.spent.read_polls += 1;
                             // Nothing more in the driver: answer with what there is. And a reader with enough
                             // to fill its answer is not kept waiting for more.
                             if !streaming || tcpst.conns[i].readable() >= max { break; }
                         }
-                        tcpst.read(rid, &mut resp[..max])
+                        let got = tcpst.read(rid, &mut resp[..max]);
+                        // Counted here, before the reply goes: the send is a copy into the reader's queue, the
+                        // same for every reply, and what this measures is what a read waits on inside.
+                        let sp = &mut tcpst.spent;
+                        let now = gs::driver::wait::ticks(&ctx);
+                        if sp.since == 0 { sp.since = t0; }
+                        sp.reads += 1;
+                        sp.read_bytes += got as u64;
+                        sp.read_ticks += now.wrapping_sub(t0).wrapping_sub(sp.poll_ticks.wrapping_sub(polled0));
+                        if from_stash { sp.stashed += 1; }
+                        got
                     }
                     COP_SEND if right & RIGHT_WRITE != 0 => {
                         let took = tcpst.write(rid, body);
