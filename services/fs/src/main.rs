@@ -5330,7 +5330,15 @@ fn data_block(blk: &mut [u8; BLOCK], payload: &[u8]) {
 /// Write `blocks` to consecutive LBAs from `lba` in ONE request (`OP_WRITE_BLOCKS`), at most
 /// `WRITE_RUN_MAX`. Direct, as `data_write` is. The answers are `block_write_kind`'s, said for the run.
 fn block_write_run(ctx: &ServiceContext, lba: u64, blocks: &[[u8; BLOCK]]) -> bool {
-    let n = blocks.len().min(WRITE_RUN_MAX);
+    // A run the protocol cannot carry is refused and said, never shortened: shortened, the blocks past
+    // `WRITE_RUN_MAX` would be reported written and never reach the disk (Audit 19). The one caller sends
+    // a chunk, which is at most `WRITE_RUN_MAX`.
+    if blocks.is_empty() || blocks.len() > WRITE_RUN_MAX {
+        ctx.log_fmt(format_args!("fs: a block run of {} at lba {} refused - a run is 1 to {} blocks",
+                                 blocks.len(), lba, WRITE_RUN_MAX));
+        return false;
+    }
+    let n = blocks.len();
     let mut req = [0u8; 10 + WRITE_RUN_MAX * BLOCK];
     req[0] = OP_WRITE_BLOCKS;
     req[1..9].copy_from_slice(&lba.to_le_bytes());

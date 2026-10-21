@@ -267,7 +267,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             gs::ipc::recv(&ctx)
         } else {
             match gs::ipc::recv_within_ms(&ctx, BLINK_MS) {
-                Some(m) => { blink_on = true; m }
+                // A message finds the cursor solid: drawn here if the blink had lifted it, because not
+                // every message redraws it (a bare `\r`, a request), and one left lifted would read as
+                // off for a whole second (Audit 19).
+                Some(m) => {
+                    if !blink_on { term.blink(true); }
+                    blink_on = true;
+                    m
+                }
                 None => {
                     blink_on = !blink_on;
                     term.blink(blink_on);

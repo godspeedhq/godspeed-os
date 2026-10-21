@@ -915,10 +915,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // /users/default/history (§8 secret taint): a password recovered on up-arrow would defeat the
                     // whole point of invisible entry. It still EXECUTES below; it just isn't remembered.
                     if !line_reads_secret(line.bytes()) {
-                        // The file is merged in BEFORE the first save, or that save would replace the
-                        // whole file with this boot's one line: every boot's first command used to wipe
-                        // the history it was meant to add to (`History::load`).
-                        if !hist.loaded { hist.load(&ctx); }
                         hist.push(line.bytes());
                         // Write-through to the fs (best-effort). Not while a job holds `fs` inside one
                         // request (a check, a scrub, a tree delete): the save would wait its 2 s for
@@ -927,7 +923,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // job that has ended does not go on stopping the save.
                         if fs_held_by_job(&ctx) { refresh_jobs(&ctx); }
                         if !fs_held_by_job(&ctx) {
-                            hist.save(&ctx);
+                            // The file is merged in BEFORE the first save, and a save never runs until it
+                            // has been: the ring is written whole, so a save over an unmerged file replaces
+                            // it with this boot's lines - every boot's first command used to wipe the
+                            // history it was meant to add to (`History::load`).
+                            if !hist.loaded { hist.load(&ctx); }
+                            if hist.loaded { hist.save(&ctx); }
                         }
                     }
                     // The command clock runs from Enter to the prompt (`begin_command_at`): every wait the
@@ -1109,13 +1110,10 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
         b'~' => match param {    // navigation cluster: ESC[<n>~
             1 | 7 => line.home(ctx),   // Home
             4 | 8 => line.end(ctx),    // End
-            // Delete (forward delete). Said in the log, with where the cursor was, because the operator
-            // reports the key doing nothing on the T630 while it works in QEMU (2026-10-20): the line
-            // shows whether the shell received it and whether there was a character to delete.
-            3     => {
-                ctx.log_fmt(format_args!("shell: Delete key at {} of {} characters", line.cur, line.len));
-                line.delete(ctx)
-            }
+            // Delete (forward delete). It was logged with where the cursor stood while the operator's
+            // report of it doing nothing on the T630 was open (2026-10-20); the next card showed it working,
+            // so a keystroke no longer writes a log line.
+            3     => line.delete(ctx),
             // PageUp OPENS `scrollback`, one page back - the key does what it was pressed for.
             // PageDown from a live prompt stays inert: you are already at the bottom, and opening a
             // viewer already scrolled to the end is a no-op dressed as an action.
@@ -1125,7 +1123,14 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
             n => ctx.log_fmt(format_args!("shell: key sequence ESC[{}~ not recognised", n)),
         },
         // An unknown final byte, already consumed: nothing is done, and the log says what it was.
-        f => ctx.log_fmt(format_args!("shell: key sequence ESC[{}{} not recognised", param, f as char)),
+        // The parameter only if one was typed, and a final byte that does not print as its value, so the
+        // line never shows `ESC[0x` for `ESC[x` or carries a control character (Audit 19).
+        f => match (have_param, (0x20..0x7f).contains(&f)) {
+            (true, true)   => ctx.log_fmt(format_args!("shell: key sequence ESC[{}{} not recognised", param, f as char)),
+            (false, true)  => ctx.log_fmt(format_args!("shell: key sequence ESC[{} not recognised", f as char)),
+            (true, false)  => ctx.log_fmt(format_args!("shell: key sequence ESC[{} with final byte {:#04x} not recognised", param, f)),
+            (false, false) => ctx.log_fmt(format_args!("shell: key sequence ESC[ with final byte {:#04x} not recognised", f)),
+        },
     }
 }
 
@@ -1899,10 +1904,12 @@ struct History {
     /// this flag ensures that happens exactly once - success OR bounded-miss - so every later up-arrow
     /// is instant and never re-touches fs.
     loaded: bool,
+    /// When a load last missed its bound (`epoch_secs_monotonic`), or 0: what spaces the retries.
+    missed_at: i64,
 }
 impl History {
     fn new() -> Self {
-        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0, loaded: false }
+        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0, loaded: false, missed_at: 0 }
     }
     fn len(&self) -> usize { self.n }
     fn get(&self, i: usize) -> &[u8] { &self.lines[i][..self.lens[i]] }
@@ -1938,12 +1945,34 @@ impl History {
     #[inline(never)]
     fn load(&mut self, ctx: &ShellCtx) {
         if self.loaded { return; }
-        self.loaded = true;
+        let now = gs::task::epoch_secs_monotonic(ctx);
+        if self.missed_at != 0 && now - self.missed_at < HIST_RETRY_SECS { return; }
         let path = HISTORY;
-        let sz = match fs_stat_bounded(ctx, path, HIST_LOAD_SECS) { Some((s, false)) if s > 0 => s as usize, _ => return };
+        let st = {
+            let mut g = ctx.fs().patience_secs(HIST_LOAD_SECS);
+            let r = g.stat(path);
+            ctx.fs_tag.set(g.tag());
+            r
+        };
+        let sz = match st {
+            Ok(st) if !st.is_dir && st.size > 0 => st.size as usize,
+            // An answer: an empty file, a directory there, no file, or no filesystem to hold one (the disk not
+            // yet formatted, or one `fs` refuses). Nothing to merge, and a save is safe or refused on its own.
+            Ok(_) | Err(gs::Error::NotFound | gs::Error::NoFilesystem | gs::Error::Foreign | gs::Error::PermissionDenied) => {
+                self.loaded = true;
+                return;
+            }
+            // No answer, or one that leaves the file's bytes unknown (unreadable, damaged, not parsed): a save
+            // now could replace lines that are still on the disk.
+            Err(_) => { self.missed_at = now.max(1); return; }
+        };
         let sz = sz.min(HIST_MAX * (MAX_LINE + 1));
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
-        if !read_file_exact_bounded(ctx, path, 0, &mut buf[..sz], HIST_LOAD_SECS) { return; }
+        if !read_file_exact_bounded(ctx, path, 0, &mut buf[..sz], HIST_LOAD_SECS) {
+            self.missed_at = now.max(1);
+            return;
+        }
+        self.loaded = true;
         // Snapshot the session lines (newest, must survive), rebuild the ring as [file lines..., session
         // lines], so up-arrow walks the session first and the file underneath, oldest dropped first.
         let mut sess = [[0u8; MAX_LINE]; HIST_MAX];
@@ -21583,6 +21612,8 @@ const HIST_LOAD_SECS: i64 = 2;
 
 /// The net-stack request correlation tag.
 ///
+/// How long after a history load missed its bound before one is tried again (`History::load`).
+const HIST_RETRY_SECS: i64 = 30;
 /// Its own counter in `ShellCtx` for the same reason `fs_tag` has one: a `static` here is the
 /// unowned global mutable state Invariant 9 forbids, and audit C6-1 already had to undo exactly that
 /// mistake on the fs channel. Never 0 - a zero tag can only come from a sender that does not tag.
@@ -21859,18 +21890,8 @@ fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Optio
     r.ok()
 }
 
-/// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
-/// `max_secs`, so an alive-but-not-serving fs (respawned, still re-mounting) cannot hang the prompt.
-/// `None` on timeout/miss/absent, treated as "no file".
-fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
-    let mut g = ctx.fs().patience_secs(max_secs);
-    let r = g.stat(path);
-    ctx.fs_tag.set(g.tag());
-    r.ok().map(|st| (st.size, st.is_dir))
-}
-
-/// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
-/// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
+/// Deadline-bounded twin of `fs_read_at` for the history load (`History::load`, whose `stat` takes the same
+/// bound), so a stalled fs times out instead of blocking the shell.
 fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
     let mut g = ctx.fs().patience_secs(max_secs);
     let r = g.read_at(path, offset, out);

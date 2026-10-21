@@ -1822,11 +1822,17 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     let budget = ticks_ms(ctx, POLL_BUDGET_MS);
     let batch = nic_drain_ms(ctx, pending, POLL_TX_MS);
     let td = gs::driver::wait::ticks(ctx);
-    t.spent.polls += 1;
-    t.spent.drains += 1;
-    t.spent.drain_ticks += td.wrapping_sub(t0);
+    // Counted from a connection's first read (`tcp::Spent`), so a connect and its handshake are not.
+    let counting = t.spent.since != 0;
+    if counting {
+        t.spent.polls += 1;
+        t.spent.drains += 1;
+        t.spent.drain_ticks += td.wrapping_sub(t0);
+    }
     let any = poll_frames(ctx, pending, st, t, net, asks, batch.as_ref(), t0, budget);
-    t.spent.poll_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(t0);
+    if counting && t.spent.since != 0 {
+        t.spent.poll_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(t0);
+    }
     any
 }
 
@@ -1840,8 +1846,10 @@ fn poll_frames(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState, t: 
     let p = m.payload_bytes();
     if p.is_empty() { return false; }
     let count = p[0] as usize;
-    t.spent.frames += count as u32;
-    if count == 0 { t.spent.empty += 1; }
+    if t.spent.since != 0 {
+        t.spent.frames += count as u32;
+        if count == 0 { t.spent.empty += 1; }
+    }
     let mut pos = 1usize;
     let mut any = false;
     let mut out = [0u8; 1600];
@@ -1932,8 +1940,10 @@ fn poll_frames(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState, t: 
             // that lost the frame, which is the one thing it must not be confused with (§26.7).
             let ts = gs::driver::wait::ticks(ctx);
             let taken = nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS);
-            t.spent.sends += 1;
-            t.spent.send_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(ts);
+            if t.spent.since != 0 {
+                t.spent.sends += 1;
+                t.spent.send_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(ts);
+            }
             if taken.is_none() {
                 t.poll_tx_slow = t.poll_tx_slow.saturating_add(1);
                 if t.poll_tx_slow == 1 || t.poll_tx_slow % 64 == 0 {
@@ -3609,6 +3619,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // at the next scheduled poll. One poll is one batch, two full frames at most (a
                         // message is 4 KiB), so one poll per read was a download paced by this loop.
                         let t0 = gs::driver::wait::ticks(&ctx);
+                        // The count starts here, at the first read, so the polls this read runs are in it.
+                        if tcpst.spent.since == 0 { tcpst.spent.since = t0; }
                         let polled0 = tcpst.spent.poll_ticks;
                         let budget = ticks_ms(&ctx, RECV_DRAIN_MS);
                         // A reader whose answer is already waiting is answered at once: the stream poll keeps
@@ -3632,7 +3644,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // same for every reply, and what this measures is what a read waits on inside.
                         let sp = &mut tcpst.spent;
                         let now = gs::driver::wait::ticks(&ctx);
-                        if sp.since == 0 { sp.since = t0; }
                         sp.reads += 1;
                         sp.read_bytes += got as u64;
                         sp.read_ticks += now.wrapping_sub(t0).wrapping_sub(sp.poll_ticks.wrapping_sub(polled0));
