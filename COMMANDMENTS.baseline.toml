@@ -123,7 +123,13 @@ features = [
 # non-relocatable image, so this is a real difference rather than a forced one. The change that would
 # retire it is a position-independent kernel - real work, recorded in backlog/14 rather than pretended
 # at. If that lands, this pin goes.
-    "visionfive"
+    "visionfive",
+# Diagnostic ONLY, registered for the reason `name-trace` is: it gates OUTPUT, never what the kernel
+# does. It counts cross-core wake IPIs sent and taken, times their delivery and a woken task's wait to
+# run, and says how far the tick clock moved, so a slow cross-core round trip (BP2 at 10.3 ms on the
+# Wyse, backlog/93) can be put in one place by measurement. No syscall, no subsystem, no responsibility;
+# the one always-built piece is an empty function the x86 wake stub calls.
+    "wake-trace"
 ]
 
 # DEBT, NOT AN ALLOWANCE. This list may only ever SHRINK. Kernel responsibility does not expand, so
