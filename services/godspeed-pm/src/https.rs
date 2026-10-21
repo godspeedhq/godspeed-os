@@ -40,6 +40,14 @@ pub(crate) const HEAD_MAX: usize = 4096;
 /// `time` row's waits, 2026-10-20).
 pub(crate) const IDLE_MS: u64 = 2;
 
+/// How long a read that finds nothing YIELDS and asks again before it parks for `IDLE_MS`: busy-polling, as
+/// Linux's sockets can (`SO_BUSY_POLL`), bounded so that a quiet connection still parks. Parking was all there
+/// was, and because the kernel ends a short sleep on the next scheduler tick (only the Pi 2 has a sub-tick
+/// timer) every empty read cost a tick: over the Pi 4's radio, 3,818 of them were 33 s of a 51 s download
+/// (8.7 ms each), where over the cable 43 were 0.4 s (`backlog/93`, 2026-10-21). A frame that arrives within
+/// this is read within an ask of it.
+pub(crate) const SPIN_US: u64 = 2_000;
+
 /// Where a session's time went, in counter ticks: what a download reports so the stage that holds it back is
 /// measured rather than guessed (`backlog/93`). The handshake is in it, in both the reads and the decrypting
 /// (its records are opened by `read_record` too, the certificate checks with them). Single-threaded, so the
@@ -50,7 +58,7 @@ pub struct Timing {
     /// In `net-stack` reads that brought bytes, and how many there were.
     pub recv: u64,
     pub recvs: u32,
-    /// Reads that found nothing yet, and the pauses after them (`IDLE_MS` each).
+    /// Reads that found nothing yet, and the pauses after them: a yield inside `SPIN_US`, an `IDLE_MS` park after.
     pub empty: u32,
     pub idle: u64,
     /// Opening records (TLS's `read_record`).
@@ -190,6 +198,8 @@ impl Session<'_, '_, '_, '_> {
         let mut have = self.read_len - self.rec_len;
         self.rec_len = 0;
         self.read_len = have;
+        // Since when the reads have found nothing: the start of the `SPIN_US` before a park.
+        let mut quiet: Option<gs::driver::wait::Since> = None;
         loop {
             // One whole record: its header says how long. READ AHEAD past it, as much as there is room for: a
             // read is a round trip to `net-stack`, and asking for a record's 5-byte header on its own was one
@@ -207,11 +217,17 @@ impl Session<'_, '_, '_, '_> {
                     self.timing.recv += t2.wrapping_sub(t);
                     self.timing.recvs += 1;
                     self.moved();
+                    quiet = None;
                 } else {
                     if self.stalled() {
                         return Err(Fail::Timeout);
                     }
-                    gs::task::sleep_ms(self.ctx, IDLE_MS);
+                    let since = *quiet.get_or_insert_with(|| gs::driver::wait::Since::now(self.ctx));
+                    if since.passed(self.ctx, gs::driver::wait::Budget::us(SPIN_US)) {
+                        gs::task::sleep_ms(self.ctx, IDLE_MS);
+                    } else {
+                        gs::task::yield_now(self.ctx);
+                    }
                     self.timing.empty += 1;
                     self.timing.idle += gs::driver::wait::ticks(self.ctx).wrapping_sub(t);
                 }
