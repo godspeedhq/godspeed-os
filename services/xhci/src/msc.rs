@@ -349,6 +349,12 @@ impl Disk {
         }
     }
 
+    /// Something answered as written was lost before this disk was bound (a re-scan or a drop of the one
+    /// before it): its first FLUSH fails, so `fs` learns it at its barrier (6.1).
+    pub fn mark_lost(&mut self) {
+        self.gather_lost = true;
+    }
+
     /// Sectors held, or in flight, not yet on the stick.
     pub fn gathered(&self) -> u32 {
         self.gather_n + self.pending.map_or(0, |p| p.n)
@@ -796,8 +802,7 @@ pub fn try_finish(ctx: &ServiceContext, dma: &Parts, d: &mut Disk, eaten: &mut E
         // write is left in flight, and `finish_pending` decides it within the transfer bound. Taking it as
         // this write's failure would mark it lost while its CSW may still come.
         Some(Err(_)) => {
-            d.pending = None;
-            settle(ctx, dma, d, p, None);
+            d.stale = d.stale.saturating_add(1);
         }
         None => {}
     }
@@ -841,8 +846,11 @@ pub fn flush_gather_if_idle(
 }
 
 /// Say what is lost when a disk is dropped holding gathered sectors. For every place that drops one.
-pub fn note_drop(ctx: &ServiceContext, disk: &Option<Disk>) {
-    if let Some(d) = disk.as_ref() {
+/// `true` when something answered as written may not be on the stick - held, in flight, or a failed write
+/// not yet reported at a FLUSH - which the caller carries to the disk bound next (`Disk::mark_lost`).
+pub fn note_drop(ctx: &ServiceContext, disk: &Option<Disk>) -> bool {
+    let Some(d) = disk.as_ref() else { return false };
+    {
         if d.gather_n > 0 {
             ctx.log_fmt(format_args!(
                 "xhci: the disk was dropped holding {} gathered sectors at lba {} - they were answered as written and are LOST",
@@ -854,6 +862,33 @@ pub fn note_drop(ctx: &ServiceContext, disk: &Option<Disk>) {
                 p.n, p.lba));
         }
     }
+    d.gather_n > 0 || d.pending.is_some() || d.gather_lost
+}
+
+/// Before the controller is re-scanned with this disk still bound (a `break 'poll` or a `continue 'reenum`
+/// that is not an unplug): write out and finish what is held while the stick still answers. `true` when
+/// something answered as written is not known to be on it, which the caller carries to the disk bound
+/// after the re-scan. A re-scan used to drop the disk with all of it, and the FLUSH after the rebind passed
+/// over data that never reached the stick (Audit 20).
+#[allow(clippy::too_many_arguments)]
+pub fn settle_before_rescan(
+    ctx: &ServiceContext,
+    dma: &Parts,
+    mmio: &Registers,
+    dboff: usize,
+    ir0: usize,
+    disk: &mut Option<Disk>,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut EvMail,
+) -> bool {
+    let Some(d) = disk.as_mut() else { return false };
+    flush_gather(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten);
+    finish_pending(ctx, dma, mmio, ir0, d, ev_idx, ev_cycle, eaten);
+    if d.gather_lost {
+        ctx.log("xhci: re-scanning with a gathered write lost since the last FLUSH - the disk bound next fails its first FLUSH");
+    }
+    d.gather_lost
 }
 
 /// SCSI SYNCHRONIZE CACHE(10) - the durability barrier a journal's ordering depends on.
@@ -1000,8 +1035,8 @@ pub const OP_FLUSH: u8 = 5;
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;
-// A run must fit the one data buffer a command transfers from.
-const _: () = assert!(WRITE_RUN_MAX as u32 * SECTOR <= MAX_XFER);
+// A run must fit a gather buffer, with room for the next before the buffer is written.
+const _: () = assert!(WRITE_RUN_MAX * SECTOR as usize <= GATHER_BYTES);
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device. Distinct from `STATUS_ERR`, which

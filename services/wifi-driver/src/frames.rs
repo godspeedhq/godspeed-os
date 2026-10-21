@@ -159,6 +159,9 @@ pub fn pull(
 /// said on a counter the kernel could not calibrate, where there is no minute to measure.
 fn report_pulls(s: &mut Session, ctx: &ServiceContext) {
     let now = s.now_ms(ctx);
+    if now == 0 {
+        return;
+    }
     if s.stats.pull_report_ms == 0 {
         s.stats.pull_report_ms = now.max(1);
         return;
@@ -168,11 +171,13 @@ fn report_pulls(s: &mut Session, ctx: &ServiceContext) {
     }
     let st = &s.stats;
     let per = |us: u64, n: u32| if n == 0 { 0 } else { us / n as u64 };
-    ctx.log_fmt(format_args!(
-        "wifi-driver: pulls this minute - {} in {} ms ({} us each); reads that brought a frame {} ({} us each), that found none {} ({} us each)",
-        st.pulls, st.pull_us / 1000, per(st.pull_us, st.pulls),
-        st.reads_frame, per(st.read_frame_us, st.reads_frame),
-        st.reads_empty, per(st.read_empty_us, st.reads_empty)));
+    if st.reads_frame > 0 {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: pulls this minute - {} in {} ms ({} us each); reads that brought a frame {} ({} us each), that found none {} ({} us each)",
+            st.pulls, st.pull_us / 1000, per(st.pull_us, st.pulls),
+            st.reads_frame, per(st.read_frame_us, st.reads_frame),
+            st.reads_empty, per(st.read_empty_us, st.reads_empty)));
+    }
     s.stats.pulls = 0;
     s.stats.pull_us = 0;
     s.stats.reads_frame = 0;

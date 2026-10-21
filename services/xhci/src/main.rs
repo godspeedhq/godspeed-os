@@ -282,7 +282,7 @@ impl EvMail {
 // the controller's 7 + 6 slices of 4 (24) + the SBA (1) = 32, then 256 of scratchpad, then the
 // disk's 32 (`msc::DISK_REGION_BYTES`); `lay_out` refuses, naming the part, an arena that is short.
 const MAX_SLICES: usize = 6; // per-device DMA slices (bound HIDs + transient hub/enum)
-const MAX_SCRATCHPAD: usize = 256; // arena room = 292 pages - 32 - the disk's 4
+const MAX_SCRATCHPAD: usize = 256; // arena room = 320 pages - 32 - the disk's 32
 
 /// Counter ticks in `ms` milliseconds, exactly as the SDK's `duration_cycles` computes them: never 0,
 /// and 1 on a machine whose counter the kernel could not calibrate. For the tick-domain instruments
@@ -4074,6 +4074,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut reenums_at_report: u64 = 0;
     let mut last_pass_report = wait::Since::now(&ctx);
 
+    // Something answered as written that a re-scan or a drop lost (`msc::note_drop`,
+    // `msc::settle_before_rescan`): carried to the disk bound next, whose first FLUSH then fails (Audit 20).
+    let mut disk_lost_carry = false;
     'reenum: loop {
         reenums += 1;
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
@@ -4986,6 +4989,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // and either one owes the endpoint a re-arm - so the set spans them. Per pass, but the disk's
             // entry is kept (above).
             eaten.keep_only(disk.as_ref().map(|d| d.slot));
+            if disk_lost_carry {
+                if let Some(d) = disk.as_mut() {
+                    d.mark_lost();
+                    disk_lost_carry = false;
+                }
+            }
             // Set by the hub scan when the disk's own port reports DISCONNECTED. Acted on AFTER the
             // scan rather than inside it, so the scan's borrow of `disk` and the clearing of it do
             // not overlap.
@@ -5201,7 +5210,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops, &mut no_disk_said) {
                             ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                             notify(&ctx, "storage disconnected (xhci)");
-                            msc::note_drop(&ctx, &disk);
+                            disk_lost_carry |= msc::note_drop(&ctx, &disk);
                             disk = None;
                             continue 'reenum;
                         }
@@ -5271,7 +5280,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             msc::flush_gather_if_idle(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &mut ev_idx, &mut ev_cycle, &mut eaten);
             if !disk_alive {
                 ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
-                msc::note_drop(&ctx, &disk);
+                disk_lost_carry |= msc::note_drop(&ctx, &disk);
                 disk = None;
                 continue 'reenum;
             }
@@ -5786,6 +5795,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 if !ok {
                                     ctx.log("xhci: not repairable in place - re-enumerating to rebuild the endpoint");
                                     announce = false;
+                                    disk_lost_carry |= msc::settle_before_rescan(&ctx, &dma, &mmio, dboff, ir0, &mut disk,
+                                                                                 &mut ev_idx, &mut ev_cycle, &mut eaten);
                                     continue 'reenum;
                                 }
                             }
@@ -6048,7 +6059,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Drop it and re-scan. The filesystem above sees its next request fail and
                 // reacquires when the stick returns (§14.3) - the same recovery a service restart
                 // already asks of it.
-                msc::note_drop(&ctx, &disk);
+                disk_lost_carry |= msc::note_drop(&ctx, &disk);
                 disk = None;
                 announce = true;
                 continue 'reenum;
@@ -6131,5 +6142,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
+        // Every `break 'poll` lands here, ahead of a re-scan, with the disk still bound and answering.
+        disk_lost_carry |= msc::settle_before_rescan(&ctx, &dma, &mmio, dboff, ir0, &mut disk,
+                                                     &mut ev_idx, &mut ev_cycle, &mut eaten);
     } // end 'reenum loop
 }

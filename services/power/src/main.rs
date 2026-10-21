@@ -447,9 +447,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
-        if before > 0 && leases.open() == 0 && !gov.fast && clock_fast {
+        // The clock's state is recorded only when the kernel made the change (the governor's rule too).
+        if before > 0 && leases.open() == 0 && !gov.fast && clock_fast
+            && apply(&ctx, false, "the last lease expired", &mut no_control_said).is_some()
+        {
             clock_fast = false;
-            let _ = apply(&ctx, false, "the last lease expired", &mut no_control_said);
         }
 
         // The pending shutdown: re-read the kernel's deadline (a cancel, or one brought earlier), warn at the
@@ -496,8 +498,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log_fmt(format_args!("power: lease {} opened for {} s ({} open)", id, secs, leases.open()));
                 // 0 when the clock was already at its maximum - another lease, or the governor.
                 let hz = if !clock_fast {
-                    clock_fast = true;
-                    apply(&ctx, true, "a lease is open", &mut no_control_said).unwrap_or(0)
+                    match apply(&ctx, true, "a lease is open", &mut no_control_said) {
+                        Some(hz) => {
+                            clock_fast = true;
+                            hz
+                        }
+                        None => 0,
+                    }
                 } else {
                     0
                 };
@@ -521,9 +528,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match found {
                     Some(_) => {
                         ctx.log_fmt(format_args!("power: lease {} released ({} open)", id, leases.open()));
-                        if leases.open() == 0 && !gov.fast && clock_fast {
+                        if leases.open() == 0 && !gov.fast && clock_fast
+                            && apply(&ctx, false, "no lease is open", &mut no_control_said).is_some()
+                        {
                             clock_fast = false;
-                            let _ = apply(&ctx, false, "no lease is open", &mut no_control_said);
                         }
                         reply(&ctx, cap, &[ST_OK]);
                     }
