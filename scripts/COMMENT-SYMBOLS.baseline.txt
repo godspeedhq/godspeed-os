@@ -661,3 +661,7 @@ NameOp                             # ACPI Machine Language opcode 0x08, named in
 PackageOp                          # ACPI Machine Language opcode 0x12, named in the ACPI specification; cited by arch/x86_64/acpi.rs - external, 26.14
 PM_RSTS_RASPBERRYPI_HALT           # Linux drivers/watchdog/bcm2835_wdt.c, the halt partition (0x555) the Pi firmware reads; cited by the Pis' power_off - external, 26.14
 bcm2835_power_off                  # Linux drivers/watchdog/bcm2835_wdt.c, the Pi power-off path the Pis' power_off follows (docs/shutdown.md 5) - external, 26.14
+CPU_ONDEMAND_DOWN_SAMPLING_FACTOR  # raspi-config debian/raspi-config.init, the variable power's SAMPLING_DOWN_FACTOR copies (50) - external, 26.14
+CPU_ONDEMAND_SAMPLING_RATE         # raspi-config debian/raspi-config.init, the variable power's SAMPLE_MS copies (100000 us) - external, 26.14
+CPU_ONDEMAND_UP_THRESHOLD          # raspi-config debian/raspi-config.init, the variable power's UP_THRESHOLD copies (50) - external, 26.14
+od_update                          # Linux drivers/cpufreq/cpufreq_ondemand.c, the ondemand rule power's governor follows - external, 26.14

@@ -116,3 +116,11 @@ spawn_pipe                         # backlog/fixed/80 K14 - DELETED 2026-10-10, 
 spawn_pipe_on                      # backlog/fixed/80 K14 - DELETED 2026-10-10, the per-core SDK wrapper for SpawnPipe (19); syscall retired; a record of a removal must name what was removed
 CAP_SYS_BOOT                       # docs/shutdown.md - Linux capability gating reboot(2), EXTERNAL; how other systems gate shutdown
 zx_system_powerctl                 # docs/shutdown.md - Fuchsia syscall, EXTERNAL; how other systems gate shutdown
+RASPBERRYPI_FREQ_INTERVAL          # docs/power.md 15.7 - Linux raspberrypi-cpufreq.c, EXTERNAL; the 100 MHz step the governor's design was read from
+cpufreq_policy_transition_delay_us # docs/power.md 15.7 - Linux cpufreq.c, EXTERNAL; caps ondemand's default interval at 10 ms on the Pi 4
+cpumask_setall                     # docs/power.md 15.7 - Linux cpufreq-dt.c, EXTERNAL; every core in one policy
+dbs_update                         # docs/power.md 15.7 - Linux cpufreq_governor.c, EXTERNAL; how ondemand measures load
+io_is_busy                         # docs/power.md 15.7 - Linux ondemand tunable, EXTERNAL; raspi-config sets it 0
+sampling_down_factor               # docs/power.md 15.7 - Linux ondemand tunable, EXTERNAL; raspi-config sets it 50
+sampling_rate                      # docs/power.md 15.7 - Linux ondemand tunable, EXTERNAL; raspi-config sets it 100000 us
+up_threshold                       # docs/power.md 15.7 - Linux ondemand tunable, EXTERNAL; raspi-config sets it 50
