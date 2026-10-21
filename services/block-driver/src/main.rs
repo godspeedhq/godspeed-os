@@ -245,7 +245,7 @@ const OP_FLUSH: u8 = 5;
 // was seven requests (`backlog/93` item 12). AHCI issues it as one multi-sector command; the USB backend
 // writes its blocks in turn. All or an error: a reply of `STATUS_ERR` says the run did not complete.
 const OP_WRITE_BLOCKS: u8 = 6;
-/// The most blocks one `OP_WRITE_BLOCKS` carries: 7 x 512 + 10, with the tag, is 3,595 bytes, inside one
+/// The most blocks one `OP_WRITE_BLOCKS` carries: 1 (the tag) + 10 + 7 x 512 is 3,595 bytes, inside one
 /// 4 KiB message. `fs` sends no more (its own `WRITE_RUN_MAX`).
 const WRITE_RUN_MAX: usize = 7;
 const STATUS_OK: u8 = 0;

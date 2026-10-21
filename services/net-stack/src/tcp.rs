@@ -851,13 +851,16 @@ pub struct Tcp {
 }
 
 /// Where `net-stack`'s time goes while a connection is being read, in counter ticks, from its first read
-/// to its release (`backlog/93` item 12). A read of 4 KiB costs a download 250 to 550 us on the T630, where
+/// to its release (`backlog/93` item 12). The polls are the service's, not one connection's: with two
+/// connections open, a poll for either is counted, and the report is said when either is released. The
+/// release comes about 2 s after the last read (the close and TIME_WAIT), and that time is in the report's
+/// "waiting to be asked". A read of 4 KiB costs a download 250 to 550 us on the T630, where
 /// a round trip and a 4 KiB copy should cost about 62 (BP1, BP9); this says which part of this service
 /// holds the rest. The parts do not overlap: a read's own time leaves out the polls it ran, which are
 /// counted with the polls.
 #[derive(Clone, Copy, Default)]
 pub struct Spent {
-    /// When the first read was answered, or 0 before it.
+    /// When the first read began, or 0 before it: nothing is counted until then.
     pub since: u64,
     /// Reads answered, the bytes they carried, and the time answering them, the polls they ran left out.
     pub reads: u32,

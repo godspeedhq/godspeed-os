@@ -238,7 +238,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // frame and then another. Draining the backlog first and painting once ends all three, because
         // the queue empties at the speed of the copy into the shadow rather than the speed of the pixels.
         //
-        // Blocking `recv` for the first message (idle costs nothing), then `try_recv` for whatever else
+        // A `recv` bounded at `BLINK_MS` for the first message (an idle console wakes twice a second to
+        // blink the cursor; where the clock is uncalibrated it blocks), then `try_recv` for whatever else
         // has already arrived - until the pass reaches its paint deadline (`paint_deadline`, a clock),
         // or, where the clock is uncalibrated, `DRAIN_BOUND` messages (§26.6 - a bound that is stated
         // must also be enforced).
@@ -256,8 +257,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // 60% of its core while its own accounting - taken at the loop's tail - recorded exactly
         // zero, because the tail was unreachable).
         //
-        // Bounding the pass bounds the work per pass, paints at least once per bound, and returns to a
-        // blocking recv so the core goes to whoever is waiting for it. A producer that keeps writing
+        // Bounding the pass bounds the work per pass, paints at least once per bound, and returns to the
+        // wait for the next message so the core goes to whoever is waiting for it. A producer that keeps writing
         // cannot hold this loop here.
         //
         // (Two diagnostics that once sat here are gone: cumulative paint and busy CYCLES, reported as

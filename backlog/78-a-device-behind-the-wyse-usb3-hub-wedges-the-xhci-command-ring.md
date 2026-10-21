@@ -97,8 +97,8 @@ hubs that a HID or the disk happens to be behind. QEMU can show it (`usb-hub` wi
 stick behind a second hub, then removing and re-adding the keyboard from the QEMU monitor).
 
 **Built 2026-10-20 (`c095c1ed`), QEMU-verified, and the Wyse card PASSED 2026-10-21.** Enumeration records every hub it keeps (`KeptHub`), and
-the poll loop watches each one no other scan covers - no HID behind it, not the disk's, not the dongle's -
-from an EP0 ring made coherent at loop entry as the HID hubs' rings are. QEMU, `q35`, a keyboard behind one
+the poll loop watches each kept hub with no HID, disk or dongle behind it, from an EP0 ring made coherent at
+loop entry as the HID hubs' rings are. QEMU, `q35`, a keyboard behind one
 `usb-hub` and a stick behind another: without the change the replugged keyboard was never found; with it,
 "device arrived on hub slot 1 port 1 (a hub nothing was bound behind) - re-enumerating" and the keyboard back.
 
@@ -115,6 +115,13 @@ confirmed: on that layout the keyboard and the stick are both on port 1 of their
 probe of the stick's port reset the keyboard's count ("reads connected (1/2)", for ever). The watch keeps its
 own state per hub now. The HID-driven scan and the disk scan still share theirs, so a device on port N of one
 hub and another on port N of a second can disturb each other's confirmation there too; not fixed.
+
+**Two hubs still watched by nobody, found by Audit 19 (2026-10-21) and not fixed:** the watch leaves out the
+disk's hub, and the disk scan runs only while no HID is bound (`ndev == 0`), so with a keyboard on one hub and
+the stick alone on another - the Wyse's layout - a device plugged in beside the stick is not seen while the
+keyboard is bound. And a hub with only the WiFi dongle behind it is left out as the dongle's, while no scan of
+the dongle's own exists, so neither an arrival there nor the dongle's unplug is seen. The exclusions should
+hold only while the scan they defer to is running; the care is the same as for the watch, one cursor per ring.
 
 **And one more, older than the watch, found the same day:** the other QEMU layout - the keyboard and the stick
 behind the SAME hub, the Pi 4's shape, which the disk scan is meant to cover - does not see the keyboard's replug

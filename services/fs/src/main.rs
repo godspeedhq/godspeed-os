@@ -579,14 +579,13 @@ const _: () = assert!(
     "Fs exceeds its stack budget - see the note above this assertion before raising it"
 );
 
-/// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
 /// The one path `Fs::walk` last resolved, and its entry.
 ///
 /// **A derived view, and subordinate (26.4, Commandment III):** the directory tree on the disk is the truth,
 /// and this is a copy of one lookup in it. It is forgotten at every metadata write (`tb_write`, through which
-/// every directory, bitmap and superblock block goes), at every transaction's commit and abort, and with the
-/// `Fs` itself at every mount; and it is neither read nor filled while a transaction is open, so it never holds
-/// a lookup of staged, uncommitted blocks. A file's data writes (`write_at`) change no directory block, which is
+/// every directory, bitmap and superblock block goes), when a transaction begins or aborts, and with the `Fs`
+/// itself at every mount; and it is neither read nor filled while a transaction is open, so a commit finds it
+/// empty and it never holds a lookup of staged, uncommitted blocks. A file's data writes (`write_at`) change no directory block, which is
 /// why a streamed file keeps its entry from one chunk to the next. A miss is a walk, so the worst a stale entry
 /// could do is what these rules exist to rule out; a path longer than `WALK_CACHE_PATH` is never cached.
 #[derive(Clone, Copy)]
@@ -600,6 +599,7 @@ impl WalkCache {
     const EMPTY: WalkCache = WalkCache { len: 0, path: [0; WALK_CACHE_PATH], entry: None };
 }
 
+/// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
 /// means the root directory (its extent lives in the superblock, it has no parent entry).
 #[derive(Clone, Copy)]
 struct Entry {
@@ -4823,9 +4823,9 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// One block-protocol transfer buffer: big enough for the largest REQUEST (write: op + lba + block)
-/// as well as the largest reply (status + block), because the bounded call stages the request and
-/// receives the reply in the SAME buffer.
+/// One single-block transfer: big enough for a one-block write REQUEST (tag + op + lba + block) as well as
+/// the largest reply (tag + status + block). A run (`OP_WRITE_BLOCKS`) is larger, and the bounded call
+/// carries it in `BLK_CALL_MAX`.
 ///
 /// One constant, used by both the buffer and this struct. They were two separate expressions - 514
 /// here and 514 at the call site, against a 522-byte write request - and sizing them independently is
@@ -4949,18 +4949,20 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // over `..._outcome`, whose enum CARRIES a `Message` - a second 4 KiB temporary on a service
     // already near its 256 KiB stack. On hardware it was an instant data abort at startup and an
     // 826-deep restart loop: a change meant to prevent a hang produced an unusable machine. The
-    // wrapper now writes the wait out itself and costs one message frame, not two.
+    // wrapper now writes the wait out itself, so no second `Message` temporary is made; its frame holds the
+    // call buffer and the request (`BLK_CALL_MAX`, `block_write_run`), about two messages' worth.
     //
     // 30 s is chosen against the WORK: `block-driver` retries a busy device for up to 30 s per block,
-    // so anything shorter abandons a request still being legitimately serviced.
+    // so anything shorter abandons a request still being legitimately serviced. A run of seven blocks is one
+    // request under the same 30 s, which a slow USB stick can outlast (`backlog/93` item 12, not changed).
     const BLOCK_RPC_SECS: i64 = 30;
-    // The reply lands in a buffer THIS function owns, sized to the protocol (status + one block), and
-    // the caller reads it as a slice. No `Message` is returned, forwarded or mutated anywhere on this
+    // The reply lands in a buffer THIS function owns, `BLK_CALL_MAX` (the call carries the request out in
+    // it and the reply back), and is copied into a `BlockReply` of `BLK_REPLY_MAX` for the caller. No `Message` is returned, forwarded or mutated anywhere on this
     // path - which is what makes room for the correlation tag that would not previously fit.
     // TAG + STATUS + BLOCK. Sized 1 + BLOCK first, which truncated every read by one byte: `fs` then
     // saw a 512-byte body where 513 belongs and rejected it as a desync - "block read at lba 0 got a
     // MALFORMED reply (512 bytes)". The shape check did its job; the buffer was simply a byte short.
-    // The shared transfer size - see `BLK_XFER_MAX`.
+    // A reply is at most `BLK_XFER_MAX`; the buffer is larger because it carries a run out too.
     let mut rbuf = [0u8; BLK_CALL_MAX];
 
     // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.

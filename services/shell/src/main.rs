@@ -917,10 +917,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if !line_reads_secret(line.bytes()) {
                         hist.push(line.bytes());
                         // Write-through to the fs (best-effort). Not while a job holds `fs` inside one
-                        // request (a check, a scrub, a tree delete): the save would wait its 2 s for
-                        // nothing, before the command had begun. The ring is written whole, so the next
-                        // save carries this line. Looked at again first (a short look, `copier_status`), so a
-                        // job that has ended does not go on stopping the save.
+                        // request (a check, a scrub, a tree delete): the load and the save would each wait
+                        // their 2 s for nothing, before the command had begun. The ring is written whole, so
+                        // the next save carries this line. Looked at again first (a short look,
+                        // `copier_status`), so a job that has ended does not go on stopping the save.
                         if fs_held_by_job(&ctx) { refresh_jobs(&ctx); }
                         if !fs_held_by_job(&ctx) {
                             // The file is merged in BEFORE the first save, and a save never runs until it
@@ -1084,8 +1084,8 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
                 // session history - do the bounded disk load (at most once, the `loaded` gate). It merges
                 // /users/default/history BEHIND the session, so `added` older lines land at the front; step into the
                 // newest of them and continue the up-nav. A wedged/absent/empty file adds nothing -> stay put.
-                // Consequence: startup never touches fs; a session that already fills HIST_MAX never loads
-                // (this arm's guard is false); the disk is read at most once, only on running out of history.
+                // Startup never touches fs, and the first command entered usually loads it first (`load`);
+                // a session that already fills HIST_MAX never loads here (this arm's guard is false).
                 let before = hist.len();
                 hist.load(ctx);
                 let added = hist.len() - before;
@@ -1929,16 +1929,19 @@ impl History {
     }
     /// Best-effort persistence to `/users/default/history` (§15: history is shell-OWNED state, externalized to the
     /// fs so a `kill shell` respawn reconstructs it). History is an ENHANCEMENT, never a requirement, so
-    /// neither path may hang the prompt on a slow/down fs (§26.7): the LOAD is lazy (only when the user
-    /// runs out of session history) and bounded, the SAVE is deadline-bounded (a true fire-and-forget save
+    /// neither path may hang the prompt on a slow/down fs (§26.7): the LOAD is lazy (at the first command
+    /// entered, or on running out of session history) and bounded, the SAVE is deadline-bounded (a true fire-and-forget save
     /// is blocked by fs's single-endpoint block-driver multiplexing - see `save`). A rug-pulled fs is then a
     /// non-event - no recall this session, shell fully usable - and both resume when fs heals.
     ///
     /// LAZY + one-shot + merge-behind. Not called at startup. It runs at whichever comes first: the first
     /// command entered (before its write-through, which saves the ring WHOLE - unmerged, that save replaced
     /// the file with this boot's lines alone and lost every earlier one, 2026-10-20), or an up-arrow PAST the
-    /// session's commands while there is room (len < HIST_MAX). Runs at most once (the `loaded` gate, set even on a bounded miss so later up-arrows never re-touch fs).
-    /// Bounded: a wedged/absent fs just leaves the session's own commands. The file's lines are OLDER than
+    /// session's commands while there is room (len < HIST_MAX). Succeeds at most once (the `loaded` gate),
+    /// and `loaded` is set only on an answer: the file read, or `fs` saying there is none. A bounded MISS
+    /// leaves it clear, so no save replaces a file that was never merged (Audit 19), and is tried again no
+    /// sooner than `HIST_RETRY_SECS`, so a down fs costs one bounded wait per half minute, not per command.
+    /// Bounded: a wedged fs just leaves the session's own commands. The file's lines are OLDER than
     /// anything typed this session, so they merge BEHIND the session commands (newest, kept); `push` drops
     /// the oldest - a file line - if the merge exceeds HIST_MAX. `#[inline(never)]` keeps its ~4 KiB frame
     /// off the interactive key path (the shell's user stack is tight).
@@ -21609,11 +21612,11 @@ const HIST_SAVE_SECS: i64 = 2;
 /// prompt forever on an unbounded request - the whole shell wedges and the keyboard looks dead. Bound it:
 /// a quick try, then "no history", so the prompt + `console_read` always come up regardless of fs health.
 const HIST_LOAD_SECS: i64 = 2;
+/// How long after a history load missed its bound before one is tried again (`History::load`).
+const HIST_RETRY_SECS: i64 = 30;
 
 /// The net-stack request correlation tag.
 ///
-/// How long after a history load missed its bound before one is tried again (`History::load`).
-const HIST_RETRY_SECS: i64 = 30;
 /// Its own counter in `ShellCtx` for the same reason `fs_tag` has one: a `static` here is the
 /// unowned global mutable state Invariant 9 forbids, and audit C6-1 already had to undo exactly that
 /// mistake on the fs channel. Never 0 - a zero tag can only come from a sender that does not tag.

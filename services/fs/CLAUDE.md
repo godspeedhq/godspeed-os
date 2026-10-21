@@ -28,8 +28,8 @@ until it actually uses a feature. See §6.15; proven by `osdev test fs-compat`. 
 structures and no more - a **superblock**, a **free bitmap** (1 bit/block, the only global
 structure), and a **directory tree** of self-describing 64-byte `file_record`s (no inode
 table, no inode number, no global file cap; the tree *is* the index, the bitmap is the
-allocation map, reclamation is intrinsic). 512-byte blocks (= one AHCI sector = one block-IPC
-request), all capacity fields **u64** (~8 ZiB ceiling).
+allocation map, reclamation is intrinsic). 512-byte blocks (= one AHCI sector; a read is one block-IPC
+request, a write one block or a run of up to seven, `OP_WRITE_BLOCKS`), all capacity fields **u64** (~8 ZiB ceiling).
 
 **Backup superblock (GSFS0008):** a second superblock copy lives at the **last block**
 (`total_blocks-1`, reserved in the bitmap). `mount` validates the primary (LBA 0); if its

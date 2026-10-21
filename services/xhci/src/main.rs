@@ -4782,9 +4782,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // failure path still repairs. Never silently assume the re-point happened (§26.7).
         }
         // THE HUBS NOBODY ELSE WATCHES (`KeptHub`). A hub with a HID behind it is probed by the HID-driven
-        // scan, the disk's hub by the disk scan when no HID is bound, and the WiFi dongle's by its own
-        // watch; each of those keeps its own cursor on that hub's one EP0 ring, so a second scanner there
-        // would desync it. Every OTHER kept hub is watched below, from a ring made coherent here exactly
+        // scan, and the disk's hub by the disk scan when no HID is bound; each keeps its own cursor on that
+        // hub's one EP0 ring, so a second scanner there would desync it. The disk's and the WiFi dongle's
+        // hubs are left out here too, which leaves two cases no scan covers (`backlog/78`, not fixed): the
+        // disk's hub while a HID is bound elsewhere, and a hub with only the dongle behind it, which those
+        // two scans reach only where they share it. Every OTHER kept hub is watched below, from a ring made coherent here exactly
         // as the HID hubs' rings are above: cleared, its dequeue re-pointed at the base, its cursor at 0.
         let mut watch = [false; MAX_HUBS];
         let mut kh_cur = [0usize; MAX_HUBS];
@@ -4793,7 +4795,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // `hub_tried` are kept by port NUMBER alone, so on the Wyse layout - the keyboard on port 1 of
         // one hub, the stick on port 1 of another - the disk scan's every unanswered probe of its port 1
         // reset the keyboard's count too, and the arrival read "connected (1/2)" for ever (QEMU,
-        // 2026-10-20). These persist across passes as theirs do not need to: a pass re-makes the hubs.
+        // 2026-10-20). These are re-made every pass, where theirs persist: a pass re-makes the hubs, so there
+        // is nothing to carry.
         let mut kh_seen = [[0u8; 64]; MAX_HUBS];
         let mut kh_tried = [0u64; MAX_HUBS];
         for h in 0..nhubs {

@@ -316,7 +316,8 @@ mod tests {
 
     #[test]
     fn the_rtl8168_layout_fits_exactly_and_one_more_byte_does_not() {
-        // TX ring, TX buffer, RX ring, 24 x 2 KiB RX buffers, the tally: what nic-driver lays out by hand.
+        // TX ring, TX buffer, RX ring, 24 x 2 KiB RX buffers, the tally: the RTL8168's layout when its ring was
+        // 24 (it is 256 now, in 132 pages); kept as a layout that fills its arena exactly.
         let mut used = 0;
         for (name, len, align) in [("tx ring", 128, 256), ("tx buffer", 2048, 4096), ("rx ring", 384, 4096),
                                    ("rx buffers", 24 * 2048, 4096), ("tally", 64, 64)] {

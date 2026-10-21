@@ -35,12 +35,16 @@ const OUT_MAX: usize = 4096;
 pub(crate) const HEAD_MAX: usize = 4096;
 /// A pause between reads that found nothing. `net-stack` keeps taking a download's frames in while this
 /// waits (it polls every millisecond while frames arrive, into a 256 KiB window), so the pause costs the
-/// download nothing but a little latency; it is short so that latency stays small.
+/// download nothing but a little latency; it is short so that latency stays small. Measured, it is longer than
+/// asked: the kernel ends a short sleep on the next scheduler tick, so each costs about 9 ms on the T630 (the
+/// `time` row's waits, 2026-10-20).
 pub(crate) const IDLE_MS: u64 = 2;
 
 /// Where a session's time went, in counter ticks: what a download reports so the stage that holds it back is
-/// measured rather than guessed (`backlog/93`). The handshake is in it. Single-threaded, so the parts do not
-/// overlap: what is left of a download's time beside them is the disk, the screen and the HTTP framing.
+/// measured rather than guessed (`backlog/93`). The handshake is in it, in both the reads and the decrypting
+/// (its records are opened by `read_record` too, the certificate checks with them). Single-threaded, so the
+/// parts do not overlap: what is left of a download's time beside them is the disk, the screen, the HTTP
+/// framing, and what comes before a session or is sent in one - the name lookup, the TCP connect and the sends.
 #[derive(Clone, Copy, Default)]
 pub struct Timing {
     /// In `net-stack` reads that brought bytes, and how many there were.

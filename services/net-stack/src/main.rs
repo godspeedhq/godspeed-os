@@ -2772,18 +2772,6 @@ fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: 
     })
 }
 
-/// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
-///
-/// The ping window is ~900 ms and cycle-based; this call was bounded by `LINK_SECS = 1` on the
-/// WHOLE-SECOND clock, so ONE drain could outlast the entire window. It did: the Pi 4 reported
-/// `closed after 1017663 us [budget 900000 us]` with `0 drains` - that counter increments after the
-/// deadline check, so zero means the loop completed exactly one pass and that pass ate the budget.
-/// Ping paces at 1 s, so a window running 1.018 s misses about every third reply, which reads as a
-/// flaky network and is arithmetic.
-///
-/// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
-/// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
-/// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
 /// Say where this service's time went while the connection just released was read (`tcp::Spent`), and start
 /// the count again. Said only for a connection that was read, so a connect that carried nothing is quiet.
 /// What is left of the time beside the parts is this loop waiting for a client to ask.
@@ -2809,6 +2797,18 @@ fn report_spent(ctx: &ServiceContext, sp: &mut tcp::Spent) {
     *sp = tcp::Spent::default();
 }
 
+/// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
+///
+/// The ping window is ~900 ms and cycle-based; this call was bounded by `LINK_SECS = 1` on the
+/// WHOLE-SECOND clock, so ONE drain could outlast the entire window. It did: the Pi 4 reported
+/// `closed after 1017663 us [budget 900000 us]` with `0 drains` - that counter increments after the
+/// deadline check, so zero means the loop completed exactly one pass and that pass ate the budget.
+/// Ping paces at 1 s, so a window running 1.018 s misses about every third reply, which reads as a
+/// flaky network and is arithmetic.
+///
+/// A whole-second bound cannot fit inside a 900 ms budget, so the bound and the budget it must fit
+/// inside are now read from the same clock. Abandoning on timeout is NOT new - the seconds variant
+/// this replaces abandoned at 1 s; this only makes the wait shorter and sub-second.
 fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Option<Message> {
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment

@@ -27,6 +27,10 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    download on the Wyse, about 64 per 12,000 frames on the T630. Each stop is a loss the sender recovers
    from. A larger arena and ring is the obvious step. **Why the Wyse is 3.6 times slower than the T630 on the
    same chip and image is not measured.**
+   *(2026-10-21: the ring is 256 in a 132-page arena (`b162d007`). The T630 card on it saw no restart during a
+   download and none since, only while the link is idle; downloads went from 0.16-0.72 to 1.5-2.0 MiB/s on
+   that change alone. Why the Wyse is slower is measured now, in item 12: the same work, a slower trip
+   between cores.)*
 2. **The Pi 4's radio loses superframes over 4 KiB.** *(The region read is built on `feat/gs-driver`,
    `1bcfb9cb`: the CYW43455's data and scan paths read into a 64 KiB region. A Pi 4 card is owed, and
    `small_window` is not yet lifted. Item 10 names the paths that still read 4 KiB.)* `wifi-driver` reads the CYW43455 into a 4096-byte
@@ -146,6 +150,41 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    so the cable's hop alone tops out near 55 MB/s with perfect batching, before TLS and `fs` take theirs. An
    estimate of 15 to 30 MB/s is what this design can reach; beyond that is a constitutional question for the
    operator, not a change to make quietly.
+
+   **2026-10-21: where it stands, and where a read's time goes.** Three changes since: the ring of 256 (item 1),
+   `fs` keeping the last path walk (`d4c5a750`) and a chunk's seven blocks written in one request
+   (`OP_WRITE_BLOCKS`, `075734d5`; on AHCI one command, on USB still one host call per block). So the disk path
+   above, a walk from the root and seven requests per chunk, is how it was until 2026-10-20. Six T630 downloads
+   at `c095c1ed`: **3.0 to 3.8 MiB/s**, the network 1.0 to 1.7 s, decrypting 0.4 s, the disk 0.56 to 1.08 s.
+   The Wyse on the same image: 1.5 to 2.1 MiB/s, the network 1.7 to 3.8 s, the disk 1.0 to 1.8 s - its disk is
+   a "32GB SATA Flash Drive" on AHCI, the T630's a Samsung SSD.
+
+   `net-stack` now says where its own time goes while a connection is read (`tcp::Spent`, `14ac8dd8`). Its
+   card, both machines, five or six downloads each, gives one read of 4 KiB from both sides:
+
+   | Machine | `godspeed-pm` on | one read, as `godspeed-pm` waits for it | `net-stack`'s work for it | one ask of `nic-driver` |
+   |---------|------------------|------------------------------------------|---------------------------|-------------------------|
+   | T630 | core 0, 2 or 3 | 243 to 291 us | 2 us | 173 to 208 us, 1.9 frames |
+   | T630 | core 1, beside `net-stack` | 508 us | 2 us | 329 us |
+   | Wyse | core 0, 2 or 3 | 679 to 805 us | 2 us | 157 to 166 us |
+   | Wyse | core 1 | 1,032 to 1,258 us | 3 us | 480 to 487 us |
+
+   So a read costs `net-stack` almost nothing. 40 to 55% of reads arrive while it is asking `nic-driver` for
+   frames and wait out the ask (about 45 us on average on the T630); the rest, about 230 us on the T630 and
+   about 650 on the Wyse, is the request and the reply crossing between cores, where a same-core round trip
+   measured 51 us (BP1). Core 1 is slower still because `godspeed-pm` then shares it with `nic-driver`,
+   `net-stack`, `fs` and `block-driver`. That is the Wyse's slower network, and likely its slower disk, since
+   every write is a call to `fs` on core 1 too. Spreading services over cores was considered and set aside:
+   it adds cross-core trips rather than removing cost (the operator's question, 2026-10-21). **The next
+   measurement is BP1 and BP2 on today's kernel, on both machines** (`osdev image --mode perf-brutal`), to see
+   whether the cross-core round trip itself costs what these reads imply; if it does, its wake path is the
+   target.
+
+   Two code defects in the disk path, found by Audit 19 and not changed: `fs`'s `BLOCK_RPC_SECS` (30 s) now
+   bounds a whole run of seven blocks, while on USB `block-driver` makes seven host calls of up to
+   `IO_RPC_SECS` (10 s) each, so a slow stick can have `fs` give up on a run still in progress and leave its
+   reply orphaned; and `block_write_run` shortens a run longer than `WRITE_RUN_MAX` without a word (its one
+   caller never passes one).
 
 ## Where to start
 

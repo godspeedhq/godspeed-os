@@ -371,7 +371,9 @@ historical Phase-1 record.
 - **A global accelerator** (skip the walk for hot paths) would be a *performance* cache. If
   a measured need ever pulls one in (§26.2), it lives **on disk, rebuildable, disposable,
   never RAM-resident, never authoritative** (the tree stays truth) and **visible, not a
-  hidden layer** (§26.4). Not built now.
+  hidden layer** (§26.4). Not built now. *(2026-10-20: `fs` keeps ONE path walk in RAM, the last
+  (`WalkCache`), so a streamed file is not looked up from the root per chunk. It is not this accelerator: one
+  entry, cleared at every metadata write and when a transaction begins or aborts, never used inside one.)*
 
 **Bounds (still bounded, §26.6) - but local, not a global wall:** the only ceiling is the
 disk itself (the bitmap). Directories **grow** (allocate a bigger extent when full), so
@@ -1238,7 +1240,7 @@ Test 14).
 > **Note (2026-10-09): the proposal, not the protocol.** What shipped is opcode-addressed with a
 > correlation tag at byte 0. `fs` <-> `block-driver`: `[tag, op, lba:u64 LE, ...]` -> `[tag, status,
 > ...]`, ops 1 `OP_READ_BLOCK`, 2 `OP_WRITE_BLOCK`, 3 `CAPACITY`, 4 `OP_WRITE_ZEROS`, 5 `FLUSH` - one block per
-> request, not a count. Client <-> `fs`: ops 10-31 (`OP_WRITE_FILE` 10, `OP_READ_FILE` 11,
+> request, not a count - and since 2026-10-20 6 `OP_WRITE_BLOCKS`, a run of 1 to 7 consecutive blocks (`count:u8`). Client <-> `fs`: ops 10-31 (`OP_WRITE_FILE` 10, `OP_READ_FILE` 11,
 > `OP_STAT_FILE` 12, directories, rename/move/delete, drives, streaming `OP_WRITE_NEW`/`OP_WRITE_AT`/
 > `OP_READ_AT` 24-26, check, scrub, `OP_OPEN` 30, `OP_SEAL` 31). The constants are the definition:
 > `services/fs/src/main.rs` and `services/block-driver/src/main.rs`.

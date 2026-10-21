@@ -119,7 +119,7 @@ const TX_RING_BYTES: u32   = (TX_RING_COUNT * 16) as u32;
 // (2026-10-18). A sender puts a window's worth on the wire at once, and the ring is all that holds a
 // burst until net-stack takes it: past eight frames the rest were dropped, the sender saw loss, and a
 // download in QEMU never had more than 12.7 KiB in flight against a 64 KiB window, with three to five
-// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too.
+// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too, and still are.
 //
 // TWO HUNDRED AND FIFTY-SIX (2026-10-20), because twenty-four was the CABLE's limit as eight had been QEMU's.
 // The receive window is 256 KiB, and a sender puts that on the wire at line rate - about 180 full frames in
@@ -423,16 +423,6 @@ fn rtl_arm_rx(arena: &Parts, i: usize) {
     arena.rx_ring.write32(d, o1);
 }
 
-/// Restart the RTL8168's receiver on an empty ring: RX off, a pause for a frame the chip is still
-/// writing, every descriptor armed, the ring base re-pointed (which puts the chip back at descriptor 0),
-/// RX on. Whatever the ring held is gone, so this runs only for a receiver the chip stopped, and only once
-/// its frames are taken or stale (`RTL_STALE_RX_MS`).
-///
-/// **The pause is the fix for damaged segments** (`backlog/93` item 11). Without it, a frame in flight when
-/// RX went off finished landing - its status written - after its descriptor had been armed again, and was
-/// taken as a frame: its first 128 bytes (one DMA write) were the right frame and the rest another's, or its
-/// length was another frame's. Every one of seven such segments on the T630 came within 0 to 76 ms of a
-/// restart. The bring-up quiesces the same way, for the same reason (`RTL_QUIESCE_MS`).
 /// Whether a received descriptor the chip handed back holds a whole, sound frame: no error summary
 /// (`RTL_RX_RES`), and first AND last segment, so the frame is all in this one buffer. What r8169 checks before
 /// it takes a frame, and this driver did not until 2026-10-20: `net-stack` was dropping segments whose bytes past
@@ -442,6 +432,17 @@ fn rtl_rx_sound(o1: u32) -> bool {
     o1 & RTL_RX_RES == 0 && o1 & (RTL_DESC_FS | RTL_DESC_LS) == (RTL_DESC_FS | RTL_DESC_LS)
 }
 
+/// Restart the RTL8168's receiver on an empty ring: RX off, a pause for a frame the chip is still
+/// writing, every descriptor armed, the ring base re-pointed (which puts the chip back at descriptor 0),
+/// RX on. Whatever the ring held is gone, so this runs only for a receiver the chip stopped, and only once
+/// its frames are taken or stale (`RTL_STALE_RX_MS`).
+///
+/// **The pause was the first suspect for damaged segments** (`backlog/93` item 11): a frame in flight when RX
+/// went off could finish landing after its descriptor had been armed again, and be taken as a frame whose first
+/// 128 bytes (one DMA write) were right and the rest another's. Every one of seven such segments on the T630
+/// came within 0 to 76 ms of a restart. The pause did not end them, and neither did `rtl_rx_sound`; a ring of
+/// 256 (`RX_RING_COUNT`) did: with it no restart has come during a download, only while the link is idle. The
+/// pause stays, as the bring-up's does (`RTL_QUIESCE_MS`).
 fn rtl_restart_rx(ctx: &ServiceContext, mmio: &Registers, arena: &Parts) {
     mmio.write8(RTL_CR, RTL_CR_TE);
     delay::hold(ctx, Budget::ms(RTL_RX_QUIESCE_MS));
@@ -627,10 +628,9 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
         if let Some(why) = why {
             rtl_restart_rx(ctx, mmio, arena);
             rx_restarts = rx_restarts.saturating_add(1);
-            // EVERY restart is said, for now, not the first eight and every 64th: `net-stack` drops
-            // segments whose bytes past the first 128 belong to another frame, and whether each follows a
-            // restart is a question of timestamps (`backlog/93` item 11, 2026-10-20). Thinned again
-            // once that is answered.
+            // EVERY restart is said, not the first eight and every 64th, while `backlog/93` item 11 is
+            // open: `net-stack` dropped segments whose bytes past the first 128 belonged to another frame,
+            // and these lines are what showed each followed a restart (`6cda1d65`, 2026-10-20).
             ctx.log_fmt(format_args!(
                 "nic-driver: RTL8168 receiver restarted (#{}) - {}; ISR since the last 0x{:04x}, rx_idx was {}, {} frames taken",
                 rx_restarts, why, isr_seen, rx_idx, rx_count));
@@ -942,8 +942,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok
         let tx_done = arena.tx_ring.read32(td) & RTL_DESC_OWN == 0;
         if !tx_done {
             // With a single descriptor a ring desync is impossible, so a timeout here is a genuine NIC
-            // hiccup, not a cascade. Fail FAST (the tight bound above), DIAGNOSE (first few, to confirm
-            // the desync is gone), and RECOVER the engine: TE off/on to reset it, clear latched status,
+            // hiccup, not a cascade. Fail FAST (the tight bound above), DIAGNOSE (every one, below), and
+            // RECOVER the engine: TE off/on to reset it, clear latched status,
             // drop the stuck OWN. RE stays on, so RX is undisturbed (VIII bounded+loud, IX recover).
             let isr = mmio.read16(RTL_ISR);
             let cr  = mmio.read8(RTL_CR);

@@ -1641,3 +1641,72 @@ in code, recorded and not changed.
 
 **Gates:** every documentation checker green (dash, doc refs, docs index, facts, line refs, doc and comment
 symbols), and the commandments selftest 78/78.
+
+## Audit 19 - documents and code comments, the download and hot-plug work (2026-10-21)
+
+Scope: the 18 commits on `feat/gs-driver` after Audit 18 (`f461feaa..14ac8dd8`): the TCP checksum and the
+damaged-segment comparison in `net-stack`, the RTL8168 restarts, sound check and ring of 256 in `nic-driver`,
+the download's `time` row, the shell's history and key logging, the console's blink, `fs`'s walk cache and
+`OP_WRITE_BLOCKS`, xhci's watch of every kept hub, and `net-stack`'s `tcp::Spent` - 22 files. Two read-only
+reviewers split the diff and swept the current-tense docs beside it; every finding was re-read against the
+code by the session that made the change, so this is closer to a self-audit than an independent one.
+
+**Result.** Corrections in the comments of 11 source files and in 7 documents. One finding was wrong and is not
+applied.
+Eight code defects: five fixed in a separate commit, three recorded.
+
+**Comments on the wrong item, after an insertion:** `rtl_rx_sound` was put between `rtl_restart_rx`'s doc and
+its `fn`, `report_spent` between `nic_drain_ms`'s doc and its `fn`, and `WalkCache` inside `Entry`'s doc, so
+each of three docs described the item beside the one it was written for. Moved back.
+
+**Overclaims and text the work made false:**
+- `rtl_restart_rx`'s doc called its pause "the fix for damaged segments"; the next card showed it was not, and
+  neither was the sound check. It says so now, and that the ring of 256 ended them.
+- The comments on logging every RTL8168 restart and TX timeout said "thinned again once that is answered" and
+  "first few"; the timing was answered (`6cda1d65`), and every one is said while item 11 is open.
+- The console's loop said its first wait blocks ("idle costs nothing"); it is bounded at `BLINK_MS` to blink.
+  `Term::blink` said output redraws the cursor "after every byte"; a bare `\r` and a request do not.
+- The shell's history said the load runs "only when the user runs out of session history"; the first command
+  entered loads it too.
+- `Timing` and `utilities/65_download.md` said what is left beside the parts is the disk, the screen and the
+  framing; the name lookup, the connect and the sends are in no figure, and the handshake is in two.
+  `IDLE_MS` is asked for as 2 ms and costs about 9 on the T630 (a sleep ends on the next tick).
+- `tcp::Spent` said it counts "from its first read to its release"; its polls were counted from the last
+  report. The counting was changed to match (a defect, below), and the doc says the polls are the service's,
+  and that the release's TIME_WAIT is in the "waiting" figure.
+- `fs`'s `BLK_XFER_MAX` doc, `block_rpc`'s buffer comments and its "one message frame" were written for the
+  1 KiB call buffer; the call buffer is `BLK_CALL_MAX`, 4 KiB, and a run is under the same 30 s as a block.
+  `WalkCache` said it is forgotten "at every commit"; it is cleared when a transaction begins or aborts.
+- xhci's hub watch said the dongle's hub has "its own watch" (there is none) and that its per-hub state
+  persists across passes (it is re-made each pass; the shared state persists). `backlog/78` said the watch
+  covers every hub no other scan covers; two hubs are covered by none (a defect, below).
+- `block-driver`'s `WRITE_RUN_MAX` doc gave "7 x 512 + 10, with the tag" as 3,595, which is 3,594 without it.
+- `docs/persistence.md` 8 listed five block ops "one block per request, not a count"; op 6 carries a count. Its
+  "global accelerator ... never RAM-resident, not built now" now says what the walk cache is and is not.
+  `services/fs/CLAUDE.md` made a block one block-IPC request; a write may be a run.
+- `stdlib`'s arena test called its 24-buffer layout "what nic-driver lays out"; the RTL8168's ring is 256.
+- `backlog/93` items 1 and 12 described the 24-ring and the walk from the root per chunk as current, and its
+  README row the ring as the next step. Each is dated now, with the card that measured where a read's time goes.
+- `docs/tcp-design.md` gave `tcp selftest` as 67 checks without a date; 77 on 2026-10-21.
+
+**One finding not applied:** that nic-driver's arena is 132 pages "on every port", so GENET's and dwmac's
+"64 KiB" comments are stale. The kernel uses a spawn's `dma_pages` only for a PCI class
+(`kernel/src/task/mod.rs`, `HwClass::dma_pages`); the fixed GENET and dwmac windows still get 64 KiB.
+
+**Code defects, fixed separately (an audit changes documents and comments only):**
+- The shell marked history loaded when its load MISSED its bound, so the next save replaced the file with
+  this boot's lines: the wipe that `aa81a796` fixed, still open on a slow `fs`. It also loaded before checking
+  for a job holding `fs`. Now only an answer marks it loaded, a save waits for one, a miss is retried no sooner
+  than 30 s, and neither runs while a job holds `fs`.
+- The shell's unrecognised-key line printed `ESC[0x` for `ESC[x` and could carry a control byte.
+- The console marked its cursor drawn on any message, so after a `\r` the next blink lifted a cursor that was
+  already lifted, and it stayed off for about a second.
+- `report_spent`'s "waiting" figure saturated to 0 when the polls before a connection's first read outweighed
+  its reads; polls now count from the first read.
+- `block_write_run` shortened a run longer than `WRITE_RUN_MAX` without a word; it refuses one now.
+
+**Code defects, recorded and not changed:** two xhci hubs watched by no scan (`backlog/78`); a run of seven
+blocks under `fs`'s one 30 s bound while a USB stick takes up to seven host calls of 10 s (`backlog/93` item 12).
+
+**Gates:** every documentation checker green (dash, doc refs, docs index, facts, line refs, doc and comment
+symbols, foreign words, doc commands, backlog).
