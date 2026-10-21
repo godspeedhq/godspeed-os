@@ -180,11 +180,29 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    whether the cross-core round trip itself costs what these reads imply; if it does, its wake path is the
    target.
 
-   Two code defects in the disk path, found by Audit 19 and not changed: `fs`'s `BLOCK_RPC_SECS` (30 s) now
+   **2026-10-21, later: it does not.** perf-brutal at `376e1595`: BP1 (same core) 112,013 cycles on the T630
+   (56 us) and 64,498 on the Wyse (43 us); BP2 (cross core) 135,651 on the T630 (68 us) and 15,448,268 on the
+   Wyse (10.3 ms, 1.03 ticks). A kernel wake trace (feature `wake-trace`, `51379c86`) then ran the same suite
+   on both: no wake IPI is lost (sent and taken agree on every core), the tick clock keeps time (500 ticks in
+   5,030 to 5,040 ms), and a woken task runs as soon as the IPI's handler does. What is slow is DELIVERY, and
+   it has two clusters with nothing between: under 50 us, or 1 ms to 166 ms, none at 200 to 1,000 us. The slow
+   ones fall only while the suite runs - every wake after it took under 50 us - on the T630 77 of about 580
+   (13%), on the Wyse 177 of about 560 (32%). That is a core taking no interrupts for milliseconds under the
+   suite's load (the spawn and restart probes are the first suspect, not shown), on both machines and worse
+   on the Wyse, so BP2's 10 ms there measured the suite, not the machine.
+
+   **And the T630's reads were not the cost.** The `time` row of a download at the same build (card of
+   2026-10-21): 2,515 reads in 1,157 ms, of which 115 found nothing and waited 1,082 ms - the 2,400 that
+   brought bytes cost about 31 us each. Its 9,023 frames came in 4,916 asks of `nic-driver` (190 us each, 935
+   ms), a pace that would allow about 14 MB/s. So the table above, read as "a read costs 243 to 291 us", folds
+   the waiting in; on the T630 the time is data not yet arriving, and why it arrives slowly (the TCP window,
+   the acknowledgement pace) is the next question, not the cross-core hop.
+
+   Two code defects in the disk path, found by Audit 19: `fs`'s `BLOCK_RPC_SECS` (30 s) now
    bounds a whole run of seven blocks, while on USB `block-driver` makes seven host calls of up to
    `IO_RPC_SECS` (10 s) each, so a slow stick can have `fs` give up on a run still in progress and leave its
-   reply orphaned; and `block_write_run` shortens a run longer than `WRITE_RUN_MAX` without a word (its one
-   caller never passes one).
+   reply orphaned; and `block_write_run` shortened a run longer than `WRITE_RUN_MAX` without a word (its one
+   caller never passes one) - that one is fixed, it refuses such a run now (`97892ba0`).
 
 ## Where to start
 
