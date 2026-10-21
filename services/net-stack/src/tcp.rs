@@ -48,6 +48,12 @@ pub const RCV_SMALL: usize = 8192;
 /// whatever the link can do. 256 KiB over the same path is 10 MiB/s, which is past what this stack can take
 /// in through 4 KiB messages today, so the window stops being the limit.
 pub const RCV_BIG: usize = 256 * 1024;
+/// The most a connection over a RADIO offers ([`Conn::small_window`]): 32 KiB, half of the 64 KiB region
+/// each radio driver reads the chip into, so a burst the window allows always fits one read. Under 64 KiB,
+/// so the window field holds it unscaled and the SYN asks no scale. It was [`RCV_SMALL`], 8 KiB, which over
+/// a WiFi round trip is about 200 KiB/s: a 10 MB download over the Pi 4's radio came down at 208 KiB/s,
+/// 25 s of its 46 waiting for data (backlog/93, 2026-10-21).
+pub const RCV_RADIO: usize = 32 * 1024;
 /// Out-of-order RANGES tracked while waiting for a gap to fill. A segment that arrives ahead of a gap is put
 /// straight into its place in the receive arena - the window is the arena's free space, so anything in the
 /// window has a place - and only its sequence range is kept here; neighbouring ranges merge. A segment that
@@ -380,17 +386,18 @@ impl Conn {
         have.min(self.rcv_limit)
     }
 
-    /// Offer the peer no more than the small window ([`RCV_SMALL`]), for a connection whose link cannot take a
-    /// large one's bursts. Before the SYN: the window and its scale are settled by the handshake.
+    /// Offer the peer no more than [`RCV_RADIO`], for a connection whose link cannot take a large window's
+    /// bursts. Before the SYN: the window and its scale are settled by the handshake.
     ///
     /// **Why a link would not.** Over a radio both drivers here read the chip into fixed buffers, and a large
     /// window lets the access point send bursts the chip hands over as one transfer: 26 KiB through the
     /// VisionFive's AIC8800 (which now reads its whole queue) and superframes of 4.7 to 14 KB through the Pi 4's
     /// CYW43455, whose driver reads at most 4 KiB - so the rest stayed unread, the radio stopped, and after a
-    /// `godspeed fetch` even `ping` failed (2026-10-19). Until the radio drivers can take a large window's
-    /// bursts, a connection over a radio keeps the window it had before, which worked.
+    /// `godspeed fetch` even `ping` failed (2026-10-19). Both drivers now read into a 64 KiB region (the
+    /// CYW43455's `ctrl::RX_REGION`, the AIC8800's `aic::RX_REGION`), and a 7,232-byte superframe came through
+    /// whole on the Pi 4, so the limit is half of that region rather than the 8 KiB that came before it.
     pub fn small_window(&mut self) {
-        self.rcv_limit = RCV_SMALL;
+        self.rcv_limit = RCV_RADIO;
     }
 
     fn rcv_ring(&mut self) -> &mut [u8] {
@@ -1600,11 +1607,11 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
         check(c.last_adv as usize == RCV_BIG, "a scaled peer is told the whole arena", &mut pass, &mut fail);
     }
     if c.rcv_big.is_some() {
-        // Over a radio the large arena offers only the small window, and its SYN asks no scale.
+        // Over a radio the large arena offers only the radio's window, and its SYN asks no scale.
         c.reset();
         c.small_window();
-        check(c.window() as usize == RCV_SMALL && c.our_ws() == 0,
-              "a connection over a radio offers the small window, unscaled, from the large arena", &mut pass, &mut fail);
+        check(c.window() as usize == RCV_RADIO && c.our_ws() == 0,
+              "a connection over a radio offers 32 KiB, unscaled, from the large arena", &mut pass, &mut fail);
     }
     *spare = c.rcv_big.take();
 
