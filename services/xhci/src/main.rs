@@ -5299,6 +5299,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                &mut kb_rep, &mut kb_caps, &mut mouse);
                             if !irq_this_pass { hid_needs_poll = true; }   // harvested without an interrupt: polling is load-bearing here
                             need_queue[d] = true;
+                        } else if disk.as_ref().is_some_and(|d| d.slot == slot_id) {
+                            // The disk's gather write, finished while nothing was waiting for it
+                            // (`msc`, OVERLAP). Filed, so `msc::try_finish` or the next wait collects it.
+                            eaten.put(slot_id, ep, cc, res, ptr);
                         } else if devs[..ndev].iter().any(|h| h.hub_slot == slot_id) {
                             // A hub's completion, dequeued here with no probe waiting - it arrived
                             // after the probe that asked gave up. FILE IT rather than discard it, so

@@ -68,13 +68,14 @@ const CMD_PAGE: usize = 0x2000;
 const CSW_OFF: usize = CMD_PAGE + 64;
 /// Data buffer (one page). Caps a single transfer at 8 sectors of 512 B.
 const DATA_BUF: usize = 0x3000;
-/// The GATHER buffer: consecutive runs of a file's data, held here and written to the stick as one
-/// WRITE(10) ([`GATHER_SECTORS`]). 56 KiB, sixteen of `fs`'s seven-block runs. Its own pages, as the
-/// data page is, so nothing else's transfer can land on what is waiting to be written.
-const GATHER_BUF: usize = 0x4000;
+/// The two GATHER buffers: consecutive runs of a file's data, held and written to the stick as one
+/// WRITE(10) ([`GATHER_SECTORS`]). 56 KiB each, sixteen of `fs`'s seven-block runs. TWO, so one is
+/// written while the next fills (OVERLAP, below). Their own pages, as the data page is, so nothing
+/// else's transfer can land on what is waiting to be written.
+const GATHER_BUFS: [usize; 2] = [0x4000, 0x4000 + GATHER_BYTES];
 const GATHER_BYTES: usize = 0xE000;
 /// Total size of the region: the size of its part (`lay_out`).
-pub const DISK_REGION_BYTES: usize = GATHER_BUF + GATHER_BYTES;
+pub const DISK_REGION_BYTES: usize = 0x4000 + 2 * GATHER_BYTES;
 
 /// WRITE GATHERING. A stick answers each Bulk-Only command after its own turnaround, so a file written
 /// a seven-block run at a time paid that turnaround per run: on the Pi 4, 10 s of a 12 s, 10 MB download
@@ -93,6 +94,15 @@ pub const DISK_REGION_BYTES: usize = GATHER_BUF + GATHER_BYTES;
 pub const GATHER_SECTORS: u32 = (GATHER_BYTES / SECTOR as usize) as u32;
 /// How long a held run waits for the next before it is written.
 pub const GATHER_IDLE_MS: u64 = 10;
+
+// OVERLAP. A gather's WRITE(10) is STARTED and left in flight - command, data and the status read all
+// posted, the status the only one that raises an event - and the driver goes back to serving `fs`, which
+// fills the other buffer while the stick takes the first. With one buffer the download waited out every
+// write: on the Pi 4, 4.5 to 5 s of a 6 to 7 s download, with the network's 1.5 s in series with it
+// (`backlog/93`). The write is FINISHED - its status collected, from the mailbox the main loop files it in
+// (`EvMail`) or from the ring - before anything else needs the stick: the next gather, a read, a single
+// write or a flush. So a FLUSH still answers only once every byte before it is written, and a read still
+// sees what was written; what moved is only when the driver waits.
 
 /// Largest data payload one BOT command may carry - the data page.
 pub const MAX_XFER: u32 = 0x1000;
@@ -129,9 +139,10 @@ const MAX_UNRELATED_EVENTS: u32 = 4096;
 
 /// A bulk endpoint's transfer ring: a one-page producer cursor with a Link TRB at the tail.
 ///
-/// The ring can never fill, and that is a proof rather than a hope: BOT is strictly synchronous, so
-/// at most ONE TRB is outstanding on either ring at any moment (every push is followed by an await
-/// before the next). A fullness check here could never fire, and a check that cannot fire is not
+/// The ring can never fill, and that is a proof rather than a hope: BOT allows one command at a time, so
+/// at most one command's TRBs are outstanding on either ring at any moment - three on the OUT ring for a
+/// gather write in flight (its CBW and a data TD of at most two), one otherwise - and every command is
+/// finished before the next is posted. A fullness check here could never fire, and a check that cannot fire is not
 /// evidence of anything - so the invariant is stated instead of tested, and the only bookkeeping is
 /// the wrap.
 struct Ring {
@@ -157,6 +168,11 @@ impl Ring {
     /// Returns the TRB's physical address: the pointer its transfer event will carry, which is how
     /// the wait knows the completion is this TD's (`await_on_slot`).
     fn push(&mut self, dma: &Parts, buf_phys: u64, len: u32) -> u64 {
+        self.push_ioc(dma, buf_phys, len, true)
+    }
+
+    /// [`Ring::push`], with Interrupt On Completion only if `ioc`: a stage nobody waits on raises no event.
+    fn push_ioc(&mut self, dma: &Parts, buf_phys: u64, len: u32, ioc: bool) -> u64 {
         // Wrap if this TRB plus the Link that would follow it do not both fit. The Link is written
         // AT the cursor (where the controller's dequeue pointer sits), so there is no stale gap in
         // front of it for the controller to stop on.
@@ -179,7 +195,7 @@ impl Ring {
         // TD Transfer Size in 21:0. Interrupter target 0.
         dma.disk.write32(t + 8, len & 0x1F_FFFF);
         // Cycle | IOC (bit 5) | type. IOC is what makes the transfer produce the event we await.
-        dma.disk.write32(t + 12, self.pcs | (1 << 5) | (TRB_NORMAL << 10));
+        dma.disk.write32(t + 12, self.pcs | if ioc { 1 << 5 } else { 0 } | (TRB_NORMAL << 10));
         self.cur += TRB_SIZE;
         dma.disk.phys_at(t)
     }
@@ -190,6 +206,11 @@ impl Ring {
     /// last TRB's address, the one its event carries. A buffer that crosses no boundary is one TRB, as
     /// [`Ring::push`] posts.
     fn push_td(&mut self, dma: &Parts, buf_phys: u64, len: u32, mps: u32) -> u64 {
+        self.push_td_ioc(dma, buf_phys, len, mps, true)
+    }
+
+    /// [`Ring::push_td`], with Interrupt On Completion on its last TRB only if `ioc`.
+    fn push_td_ioc(&mut self, dma: &Parts, buf_phys: u64, len: u32, mps: u32, ioc: bool) -> u64 {
         const BOUND: u64 = 0x1_0000;
         let mut pieces = [(0u64, 0u32); 4];
         let (mut n, mut at, mut left) = (0usize, buf_phys, len as u64);
@@ -222,8 +243,8 @@ impl Ring {
             dma.disk.write32(t, phys as u32);
             dma.disk.write32(t + 4, (phys >> 32) as u32);
             dma.disk.write32(t + 8, (plen & 0x1_FFFF) | (td_size << 17));
-            // Chain (bit 4) on all but the last; IOC (bit 5) on the last.
-            let flags = if more { 1 << 4 } else { 1 << 5 };
+            // Chain (bit 4) on all but the last; IOC (bit 5) on the last, if asked for.
+            let flags = if more { 1 << 4 } else if ioc { 1 << 5 } else { 0 };
             dma.disk.write32(t + 12, self.pcs | flags | (TRB_NORMAL << 10));
             self.cur += TRB_SIZE;
             last = dma.disk.phys_at(t);
@@ -281,6 +302,20 @@ pub struct Disk {
     gather_at: Option<wait::Since>,
     /// A held write failed since the last FLUSH: the next FLUSH answers an error, once.
     gather_lost: bool,
+    /// Which of [`GATHER_BUFS`] is filling.
+    gather_buf: usize,
+    /// The gather write in flight (OVERLAP): its status TRB, its CBW tag, and what it covers.
+    pending: Option<Pending>,
+}
+
+/// A WRITE(10) started and not yet finished: the TRB its CSW retires, the tag the CSW must carry, and the
+/// sectors it writes, for what is said if it fails.
+#[derive(Clone, Copy)]
+struct Pending {
+    csw_trb: u64,
+    tag: u32,
+    lba: u64,
+    n: u32,
 }
 
 impl Disk {
@@ -306,12 +341,14 @@ impl Disk {
             gather_n: 0,
             gather_at: None,
             gather_lost: false,
+            gather_buf: 0,
+            pending: None,
         }
     }
 
-    /// Sectors held in the gather buffer, not yet on the stick.
+    /// Sectors held, or in flight, not yet on the stick.
     pub fn gathered(&self) -> u32 {
-        self.gather_n
+        self.gather_n + self.pending.map_or(0, |p| p.n)
     }
 
     /// Physical address of the bulk-OUT ring, for the Configure Endpoint input context.
@@ -676,9 +713,9 @@ pub fn write10(
     ) == Some(0)
 }
 
-/// Write what the gather buffer holds as one WRITE(10), and empty it. A failure is said, with the
-/// sectors it covered, and marks the next FLUSH to fail (`Disk::gather_lost`). `true` when nothing was held
-/// or the write took.
+/// START writing what the filling gather buffer holds, as one WRITE(10), and turn to the other buffer
+/// (OVERLAP). The write before it is finished first, because the CBW page and the other buffer are its.
+/// `true` when nothing was held or the write was started.
 #[allow(clippy::too_many_arguments)]
 pub fn flush_gather(
     ctx: &ServiceContext,
@@ -695,16 +732,82 @@ pub fn flush_gather(
     if n == 0 {
         return true;
     }
+    finish_pending(ctx, dma, mmio, ir0, d, ev_idx, ev_cycle, eaten);
     d.gather_n = 0;
+    let buf = GATHER_BUFS[d.gather_buf];
+    d.gather_buf ^= 1;
     let l = lba as u32;
     let cmd = [0x2A, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, (n >> 8) as u8, n as u8, 0];
-    let ok = bot_at(ctx, dma, mmio, dboff, ir0, d, &cmd, GATHER_BUF, GATHER_BYTES as u32, n * SECTOR, false,
-                    ev_idx, ev_cycle, eaten) == Some(0);
+    let tag = d.tag;
+    d.tag = d.tag.wrapping_add(1);
+    // The CBW, as `bot_at` builds it.
+    for i in 0..31 {
+        dma.disk.write8(CMD_PAGE + i, 0);
+    }
+    dma.disk.write32(CMD_PAGE, 0x4342_5355);
+    dma.disk.write32(CMD_PAGE + 4, tag);
+    dma.disk.write32(CMD_PAGE + 8, n * SECTOR);
+    dma.disk.write8(CMD_PAGE + 14, cmd.len() as u8);
+    for (i, b) in cmd.iter().enumerate() {
+        dma.disk.write8(CMD_PAGE + 15 + i, *b);
+    }
+    // CBW and data on the OUT ring, the status on the IN ring, and only the status raises an event: an
+    // error on the others raises one regardless, and is caught when the status never comes.
+    d.out_ring.push_ioc(dma, dma.disk.phys_at(CMD_PAGE), 31, false);
+    d.out_ring.push_td_ioc(dma, dma.disk.phys_at(buf), n * SECTOR, d.mps, false);
+    mmio.write32(dboff + d.slot as usize * 4, d.out_dci);
+    let csw_trb = d.in_ring.push(dma, dma.disk.phys_at(CSW_OFF), 13);
+    mmio.write32(dboff + d.slot as usize * 4, d.in_dci);
+    d.pending = Some(Pending { csw_trb, tag, lba, n });
+    true
+}
+
+/// FINISH the gather write in flight, if there is one: wait for its status and check it. A failure is said,
+/// with the sectors it covered, and marks the next FLUSH to fail (`Disk::gather_lost`).
+#[allow(clippy::too_many_arguments)]
+pub fn finish_pending(
+    ctx: &ServiceContext,
+    dma: &Parts,
+    mmio: &Registers,
+    ir0: usize,
+    d: &mut Disk,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut EvMail,
+) -> bool {
+    let Some(p) = d.pending.take() else { return true };
+    let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, p.csw_trb, &mut d.stale, ev_idx, ev_cycle, eaten);
+    settle(ctx, dma, d, p, cc)
+}
+
+/// Collect the write in flight's status IF it has already been filed in the mailbox, without waiting.
+pub fn try_finish(ctx: &ServiceContext, dma: &Parts, d: &mut Disk, eaten: &mut EvMail) {
+    let Some(p) = d.pending else { return };
+    match eaten.take_trb(d.slot, p.csw_trb) {
+        Some(Ok(cc)) => {
+            d.pending = None;
+            settle(ctx, dma, d, p, Some(cc));
+        }
+        // A completion for another TRB on the disk's slot: an error on the CBW or the data, whose status
+        // will never come. Finished as failed now, rather than waiting out the transfer bound.
+        Some(Err(_)) => {
+            d.pending = None;
+            settle(ctx, dma, d, p, None);
+        }
+        None => {}
+    }
+}
+
+/// Judge a finished gather write by its status stage and its CSW, and say a failure.
+fn settle(ctx: &ServiceContext, dma: &Parts, d: &mut Disk, p: Pending, cc: Option<u32>) -> bool {
+    let ok = matches!(cc, Some(1) | Some(13))
+        && dma.disk.read32(CSW_OFF + 4) == p.tag
+        && dma.disk.read8(CSW_OFF + 12) == 0;
     if !ok {
         d.gather_lost = true;
         ctx.log_fmt(format_args!(
             "xhci: a gathered WRITE(10) of {} sectors at lba {} FAILED - they were answered as written and are not on the stick; the next FLUSH fails",
-            n, lba));
+            p.n, p.lba));
     }
     ok
 }
@@ -723,6 +826,7 @@ pub fn flush_gather_if_idle(
     eaten: &mut EvMail,
 ) {
     let Some(d) = disk.as_mut() else { return };
+    try_finish(ctx, dma, d, eaten);
     if d.gather_n == 0 {
         return;
     }
@@ -738,6 +842,11 @@ pub fn note_drop(ctx: &ServiceContext, disk: &Option<Disk>) {
             ctx.log_fmt(format_args!(
                 "xhci: the disk was dropped holding {} gathered sectors at lba {} - they were answered as written and are LOST",
                 d.gather_n, d.gather_lba));
+        }
+        if let Some(p) = d.pending {
+            ctx.log_fmt(format_args!(
+                "xhci: the disk was dropped with a gathered write of {} sectors at lba {} in flight - not known to be on the stick",
+                p.n, p.lba));
         }
     }
 }
@@ -949,6 +1058,7 @@ pub fn serve_block(
     // single write or a flush is ordered after it.
     if req[0] != OP_WRITE_BLOCKS && req[0] != OP_CAPACITY {
         flush_gather(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten);
+        finish_pending(ctx, dma, mmio, ir0, d, ev_idx, ev_cycle, eaten);
     }
 
     match req[0] {
@@ -1068,7 +1178,7 @@ pub fn serve_block(
             if d.gather_n == 0 {
                 d.gather_lba = lba;
             }
-            let at = GATHER_BUF + d.gather_n as usize * SECTOR as usize;
+            let at = GATHER_BUFS[d.gather_buf] + d.gather_n as usize * SECTOR as usize;
             for i in 0..count * SECTOR as usize {
                 dma.disk.write8(at + i, req[10 + i]);
             }
