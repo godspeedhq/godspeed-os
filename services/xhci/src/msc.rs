@@ -80,7 +80,7 @@ pub const DISK_REGION_BYTES: usize = 0x4000 + 2 * GATHER_BYTES;
 /// WRITE GATHERING. A stick answers each Bulk-Only command after its own turnaround, so a file written
 /// a seven-block run at a time paid that turnaround per run: on the Pi 4, 10 s of a 12 s, 10 MB download
 /// went to the stick, about 2.7 ms a run inside this driver (`backlog/93`, 2026-10-21). Linux gathers
-/// through its page cache and writes large commands. Here consecutive runs are kept in [`GATHER_BUF`] and
+/// through its page cache and writes large commands. Here consecutive runs are kept in [`GATHER_BUFS`] and
 /// written as ONE command when the buffer is full, when a write that does not follow on arrives, before
 /// any other request (a read, a single write, a flush - so a read always sees what was written, and
 /// `fs`'s barriers still order everything before them), and after [`GATHER_IDLE_MS`] with nothing new.
@@ -295,7 +295,7 @@ pub struct Disk {
     read_fail_said: bool,
     /// The bulk endpoints' max packet size, for a chained TD's TD Size.
     mps: u32,
-    /// What [`GATHER_BUF`] holds: `gather_n` sectors from `gather_lba`, the last appended at
+    /// What [`GATHER_BUFS`] holds: `gather_n` sectors from `gather_lba`, the last appended at
     /// `gather_at`. 0 sectors = nothing held.
     gather_lba: u64,
     gather_n: u32,
