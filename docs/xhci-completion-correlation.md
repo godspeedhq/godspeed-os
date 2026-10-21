@@ -38,7 +38,7 @@ did not watch.
 
 ## 2. The actual mechanism
 
-`msc::await_on_slot` (`services/xhci/src/msc.rs:263`) waits for the disk's completion and, on a
+`msc::await_on_slot` (in `services/xhci/src/msc.rs`) waits for the disk's completion and, on a
 transfer event belonging to any other slot, **consumes and discards** it:
 
 ```rust
