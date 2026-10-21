@@ -198,6 +198,25 @@ longer emptied on every send, an orphaned fin-wait-2 bounded at 2 s, and the `do
    the waiting in; on the T630 the time is data not yet arriving, and why it arrives slowly (the TCP window,
    the acknowledgement pace) is the next question, not the cross-core hop.
 
+   **2026-10-21, the Pi 4, one change per card** (10 MB, cable then radio unless said):
+
+   | Build | Change | Cable | Radio |
+   |-------|--------|-------|-------|
+   | `0a927f39` | before | 124 KiB/s, 78 s (disk 40 s) | 63 KiB/s, 154 s (disk 43 s) |
+   | `b2f91e9a` | a chunk to the stick as one WRITE(10) | 192 KiB/s, 50 s (disk 9.8 s) | 66 KiB/s, 146 s |
+   | `3745c471` | GENET's ring 24 -> 256, the kernel's fixed-NIC arena 528 KiB | 655 KiB/s, 14 s | - |
+   | `c772d2cc` | the SDIO host's settling gaps by the clock (a "2 us" spin was 137 us) | - | 208 KiB/s, 46 s |
+   | `2bf32f56` | a 32 KiB window over a radio, not 8 | 673 KiB/s, 14 s | 191 KiB/s, 50 s: not the limit |
+   | `ec7e2bf0` | `power`'s governor (Raspberry Pi OS's ondemand, `docs/power.md` 15.7) | **776 KiB/s, 12 s** | 188 KiB/s, 51 s |
+
+   The cable is the stick's now: 10 s of its 12 writing, a chunk of seven blocks per USB command, and more
+   than seven needs more than one 4 KiB message (2.5, 8.5). GENET's overflow and discard counters read 0
+   with the ring of 256; they were not read with 24. The radio is something else: its reads cost 606 us a
+   frame and 105 us empty at either clock, so it is not the CPU, and 33 s of its 51 are reads that found
+   nothing - the data is not arriving, for a reason not yet measured. The governor takes the clock to 1,500
+   MHz within a look of a download starting and, once there, drops back for one look each 5 s when the
+   load at full speed falls under half, as ondemand does with no step between the two ends.
+
    Two code defects in the disk path, found by Audit 19: `fs`'s `BLOCK_RPC_SECS` (30 s) now
    bounds a whole run of seven blocks, while on USB `block-driver` makes seven host calls of up to
    `IO_RPC_SECS` (10 s) each, so a slow stick can have `fs` give up on a run still in progress and leave its
