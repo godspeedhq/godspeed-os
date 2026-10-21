@@ -1003,7 +1003,7 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         // asks for 256 and malfunctions without them), and the disk's 18 pages (its rings, its command
         // page, its data page and the 56 KiB gather buffer, `services/xhci/src/msc.rs`), kept apart ON
         // PURPOSE: the Pi 4 lost days to one page shared by a keyboard report, a hub's port status and the
-        // disk's CBW. These sizes were the kernel's `XHCI_DMA_PAGES` until 2026-10-21.
+        // disk's CBW. The kernel held these sizes as a constant of its own until 2026-10-21.
         "xhci" => 32 + 256 + 18,
         // 64 KiB: the control transfer and the poll slots (`services/ehci`), as main had it. Not more: the
         // driver zeroes both parts on every control transfer, and the xHCI-sized 1 MiB it once shared a
