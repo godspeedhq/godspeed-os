@@ -443,6 +443,18 @@ const SMSC_MAC_CR_RCVOWN: u32 = 0x0080_0000;
 const SMSC_MII_LPA: u32 = 5;
 /// 100BASE-TX full duplex, 10BASE-T full duplex, in both ADVERTISE and LPA.
 const MII_FULL_DUPLEX: u16 = 0x0100 | 0x0040;
+/// Pause (802.3x), and asymmetric pause, in ADVERTISE and LPA.
+const MII_PAUSE_CAP: u16 = 0x0400;
+const MII_PAUSE_ASYM: u16 = 0x0800;
+/// What the PHY advertises: every 10/100 mode, CSMA, and both pauses - Linux's `ADVERTISE_ALL |
+/// ADVERTISE_CSMA | ADVERTISE_PAUSE_CAP | ADVERTISE_PAUSE_ASYM` (v4.19 `smsc95xx_phy_initialize`).
+///
+/// **Pause is what keeps the chip's receive FIFO from overflowing.** It was 0x01E1, no pause: on the Pi 2 a
+/// download over a large window filled the FIFO faster than one 4 KiB bulk IN at a time drains it, the chip
+/// dropped frames (`INT_STS` bit 11, RXDF, set throughout), and the download fell from 42 to 5 KiB/s
+/// (2026-10-21). With transmit pause negotiated the chip sends a PAUSE frame to the switch when the FIFO
+/// passes `AFC_CFG`'s high mark (15.5 KB), and the switch holds the frames instead.
+const SMSC_ADVERTISE: u16 = 0x0DE1;
 const SMSC_BURST_CAP: u16 = 0x38;
 const SMSC_BULK_IN_DLY: u16 = 0x6C;
 const SMSC_MAC_CR: u16 = 0x100;
@@ -525,10 +537,11 @@ fn link_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, nic: &mut
 /// was still auto-negotiating, and then never revisited. So the MAC kept whatever duplex we guessed
 /// before the link existed, and FLOW kept whatever reset left.
 ///
-/// Linux's rules, exactly:
-///   full duplex -> MAC_CR |= FDPX, MAC_CR &= ~RCVOWN, AFC_CFG &= ~0xF   (no pause negotiated)
-///   half duplex -> MAC_CR &= ~FDPX, MAC_CR |= RCVOWN, AFC_CFG |= 0xF
-///   FLOW = 0 unless pause was negotiated, which we do not advertise.
+/// Linux's rules, exactly (v4.19, `mii_resolve_flowctrl_fdx` for the pause, IEEE 802.3 table 28B-3):
+///   full duplex -> MAC_CR |= FDPX, MAC_CR &= ~RCVOWN
+///                  receive pause  -> FLOW = 0xFFFF0002
+///                  transmit pause -> FLOW |= 0xFFFF0000, AFC_CFG |= 0xF, else AFC_CFG &= ~0xF
+///   half duplex -> MAC_CR &= ~FDPX, MAC_CR |= RCVOWN, AFC_CFG |= 0xF, FLOW = 0
 ///
 /// Whether this is the transmit fault is NOT established - it is a missing step in the port, found by
 /// diffing against the vendor driver, and it happens at exactly the moment transmit dies. The device
@@ -539,6 +552,14 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) 
     let adv = mii_read(ctx, m, d, t, SMSC_MII_ADVERTISE).unwrap_or(0);
     let lpa = mii_read(ctx, m, d, t, SMSC_MII_LPA).unwrap_or(0);
     let full = adv & lpa & MII_FULL_DUPLEX != 0;
+    // Pause resolved as `mii_resolve_flowctrl_fdx` does: (transmit, receive).
+    let (tx_pause, rx_pause) = if adv & lpa & MII_PAUSE_CAP != 0 {
+        (true, true)
+    } else if adv & lpa & MII_PAUSE_ASYM != 0 {
+        (lpa & MII_PAUSE_CAP != 0, adv & MII_PAUSE_CAP != 0)
+    } else {
+        (false, false)
+    };
 
     // A READ-MODIFY-WRITE MUST NOT PROCEED ON A READ THAT DID NOT HAPPEN.
     //
@@ -555,22 +576,30 @@ fn link_reconfigure(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) 
         ctx.log("dwc2-svc: link update SKIPPED - could not read MAC_CR/AFC_CFG, refusing to write a config built on a fabricated value (link left as it was)");
         return;
     };
+    let mut flow = 0u32;
     if full {
         mac_cr |= SMSC_MAC_CR_FDPX;
         mac_cr &= !SMSC_MAC_CR_RCVOWN;
-        afc &= !0xF;
+        if rx_pause {
+            flow = 0xFFFF_0002;
+        }
+        if tx_pause {
+            afc |= 0xF;
+            flow |= 0xFFFF_0000;
+        } else {
+            afc &= !0xF;
+        }
     } else {
         mac_cr &= !SMSC_MAC_CR_FDPX;
         mac_cr |= SMSC_MAC_CR_RCVOWN;
         afc |= 0xF;
     }
     smsc_write(ctx, m, d, t, SMSC_MAC_CR, mac_cr);
-    // No pause is advertised, so FLOW stays 0 - the branch Linux takes when neither side asked for it.
-    smsc_write(ctx, m, d, t, SMSC_FLOW, 0);
+    smsc_write(ctx, m, d, t, SMSC_FLOW, flow);
     smsc_write(ctx, m, d, t, SMSC_AFC_CFG, afc);
     ctx.log_fmt(format_args!(
-        "dwc2-svc: link up - {} duplex (adv {:#06x} lpa {:#06x}); MAC_CR={:#010x} AFC_CFG={:#010x} FLOW=0",
-        if full { "FULL" } else { "HALF" }, adv, lpa, mac_cr, afc));
+        "dwc2-svc: link up - {} duplex (adv {:#06x} lpa {:#06x}), pause tx {} rx {}; MAC_CR={:#010x} AFC_CFG={:#010x} FLOW={:#010x}",
+        if full { "FULL" } else { "HALF" }, adv, lpa, full && tx_pause, full && rx_pause, mac_cr, afc, flow));
 }
 
 /// The link state, re-read at most every `LINK_TTL_MS`.
@@ -913,7 +942,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) -> 
     if !phy_ready {
         ctx.log("dwc2-svc: PHY reset never cleared - autonegotiation may not start (no link)");
     }
-    mii_write(ctx, m, d, t, SMSC_MII_ADVERTISE, 0x01E1);
+    mii_write(ctx, m, d, t, SMSC_MII_ADVERTISE, SMSC_ADVERTISE);
     mii_write(ctx, m, d, t, SMSC_MII_BMCR, 0x1200);
     // VERIFY THE WRITE TOOK. This is the one that decides whether there is ever a link, and it was
     // written blind: if the PHY swallowed it, nothing here noticed and the failure surfaced minutes
@@ -921,7 +950,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) -> 
     // once accepted (bit 9, RESTART, self-clears as the negotiation runs, so it is not a witness).
     // Retried once, because the common cause is simply having asked a moment too early.
     if !matches!(mii_read(ctx, m, d, t, SMSC_MII_BMCR), Some(v) if v & 0x1000 != 0) {
-        mii_write(ctx, m, d, t, SMSC_MII_ADVERTISE, 0x01E1);
+        mii_write(ctx, m, d, t, SMSC_MII_ADVERTISE, SMSC_ADVERTISE);
         mii_write(ctx, m, d, t, SMSC_MII_BMCR, 0x1200);
         match mii_read(ctx, m, d, t, SMSC_MII_BMCR) {
             Some(v) if v & 0x1000 != 0 =>
