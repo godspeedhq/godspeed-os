@@ -2490,7 +2490,7 @@ fn bind_msc(
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
 ) -> Option<msc::Disk> {
-    let mut disk = msc::Disk::new(slot, m.out_ep, m.in_ep, port);
+    let mut disk = msc::Disk::new(slot, m.out_ep, m.in_ep, port, m.mps as u32);
     let (out_dci, in_dci) = (disk.out_dci(), disk.in_dci());
     let max_dci = out_dci.max(in_dci);
     ctx.log_fmt(format_args!(
@@ -5106,6 +5106,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             } else {
                 base.saturating_mul(25)
             };
+            // Held writes are written once nothing joins them for `GATHER_IDLE_MS`, so the wait is no
+            // longer than that while any are held.
+            let deadline_ms = if disk.as_ref().is_some_and(|d| d.gathered() > 0) {
+                deadline_ms.min(msc::GATHER_IDLE_MS)
+            } else {
+                deadline_ms
+            };
             // This is the driver's idle point, and therefore where block requests are answered.
             // Both the timed wait and the drain below used to DISCARD whatever arrived, which was
             // right when every message was an interrupt wakeup carrying no information. A block
@@ -5178,6 +5185,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops, &mut no_disk_said) {
                             ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                             notify(&ctx, "storage disconnected (xhci)");
+                            msc::note_drop(&ctx, &disk);
                             disk = None;
                             continue 'reenum;
                         }
@@ -5244,8 +5252,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 }
             }
+            msc::flush_gather_if_idle(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &mut ev_idx, &mut ev_cycle, &mut eaten);
             if !disk_alive {
                 ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
+                msc::note_drop(&ctx, &disk);
                 disk = None;
                 continue 'reenum;
             }
@@ -6018,6 +6028,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Drop it and re-scan. The filesystem above sees its next request fail and
                 // reacquires when the stick returns (§14.3) - the same recovery a service restart
                 // already asks of it.
+                msc::note_drop(&ctx, &disk);
                 disk = None;
                 announce = true;
                 continue 'reenum;

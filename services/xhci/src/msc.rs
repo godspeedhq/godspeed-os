@@ -68,8 +68,31 @@ const CMD_PAGE: usize = 0x2000;
 const CSW_OFF: usize = CMD_PAGE + 64;
 /// Data buffer (one page). Caps a single transfer at 8 sectors of 512 B.
 const DATA_BUF: usize = 0x3000;
+/// The GATHER buffer: consecutive runs of a file's data, held here and written to the stick as one
+/// WRITE(10) ([`GATHER_SECTORS`]). 56 KiB, sixteen of `fs`'s seven-block runs. Its own pages, as the
+/// data page is, so nothing else's transfer can land on what is waiting to be written.
+const GATHER_BUF: usize = 0x4000;
+const GATHER_BYTES: usize = 0xE000;
 /// Total size of the region: the size of its part (`lay_out`).
-pub const DISK_REGION_BYTES: usize = 0x4000;
+pub const DISK_REGION_BYTES: usize = GATHER_BUF + GATHER_BYTES;
+
+/// WRITE GATHERING. A stick answers each Bulk-Only command after its own turnaround, so a file written
+/// a seven-block run at a time paid that turnaround per run: on the Pi 4, 10 s of a 12 s, 10 MB download
+/// went to the stick, about 2.7 ms a run inside this driver (`backlog/93`, 2026-10-21). Linux gathers
+/// through its page cache and writes large commands. Here consecutive runs are kept in [`GATHER_BUF`] and
+/// written as ONE command when the buffer is full, when a write that does not follow on arrives, before
+/// any other request (a read, a single write, a flush - so a read always sees what was written, and
+/// `fs`'s barriers still order everything before them), and after [`GATHER_IDLE_MS`] with nothing new.
+///
+/// **What a run's reply means now, said plainly.** "Held, to be written", not "on the stick": the promise
+/// a device's own write cache already makes. Only file data comes as runs (`fs`'s direct path); the
+/// journal and metadata are single writes and pass straight through, after what is held. A gathered
+/// write that fails is said, and the next FLUSH answers an error, so `fs` learns it at its barrier
+/// (6.1). What is held when the stick is pulled or this driver dies is lost, and that is said too; file
+/// data written direct was never promised across a power cut, and its CRC catches it on read.
+pub const GATHER_SECTORS: u32 = (GATHER_BYTES / SECTOR as usize) as u32;
+/// How long a held run waits for the next before it is written.
+pub const GATHER_IDLE_MS: u64 = 10;
 
 /// Largest data payload one BOT command may carry - the data page.
 pub const MAX_XFER: u32 = 0x1000;
@@ -160,6 +183,53 @@ impl Ring {
         self.cur += TRB_SIZE;
         dma.disk.phys_at(t)
     }
+
+    /// Post one TD for `len` bytes at `buf_phys`, as chained Normal TRBs split where the buffer crosses
+    /// a 64 KiB boundary, which one TRB's buffer may not (xHCI 4.11.7.1). Interrupt On Completion on the
+    /// last only, and each TRB's TD Size is the packets of `mps` left after it (xHCI 4.11.2.4). Returns the
+    /// last TRB's address, the one its event carries. A buffer that crosses no boundary is one TRB, as
+    /// [`Ring::push`] posts.
+    fn push_td(&mut self, dma: &Parts, buf_phys: u64, len: u32, mps: u32) -> u64 {
+        const BOUND: u64 = 0x1_0000;
+        let mut pieces = [(0u64, 0u32); 4];
+        let (mut n, mut at, mut left) = (0usize, buf_phys, len as u64);
+        while left > 0 && n < pieces.len() {
+            let room = BOUND - (at % BOUND);
+            let take = left.min(room);
+            pieces[n] = (at, take as u32);
+            n += 1;
+            at += take;
+            left -= take;
+        }
+        // The whole TD before the Link: a Link inside a TD would need its own chain bit.
+        if self.cur + (n + 1) * TRB_SIZE > Self::BYTES {
+            let bp = dma.disk.phys_at(self.base);
+            dma.disk.write32(self.base + self.cur, bp as u32);
+            dma.disk.write32(self.base + self.cur + 4, (bp >> 32) as u32);
+            dma.disk.write32(self.base + self.cur + 8, 0);
+            dma.disk.write32(self.base + self.cur + 12, (crate::TRB_LINK << 10) | (1 << 1) | self.pcs);
+            self.cur = 0;
+            self.pcs ^= 1;
+        }
+        let mps = mps.max(1);
+        let mut sent = 0u32;
+        let mut last = 0u64;
+        for (i, &(phys, plen)) in pieces[..n].iter().enumerate() {
+            sent += plen;
+            let more = i + 1 < n;
+            let td_size = if more { (len - sent).div_ceil(mps).min(31) } else { 0 };
+            let t = self.base + self.cur;
+            dma.disk.write32(t, phys as u32);
+            dma.disk.write32(t + 4, (phys >> 32) as u32);
+            dma.disk.write32(t + 8, (plen & 0x1_FFFF) | (td_size << 17));
+            // Chain (bit 4) on all but the last; IOC (bit 5) on the last.
+            let flags = if more { 1 << 4 } else { 1 << 5 };
+            dma.disk.write32(t + 12, self.pcs | flags | (TRB_NORMAL << 10));
+            self.cur += TRB_SIZE;
+            last = dma.disk.phys_at(t);
+        }
+        last
+    }
 }
 
 
@@ -202,10 +272,19 @@ pub struct Disk {
     /// field of the disk rather than a static (Invariant 9, backlog/fixed/80 D9), so a new disk starts
     /// unsaid by construction.
     read_fail_said: bool,
+    /// The bulk endpoints' max packet size, for a chained TD's TD Size.
+    mps: u32,
+    /// What [`GATHER_BUF`] holds: `gather_n` sectors from `gather_lba`, the last appended at
+    /// `gather_at`. 0 sectors = nothing held.
+    gather_lba: u64,
+    gather_n: u32,
+    gather_at: Option<wait::Since>,
+    /// A held write failed since the last FLUSH: the next FLUSH answers an error, once.
+    gather_lost: bool,
 }
 
 impl Disk {
-    pub fn new(slot: u32, out_ep: u8, in_ep: u8, port: u32) -> Self {
+    pub fn new(slot: u32, out_ep: u8, in_ep: u8, port: u32, mps: u32) -> Self {
         Disk {
             slot,
             out_dci: (out_ep & 0x0F) as u32 * 2,
@@ -222,7 +301,17 @@ impl Disk {
             hub_nports: 0,
             hub_off: 0,
             read_fail_said: false,
+            mps,
+            gather_lba: 0,
+            gather_n: 0,
+            gather_at: None,
+            gather_lost: false,
         }
+    }
+
+    /// Sectors held in the gather buffer, not yet on the stick.
+    pub fn gathered(&self) -> u32 {
+        self.gather_n
     }
 
     /// Physical address of the bulk-OUT ring, for the Configure Endpoint input context.
@@ -353,8 +442,29 @@ pub fn bot(
     ev_cycle: &mut u32,
     eaten: &mut EvMail,
 ) -> Option<u8> {
-    if data_len > MAX_XFER {
-        return None; // caller asked for more than the bounded data page holds
+    bot_at(ctx, dma, mmio, dboff, ir0, d, cmd, DATA_BUF, MAX_XFER, data_len, data_in, ev_idx, ev_cycle, eaten)
+}
+
+/// [`bot`] with its data in the buffer at `buf`, which holds `buf_cap` bytes.
+#[allow(clippy::too_many_arguments)]
+fn bot_at(
+    ctx: &ServiceContext,
+    dma: &Parts,
+    mmio: &Registers,
+    dboff: usize,
+    ir0: usize,
+    d: &mut Disk,
+    cmd: &[u8],
+    buf: usize,
+    buf_cap: u32,
+    data_len: u32,
+    data_in: bool,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut EvMail,
+) -> Option<u8> {
+    if data_len > buf_cap {
+        return None; // caller asked for more than the bounded buffer holds
     }
     let tag = d.tag;
     d.tag = d.tag.wrapping_add(1);
@@ -387,7 +497,7 @@ pub fn bot(
         } else {
             &mut d.out_ring
         };
-        let trb = ring.push(dma, dma.disk.phys_at(DATA_BUF), data_len);
+        let trb = ring.push_td(dma, dma.disk.phys_at(buf), data_len, d.mps);
         mmio.write32(dboff + d.slot as usize * 4, dci);
         let cc = await_on_slot(ctx, dma, mmio, ir0, d.slot, trb, &mut d.stale, ev_idx, ev_cycle, eaten)?;
         // 13 is Short Packet: the device sent less than asked, which for a data stage is normal.
@@ -564,6 +674,72 @@ pub fn write10(
         ev_cycle,
         eaten,
     ) == Some(0)
+}
+
+/// Write what the gather buffer holds as one WRITE(10), and empty it. A failure is said, with the
+/// sectors it covered, and marks the next FLUSH to fail (`Disk::gather_lost`). `true` when nothing was held
+/// or the write took.
+#[allow(clippy::too_many_arguments)]
+pub fn flush_gather(
+    ctx: &ServiceContext,
+    dma: &Parts,
+    mmio: &Registers,
+    dboff: usize,
+    ir0: usize,
+    d: &mut Disk,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut EvMail,
+) -> bool {
+    let (lba, n) = (d.gather_lba, d.gather_n);
+    if n == 0 {
+        return true;
+    }
+    d.gather_n = 0;
+    let l = lba as u32;
+    let cmd = [0x2A, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, (n >> 8) as u8, n as u8, 0];
+    let ok = bot_at(ctx, dma, mmio, dboff, ir0, d, &cmd, GATHER_BUF, GATHER_BYTES as u32, n * SECTOR, false,
+                    ev_idx, ev_cycle, eaten) == Some(0);
+    if !ok {
+        d.gather_lost = true;
+        ctx.log_fmt(format_args!(
+            "xhci: a gathered WRITE(10) of {} sectors at lba {} FAILED - they were answered as written and are not on the stick; the next FLUSH fails",
+            n, lba));
+    }
+    ok
+}
+
+/// Write what is held if nothing has joined it for [`GATHER_IDLE_MS`]. The main loop's, each pass.
+#[allow(clippy::too_many_arguments)]
+pub fn flush_gather_if_idle(
+    ctx: &ServiceContext,
+    dma: &Parts,
+    mmio: &Registers,
+    dboff: usize,
+    ir0: usize,
+    disk: &mut Option<Disk>,
+    ev_idx: &mut usize,
+    ev_cycle: &mut u32,
+    eaten: &mut EvMail,
+) {
+    let Some(d) = disk.as_mut() else { return };
+    if d.gather_n == 0 {
+        return;
+    }
+    if d.gather_at.map_or(true, |t| t.passed(ctx, Budget::ms(GATHER_IDLE_MS))) {
+        flush_gather(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten);
+    }
+}
+
+/// Say what is lost when a disk is dropped holding gathered sectors. For every place that drops one.
+pub fn note_drop(ctx: &ServiceContext, disk: &Option<Disk>) {
+    if let Some(d) = disk.as_ref() {
+        if d.gather_n > 0 {
+            ctx.log_fmt(format_args!(
+                "xhci: the disk was dropped holding {} gathered sectors at lba {} - they were answered as written and are LOST",
+                d.gather_n, d.gather_lba));
+        }
+    }
 }
 
 /// SCSI SYNCHRONIZE CACHE(10) - the durability barrier a journal's ordering depends on.
@@ -769,6 +945,12 @@ pub fn serve_block(
     // A disk is bound: the next absence is news again.
     *no_disk_said = false;
 
+    // Anything but a run, or a capacity (no I/O), writes what is held first: a read then sees it, and a
+    // single write or a flush is ordered after it.
+    if req[0] != OP_WRITE_BLOCKS && req[0] != OP_CAPACITY {
+        flush_gather(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten);
+    }
+
     match req[0] {
         OP_CAPACITY => {
             // Ask the DEVICE whether it is still there before quoting its size.
@@ -810,6 +992,12 @@ pub fn serve_block(
             9
         }
         OP_FLUSH => {
+            // A held write that failed since the last barrier fails this one: `fs` was told the run
+            // was written, and the barrier is where it must learn otherwise (6.1).
+            if core::mem::replace(&mut d.gather_lost, false) {
+                ctx.log("xhci: FLUSH answered with an error - a gathered write failed since the last one");
+                return 1;
+            }
             // The one command a stick genuinely needs: it acknowledges a WRITE(10) into its own
             // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just
             // written. Its outcome is reported, never assumed (§6.1, the backend-conditional
@@ -862,21 +1050,35 @@ pub fn serve_block(
             1
         }
         OP_WRITE_BLOCKS => {
-            // One Bulk-Only command for the whole run. Each command is three transfers (CBW, data, CSW)
-            // and the stick's own turnaround, so a chunk sent block by block paid that seven times: the
-            // Pi 4 spent 40 s of a 10 MB download's 78 on the stick (2026-10-21).
+            // GATHERED (`GATHER_SECTORS`): held with the runs before it and written with them as one
+            // command. A run that does not follow on, or does not fit, writes what is held first.
             let count = req.get(9).copied().unwrap_or(0) as usize;
             if count == 0 || count > WRITE_RUN_MAX || req.len() < 10 + count * SECTOR as usize {
                 return 1;
             }
-            for i in 0..count * SECTOR as usize {
-                data_write8(dma, i, req[10 + i]);
+            let lba = lba_of(req);
+            if lba.saturating_add(count as u64) > d.sectors || lba > u32::MAX as u64 {
+                return 1;
             }
-            out[0] = if write10(ctx, dma, mmio, dboff, ir0, d, lba_of(req), count as u32, ev_idx, ev_cycle, eaten) {
-                STATUS_OK
-            } else {
-                STATUS_ERR
-            };
+            if d.gather_n > 0
+                && (lba != d.gather_lba + d.gather_n as u64 || d.gather_n + count as u32 > GATHER_SECTORS)
+            {
+                flush_gather(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten);
+            }
+            if d.gather_n == 0 {
+                d.gather_lba = lba;
+            }
+            let at = GATHER_BUF + d.gather_n as usize * SECTOR as usize;
+            for i in 0..count * SECTOR as usize {
+                dma.disk.write8(at + i, req[10 + i]);
+            }
+            d.gather_n += count as u32;
+            d.gather_at = Some(wait::Since::now(ctx));
+            // Full enough that the next run would not fit: written now rather than on the next request.
+            if d.gather_n + WRITE_RUN_MAX as u32 > GATHER_SECTORS {
+                flush_gather(ctx, dma, mmio, dboff, ir0, d, ev_idx, ev_cycle, eaten);
+            }
+            out[0] = STATUS_OK;
             1
         }
         OP_WRITE_ZEROS => {

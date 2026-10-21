@@ -216,13 +216,14 @@ pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU6
 /// them). Six slices (up from two) so hub enumeration can address the hub AND its
 /// downstream devices at once (docs/usb-hub.md). Confined identity-mapped, so the
 /// device reaches all of it (§12, H1).
-/// Plus 4 pages at the tail for the USB MASS-STORAGE region (`services/xhci/src/msc.rs`
-/// `DISK_REGION_BYTES`, the driver's `disk` part): the two bulk transfer rings, the CBW/CSW page, and one data page. They sit past the
+/// Plus 18 pages at the tail for the USB MASS-STORAGE region (`services/xhci/src/msc.rs`
+/// `DISK_REGION_BYTES`, the driver's `disk` part): the two bulk transfer rings, the CBW/CSW page, one data
+/// page, and the 56 KiB buffer consecutive writes are gathered in (`GATHER_SECTORS`, backlog/93). They sit past the
 /// scratchpad rather than sharing any earlier page ON PURPOSE - the Pi 4 port lost days to one DMA
 /// page owned by a keyboard report, a hub's port status AND the disk's CBW at once, where an armed
 /// interrupt endpoint overwrote a command mid-flight on every keypress. Four pages of arena buys
 /// that class of bug being unrepresentable.
-const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
+const XHCI_DMA_PAGES:      u64 = 32 + 256 + 18;
 /// Pages of contiguous DMA memory for the **EHCI** driver - 64 KiB, as on main.
 /// EHCI has no scratchpad concept, and its driver zeroes its arena's two parts (the control
 /// transfer and the poll slots) on every control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
