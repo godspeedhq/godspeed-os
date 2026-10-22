@@ -329,6 +329,13 @@ and beacon timings (transmit, which R5 needs and R3 does not), the IQ calibratio
 rejection and EVM; the baseband table loads default matrices, and a 1 Mb/s beacon does not need it), and the
 thermal meter.
 
+*(Note 2026-10-22: R5 sent frames and R11 set the transmit power, but the rest of that transmit side was never
+added - the response rate set, the SIFS the chip answers after, the retry limits, the EDCA parameters, the
+rate fallback and the ACK timeout. They decide how the chip ACKNOWLEDGES what it receives, and on the Pi 2 an
+access point ended an association for frames left unacknowledged (reason 34) while a download ran at 41 frames
+a second. `rtl8188::transmit_side` now does them as `rtl8xxxu_init_device` does. The beacon timings, the IQ
+calibration and the thermal meter are still out.)*
+
 **Its check is the RF chip itself.** After the channel is set, `RF_MODE_AG` is read back through the HSSI
 path - the one register that only a working RF serial interface can answer - and its channel field must read
 1. Prediction, after R2's lines: `MAC, baseband and RF set up in ... ms (137 RF registers); RF_MODE_AG reads

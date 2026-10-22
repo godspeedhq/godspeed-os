@@ -348,6 +348,21 @@ const REG_TXPKTBUF_BCNQ_BDNY: u16 = 0x0424;
 const REG_TXPKTBUF_MGQ_BDNY: u16 = 0x0425;
 const REG_TXPKTBUF_WMAC_LBK_BF_HD: u16 = 0x045D;
 const REG_FAST_EDCA_CTRL: u16 = 0x0460;
+// The transmit side of `rtl8xxxu_init_device` (`transmit_side`), with `rtl8xxxu_regs.h`'s names.
+const REG_SPEC_SIFS: u16 = 0x0428;
+const REG_RETRY_LIMIT: u16 = 0x042A;
+const REG_DARFRC: u16 = 0x0430;
+const REG_RARFRC: u16 = 0x0438;
+const REG_RESPONSE_RATE_SET: u16 = 0x0440;
+const RESPONSE_RATE_BITMAP_ALL: u32 = 0xF_FFFF;
+const RESPONSE_RATE_RRSR_CCK_ONLY_1M: u32 = 0xF_FFF1;
+const REG_EDCA_VO_PARAM: u16 = 0x0500;
+const REG_EDCA_VI_PARAM: u16 = 0x0504;
+const REG_EDCA_BE_PARAM: u16 = 0x0508;
+const REG_EDCA_BK_PARAM: u16 = 0x050C;
+const REG_MAC_SPEC_SIFS: u16 = 0x063A;
+const REG_ACKTO: u16 = 0x0640;
+const FWHW_TXQ_CTRL_AMPDU_RETRY: u8 = 1 << 7;
 const REG_MAX_AGGR_NUM: u16 = 0x04CA;
 const REG_BAR_MODE_CTRL: u16 = 0x04CC;
 const REG_SIFS_CCK: u16 = 0x0514;
@@ -905,10 +920,45 @@ pub fn set_channel(ctx: &ServiceContext, channel: u8, power: &TxPower) -> Result
     set_tx_power(ctx, power, channel)
 }
 
-/// R3a: everything `rtl8xxxu_init_device` does after the firmware that bears on RECEIVING, then
-/// `rtl8xxxu_start`'s RF enable, filters and gain, then `channel`. Left out, and recorded in
-/// `docs/wifi-usb.md`: the transmit side (the response rate set and retry limits, the EDCA, ACK and
-/// beacon timings), the IQ calibration and the thermal meter - none decides whether a beacon is heard.
+/// THE TRANSMIT SIDE of `rtl8xxxu_init_device`, "Init adaptive controls" to "Set ACK timeout", with its
+/// values: the response rate set (CCK at 1 Mb/s, every OFDM and HT rate), the SIFS the chip waits before it
+/// answers, the retry limits, the EDCA parameters, the rate-fallback tables, A-MPDU retry and the ACK timeout.
+///
+/// **Left out at R3a, as not deciding whether a beacon is heard - true, and it decides how the chip
+/// ANSWERS what it hears.** Its acknowledgements are sent by the chip itself, with these timings. On the Pi 2
+/// an access point ended an association with reason 34 (frames left unacknowledged) before the handshake, a
+/// download brought 41 frames a second over a 25 ms path, and earlier runs saw the access point resend frames
+/// already received (wifi-usb's "replayed" lines) - all what an access point does when it misses our
+/// acknowledgements (2026-10-22). The channel's own SIFS byte follows in `set_channel`, as `rtl8xxxu_gen1_config_channel`
+/// follows this in Linux.
+fn transmit_side(ctx: &ServiceContext) -> Result<(), &'static str> {
+    let rrsr = read32(ctx, REG_RESPONSE_RATE_SET)?;
+    write32(ctx, REG_RESPONSE_RATE_SET, (rrsr & !RESPONSE_RATE_BITMAP_ALL) | RESPONSE_RATE_RRSR_CCK_ONLY_1M)?;
+    // `rtl8xxxu_set_spec_sifs(0x10, 0x10)`, the retry limits 0x30 and 0x30, then `set_spec_sifs(0x0a, 0x10)`:
+    // CCK in the low byte, OFDM in the high; the short limit in bits 13:8, the long in 5:0.
+    write16(ctx, REG_SPEC_SIFS, 0x1010)?;
+    write16(ctx, REG_RETRY_LIMIT, (0x30 << 8) | 0x30)?;
+    write16(ctx, REG_SPEC_SIFS, 0x100A)?;
+    write16(ctx, REG_MAC_SPEC_SIFS, 0x100A)?;
+    write16(ctx, REG_SIFS_CCK, 0x100A)?;
+    write16(ctx, REG_SIFS_OFDM, 0x100A)?;
+    write32(ctx, REG_EDCA_BE_PARAM, 0x005E_A42B)?;
+    write32(ctx, REG_EDCA_BK_PARAM, 0x0000_A44F)?;
+    write32(ctx, REG_EDCA_VI_PARAM, 0x005E_A324)?;
+    write32(ctx, REG_EDCA_VO_PARAM, 0x002F_A226)?;
+    write32(ctx, REG_DARFRC, 0x0000_0000)?;
+    write32(ctx, REG_DARFRC + 4, 0x1008_0404)?;
+    write32(ctx, REG_RARFRC, 0x0403_0201)?;
+    write32(ctx, REG_RARFRC + 4, 0x0807_0605)?;
+    let q = read8(ctx, REG_FWHW_TXQ_CTRL)?;
+    write8(ctx, REG_FWHW_TXQ_CTRL, q | FWHW_TXQ_CTRL_AMPDU_RETRY)?;
+    write8(ctx, REG_ACKTO, 0x40)
+}
+
+/// R3a: everything `rtl8xxxu_init_device` does after the firmware that bears on RECEIVING, its transmit side
+/// (`transmit_side`, since 2026-10-22), then `rtl8xxxu_start`'s RF enable, filters and gain, then `channel`.
+/// Still left out, and recorded in `docs/wifi-usb.md`: the beacon timings, the IQ calibration and the thermal
+/// meter.
 /// `RF_MODE_AG` read back after the channel is set, for the caller to check.
 pub fn init_radio(ctx: &ServiceContext, cold: bool, channel: u8, power: &TxPower) -> Result<(usize, u32), &'static str> {
     for (reg, val) in rtl_tables::MAC_INIT.iter() {
@@ -937,6 +987,7 @@ pub fn init_radio(ctx: &ServiceContext, cold: bool, channel: u8, power: &TxPower
     write32(ctx, REG_RCR, RCR_SCAN)?;
     write32(ctx, REG_MAR, 0xFFFF_FFFF)?;
     write32(ctx, REG_MAR + 4, 0xFFFF_FFFF)?;
+    transmit_side(ctx)?;
     // Receive aggregation OFF (`rtl8xxxu_gen1_init_aggregation`, its default): one frame per bulk transfer.
     let u = read8(ctx, REG_USB_SPECIAL_OPTION)?;
     write8(ctx, REG_USB_SPECIAL_OPTION, u & !(1 << 3))?;
