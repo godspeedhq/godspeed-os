@@ -247,6 +247,7 @@ On 2026-10-19 (item 12 has the figures since):
    | `78185667` | a transmit keeps the receive it stands down, and a cut frame is carried | **170-183 KiB/s**, none unparsed (52-87 caught by a transmit, 1-3 joined); then, at about 6%, the controller wedged - twice |
    | `742f6b00` | the whole core said beside a channel that never halted (instrument only) | wedged four times in four downloads (1-9%); `kill dwc2` alone recovered each |
    | `4cd3a01d` | the AHB burst length Linux sets for this core (`GAHBCFG_HBSTLEN_BCM`) | **136-161 KiB/s, 1 min to 1 min 11 s, six downloads in six**, with the keyboard re-plugged and the stick moved to another port between them; no stall. Disk 43-50 s of each, network 11-16 s |
+   | `fac877e8` | a run of up to seven blocks to the stick as one WRITE(10), not seven | **286-338 KiB/s, 28-35 s, four downloads in four** (disk 16-19 s, network 8-12 s, decrypt 4.5-6.9 s); `drives check` clean |
 
    **The wedge, as it was seen (fixed at `4cd3a01d`, by the burst length).** Both times the stick's WRITE(10) bulk OUT never halted first
    (`HCCHAR` with ChEna and ChDis both set), then every transfer to every device did; `block-driver` lost
@@ -283,4 +284,9 @@ controller (item 12): the wedge first, then the receive transfer Linux uses (a b
 bytes, a bulk-in delay of 0x2000) against this driver's 8 and 4,096. *(2026-10-22: the wedge is fixed at
 `4cd3a01d`, and the Pi 2's cable is now the stick's - 43-50 s of a 60-71 s download is the disk, 11-16 s
 the network - so `dwc2`'s stick writes are next, ahead of the receive transfer; xhci's gather and overlap
-are the Pi 4's answer to the same thing.)*
+are the Pi 4's answer to the same thing.)* *(Later the same day: the one-command run took the disk to 16 s (`fac877e8`), and the disk is still the
+largest share; gathering runs and overlapping them, as xhci does, is next. Over the RTL8188CUS a download ran
+at about 50 KiB/s, and plugging the cable in part way through stalled it for about 90 s: `nic-driver` moved
+the frames to the cable on its next read of the link bit, while `net-stack` kept the radio's address and
+gateway until its next address check (`ADDR_CHECK_SECS`), so the download's frames went to the other
+network. Every backend with a radio routes by that live bit (`dwc2`'s, GENET's, dwmac's and the RTL8168's).)*
