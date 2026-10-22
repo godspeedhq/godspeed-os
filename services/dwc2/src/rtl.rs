@@ -471,6 +471,9 @@ fn bulk_out(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radio, 
     for (i, &b) in data.iter().enumerate() {
         dma.radio_tx.write8(i, b);
     }
+    // The IN stands aside for its own device's OUT, as for every bulk transfer but the disk's
+    // (`chan::program_ping`): this one shares the disk's channel, so it says so itself.
+    chan::halt(ctx, mmio, CH_RADIO_RX);
     let sent = crate::msc::bulk_xfer(ctx, mmio, &r.t, r.out_mps, false, r.outs[idx],
                                      dma.radio_tx.phys() as u32, data.len() as u32, RADIO_TX_BUDGET_MS,
                                      &mut r.pid_out[idx]);
