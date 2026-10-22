@@ -387,9 +387,9 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
             r.rx = Rx::Full;
             r.full_at = Some(wait::Since::now(ctx));
         }
-        // Told once the ring holds something: the driver collects until it is empty, asked by `nic-driver`'s
-        // polls or by its own loop, so a notice per transfer would only be more notices to take in place of an
-        // answer (`usbfn::OP_SYNC`).
+        // Told when the ring stops being empty; once a transfer is collected and more wait, a notice is owed
+        // again (`bulk_in_request`), so the driver - which, with the cable carrying the link, collects only
+        // when told - empties the ring one notice at a time.
         if r.ring_n == 1 && !tell_bulk(ctx) {
             r.note_owed = true;
             r.stats.notes_late = r.stats.notes_late.wrapping_add(1);
@@ -438,7 +438,10 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut 
             n = len;
             r.ring_head = (slot + 1) % RX_SLOTS;
             r.ring_n -= 1;
-            r.note_owed = false;
+            // MORE WAITING IS NEWS: said by `service`. Told only on empty-to-not, the ring stayed full for good
+            // with the cable in - the driver collected one, was never told of the other seven, and the radio
+            // heard nothing until it was no longer joined (Pi 2, 2026-10-22).
+            r.note_owed = r.ring_n > 0;
             if r.rx == Rx::Full {
                 if let Some(at) = r.full_at.take() {
                     r.stats.full_ms = r.stats.full_ms.saturating_add(at.elapsed_us(ctx) / 1000);
