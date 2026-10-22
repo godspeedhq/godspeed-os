@@ -191,9 +191,9 @@ pub fn bind(
 pub const DATA_MAX: usize = GATHER_BYTES;
 /// The disk buffer's size, and the most one WRITE(10) gathers: 32 KiB, nine of `fs`'s seven-block runs.
 /// 96 KiB was tried (`fa806f3d`) and the stick took the same 10.6 s of a 10 MB download as at 32 (Pi 2,
-/// 2026-10-22): its own writing speed is the limit, not a command's turnaround. A longer write also held
-/// the radio's receive aside for longer (it stood aside for the disk's transfers until `91e9448e`), so it
-/// went back, and the arena's room is the radio's ring.
+/// 2026-10-22): its own writing speed is the limit, not a command's turnaround. A longer write also holds
+/// the radio's receive aside for longer (it stands aside for every bulk transfer, `chan::program_ping`), so
+/// it went back, and the arena's room is the radio's ring.
 pub const GATHER_BYTES: usize = 0x8000;
 pub const GATHER_SECTORS: u32 = (GATHER_BYTES / 512) as u32;
 /// How long a held run waits for the next before it is written.

@@ -265,16 +265,28 @@ On 2026-10-19 (item 12 has the figures since):
    | `422257cb` | `dwc2` holds a ring of eight received transfers, not one | no WiFi download: a notice owed only on empty-to-not left the ring full for good with the cable in (fixed `d7f4c6ad`) |
    | `d7f4c6ad` | the ring's notice owed again while it holds more | 58 KiB/s: 9 gaps, 5.2 s behind them; 41 frames a second arrived, 87% of asks found none |
    | `d48dbc01` | the transmit side of rtl8xxxu's init (response rates, SIFS, retries, EDCA, ACK timeout) | 79 KiB/s: 102 gaps, 61 s behind them, about 23 segments a gap; the ring full only 3 s of it |
-   | `91e9448e` | the radio's IN no longer stands aside for the disk's transfers | card owed |
+   | `91e9448e` | the radio's IN no longer stands aside for the disk's transfers | 64 KiB/s: 91 gaps, 62.6 s behind them - unchanged; the disk unharmed (cable 409-470 KiB/s). Reverted: the losses are not the stand-aside |
 
-   The radio's losses come in bursts and land before `dwc2`'s ring, in the chip, while its receive is held
-   aside for the stick's writes (`91e9448e` tests that). The other cost seen throughout is `wifi-usb` running
-   without a reply mailbox (`backlog/74`): about 10,000 of the host's notices taken in place of answers in
-   three minutes, each resynchronised (`usbfn::OP_SYNC`).
+   **Where the Pi 2's radio stands, set aside by the operator 2026-10-22** ("the Pi 2 ethernet is quick enough
+   for the package manager"): 58-81 KiB/s, against 465-470 over the cable. What is known: the losses come in
+   bursts of about 23 segments, 60-100 a 10 MB download with up to a minute waited behind them; they land
+   before `dwc2`'s ring (full for 3 s of it); they are not the stand-aside (`91e9448e`); and about 41 frames a
+   second arrive, with the access point resending frames already received and once ending an association
+   for frames left unacknowledged (reason 34). What is left, in the order to try:
+   1. The chip's IQ calibration (rtl8xxxu's gen-1 IQ calibration), the last of `rtl8xxxu_init_device` not
+      done: it sets the transmitter's quality, which the access point hearing our acknowledgements turns on.
+   2. `wifi-usb`'s reply mailbox (`backlog/74`, a kernel change, the operator's to decide): about 10,000 of the
+      host's notices taken in place of answers in three minutes, each resynchronised (`usbfn::OP_SYNC`).
+   3. Receive aggregation (off by default in `rtl8xxxu`): several frames to a USB transfer.
+   4. A 32 KiB window over a radio (`net-stack`), once the losses are gone.
 
    **Recovery, the same day.** The dongle's first firmware block failed on the bus at boot on four boots and
    every control read after it was NAKed until it was replugged by hand: `wifi-usb` asks for a software
-   replug now (`usbfn::OP_REPLUG`, `bab37ad0`; routed wrongly until `ae4805fb`, not yet seen working). And an
+   replug now (`usbfn::OP_REPLUG`, `bab37ad0`; routed wrongly until `ae4805fb`). **Seen at `91e9448e`, and not
+   enough:** the port was reset and the chip did not enumerate after it (`port 2 FAILED (split)`), and `dwc2`
+   said to replug it, which brought it back. A port reset does not clear this wedge; a power cycle does, and
+   the Pi 2's USB ports share one power switch, so on this board the remaining remedy is the hand. Why the
+   first block fails at boot (four boots in eight on 2026-10-22, never on a replug) is not known. And an
    access point refused the boot rejoin once (reason 34), and nothing tried again until the dongle was
    replugged: a refused rejoin is tried three more times since `d48dbc01`.
 

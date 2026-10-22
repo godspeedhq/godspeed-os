@@ -116,14 +116,7 @@ pub fn program_ping(
     // every run with a cable.) `rtl::service` puts it back, from where it stopped, with its data toggle. The NIC's own
     // background IN is left alone: arming it is not a transfer that has to complete. Periodic transfers - the
     // keyboard, the hub's status - ride the periodic queue and are not affected. A no-op when it is not armed.
-    //
-    // NOT FOR THE DISK'S BULK TRANSFERS (`CH_BULK`), since 2026-10-22. The NIC's armed IN has never stood
-    // aside for them, and no download has shown a disk transfer starved; standing the radio aside for each one
-    // left the RTL8188CUS unread for the length of every 32 KiB write, and on the Pi 2 a WiFi download lost
-    // about 23 segments at a time, 102 times, while dwc2's own ring was full for only 3 s of it. The radio's
-    // own bulk OUT shares `CH_BULK` and stands it aside itself (`rtl::bulk_out`); whether the disk's do starve
-    // with both INs armed is what the card shows.
-    if ch != CH_RADIO_RX && ch != crate::regs::CH_NET_RX && (ep_type == 0 || (ep_type == 2 && ch != CH_BULK)) {
+    if ch != CH_RADIO_RX && ch != crate::regs::CH_NET_RX && (ep_type == 0 || ep_type == 2) {
         halt(ctx, mmio, CH_RADIO_RX);
     }
 
