@@ -280,6 +280,13 @@ On 2026-10-19 (item 12 has the figures since):
    3. Receive aggregation (off by default in `rtl8xxxu`): several frames to a USB transfer.
    4. A 32 KiB window over a radio (`net-stack`), once the losses are gone.
 
+   **The VisionFive, the same day** (10 MB, the cable and the AIC8800): at `8f150cfe`, 113-271 KiB/s over the
+   cable and two downloads in three failing to connect, the dwmac receive ring of 24 running dry (`RBU` 237
+   to 403 in a download) with 4,270 of 10,084 segments after a gap; the disk 2.1 s and decryption 1.1 s. At
+   `6bfd508d`, the ring 256 as GENET's: **1.4-1.7 MiB/s, 5-6 s, `RBU` 0**, the disk now the largest part
+   (2.5-3.2 s). The radio 37-45 KiB/s, with 122-126 gaps and up to 161 s waited behind them - unchanged, and
+   left as the Pi 2's is. The same card's `drives check` ended in a kernel panic, `backlog/94`.
+
    **Recovery, the same day.** The dongle's first firmware block failed on the bus at boot on four boots and
    every control read after it was NAKed until it was replugged by hand: `wifi-usb` asks for a software
    replug now (`usbfn::OP_REPLUG`, `bab37ad0`; routed wrongly until `ae4805fb`). **Seen at `91e9448e`, and not
