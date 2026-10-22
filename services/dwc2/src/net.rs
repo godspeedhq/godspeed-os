@@ -1380,6 +1380,14 @@ impl Nic {
         RXQ_BYTES - self.rxbuf_fill >= RXQ_PER_BURST
     }
 
+    /// The length of the oldest queued frame, without taking it (`OP_NET_RX_BATCH` asks before it takes).
+    pub fn rxq_peek_len(&self) -> Option<usize> {
+        if self.rxq_count == 0 {
+            return None;
+        }
+        Some(self.rxbuf[self.rxbuf_pos] as usize | (self.rxbuf[self.rxbuf_pos + 1] as usize) << 8)
+    }
+
     /// Copy the oldest queued frame into `out` and remove it. Returns its length, 0 if empty.
     ///
     /// Emptying resets the cursor, so the next bursts start at the front of the buffer.
@@ -1790,6 +1798,14 @@ pub const CH_NET_RX: u32 = 3;
 pub const OP_NET_INFO: u8 = 0x10;
 pub const OP_NET_TX: u8 = 0x11;
 pub const OP_NET_RX: u8 = 0x12;
+/// RX, BATCHED: `[count, (len:u16 LE, frame) x count]`, as many queued frames as fit `RX_BATCH_BODY` and
+/// at most `RX_BATCH_FRAMES` - `nic-driver`'s own batch format (its op 9), so it forwards the answer whole.
+/// One exchange where `OP_NET_RX` took one a frame and one more to find the queue empty: on the Pi 2 a
+/// 10 MB download asked `nic-driver` 7,200 times for 10,100 frames, 2.7 ms an ask (2026-10-22).
+pub const OP_NET_RX_BATCH: u8 = 0x13;
+/// `nic-driver`'s `BATCH_MSG_MAX` and `BATCH_MAX`: the answer it builds from this one must fit its own.
+pub const RX_BATCH_BODY: usize = 3072;
+pub const RX_BATCH_FRAMES: usize = 8;
 
 /// Serve one frame request. Returns false if the message was not one.
 pub fn serve(
@@ -1819,7 +1835,7 @@ pub fn serve(
     //
     // `fs` has had exactly this and exactly this fix since the "run ls twice" desync
     // (`docs/net-tags-design.md` is the design for this path). The tag costs one byte per reply.
-    let mut out = [0u8; FRAME_MAX + 5];
+    let mut out = [0u8; RX_BATCH_BODY + 2];
     out[0] = p[0];
     let body = &mut out[1..];
     let n = match p[0] {
@@ -1878,6 +1894,42 @@ pub fn serve(
             body[0] = (got & 0xFF) as u8;
             body[1] = ((got >> 8) & 0xFF) as u8;
             got + 2
+        }
+        OP_NET_RX_BATCH => {
+            // The wire is touched when the queue is empty, at most twice: once to begin, once more if the
+            // queue empties before the answer is full.
+            let mut count = 0usize;
+            let mut at = 1usize;
+            let mut harvests = 0;
+            loop {
+                if nic.rxq_count == 0 {
+                    if harvests == 2 {
+                        break;
+                    }
+                    harvests += 1;
+                    rx(ctx, mmio, dma, t, nic);
+                    if nic.rxq_count == 0 {
+                        break;
+                    }
+                }
+                let Some(len) = nic.rxq_peek_len() else { break };
+                if count == RX_BATCH_FRAMES || at + 2 + len > RX_BATCH_BODY {
+                    break;
+                }
+                let mut frame = [0u8; FRAME_MAX];
+                let got = nic.rxq_pop(&mut frame);
+                if got == 0 {
+                    break;
+                }
+                nic.stats.rx_popped = nic.stats.rx_popped.saturating_add(1);
+                body[at] = (got & 0xFF) as u8;
+                body[at + 1] = ((got >> 8) & 0xFF) as u8;
+                body[at + 2..at + 2 + got].copy_from_slice(&frame[..got]);
+                at += 2 + got;
+                count += 1;
+            }
+            body[0] = count as u8;
+            at
         }
         // ANSWER, do not return. The comment here used to read "not a net op - the block server gets a
         // look at it", and that was false: `dispatch` takes the reply cap BEFORE calling this, so

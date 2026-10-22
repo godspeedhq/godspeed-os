@@ -1259,6 +1259,25 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             None => 0,
         }
     };
+    // `dwc2`'s batch (`OP_NET_RX_BATCH`, 0x13): its answer is `[0x13, count, (len, frame) x count]`, this
+    // driver's own batch format after the tag, so it is checked frame by frame and copied whole into `out`
+    // (`out[0]` the count). Returns the bytes of `out` used; a malformed frame ends the batch there.
+    let dev_rx_batch = |ctx: &ServiceContext, out: &mut [u8]| -> usize {
+        let Some(r) = dwc2_rpc(ctx, &Message::from_bytes(&[0x13])) else { out[0] = 0; return 1 };
+        let p = r.payload_bytes();
+        let want = p.get(1).copied().unwrap_or(0) as usize;
+        let (mut at, mut count) = (2usize, 0usize);
+        while count < want && count < BATCH_MAX as usize {
+            if at + 2 > p.len() { break; }
+            let n = (p[at] as usize) | ((p[at + 1] as usize) << 8);
+            if n == 0 || n > FRAME_MAX || at + 2 + n > p.len() || at - 1 + 2 + n > out.len() { break; }
+            out[at - 1..at - 1 + 2 + n].copy_from_slice(&p[at..at + 2 + n]);
+            at += 2 + n;
+            count += 1;
+        }
+        out[0] = count as u8;
+        at - 1
+    };
     let mut info = [0u8; 7];
     if dev_info(&ctx, &mut info) {
         ctx.log_fmt(format_args!(
@@ -1345,13 +1364,19 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             let mut out = [0u8; BATCH_MSG_MAX];
             let mut opos = 1usize;
             let mut count = 0u8;
-            while count < BATCH_MAX {
+            // The cable's batch is `dwc2`'s, in one exchange (`dev_rx_batch`); the radio's is built here,
+            // a frame at a time.
+            if cable {
+                opos = dev_rx_batch(&ctx, &mut out);
+                count = out[0];
+            }
+            while !cable && count < BATCH_MAX as u8 {
                 // Check a MAX-size frame would fit BEFORE dequeuing, so a frame is never pulled off the
                 // device only to be dropped for lack of room (userspace-audit Audit 5, A5-U2). net-stack
                 // re-polls (op 4/9) for whatever we stop short of.
                 if opos + 2 + FRAME_MAX > out.len() { break; }
                 let mut rx = [0u8; FRAME_MAX];
-                let n = if cable { dev_rx(&ctx, &mut rx) } else { radio.rx(&ctx, &mut rx) };
+                let n = radio.rx(&ctx, &mut rx);
                 if n == 0 { break; }
                 out[opos] = (n & 0xff) as u8;
                 out[opos + 1] = ((n >> 8) & 0xff) as u8;
