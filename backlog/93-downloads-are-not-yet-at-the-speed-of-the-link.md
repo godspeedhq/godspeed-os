@@ -285,7 +285,7 @@ On 2026-10-19 (item 12 has the figures since):
    to 403 in a download) with 4,270 of 10,084 segments after a gap; the disk 2.1 s and decryption 1.1 s. At
    `6bfd508d`, the ring 256 as GENET's: **1.4-1.7 MiB/s, 5-6 s, `RBU` 0**, the disk now the largest part
    (2.5-3.2 s). The radio 37-45 KiB/s, with 122-126 gaps and up to 161 s waited behind them - unchanged, and
-   left as the Pi 2's is. The same card's `drives check` ended in a kernel panic, `backlog/94`.
+   left as the Pi 2's is. The same card's `drives check` ended in a kernel panic, `backlog/fixed/94`.
 
    **The VisionFive's WiFi stays slow, set aside at the operator's word (2026-10-22).** The serve loop's receive
    queue of 32 (`1047ac67`) cut the frames turned away from 136 to 1, and the radio stayed at about 60 KiB/s,

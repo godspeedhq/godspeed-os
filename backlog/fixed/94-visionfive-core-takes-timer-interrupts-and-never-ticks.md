@@ -1,7 +1,7 @@
 # 94. VisionFive: a core takes timer interrupts, about 1,450 a second, and never reaches the tick
 
-**Status: OPEN - FIX BUILT, owed a card. Seen twice, 2026-10-22, on the VisionFive 2 Lite (`6bfd508d` and
-`860fe372`), both during `drives check`; the cause is found (below) and the fix is in `arch/riscv64`.**
+**Status: FIXED 2026-10-22, hardware-verified on the VisionFive 2 Lite at `7b022a9e`. Seen twice that day
+(`6bfd508d` and `860fe372`), both during `drives check`; the cause is below and the fix is in `arch/riscv64`.**
 Recorded at the operator's choice, as its own entry rather than under `backlog/49`, because the evidence says
 the core was stuck rather than late.
 
@@ -78,3 +78,19 @@ past is a tick pending until interrupts are unmasked. No neutral change.
 **What the card should show:** `drives check` after cable downloads finishing with no panic. **Not checked:**
 whether the x86, AArch64 or ARMv7 re-arms can starve a tick the same way; the same neutral calls reach them.
 
+## The card (2026-10-22, `7b022a9e`)
+
+Booted with the cable in: three 10 MB downloads over it at 1000 Mbit/s, each saved and checked, then the cable
+pulled and a fourth over the radio (84 KiB/s, `backlog/93`), then `drives check` twice, 40 s and 11 minutes
+after it. Both finished:
+
+```
+check: 16 files, 21 dirs, 0 bad; 27431 blocks used, 31239385 free (bitmap + free count rebuilt from the tree)
+check: ok - filesystem is consistent
+```
+
+No `KERNEL PANIC`, no `LIVENESS WEDGE`, and no service died in the whole run (`build/serial_output.log` of that
+day, from 19:09). The prediction was that `drives check` after downloads would finish with no panic, and it did.
+
+**Still not checked**, as above: whether the x86, AArch64 or ARMv7 re-arms can starve a tick the same way.
+And the neutral panic text still says "timer interrupts" for what this port counts as every interrupt.

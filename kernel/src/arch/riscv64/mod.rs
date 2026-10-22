@@ -1785,7 +1785,7 @@ pub mod boot {
     /// live-locks in the handler. The tick sets it itself (`arm_timer`); this exists because the
     /// scheduler re-arms on entering and LEAVING idle, before it has taken a tick to do it in.
     ///
-    /// **Only ever earlier, and that is the fix for `backlog/94`.** This used to set `now + 10 ms`
+    /// **Only ever earlier, and that is the fix for `backlog/fixed/94`.** This used to set `now + 10 ms`
     /// every time it was called, and the scheduler calls it on every pass through idle and every
     /// switch out of it. A core woken by other harts more often than every 10 ms - `fs` on core 1
     /// during `drives check`, about 1,300 software interrupts a second, `last vector 0x00000001` -
