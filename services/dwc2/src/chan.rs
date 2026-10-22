@@ -111,8 +111,9 @@ pub fn program_ping(
     // retried by the core in hardware, and every retry takes an entry in the NON-PERIODIC REQUEST QUEUE that
     // control and bulk transfers on every other channel need - `net::tx` found it starving a transmit, with
     // GNPTXSTS reporting zero entries free. Whether it starves a control transfer too has not been measured
-    // on this board (no run has had the NIC's IN armed), and a SETUP takes the same queue, so it stands
-    // aside for both. `rtl::service` puts it back, from where it stopped, with its data toggle. The NIC's own
+    // on this board, and a SETUP takes the same queue, so it stands aside for both. (This said "no run has had
+    // the NIC's IN armed", which was true of the radio's first logs and not since: the NIC's IN is armed in
+    // every run with a cable.) `rtl::service` puts it back, from where it stopped, with its data toggle. The NIC's own
     // background IN is left alone: arming it is not a transfer that has to complete. Periodic transfers - the
     // keyboard, the hub's status - ride the periodic queue and are not affected. A no-op when it is not armed.
     //

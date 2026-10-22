@@ -80,7 +80,8 @@ pub const OP_SYNC: u8 = 0x25;
 
 /// `[NOTE_BULK_IN]`, sent BY the host TO the driver, no reply expected: a bulk IN transfer is held, ask
 /// `OP_BULK_IN`. Sent with `try_send`; one the driver's full queue refused is sent again on the host's next
-/// pass, because the host arms nothing until the transfer is collected and a lost notice would stop receive.
+/// pass, because a lost notice would stop receive: `xhci` arms nothing until the transfer is collected, and
+/// `dwc2`'s ring is emptied only as the driver is told it holds something.
 pub const NOTE_BULK_IN: u8 = 0x2E;
 
 /// `[op]` -> `[op, status]`: REPLUG the radio - reset its port and bind it afresh, what unplugging and plugging

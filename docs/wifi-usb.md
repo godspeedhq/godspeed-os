@@ -402,7 +402,11 @@ zero entries free). Whether it starves a control transfer has never been measure
 show the NIC's IN never armed (`nohalt 0`), so they cannot answer it, though they first looked as if they
 did - and a SETUP takes the same queue. So `chan::program_ping` halts the radio's IN before programming any
 control or bulk transfer on another channel, and `rtl::service` puts it back from the packet it reached, with
-the data toggle read out of the channel. Periodic transfers (the keyboard, the hub's status) ride the other
+the data toggle read out of the channel. *(Note 2026-10-22: two of these paragraphs' facts have changed. `dwc2`
+now takes the radio's transfers into a ring of eight and arms again at once (`rtl::RX_SLOTS`), notifying while
+the ring holds any; and the IN no longer stands aside for the disk's bulk transfers (`91e9448e`, owed a card),
+after a WiFi download lost bursts of about 23 segments while its receive was held aside for each 32 KiB write.
+`backlog/93` has the cards.)* Periodic transfers (the keyboard, the hub's status) ride the other
 queue and do not stand it aside.
 
 **The interrupt could be dropped, and now cannot.** The USB interrupt reaches `dwc2` as the message `[0x29]`

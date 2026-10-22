@@ -98,7 +98,8 @@ pub struct Radio {
     full_at: Option<wait::Since>,
     /// The driver asked for a replug (`usbfn::OP_REPLUG`); the main loop does it once the answer is sent.
     pub replug_asked: bool,
-    /// Whether one may be done now - the main loop's bound (`REPLUG_MAX`), set when it binds the radio.
+    /// Whether one may be done now: true at a bind, and false on the bind after a replug once the main
+    /// loop's bound (`REPLUG_MAX`) is spent.
     pub replug_allowed: bool,
     /// Consecutive transaction errors on the IN, for `RX_ERROR_TRIES`.
     errs_run: u32,

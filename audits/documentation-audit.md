@@ -1798,3 +1798,36 @@ returns nothing, so `tx` reads a channel whose halt expired as retired and `resu
 treats held bytes as a burst that may continue even when the IN completed on a short packet.
 
 **Gates:** every documentation checker green.
+
+## Audit 22 - documents and code comments, the Pi 2 cable and radio work (2026-10-22)
+
+Scope: the commits on `feat/gs-driver` after Audit 21 (`4a6d04cf..801a09fc`), 27 files: the AHB burst
+length, the stick's runs as one WRITE(10) and then gathered, the cable's batch receive, the shell's
+backgrounded-job line, the radio's beacon filter, receive ring and transmit-side init, the software replug
+and its routing, the refused-rejoin retry, the stand-aside change and four instruments. A self-audit: the
+session that made the changes re-read every new comment against the code and swept the docs that describe
+`dwc2`'s radio receive.
+
+**Result.** 6 corrections across 6 files. No code defect found by the audit; the two the day had (the ring's
+notice owed only on empty-to-not, and `OP_REPLUG` routed to the network) were found on hardware and fixed
+in `d7f4c6ad` and `ae4805fb`.
+
+**In comments:**
+- `msc.rs`: the gather size said a longer write holds the radio aside for longer; since `91e9448e` the radio
+  does not stand aside for the disk.
+- `chan.rs`: the stand-aside rule said "no run has had the NIC's IN armed", which has not been true since the
+  radio's first logs.
+- `rtl.rs`: `replug_allowed` was "set when it binds the radio"; it is lowered only on the bind after a replug.
+- `usbfn.rs`: `NOTE_BULK_IN`'s reason was that the host arms nothing until a transfer is collected - true of
+  `xhci`, not of `dwc2`'s ring.
+
+**In documents:**
+- `sdk/wifi/CLAUDE.md`: the `usbfn` row did not list `OP_REPLUG` or `is_request`.
+- `docs/wifi-usb.md`: the R3b design record (one held transfer, the stand-aside for every transfer) given a
+  dated note.
+
+**Recorded, not changed:** the release profile is `opt-level = "s"` for the whole workspace, and TLS
+decryption takes 5.3-5.4 s of a 20 s cable download on the Pi 2 (about 480 cycles a byte for AES-128-GCM);
+whether the crypto crates gain from a higher level is a build-wide choice, not an audit's.
+
+**Gates:** every documentation checker green.
