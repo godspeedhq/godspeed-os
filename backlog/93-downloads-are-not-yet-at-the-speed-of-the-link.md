@@ -287,6 +287,18 @@ On 2026-10-19 (item 12 has the figures since):
    (2.5-3.2 s). The radio 37-45 KiB/s, with 122-126 gaps and up to 161 s waited behind them - unchanged, and
    left as the Pi 2's is. The same card's `drives check` ended in a kernel panic, `backlog/94`.
 
+   **The VisionFive's WiFi stays slow, set aside at the operator's word (2026-10-22).** The serve loop's receive
+   queue of 32 (`1047ac67`) cut the frames turned away from 136 to 1, and the radio stayed at about 60 KiB/s,
+   with `nic-driver`'s frame reads taking 23-86 ms. The SDIO bus never leaves the identification clock (400 kHz
+   by the driver's arithmetic, one data line), so two cards raised it to 25 MHz. Raised at identification
+   (`ae94e8a5`), the uploads ran in half the time and the ROM then stopped answering in the patch table's
+   Bluetooth power-on group. Raised after the firmware's start (`0e9aec68`), the first CMD53 after the switch
+   went unanswered (`INT` 0). Both left the radio down, and both are reverted (`860fe372`). Two facts for
+   whoever picks it up: the patch upload's 21 ms a block at the slow clock is less than its bit time at 400 kHz
+   (`docs/wifi-aic8800.md` 4), so the card clock may already be above what the driver computes, and the bus
+   may not be the whole limit; and how the reference runs this chip faster on this board (the host's sample
+   and drive phase, a clock change after the power-on group, a 4-bit bus) has not been read. Read it first.
+
    **Recovery, the same day.** The dongle's first firmware block failed on the bus at boot on four boots and
    every control read after it was NAKed until it was replugged by hand: `wifi-usb` asks for a software
    replug now (`usbfn::OP_REPLUG`, `bab37ad0`; routed wrongly until `ae4805fb`). **Seen at `91e9448e`, and not
