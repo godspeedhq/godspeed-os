@@ -486,27 +486,33 @@ pub const OP_CAPACITY: u8 = 3;
 pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
 /// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]` (`block-driver`'s
-/// `OP_WRITE_BLOCKS`). Served here block by block, each as a single write is: one request instead of
-/// `count`, the stick still asked per block. The `xhci` host gathers runs and writes them as one command.
+/// `OP_WRITE_BLOCKS`). Served here as ONE WRITE(10) of `count` blocks, which the disk buffer holds
+/// (`DATA_MAX`). The `xhci` host goes further and gathers consecutive runs into one command.
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;
+// A run is written from the disk buffer whole, so the longest one must fit it.
+const _: () = assert!(WRITE_RUN_MAX * 512 <= DATA_MAX);
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device - the same value and meaning as
 /// `xhci`'s (`backlog/57`): a refusal by a device and the absence of one are different facts.
 pub const STATUS_NO_DISK: u8 = 2;
 
-/// WRITE(10): one block from the arena's data buffer.
-pub fn write_block(
-    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+/// WRITE(10): `count` consecutive blocks from the start of the arena's data buffer, as one command.
+///
+/// **One command per run, not per block.** A 512-byte block per WRITE(10) cost the stick a command's
+/// whole turnaround for every block: on the Pi 2 a 10 MB download spent 43-50 s of its 60-71 s writing
+/// (2026-10-22), as the Pi 4 did before its runs went as one command (`b2f91e9a`, 40 s to 9.8 s).
+pub fn write_blocks(
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, count: u16,
 ) -> bool {
     let cdb = [
         0x2Au8, 0,
         (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
-        0, 0, 1, 0,
+        0, (count >> 8) as u8, count as u8, 0,
     ];
-    bot(ctx, mmio, dma, t, disk, &cdb, false, block as usize).is_some()
+    bot(ctx, mmio, dma, t, disk, &cdb, false, count as usize * 512).is_some()
 }
 
 /// Retry a BOT command that handed back BUSY, bounded by the CLOCK.
@@ -585,7 +591,7 @@ pub fn serve(
                 dma.disk.write8(i, p[9 + i]);
             }
             let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
-            out[0] = if with_busy_retry(ctx, 30_000, || write_block(ctx, mmio, dma, t, disk, lba, 512)) {
+            out[0] = if with_busy_retry(ctx, 30_000, || write_blocks(ctx, mmio, dma, t, disk, lba, 1)) {
                 STATUS_OK
             } else {
                 STATUS_ERR
@@ -596,14 +602,11 @@ pub fn serve(
             let count = p[9] as usize;
             let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
             let mut ok = (1..=WRITE_RUN_MAX).contains(&count) && p.len() >= 10 + count * 512;
-            let mut s = 0;
-            while ok && s < count {
-                for i in 0..512 {
-                    dma.disk.write8(i, p[10 + s * 512 + i]);
+            if ok {
+                for i in 0..count * 512 {
+                    dma.disk.write8(i, p[10 + i]);
                 }
-                let at = lba.wrapping_add(s as u32);
-                ok = with_busy_retry(ctx, 30_000, || write_block(ctx, mmio, dma, t, disk, at, 512));
-                s += 1;
+                ok = with_busy_retry(ctx, 30_000, || write_blocks(ctx, mmio, dma, t, disk, lba, count as u16));
             }
             out[0] = if ok { STATUS_OK } else { STATUS_ERR };
             1
