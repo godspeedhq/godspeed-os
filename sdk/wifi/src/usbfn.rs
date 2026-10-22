@@ -82,6 +82,15 @@ pub const OP_SYNC: u8 = 0x25;
 /// pass, because the host arms nothing until the transfer is collected and a lost notice would stop receive.
 pub const NOTE_BULK_IN: u8 = 0x2E;
 
+/// `[op]` -> `[op, status]`: REPLUG the radio - reset its port and bind it afresh, what unplugging and plugging
+/// it back does short of cutting its power. For a chip that has stopped answering its driver: on the Pi 2 the
+/// RTL8188CUS's first firmware block can fail on the bus at boot, and every control read after it is NAKed
+/// until the dongle is replugged (2026-10-22). `ST_OK`: the host will, after answering - it reports the radio
+/// gone and then bound again, so the supervisor stops this driver and starts a fresh one, as for a real
+/// replug. `ST_FAILED`: it has already done so as often as its bound allows, and says so. `ST_BAD_REQUEST`:
+/// a host that cannot (`xhci`, which does not take it yet).
+pub const OP_REPLUG: u8 = 0x27;
+
 // 0x29 is NOT free in this range: `dwc2` receives the USB interrupt as the one-byte message `[0x29]`, told
 // apart from a request only by carrying no reply cap, so no op may take that value. Nor is 0x26: it is
 // `godspeed_sdk::service_context::usbdev::ASK`, the supervisor asking a USB host for its device report.

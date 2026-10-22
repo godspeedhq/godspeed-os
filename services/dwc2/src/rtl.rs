@@ -88,6 +88,10 @@ pub struct Radio {
     sync_radio: bool,
     /// When the driver last asked anything, for that quiet.
     last_req: Option<wait::Since>,
+    /// The driver asked for a replug (`usbfn::OP_REPLUG`); the main loop does it once the answer is sent.
+    pub replug_asked: bool,
+    /// Whether one may be done now - the main loop's bound (`REPLUG_MAX`), set when it binds the radio.
+    pub replug_allowed: bool,
     /// Consecutive transaction errors on the IN, for `RX_ERROR_TRIES`.
     errs_run: u32,
     pub stats: RxStats,
@@ -177,7 +181,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid
     let _ = probe(ctx, mmio, dma, t);
     Radio {
         t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
-        sync_bulk: false, sync_radio: false, last_req: None,
+        sync_bulk: false, sync_radio: false, last_req: None, replug_asked: false, replug_allowed: true,
         errs_run: 0, stats: RxStats::default(),
         outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
         tx: TxStats::default(),
@@ -598,6 +602,15 @@ pub fn serve(
         }
         (usbfn::OP_CONTROL, Some(r)) => control(ctx, mmio, dma, &r.t, p, CONTROL_TRIES, &mut out),
         (usbfn::OP_CONTROL_ONCE, Some(r)) => control(ctx, mmio, dma, &r.t, p, 1, &mut out),
+        (usbfn::OP_REPLUG, Some(r)) => {
+            out[1] = if r.replug_allowed {
+                r.replug_asked = true;
+                usbfn::ST_OK
+            } else {
+                usbfn::ST_FAILED
+            };
+            2
+        }
         _ => {
             out[1] = usbfn::ST_BAD_REQUEST;
             2

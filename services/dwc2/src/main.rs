@@ -75,6 +75,10 @@ const REARM_MS: u64 = 1_000;
 const REARM_SERVICED_MS: u64 = 1;
 /// Receive harvests per interrupt. Bounded so a talkative link cannot hold the serve loop.
 const IRQ_RX_ROUNDS: u32 = 8;
+/// Replugs of the radio its driver may ask for (`usbfn::OP_REPLUG`) within `REPLUG_WINDOW_MS` of the last:
+/// a chip that a port reset does not bring back is not reset forever, and the operator is told to replug it.
+const REPLUG_MAX: u32 = 3;
+const REPLUG_WINDOW_MS: u64 = 600_000;
 /// The USB controller's vector. The kernel delivers it as the one-byte message `[USB_VECTOR]` with no reply
 /// cap, which is all that tells it apart from a request (`godspeed_wifi::usbfn` keeps the value free).
 const USB_VECTOR: u8 = 0x29;
@@ -355,6 +359,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // (`usbdev`) and `OP_INFO`'s: different from the last bind, and from a restarted host's where the
     // counter is calibrated and running (`usbfn::next_gen` says where it is not).
     let mut radio_binds: u32 = 0;
+    // The replugs its driver asked for, and when the last was (`REPLUG_MAX`).
+    let mut radio_replugs: u32 = 0;
+    let mut radio_replug_at: Option<wait::Since> = None;
     if let Some(m) = godspeed::driver::registers(&ctx) {
         if core::identify(&ctx, &m).is_some() {
             let ok = core::reset_and_host_mode(&ctx, &m);
@@ -874,6 +881,44 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             }
                         }
                     }
+                }
+            }
+
+            // --- A REPLUG THE RADIO'S DRIVER ASKED FOR (`usbfn::OP_REPLUG`) -------------------------
+            //
+            // The software half of unplugging the dongle and plugging it back: its hub port reset and the
+            // device bound afresh, reported gone and then bound, so the supervisor stops its driver and
+            // starts a fresh one. The Pi 2's ports share one power switch, so this is a reset and not a
+            // power cycle; whether it clears a chip that has stopped answering is what the card shows.
+            // Bounded (`REPLUG_MAX`): past it the radio's driver is answered `ST_FAILED`, and it says so.
+            if radio.as_ref().is_some_and(|r| r.replug_asked) {
+                if radio_replug_at.is_some_and(|at| at.passed(&ctx, Budget::ms(REPLUG_WINDOW_MS))) {
+                    radio_replugs = 0;
+                }
+                radio_replugs += 1;
+                radio_replug_at = Some(wait::Since::now(&ctx));
+                let port = radio_port;
+                let mut addr = radio.as_ref().map_or(next_addr, |r| r.t.addr);
+                rtl::stop(&ctx, &m);
+                radio = None;
+                rtl::announce(&ctx, None);
+                notify(&ctx, format_args!(
+                    "usb: WiFi dongle stopped answering its driver - resetting port {} as a replug would ({} of {})",
+                    port, radio_replugs, REPLUG_MAX));
+                match hub_target.and_then(|ht| hub::enumerate_downstream(&ctx, &m, &d, &ht, port, &mut addr)) {
+                    Some((v, p, _, dt, _)) if v == rtl::VID && p == rtl::PID => {
+                        radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                        let mut r = rtl::bind(&ctx, &m, &d, &dt, v, p, radio_binds);
+                        r.replug_allowed = radio_replugs < REPLUG_MAX;
+                        radio = Some(r);
+                        rtl::announce(&ctx, radio.as_ref());
+                        notify(&ctx, format_args!("usb: WiFi dongle bound again after its port reset (port {})", port));
+                    }
+                    Some((v, p, _, _, _)) => ctx.log_fmt(format_args!(
+                        "dwc2-svc: port {} answered its reset as {:04x}:{:04x}, not the radio - nothing bound as the radio",
+                        port, v, p)),
+                    None => notify(&ctx, format_args!(
+                        "usb: the WiFi dongle's port {} did not come back from its reset - unplug it and plug it back", port)),
                 }
             }
 

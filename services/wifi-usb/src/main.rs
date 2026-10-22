@@ -358,6 +358,21 @@ fn bring_up(ctx: &ServiceContext, tx_paths: u8) -> Option<([u8; 6], u8, rtl_powe
 /// receive path without a scan.
 const FIRST_CHANNEL: u8 = 1;
 
+/// A chip that took no firmware in `DOWNLOAD_TRIES` has stopped answering, and only a replug has brought one
+/// back (Pi 2, 2026-10-22: the first block failed on the bus at boot, and every control read after it was
+/// NAKed): ask the host to do one (`usbfn::OP_REPLUG`). On `ST_OK` the host reports the dongle gone and bound
+/// again, and this driver is stopped and a fresh one started; anything else is said, and the radio stays down.
+fn replug(ctx: &ServiceContext) {
+    let st = host(ctx, &[usbfn::OP_REPLUG]).ok()
+        .and_then(|r| { let p = r.payload_bytes(); (p.len() >= 2 && p[0] == usbfn::OP_REPLUG).then(|| p[1]) });
+    match st {
+        Some(usbfn::ST_OK) => ctx.log("wifi-usb: the chip is not answering - its host is resetting the dongle's port, as a replug would"),
+        Some(usbfn::ST_FAILED) => ctx.log("wifi-usb: the chip is not answering, and its host has reset the dongle as often as it may - unplug it and plug it back"),
+        Some(_) => ctx.log("wifi-usb: the chip is not answering, and this USB host cannot reset the dongle - unplug it and plug it back"),
+        None => ctx.log("wifi-usb: the chip is not answering, and its host did not answer a request to reset it - unplug it and plug it back"),
+    }
+}
+
 /// R2: the embedded firmware checked, its header read, downloaded (up to `DOWNLOAD_TRIES` times, as Linux
 /// tries), and started; the chip's own `WINT_INIT_READY` is the word that it runs.
 fn firmware(ctx: &ServiceContext) -> bool {
@@ -389,6 +404,7 @@ fn firmware(ctx: &ServiceContext) -> bool {
                 "wifi-usb: the download stopped ({}) - try {} of {}", why, tries, DOWNLOAD_TRIES)),
             Err(why) => {
                 ctx.log_fmt(format_args!("wifi-usb: the download did not complete in {} tries - {}", tries, why));
+                replug(ctx);
                 return false;
             }
         }
