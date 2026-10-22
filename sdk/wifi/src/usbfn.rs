@@ -53,8 +53,9 @@ pub const OP_CONTROL_ONCE: u8 = 0x22;
 /// one, and the host's IN armed again; `ST_OK` with no bytes when it holds none, which also arms the IN if it
 /// was not armed - so the driver's first ask, once the chip's receive is set up, is what starts receiving.
 /// The host keeps one IN armed in the background and takes its completion on the USB interrupt, then sends
-/// `NOTE_BULK_IN`; it does not arm again until the transfer is collected, so the chip holds what arrives
-/// meanwhile and nothing is dropped between the two. `ST_FAILED` when the radio has no bulk IN endpoint, or the host could not repair it
+/// `NOTE_BULK_IN`. `xhci` does not arm again until the transfer is collected, so the chip holds what arrives
+/// meanwhile; `dwc2` arms again at once into a ring of eight (`rtl::RX_SLOTS`), and holds the chip only when
+/// all eight wait. Either way nothing is dropped between the host and the driver. `ST_FAILED` when the radio has no bulk IN endpoint, or the host could not repair it
 /// after a failed transfer.
 pub const OP_BULK_IN: u8 = 0x23;
 /// `[op, out, transfer...]` -> `[op, status]`: one bulk OUT transfer to the radio - a frame with the chip's

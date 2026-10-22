@@ -88,8 +88,14 @@ pub struct Radio {
     sync_radio: bool,
     /// When the driver last asked anything, for that quiet.
     last_req: Option<wait::Since>,
-    /// When the transfer now held was taken, for `RxStats::held_ms`.
-    held_at: Option<wait::Since>,
+    /// The ring (`RX_SLOTS`): each slot's length and when it landed (for `RxStats::held_ms`), the oldest slot,
+    /// and how many hold a transfer.
+    ring_len: [usize; RX_SLOTS],
+    ring_at: [Option<wait::Since>; RX_SLOTS],
+    ring_head: usize,
+    ring_n: usize,
+    /// When the ring last filled, for `RxStats::full_ms`.
+    full_at: Option<wait::Since>,
     /// The driver asked for a replug (`usbfn::OP_REPLUG`); the main loop does it once the answer is sent.
     pub replug_asked: bool,
     /// Whether one may be done now - the main loop's bound (`REPLUG_MAX`), set when it binds the radio.
@@ -131,15 +137,25 @@ struct Eps {
     out_mps: u16,
 }
 
-/// Where the radio's receive is. `Armed { at }`: the IN is programmed to land at `Parts::radio_rx` at `at`, `at` being
-/// what a transfer that was stood aside had already received. `Held(n)`: a transfer of `n` bytes is waiting
-/// for `wifi-usb` to collect it, and the IN is NOT armed.
+/// Where the radio's receive is. `Armed { at }`: the IN is programmed to land in the ring's next free slot at
+/// `at`, `at` being what a transfer that was stood aside had already received. `Full`: every slot holds a
+/// transfer `wifi-usb` has not collected, and the IN is NOT armed - the chip holds what arrives, until it is full.
 #[derive(Clone, Copy, PartialEq)]
 enum Rx {
     Off,
     Armed { at: usize },
-    Held(usize),
+    Full,
 }
+
+/// THE RECEIVE RING: `RX_SLOTS` transfers, each in its own `RX_SLOT` of `Parts::radio_rx`, collected oldest
+/// first. It was ONE transfer, and the IN was not armed again until `wifi-usb` collected it, so the chip was
+/// drained only as fast as the slowest link of `net-stack` -> `nic-driver` -> `wifi-usb` -> here asked: on the
+/// Pi 2 a transfer sat uncollected for up to 708 ms during a download, and the data waited 33.7 s of 119 s
+/// behind 62 gaps, about 23 segments lost in each (2026-10-22). Now the IN is armed into the next slot the
+/// moment a transfer lands, and a slow collection fills this ring, not the chip.
+pub const RX_SLOTS: usize = 8;
+pub const RX_SLOT: usize = 0x1000;
+const _: () = assert!(usbfn::BULK_IN_MAX <= RX_SLOT);
 
 /// What the radio's receive has done, for the heartbeat report. Counts, never reset: a rate is two reports.
 #[derive(Default, Clone, Copy)]
@@ -157,6 +173,8 @@ pub struct RxStats {
     /// all and the longest, in ms: the chip holds what arrives meanwhile, and a full chip drops it.
     pub held_ms: u64,
     pub held_max_ms: u64,
+    /// The time the ring was full - the IN not armed, the chip holding what arrived - in all, in ms.
+    pub full_ms: u64,
 }
 
 // The radio's transfers land in `Parts::radio_rx`, and a frame to send is staged in `Parts::radio_tx`,
@@ -187,7 +205,8 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid
     let _ = probe(ctx, mmio, dma, t);
     Radio {
         t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
-        sync_bulk: false, sync_radio: false, last_req: None, held_at: None, replug_asked: false, replug_allowed: true,
+        sync_bulk: false, sync_radio: false, last_req: None, ring_len: [0; RX_SLOTS], ring_at: [None; RX_SLOTS], ring_head: 0, ring_n: 0, full_at: None,
+        replug_asked: false, replug_allowed: true,
         errs_run: 0, stats: RxStats::default(),
         outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
         tx: TxStats::default(),
@@ -298,8 +317,9 @@ pub fn stop(ctx: &ServiceContext, mmio: &Registers) {
 /// Arm the IN to land at `Parts::radio_rx` at `at`, for the rest of `BULK_IN_MAX`, and let it raise the interrupt.
 fn arm(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radio, at: usize) {
     let t = Target { addr: r.t.addr, mps: r.in_mps, low_speed: false };
+    let slot = (r.ring_head + r.ring_n) % RX_SLOTS;
     chan::program(ctx, mmio, &t, CH_RADIO_RX, true, r.pid_in, (usbfn::BULK_IN_MAX - at) as u32,
-                  dma.radio_rx.phys_at(at) as u32, r.ep_in as u32, 2, 0);
+                  dma.radio_rx.phys_at(slot * RX_SLOT + at) as u32, r.ep_in as u32, 2, 0);
     // The halt alone: a completion halts the channel too, so it is the one event that covers all of them.
     // HAINTMSK picks which channels may raise the core's HCHINT; the NIC's receive sets its own bit.
     mmio.write32(chan::hcintmsk_at(CH_RADIO_RX), HCINT_CHHLTD);
@@ -334,7 +354,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
             r.note_owed = true;
         }
     }
-    if r.note_owed && matches!(r.rx, Rx::Held(_)) {
+    if r.note_owed && r.ring_n > 0 {
         r.note_owed = !tell_bulk(ctx);
     }
     let at = match r.rx {
@@ -357,9 +377,20 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
         }
         r.stats.transfers = r.stats.transfers.wrapping_add(1);
         r.stats.bytes = r.stats.bytes.wrapping_add(got as u32);
-        r.rx = Rx::Held(got);
-        r.held_at = Some(wait::Since::now(ctx));
-        if !tell_bulk(ctx) {
+        let slot = (r.ring_head + r.ring_n) % RX_SLOTS;
+        r.ring_len[slot] = got;
+        r.ring_at[slot] = Some(wait::Since::now(ctx));
+        r.ring_n += 1;
+        if r.ring_n < RX_SLOTS {
+            arm(ctx, mmio, dma, r, 0);
+        } else {
+            r.rx = Rx::Full;
+            r.full_at = Some(wait::Since::now(ctx));
+        }
+        // Told once the ring holds something: the driver collects until it is empty, asked by `nic-driver`'s
+        // polls or by its own loop, so a notice per transfer would only be more notices to take in place of an
+        // answer (`usbfn::OP_SYNC`).
+        if r.ring_n == 1 && !tell_bulk(ctx) {
             r.note_owed = true;
             r.stats.notes_late = r.stats.notes_late.wrapping_add(1);
         }
@@ -393,19 +424,30 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut 
     } else {
         // A completion the interrupt has not been handled for yet is taken now rather than a pass later.
         let _ = service(ctx, mmio, dma, r);
-        if let Rx::Held(len) = r.rx {
-            if let Some(at) = r.held_at.take() {
+        if r.ring_n > 0 {
+            let slot = r.ring_head;
+            let len = r.ring_len[slot];
+            if let Some(at) = r.ring_at[slot].take() {
                 let ms = at.elapsed_us(ctx) / 1000;
                 r.stats.held_ms = r.stats.held_ms.saturating_add(ms);
                 r.stats.held_max_ms = r.stats.held_max_ms.max(ms);
             }
             for (i, b) in out[2..2 + len].iter_mut().enumerate() {
-                *b = dma.radio_rx.read8(i);
+                *b = dma.radio_rx.read8(slot * RX_SLOT + i);
             }
             n = len;
+            r.ring_head = (slot + 1) % RX_SLOTS;
+            r.ring_n -= 1;
             r.note_owed = false;
+            if r.rx == Rx::Full {
+                if let Some(at) = r.full_at.take() {
+                    r.stats.full_ms = r.stats.full_ms.saturating_add(at.elapsed_us(ctx) / 1000);
+                }
+                r.rx = Rx::Off;
+            }
         }
-        if !matches!(r.rx, Rx::Armed { .. }) {
+        // Not armed - not started yet, or the ring was full until now: armed into the slot just freed.
+        if r.rx == Rx::Off && r.ring_n < RX_SLOTS {
             arm(ctx, mmio, dma, r, 0);
         }
         out[1] = usbfn::ST_OK;
@@ -448,15 +490,16 @@ pub fn report(ctx: &ServiceContext, r: &Radio) {
     let state = match r.rx {
         Rx::Off if r.ep_in == 0 => "no bulk IN",
         Rx::Off => "not started",
-        Rx::Armed { .. } => "armed",
-        Rx::Held(_) => "held for wifi-usb",
+        Rx::Armed { .. } if r.ring_n == 0 => "armed",
+        Rx::Armed { .. } => "armed, some held for wifi-usb",
+        Rx::Full => "the ring full, held for wifi-usb",
     };
     ctx.log_fmt(format_args!(
         "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late, {} taken as answers (OP_SYNC); {}; tx - {} frames {} bytes, {} failed",
         s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, s.syncs, state, r.tx.frames, r.tx.bytes, r.tx.failed));
     ctx.log_fmt(format_args!(
-        "dwc2-svc: radio rx held - {} ms in all before the driver collected a transfer, the longest {} ms",
-        s.held_ms, s.held_max_ms));
+        "dwc2-svc: radio rx held - {} ms in all before the driver collected a transfer, the longest {} ms; the ring of {} full {} ms",
+        s.held_ms, s.held_max_ms, RX_SLOTS, s.full_ms));
 }
 
 fn tell_bulk(ctx: &ServiceContext) -> bool {

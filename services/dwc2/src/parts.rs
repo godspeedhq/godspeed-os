@@ -55,7 +55,7 @@ pub fn lay_out(ctx: &ServiceContext, a: Arena) -> Option<Parts> {
         disk: l.take("disk data", crate::msc::DATA_MAX, 0x400)?,
         tx: l.take("network tx", crate::net::FRAME_MAX + 8, 0x1000)?,
         rx: l.take("network rx", crate::net::RX_BURST, 0x1000)?,
-        radio_rx: l.take("radio rx", godspeed_wifi::usbfn::BULK_IN_MAX, 0x1000)?,
+        radio_rx: l.take("radio rx", crate::rtl::RX_SLOTS * crate::rtl::RX_SLOT, 0x1000)?,
         radio_tx: l.take("radio tx", godspeed_wifi::usbfn::BULK_OUT_MAX, 0x1000)?,
     }))();
     match laid {

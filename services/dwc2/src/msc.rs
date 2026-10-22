@@ -181,10 +181,11 @@ pub fn bind(
 /// The most one BOT command moves, the size of its data part of the arena. Its wrappers have parts of
 /// their own (`parts.rs`), so none of the three can land on another buffer.
 pub const DATA_MAX: usize = GATHER_BYTES;
-/// The disk buffer's size, and the most one WRITE(10) gathers: 96 KiB, 27 of `fs`'s seven-block runs, in a
-/// 128 KiB arena (the supervisor's `dma_pages` for `dwc2`). It was 32 KiB in 64: the stick then took 10 s of
-/// a 22 s, 10 MB download, about 31 ms a command (2026-10-22), so fewer, larger commands is the step.
-pub const GATHER_BYTES: usize = 0x18000;
+/// The disk buffer's size, and the most one WRITE(10) gathers: 32 KiB, nine of `fs`'s seven-block runs.
+/// 96 KiB was tried (`fa806f3d`) and the stick took the same 10.6 s of a 10 MB download as at 32 (Pi 2,
+/// 2026-10-22): its own writing speed is the limit, not a command's turnaround. A longer write only holds
+/// the radio's receive aside for longer, so it went back, and the arena's room is the radio's ring.
+pub const GATHER_BYTES: usize = 0x8000;
 pub const GATHER_SECTORS: u32 = (GATHER_BYTES / 512) as u32;
 /// How long a held run waits for the next before it is written.
 pub const GATHER_IDLE_MS: u64 = 10;
