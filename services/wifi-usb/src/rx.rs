@@ -20,6 +20,11 @@ use godspeed_sdk::ServiceContext;
 use godspeed_wifi::bss::{self, Network, Scan};
 use godspeed_wifi::data::{self, DataIn};
 use godspeed_wifi::rxq::RxQueue;
+
+/// The link's own queue of frames decrypted and not yet handed to the serve loop's (`RxQueue`): 8, as every
+/// queue was until 2026-10-22. The serve loop's is 32 for the AIC8800's bursts; this one is kept small
+/// because `wifi-usb` holds both, and two of 32 left its stack about 220 KiB deep of 256 on the worst path.
+const LINK_SLOTS: usize = 8;
 use godspeed_wifi::serve::{Host, Notice};
 use godspeed_wifi::{eapol, mgmt, usbfn, wire};
 
@@ -53,7 +58,7 @@ pub struct Link {
     /// The joined network's BSSID, set by the station when it joins and cleared when it leaves; `None`
     /// means no data frame is taken.
     pub bssid: Option<[u8; 6]>,
-    pub frames: RxQueue,
+    pub frames: RxQueue<LINK_SLOTS>,
     /// Frames taken, frames the queue had no room for, protected frames the chip did not decrypt, and
     /// rekey frames not answered (R7).
     pub data_in: u32,
