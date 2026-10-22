@@ -268,7 +268,16 @@ const GMAC_ADDR_ENABLE: u32 = 1 << 31;
 /// deep ring buys nothing that the caller's own pacing does not already provide, and every extra
 /// descriptor is arena that something else could be using.
 const TX_DESCS: usize = 4;
-/// Receive descriptors. **Twenty-four, and this number is a MITIGATION, not a fix.**
+/// Receive descriptors. **256, since 2026-10-22: what the 528 KiB arena holds beside the transmit side, as
+/// GENET's ring of 256 on the Pi 4 is.** At 24 a 10 MB download on the VisionFive ran the ring dry 237 times
+/// in 30 s (`RBU`), 4,270 of 10,084 segments arrived after a gap with the data waiting up to 15 s behind
+/// one, two downloads in three failed to connect, and the one that finished ran at 271 KiB/s - while the
+/// stick took 2.1 s of it and decryption 1.1 s. GENET went from 24 to 256 on the same evidence and its cable
+/// from 192 to 655 KiB/s (`backlog/93`). Linux's stmmac defaults to 512 (`DMA_DEFAULT_RX_SIZE`).
+///
+/// (The paragraphs below were written at twenty-four; the arena they name was 64 KiB then.)
+///
+/// **Twenty-four, and this number is a MITIGATION, not a fix.**
 ///
 /// Four was a bug and sixteen was a guess; the actual bug was the tail pointer (see `receive`), which
 /// made every one of those values behave as ONE. With that fixed the ring is genuinely as deep as it
@@ -305,7 +314,7 @@ const TX_DESCS: usize = 4;
 /// frames per tick" into "sixteen" - the same 10 ms exposure with four times the headroom. It is a
 /// mitigation rather than a cure: the real fix for a polled receive path is to be woken by the
 /// controller's interrupt, which this port cannot do until the PLIC is wired.
-pub const RX_DESCS: usize = 24;
+pub const RX_DESCS: usize = 256;
 /// A descriptor is four 32-bit words.
 const DESC_BYTES: usize = 16;
 /// One buffer per descriptor. 2048 rather than 1536 because `RBSZ` wants a multiple of the bus width
