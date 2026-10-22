@@ -344,6 +344,14 @@ pub fn serve<'s>(
     // Why `auto_join` is set, for its line: the boot rejoin from `/system/shared/wifi/keys`, or the rejoin after the
     // access point dropped the link (`rejoin_after_drop`).
     let mut auto_join_why: &str = "from /system/shared/wifi/keys";
+    // A REJOIN THE NETWORK REFUSED IS TRIED AGAIN, a few times, further apart each time
+    // (`AUTO_JOIN_TRIES`, `AUTO_JOIN_FIRST_WAIT_SECS`): the network, when a try is due, and the tries made.
+    // On the Pi 2 an access point ended the boot rejoin's association before the handshake (reason 34, frames
+    // left unacknowledged) and nothing tried again, so the radio stayed off the network until the dongle was
+    // replugged by hand (2026-10-22). A refusal can be transient; one that is not is said after the last try.
+    let mut auto_join_retry: Option<(([u8; SSID_MAX], u8, u8), i64, u32)> = None;
+    const AUTO_JOIN_TRIES: u32 = 3;
+    const AUTO_JOIN_FIRST_WAIT_SECS: i64 = 5;
     /// THE REJOIN AFTER A DROP. An access point drops a station for its own reasons - on 2026-10-08 a
     /// VisionFive idle for half an hour was disassociated for inactivity (reason 4) - and the network is
     /// still there and still the one chosen, so it is rejoined, ONCE per drop, through the same path as the
@@ -612,6 +620,17 @@ pub fn serve<'s>(
                 e.pmk.fill(0);
             }
         }
+        // A retry that has come due is the auto-join's, through the same path - once nothing else has joined.
+        if auto_join.is_none() && joined.is_none() {
+            if let Some((net, due, _)) = auto_join_retry {
+                if gs::task::epoch_secs_monotonic(ctx) >= due {
+                    auto_join = Some(net);
+                    auto_join_why = "again, after it refused the last try";
+                }
+            }
+        } else if joined.is_some() {
+            auto_join_retry = None;
+        }
         if let (Some((name, len, sec)), Some(session)) = (auto_join.take(), radio.as_deref_mut()) {
             let mut go = choice_use != wire::USE_NOT;
             if !go {
@@ -635,9 +654,24 @@ pub fn serve<'s>(
                                  &mut joined_at_secs, &mut joined_security, &mut rxq, ctx) {
                     Some(Outcome::Joined) => {
                         last_joined = Some((name, len, sec));
+                        auto_join_retry = None;
                         save_keys(ctx, who, &stored, None);
                     }
-                    Some(_) => say(ctx, who, "the network last joined did not take us back - not joined; `wifi join` when it is in range"),
+                    Some(_) => {
+                        let tries = auto_join_retry.map_or(0, |(_, _, t)| t);
+                        if tries < AUTO_JOIN_TRIES {
+                            let wait = AUTO_JOIN_FIRST_WAIT_SECS << tries;
+                            auto_join_retry = Some(((name, len, sec), gs::task::epoch_secs_monotonic(ctx) + wait, tries + 1));
+                            say_fmt(ctx, who, format_args!(
+                                "the network last joined did not take us back - trying again in {} s ({} of {})",
+                                wait, tries + 1, AUTO_JOIN_TRIES));
+                        } else {
+                            auto_join_retry = None;
+                            say_fmt(ctx, who, format_args!(
+                                "the network last joined did not take us back after {} more tries - not joined; `wifi join` when it is in range",
+                                AUTO_JOIN_TRIES));
+                        }
+                    }
                     None => {}
                 }
             }
