@@ -228,7 +228,14 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Registers) -> bool {
     // 6. DMA mode. The BCM2836 core is internal-DMA capable and this driver depends on it: the CPU
     //    never touches a FIFO, which is why only one page of registers is mapped and the data FIFO
     //    window at 0x1000 is deliberately absent from the grant.
-    mmio.write32(GAHBCFG, mmio.read32(GAHBCFG) | GAHBCFG_DMAEN);
+    //
+    //    THE BURST LENGTH IS THE SILICON'S, as Linux sets it for this core (`GAHBCFG_HBSTLEN_BCM`). This
+    //    driver left it at the reset value, single transfers, and on the Pi 2 a download at 180 KiB/s with
+    //    the stick writing hung the AHB master twice, at about 5%: the network's receive channel stopped
+    //    part way through its DMA (3072 of 4096 bytes in) and every other channel with it (2026-10-22).
+    //    Whether the burst length is why is what the next card shows; it is recorded as Linux's value,
+    //    not as a fix.
+    mmio.write32(GAHBCFG, (mmio.read32(GAHBCFG) & !GAHBCFG_HBSTLEN_MASK) | GAHBCFG_HBSTLEN_BCM | GAHBCFG_DMAEN);
 
     ok
 }
