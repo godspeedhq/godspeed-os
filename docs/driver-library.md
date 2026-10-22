@@ -806,3 +806,6 @@ kernel panic on any:**
   interrupt arm ran; its heartbeat still says `polling yes (interrupt does not cover HID)`, as it did on
   2026-10-08 and 2026-10-10 - the low-speed keyboard behind the hub completes without the interrupt. Two
   downloads checked (3.2 and 4.4 MiB/s); 100 rounds; selfcheck 666/0. `xhci` woke on MSI.
+- **Dell Wyse 5070 (`xhci`):** MSI count 648 and then 1,303 a minute later after the chaos run; three
+  downloads checked (1.8 to 2.2 MiB/s); the keyboard re-found after two disconnects before the run and after
+  each kill in it; 100 rounds; selfcheck 666/0. It printed the same 10 ms poll fallback line as the Pi 4.
