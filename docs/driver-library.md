@@ -792,6 +792,8 @@ No kernel change and no new authority.
 **Hardware, 2026-10-22, all at `dff477a3`, each with `chaos max-carnage all-services 100` and `selfcheck`, no
 kernel panic on any:**
 
+The operator hot-plugged the keyboard on every board, and each driver found it again.
+
 - **VisionFive 2 Lite (`xhci`):** keyboard and stick through the hub, re-found after two port moves; cable
   download 1.9 MiB/s, checked; 100 rounds; selfcheck 600/0, 1 skipped (registry not reachable). Its heartbeat
   says `0 MSI`, as it did before: this port has no PLIC, so the card shows the timeout and request paths, not
