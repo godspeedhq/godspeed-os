@@ -668,3 +668,7 @@ CPU_ONDEMAND_SAMPLING_RATE         # raspi-config debian/raspi-config.init, the 
 CPU_ONDEMAND_UP_THRESHOLD          # raspi-config debian/raspi-config.init, the variable power's UP_THRESHOLD copies (50) - external, 26.14
 od_update                          # Linux drivers/cpufreq/cpufreq_ondemand.c, the ondemand rule power's governor follows - external, 26.14
 SO_BUSY_POLL                       # Linux socket option, socket(7), the bounded busy-poll godspeed-pm's SPIN_US is modelled on - external, 26.14
+FIF_BCN_PRBRESP_PROMISC            # Linux mac80211 filter flag, set while scanning; wifi-usb's bssid_filter follows it - external, 26.14
+RCR_CHECK_BSSID_BEACON             # Linux rtl8xxxu_regs.h, RCR bit 7, which wifi-usb's RCR_CHECK_BSSID sets - external, 26.14
+RCR_CHECK_BSSID_MATCH              # Linux rtl8xxxu_regs.h, RCR bit 6, which wifi-usb's RCR_CHECK_BSSID sets - external, 26.14
+rtl8xxxu_configure_filter          # Linux rtl8xxxu_core.c, the receive filter wifi-usb's bssid_filter follows - external, 26.14
