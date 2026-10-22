@@ -63,7 +63,8 @@ On 2026-10-19 (item 12 has the figures since):
    sending files to a server.
 8. **Two connections at most** (`MAX_CONNS`). Four overflowed net-stack's stack; raising it needs the frames
    measured first.
-9. **The Pi 2 and the VisionFive have not run `d4ed712c`** (the Pi 4 has, in the download cards of 2026-10-21). Two of the last changes run on every board and
+9. **The VisionFive has not run `d4ed712c`** (the Pi 4 has, in the download cards of 2026-10-21, and the Pi 2's
+   cards of the same day ran builds that contain it, though none of them looked for the bound). Two of the last changes run on every board and
    were proved only on the two PCs: the progress line fitted to the console (`6e50b1f5`, since replaced by the
    bar on its own line, `1e282e7b`) and the fin-wait-2
    bound (`d4ed712c`). Their last cards passed on `a496e4de`.
@@ -235,6 +236,31 @@ On 2026-10-19 (item 12 has the figures since):
    the time is data that has not arrived; the link itself (signal, band, rate - `wifi info`) has not
    been looked at.
 
+   **2026-10-21 and 22, the Pi 2, one change per card** (10 MB over the LAN9514, through `dwc2`). Before
+   these, the cable was 4-13 KiB/s and the RTL8188CUS dongle 16-36 KiB/s: the radio beat the cable.
+
+   | Build | Change | Cable |
+   |-------|--------|-------|
+   | before | - | 4-13 KiB/s; 169 of 600 frames dropped inside `dwc2`, the interrupt harvesting into a receive queue of one burst still full |
+   | `6b773823` | the receive queue holds four bursts, and a burst is taken only when it fits | none dropped; the chip's own RXDF (`INT_STS` bit 11) set throughout, and 42 KiB/s sliding to 5 |
+   | `81fa1e05` | pause advertised and resolved as Linux does (`SMSC_ADVERTISE` 0x0DE1) | pause negotiated, `FLOW` 0xffff0002, `INT_STS` 0; still 53 sliding to 9, with bursts unparsed after every transmit's stand-down |
+   | `78185667` | a transmit keeps the receive it stands down, and a cut frame is carried | **170-183 KiB/s**, none unparsed (52-87 caught by a transmit, 1-3 joined); then, at about 6%, the controller wedged - twice |
+   | `742f6b00` | the whole core said beside a channel that never halted (instrument only) | card owed |
+
+   **The wedge is open and not understood.** Both times the stick's WRITE(10) bulk OUT never halted first
+   (`HCCHAR` with ChEna and ChDis both set), then every transfer to every device did; `block-driver` lost
+   its disk and `fs` its writes, and `net-stack` failed one connect while it lasted. `kill all-services`
+   recovered it, and the new `dwc2` found the AHB master not idle at its reset - the core's DMA hung. No
+   earlier run moved data this fast, so whether `78185667` caused it or exposed it is not known.
+   `742f6b00`'s lines are to say which channel's DMA was in flight, and where.
+
+   Two things to look at with them, found by Audit 21 and not yet shown to matter: `chan::halt` returns
+   nothing, so when its 50 ms expires `tx` goes on as if the receive channel were retired - reads its
+   `HCTSIZ` as held bytes, and `resume` re-arms a channel the core may still own; and `resume` takes held
+   bytes as a burst that may continue (`may_continue`) even when the IN had completed on a short packet
+   rather than been stood down, so a malformed tail would be joined to the next transfer (`HCINT`'s
+   transfer-complete bit would tell the two apart).
+
    Two code defects in the disk path, found by Audit 19: `fs`'s `BLOCK_RPC_SECS` (30 s) now
    bounds a whole run of seven blocks, while on USB `block-driver` makes seven host calls of up to
    `IO_RPC_SECS` (10 s) each, so a slow stick can have `fs` give up on a run still in progress and leave its
@@ -245,4 +271,6 @@ On 2026-10-19 (item 12 has the figures since):
 
 Item 4 is fixed and item 1 is (the ring of 256). As of 2026-10-21 the PCs' downloads are limited by data
 arriving (item 12); the Pi 4's cable by the stick's own writing speed, its radio by data not arriving, the
-link not yet looked at (`wifi info`).
+link not yet looked at (`wifi info`). The Pi 2's cable reaches 170-183 KiB/s and then wedges the USB
+controller (item 12): the wedge first, then the receive transfer Linux uses (a burst cap of 37, 18,944
+bytes, a bulk-in delay of 0x2000) against this driver's 8 and 4,096.

@@ -37,7 +37,7 @@ pub struct Stats {
     pub rx_bursts:  u32,   // bulk-IN returned >0 bytes
     pub rx_bytes:   u32,   // total bytes those bursts carried
     pub rx_frames:  u32,   // complete frames the parse handed up
-    pub rx_bad:     u32,   // bursts whose first status word did not parse
+    pub rx_bad:     u32,   // transfers whose first status word did not parse, or a cut-off tail too long to carry
     /// Transmits that stood the receive down with bytes in it, which `resume` then took: each was a burst
     /// thrown away before 2026-10-21.
     pub rx_caught:  u32,
@@ -138,10 +138,10 @@ pub struct Nic {
     /// Bounded and stack-resident (no heap, 26.6.1); a full queue counts `stats.rx_dropped` rather than
     /// losing frames quietly.
     pub rxbuf: [u8; RXQ_BYTES],
-    pub rxbuf_fill: usize,   // bytes written by the current burst
+    pub rxbuf_fill: usize,   // bytes queued, up to `RXQ_BURSTS` bursts of them
     pub rxbuf_pos: usize,    // read cursor into those bytes
     pub rxq_count: usize,    // frames still waiting to be collected
-    /// Is a bulk-IN currently armed on CH_NET, waiting for the device to have a frame?
+    /// Is a bulk-IN currently armed on CH_NET_RX, waiting for the device to have a frame?
     pub in_armed: bool,
     /// Bytes a transmit's stand-down found in the receive buffer (`tx`), not yet taken (`resume`).
     pub rx_held: usize,
@@ -1059,7 +1059,7 @@ pub const RXQ_PER_BURST: usize = RX_BURST + CARRY_MAX;
 pub const CARRY_MAX: usize = 4 + FRAME_MAX + 4 + 4;
 pub const RXQ_BYTES: usize = RXQ_BURSTS * RXQ_PER_BURST;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
-pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the kernel driver
+pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the in-kernel driver this replaced (Linux: 18944)
 // The RX burst must FIT the granted arena (64 KiB): a buffer that ran off its end would be a DMA write
 // into whatever follows, made silently by the device. The layout refuses a part that does not fit, at
 // start, with the part named (`parts.rs`).
@@ -1141,10 +1141,10 @@ pub fn tx(
     // GNPTXSTS said so plainly once read correctly: 0x18000100 is 256 FIFO words free and ZERO queue
     // entries free. Space for the data, nowhere to put the request.
     //
-    // So the IN stands aside for the duration of one frame. `rx` re-arms on its next pass because
-    // `in_armed` is what it tests, so this costs one round of receive latency; frames are not lost,
-    // the device holds them in its own FIFO, which is the whole reason RX_FIFO_INF is non-zero while
-    // this happens. Receive latency is a fair price for transmit existing at all.
+    // So the IN stands aside for the duration of one frame, and this function re-arms it at its end
+    // (`resume`), after taking what the channel had received. Frames are not lost: the device holds
+    // the rest in its own FIFO, which is the whole reason RX_FIFO_INF is non-zero while this happens.
+    // Receive latency is a fair price for transmit existing at all.
     if nic.in_armed {
         chan::halt(ctx, mmio, CH_NET_RX);
         // CARRY THE DATA TOGGLE ACROSS THE HALT.
@@ -1353,8 +1353,8 @@ pub fn tx(
 }
 
 impl Nic {
-    /// Append a frame, stored as `[len:u16 LE][bytes]`. Sized to a whole burst, so the overflow arm
-    /// should never run - it counts rather than hides if it ever does.
+    /// Append a frame, stored as `[len:u16 LE][bytes]`. A burst is taken only when a whole one fits
+    /// (`rx_room`), so the overflow arm should never run - it counts rather than hides if it ever does.
     pub fn rxq_push(&mut self, f: &[u8]) {
         let n = f.len().min(FRAME_MAX);
         if self.rxbuf_fill + 2 + n > RXQ_BYTES {
@@ -1451,8 +1451,8 @@ fn arm_in(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, nic: 
     nic.in_armed = true;
 }
 
-/// Harvest one completed bulk-IN burst into the receive queue (`rxq_push`), arming the IN first if it is
-/// not armed.
+/// Harvest one completed bulk-IN burst into the receive queue (`rxq_push`) when a whole one fits
+/// (`rx_room`). Not armed: take what a transmit's stand-down held, then arm (`resume`).
 ///
 /// Returns the number of frames queued. Zero is the ordinary answer on a quiet network and is not
 /// a failure.
@@ -1471,8 +1471,8 @@ pub fn rx(
     // it plainly: HCINT 0x00000000, nohalt 650, rx 0.
     //
     // So arm once and CHECK, never re-arm a transfer that is still legitimately pending. This is the
-    // kernel driver's background-armed IN, in the shape this service can use: a non-blocking poll per
-    // pass instead of an interrupt, because the frame path here is driven by the serve loop.
+    // in-kernel driver's background-armed IN, in the shape this service can use: a non-blocking check,
+    // made when a client asks for frames and on the USB interrupt (`usb_irq` in main.rs).
     if !nic.in_armed {
         // Nothing armed: take what a transmit's stand-down caught, if anything, and arm. Otherwise
         // nothing yet - the device answers when it has something.

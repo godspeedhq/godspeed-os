@@ -1763,3 +1763,38 @@ still offers 8 KiB).
 (`godspeed-pm/src/download.rs`); only `https://` busy-polls (`backlog/93`).
 
 **Gates:** every documentation checker green.
+
+## Audit 21 - documents and code comments, the Pi 2 receive work (2026-10-22)
+
+Scope: the 6 commits on `feat/gs-driver` after Audit 20 (`027c4ade..742f6b00`), 6 files: the Pi 2's receive
+queue of four bursts, the smsc95xx's pause, a transmit keeping the receive it stands down and a cut frame
+carried, and the core said beside a channel that never halted. One reader, the session that made the
+change, re-read every changed comment against the code and swept the current-tense docs that describe the
+Pi 2's network; so this is a self-audit.
+
+**Result.** 13 corrections across 3 files. No code defect confirmed; two leads recorded for the open wedge.
+
+**In comments** (`services/dwc2/src/net.rs`):
+- `tx`'s stand-down said `rx` re-arms the receive "on its next pass" and that frames are not lost; the
+  re-arm is at the end of `tx` (`resume`), and until `78185667` the bytes the channel held were lost.
+- `rx`'s doc said it harvests one burst and arms; it takes a burst only when one fits, and takes held bytes
+  before it arms. Its body called itself "a non-blocking poll per pass instead of an interrupt"; the USB
+  interrupt has harvested since `0812a9f7` (`usb_irq`), and it was the interrupt that overran the old queue.
+- `rxbuf_fill` was "bytes written by the current burst" (four now); `rxq_push` was "sized to a whole burst"
+  (taken only when one fits, `rx_room`); `rx_bad` counted only a first status word (also a tail too long to
+  carry); `in_armed` named `CH_NET` (the receive is `CH_NET_RX`); `RX_BURST` "matching the kernel driver"
+  read as Linux's, which is 18,944 - it is the in-kernel driver this service replaced.
+
+**In documents:**
+- `docs/arm32-status.md`: receive harvested "when a client asks", and the 2026-08-25 paragraph that
+  interrupts harvest almost nothing - given a dated note, since under a download they now harvest enough to
+  have overrun a queue of one burst.
+- `backlog/93`: nothing recorded the Pi 2 cable work. Item 12 has its table now, from 4-13 KiB/s to 170-183,
+  and the controller wedge that followed, open; item 9 said the Pi 2 had not run `d4ed712c` (its cards ran
+  builds containing it); "Where to start" names the wedge, then Linux's receive transfer.
+
+**Recorded, not changed** (`backlog/93` item 12, leads for the wedge, not shown to matter): `chan::halt`
+returns nothing, so `tx` reads a channel whose halt expired as retired and `resume` re-arms it; and `resume`
+treats held bytes as a burst that may continue even when the IN completed on a short packet.
+
+**Gates:** every documentation checker green.
