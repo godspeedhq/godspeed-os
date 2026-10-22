@@ -265,6 +265,8 @@ pub struct Conn {
     /// Out-of-order ranges already in the arena, `[start, end)` in sequence numbers, beyond `rcv_nxt`.
     ooo: [(u32, u32); MAX_OOO],
     ooo_n: usize,
+    /// When a gap opened in what has arrived (`ooo_n` going from none), for `Spent::gap_ms`; 0 with none.
+    gap_since_ms: u64,
 
     // Timers, all in milliseconds of monotonic service time.
     /// When the oldest unacknowledged segment must be resent. 0 = no timer armed.
@@ -357,7 +359,7 @@ impl Conn {
             snd_buf: [0u8; SND_BUF], snd_len: 0,
             rcv_small: [0u8; RCV_SMALL], rcv_big: None, rcv_head: 0, rcv_len: 0,
             rcv_shift: 0, snd_shift: 0, peer_ws: None, rcv_limit: RCV_BIG,
-            ooo: [(0, 0); MAX_OOO], ooo_n: 0,
+            ooo: [(0, 0); MAX_OOO], ooo_n: 0, gap_since_ms: 0,
             snd_mss: MSS_DEFAULT,
             cwnd: 0, ssthresh: u32::MAX / 2,
             dup_acks: 0, recover: 0, in_recovery: false, fast_retx: false,
@@ -895,6 +897,11 @@ pub struct Spent {
     pub seg_ahead: u32,
     pub seg_past: u32,
     pub seg_old: u32,
+    /// Gaps that opened and closed, the time the data waited behind them in all, and the longest: the
+    /// time a lost segment cost before its retransmission came.
+    pub gaps: u32,
+    pub gap_ms: u64,
+    pub gap_max_ms: u64,
 }
 
 impl Tcp {
@@ -914,7 +921,7 @@ impl Tcp {
             tx_log: [0u8; 24], tx_n: 0,
             spent: Spent { since: 0, reads: 0, read_bytes: 0, read_ticks: 0, read_polls: 0, stashed: 0, polls: 0,
                            poll_ticks: 0, drains: 0, drain_ticks: 0, frames: 0, empty: 0, sends: 0, send_ticks: 0,
-                           seg_next: 0, seg_ahead: 0, seg_past: 0, seg_old: 0 },
+                           seg_next: 0, seg_ahead: 0, seg_past: 0, seg_old: 0, gaps: 0, gap_ms: 0, gap_max_ms: 0 },
         }
     }
 
@@ -2111,6 +2118,21 @@ impl Tcp {
                     // retransmitting because it did not hear us, and staying silent repeats that). Both at once:
                     // the duplicate acknowledgements are how the sender learns of a loss.
                     need_ack = true;
+                }
+            }
+
+            // How long the data waits behind a gap (`Spent::gap_ms`): opened when out-of-order data is first
+            // held, closed when the gap is filled.
+            if c.ooo_n > 0 && c.gap_since_ms == 0 {
+                c.gap_since_ms = now.max(1);
+            } else if c.ooo_n == 0 && c.gap_since_ms != 0 {
+                let waited = now.saturating_sub(c.gap_since_ms);
+                c.gap_since_ms = 0;
+                if self.spent.since != 0 {
+                    let s = &mut self.spent;
+                    s.gaps = s.gaps.saturating_add(1);
+                    s.gap_ms = s.gap_ms.saturating_add(waited);
+                    s.gap_max_ms = s.gap_max_ms.max(waited);
                 }
             }
 

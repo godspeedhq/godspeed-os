@@ -2796,6 +2796,9 @@ fn report_spent(ctx: &ServiceContext, sp: &mut tcp::Spent) {
         ctx.log_fmt(format_args!(
             "net-stack: the connection's data segments - {} next in sequence, {} ahead of a gap ({} past the window), {} already had (a retransmission)",
             sp.seg_next, sp.seg_ahead, sp.seg_past, sp.seg_old));
+        ctx.log_fmt(format_args!(
+            "net-stack: the connection's gaps - {} opened and filled, the data waited {} ms behind them, the longest {} ms",
+            sp.gaps, sp.gap_ms, sp.gap_max_ms));
     }
     *sp = tcp::Spent::default();
 }
