@@ -12195,6 +12195,129 @@ pub fn run_deps(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// The kinds a developer makes with `godspeed new`, each a fixture `kind-<kind>-0.1.0.gsp` (`osdev test kinds`).
+pub const KINDS: [&str; 4] = ["service", "utility", "app", "driver"];
+
+/// `osdev test kinds`: every kind of program the CLI scaffolds, as it scaffolds it, installed and seen working. The
+/// four files were made by `godspeed new <kind> kind-<kind> --publisher godspeed` and `godspeed package --local` with
+/// the fixtures' throwaway key, untouched, so this is the templates themselves on a machine. The driver's template
+/// drives QEMU's `edu`, so the machine has one.
+pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("kinds: PASS - {}", $label); pass += 1; }
+        else { println!("kinds: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+        "-device", "e1000,netdev=n0", "-netdev", "user,id=n0",
+        // The driver template's device: QEMU's teaching device, which no GodspeedOS driver claims.
+        "-device", "edu",
+    ]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("kinds: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("kinds: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("kinds: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+    let _ = run!(b"godspeed config\r", 60);
+    send(&mut write_half, format!("godspeed trust add godspeed {KEY}\r").as_bytes());
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20));
+    let added = run!(b"y\r", 60);
+    check!(added.contains("trusted by this machine's operator"), "the fixtures' test key is trusted");
+
+    // A SERVICE: installed, it starts, and the supervisor keeps it running.
+    let svc = run!(b"godspeed install /kind-service-0.1.0.gsp yes\r", 240);
+    check!(svc.contains("godspeed/kind-service 0.1.0   (unpacked from an UNPUBLISHED package file)")
+               && svc.contains("installed godspeed/kind-service 0.1.0 started"),
+           "the service installs from its file, and the supervisor starts it");
+    let _ = collect_until(&buf, &mut cursor, b"kind-service: started", Duration::from_secs(30));
+    check!(String::from_utf8_lossy(&buf.lock().unwrap()).contains("kind-service: started"), "and it starts, saying so");
+    let listed = run!(b"godspeed list installed\r", 60);
+    check!(listed.contains("godspeed/kind-service") && listed.contains("running"), "and it is listed as running");
+
+    // A UTILITY: typed by name, given its arguments, its output shown, and it ends.
+    let utl = run!(b"godspeed install /kind-utility-0.1.0.gsp yes\r", 240);
+    check!(utl.contains("a utility: type `kind-utility"), "the utility installs, and the install says how to run it");
+    let ran = run!(b"kind-utility Ada\r", 60);
+    check!(ran.contains("hello, Ada"), "typed with an argument, it prints `hello, Ada` and ends");
+    let piped = run!(b"kind-utility Bo | count\r", 60);
+    check!(piped.contains("1 line, 2 words, 10 bytes"), "and its output pipes: `count` sees the one line `hello, Bo`");
+
+    // AN APP: it has the screen and the keyboard until a key, then gives them back.
+    let app = run!(b"godspeed install /kind-app-0.1.0.gsp yes\r", 240);
+    check!(app.contains("asks for: console") && app.contains("an app: type `kind-app"),
+           "the app installs, asking for the console, and the install says how to run it");
+    send(&mut write_half, b"kind-app Cy\r");
+    let shown = collect_until(&buf, &mut cursor, b"Press any key", Duration::from_secs(60)).unwrap_or_default();
+    check!(shown.contains("hello, Cy"), "the app has the screen: it shows `hello, Cy`");
+    let back = run!(b"x", 60);
+    let again = run!(b"version\r", 60);
+    check!(!back.is_empty() && again.contains("GodspeedOS"), "a key gives the console back, and the shell answers");
+
+    // A DRIVER: the operator approves the device, the OS finds which it is, and the driver drives it.
+    let drv = run!(b"godspeed install /kind-driver-0.1.0.gsp yes\r", 240);
+    check!(drv.contains("asks for: device") && drv.contains("started (") && drv.contains("its device, checked from disk"),
+           "the driver installs, asking for its device, and the supervisor starts it with that device");
+    let _ = collect_until(&buf, &mut cursor, b"5! = 120", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("kind-driver: device id 0x010000ed, alive true, 5! = 120"),
+           "the driver reads `edu`'s identity, its liveness register and a factorial, through gs::driver");
+    let listed = run!(b"godspeed list installed\r", 60);
+    check!(listed.contains("godspeed/kind-driver") && listed.contains("running"), "and it is listed as running");
+
+    // CLEANUP: all four uninstalled, and the key withdrawn.
+    for k in KINDS {
+        let out = run!(format!("godspeed uninstall godspeed/kind-{k} yes\r").as_bytes(), 120);
+        check!(out.contains("uninstalled"), format!("kind-{k} uninstalls"));
+    }
+    let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
+    check!(removed.contains("no longer trusted"), "the test key is withdrawn");
+    check!(!String::from_utf8_lossy(&buf.lock().unwrap()).contains("KERNEL PANIC"), "and the kernel did not panic");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::write("build/tests/kinds_serial.log", &*buf.lock().unwrap());
+    println!("\nkinds: {pass} passed, {fail} failed (serial: build/tests/kinds_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// `osdev test download`: how fast this machine downloads over HTTPS, measured, at sizes a package can be.
 /// `godspeed check <url>` reads a page from a public speed-test server to its end and says how fast; the server's
 /// chain reaches GTS Root R4, which is put beside the registry's root for this (`osdev/fixtures/README.md`). It

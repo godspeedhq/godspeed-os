@@ -48,6 +48,23 @@ and its contract `ipc_send = ["godspeed/dep-store"]`. Made with the CLI that rea
 GODSPEED_SIGNING_KEY=<the seed> GODSPEED_OS=<this checkout> godspeed package --arch x86_64 --local
 ```
 
+## `kind-service-0.1.0.gsp`, `kind-utility-0.1.0.gsp`, `kind-app-0.1.0.gsp` and `kind-driver-0.1.0.gsp`
+
+Four UNPUBLISHED package files for `osdev test kinds`: one of every kind a developer makes, each exactly as the CLI
+scaffolds it - nothing edited - signed by the same throwaway test key as `hello-utility-0.9.0.gsp`, for `x86_64` only.
+The suite installs each from its file and sees it do its job: the service starts, the utility answers `hello, Ada`
+and pipes, the app holds the screen until a key, and the driver drives QEMU's `edu` through `gs::driver`
+(`kind-driver: device id 0x010000ed, alive true, 5! = 120`). Made 2026-10-22 with the CLI's templates as conformed to
+`gs::driver` that day (`godspeed-cli` `feat/dependencies`), against this checkout:
+
+```text
+GODSPEED_OS=<this checkout> godspeed new <kind> kind-<kind> --publisher godspeed
+cd kind-<kind>
+GODSPEED_SIGNING_KEY=<the seed> GODSPEED_OS=<this checkout> godspeed package --arch x86_64 --local
+```
+
+Remake them when a template changes, or when the OS's program layout does.
+
 ## `gts-root-r4.der`
 
 Google Trust Services' **GTS Root R4**, the ECDSA P-384 root that `speed.cloudflare.com`'s chain reaches, for

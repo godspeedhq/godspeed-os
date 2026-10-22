@@ -849,3 +849,8 @@ grants in at step 3.
 Each wrapper is `#[inline(always)]` over the SDK call, so the code a driver runs is the code it ran.
 `one_way_check.py` counts all eight SDK methods from today: 34 call sites converted, every crate at zero, and
 a new crate held there. No kernel change, no new authority, no `unsafe`.
+
+**And the CLI's driver template, conformed the same day.** `godspeed new driver` generated a driver on the SDK's
+`ctx.mmio()` with a wait counted in sleeps; it is on `gs::driver::registers` and `wait::until` now
+(`godspeed-cli`). `osdev test kinds` installs one package of each kind the CLI makes - service, utility, app, driver,
+built from the templates untouched - and sees each do its job, the driver driving QEMU's `edu`: 19/0.
