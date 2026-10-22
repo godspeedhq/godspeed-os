@@ -1130,6 +1130,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     .as_ref()
                     .map(|(d, _, _)| (d.busy_cbw, d.busy_data, d.busy_csw, d.commands))
                     .unwrap_or((0, 0, 0, 0));
+                // Where the writes' time goes, stage by stage (`msc::Disk::w_cmds`).
+                if let Some((d, _, _)) = disk.as_ref() {
+                    let per = |us: u64| if d.w_cmds == 0 { 0 } else { us / d.w_cmds as u64 };
+                    ctx.log_fmt(format_args!(
+                        "dwc2-svc: disk writes - {}, each {} us command, {} us data, {} us status",
+                        d.w_cmds, per(d.w_cbw_us), per(d.w_data_us), per(d.w_csw_us)));
+                }
                 let ms = (wait::ticks_per_10ms(&ctx) / 10).max(1);
                 // THE DRIVER CHECKS ITS OWN HARDWARE, on its own heartbeat.
                 //

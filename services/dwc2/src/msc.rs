@@ -82,6 +82,13 @@ pub struct Disk {
     /// A gathered write failed since the last FLUSH, after its runs were answered as written: the next
     /// FLUSH answers an error, so `fs` learns it at its barrier (6.1).
     pub gather_lost: bool,
+    /// WRITE(10)s that completed, and the time in each of their three stages in all, in us: the command,
+    /// the data and the status. Where a write's time goes decides what overlapping writes could save - the
+    /// status wait can be left in flight, the data cannot.
+    pub w_cmds: u32,
+    pub w_cbw_us: u64,
+    pub w_data_us: u64,
+    pub w_csw_us: u64,
 }
 
 /// Walk a configuration descriptor for a Bulk-Only mass-storage interface and its endpoints.
@@ -175,7 +182,8 @@ pub fn bind(
         ep_in, ep_out, mps, t.mps));
     Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0, iface, fail_streak: 0,
         busy_cbw: 0, busy_data: 0, busy_csw: 0, commands: 0,
-        gather_lba: 0, gather_n: 0, gather_at: None, gather_lost: false })
+        gather_lba: 0, gather_n: 0, gather_at: None, gather_lost: false,
+        w_cmds: 0, w_cbw_us: 0, w_data_us: 0, w_csw_us: 0 })
 }
 
 /// The most one BOT command moves, the size of its data part of the arena. Its wrappers have parts of
@@ -312,9 +320,11 @@ pub fn bot(
     // port a boot every time it has appeared. CBW-out failing means the device is not accepting
     // commands at all; a data-stage failure means it accepted the command and would not answer; a
     // CSW failure means it did the work and would not report. Three different faults.
+    let t0 = wait::Since::now(ctx);
     if let Err(e) = bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.cbw.phys() as u32, 31, 2_000, &mut disk.pid_out) {
         return stage_failed(ctx, mmio, dma, t, disk, e, "CBW-out", cdb[0]);
     }
+    let t_cbw = t0.elapsed_us(ctx);
 
     let mut moved = 0usize;
     if dlen > 0 {
@@ -335,12 +345,20 @@ pub fn bot(
         };
     }
 
+    let t_data = t0.elapsed_us(ctx);
     // CSW: 13 bytes, "USBS".
     for i in 0..13 {
         dma.csw.write8(i, 0);
     }
     if let Err(e) = bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.csw.phys() as u32, 13, 2_000, &mut disk.pid_in) {
         return stage_failed(ctx, mmio, dma, t, disk, e, "CSW-in", cdb[0]);
+    }
+    if cdb[0] == 0x2A {
+        let t_all = t0.elapsed_us(ctx);
+        disk.w_cmds = disk.w_cmds.saturating_add(1);
+        disk.w_cbw_us = disk.w_cbw_us.saturating_add(t_cbw);
+        disk.w_data_us = disk.w_data_us.saturating_add(t_data.saturating_sub(t_cbw));
+        disk.w_csw_us = disk.w_csw_us.saturating_add(t_all.saturating_sub(t_data));
     }
 
     let mut csw = [0u8; 13];
