@@ -77,13 +77,11 @@ and why; read them for the reasoning, not to find out what the library contains.
 - **`irq`** - waiting for a device's interrupt on the endpoint its clients also send to. `Irq::granted`,
   `routed`, `seen`; `wait(budget)` returns `Interrupt`, `Request(message)` or `Timeout`, so a request is
   handed back to be served and never dropped; `rearm` re-opens a level-triggered line (a no-op for MSI).
-  With no interrupt routed the same loop is a timed wait that still serves requests. Its users are
-  `audio-driver` (step 2) and `pwm-audio`, which runs on the no-interrupt path. `ehci` and `dwc2` re-arm
-  through it (2026-10-09): each used to unmask a vector NUMBER of its own, and each number was proven
-  equal to the one the kernel grants it (0x29, `hw_irqs_for`), so `Irq::granted(..).rearm` is the same
-  unmask without a driver naming a vector. `xhci` reads its MSI vector through `Irq::vector`. Their WAIT
-  loops are still hand-written - moving those onto `Irq::wait` changes a driver's structure and is owed
-  its own hardware card on each board.
+  With no interrupt routed the same loop is a timed wait that still serves requests. `take` (2026-10-22)
+  is the same sorting without blocking, for a driver that drains its endpoint in a bounded loop. Its
+  users are `audio-driver` (step 2), `pwm-audio`, which runs on the no-interrupt path, and since step 4
+  (2026-10-22) `ehci`, `dwc2` and `xhci`, whose waits were hand-written until then: every driver that takes
+  an interrupt now waits for it through `irq`.
 
 - **`registers` and `arena`** (step 3, 2026-10-19) - the two grants a driver names and relies on.
   `registers(ctx)` is the device's register window (`Registers`: `read8`..`read64`, `write8`..`write64`,
@@ -96,8 +94,8 @@ and why; read them for the reasoning, not to find out what the library contains.
   and `scripts/one_way_check.py` counts `ctx.mmio()`, `xhci_mmio`, `ehci_mmio` and `dma_region()`, so a new
   driver is held to zero of them from its first line.
 
-**Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
-(1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
+**Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
+(1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet
 verified on hardware**). `audio-driver` and `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
 
 **Left by hand, each with its reason in its step.**
@@ -764,3 +762,30 @@ part landed where its constant was, with one exception, said below.
   data`, a write read back, `drives check` 0 bad.
 
 Each owes the card its grants step already owed; none adds one.
+
+## Step 4: the interrupt waits of `ehci`, `dwc2` and `xhci` on `irq` (2026-10-22)
+
+Step 2 built `irq` from these three drivers' hand-written copies and left the copies in place: a driver's
+wait is its structure, and changing one is owed a card on its board. This step moves them.
+
+**One addition first, found in two of them.** `dwc2` and `xhci` both drain their endpoint without blocking -
+a bounded loop of `try_recv` - and block only at the end of a pass, so a burst of requests is served in one
+pass. Each drain picked the interrupt out by hand. `Irq::take` is that drain's receive: the interrupt or a
+request, or `None` when nothing is queued, sorted by the same test `Irq::wait` makes, so the two cannot
+disagree. `dwc2` once dropped an interrupt in a drain as a capless request and left its line masked for
+good; that test now lives in one place.
+
+- **`ehci`**: its interrupt-driven wait is `Irq::wait`. Only the interrupt is acked and re-armed; the drain
+  that acked and re-armed on any message is gone, and a message that is not the interrupt is dropped as it
+  was, since nothing sends this driver a request it answers. Its vector constant is deleted: the driver names
+  no vector.
+- **`dwc2`**: all three receives - the no-disk drain, the block drain and the end-of-pass wait - go through
+  one `Irq` (`take`, `take`, `wait`), and so does the loop a `dwc2` with no hardware runs. Its vector constant
+  and its hand-written test of it are deleted.
+- **`xhci`**: the main loop's wait is `Irq::wait`, and the one-request drain after it is `Irq::take`, which
+  now counts an interrupt that arrives mid-pass instead of handing it to the block server as a capless
+  message. It still never re-arms, as before: its interrupt is an MSI. The three idle drains where nothing is
+  enumerated answer radio requests "no device" and never wait for an interrupt, so they stay `try_recv`.
+
+No kernel change and no new authority. Owed: a card on each board - `ehci` on the T630 (its keyboard),
+`dwc2` on the Pi 2 (keyboard, disk, cable), `xhci` on a board with a keyboard and a disk behind it.

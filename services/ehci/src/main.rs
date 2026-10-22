@@ -29,6 +29,7 @@
 
 use godspeed as gs;
 use godspeed::driver::{delay, Part};
+use godspeed::driver::irq::Woke;
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 use core::cell::Cell;
@@ -904,7 +905,7 @@ fn poll_devices(
 
     // E2 (interrupt-driven, §12): enable the controller's interrupts. The interrupt qTDs
     // already carry IOC, so a completed report sets USBSTS.USBINT and the controller asserts
-    // its (level) INTx, which the kernel routes via the IOAPIC to EHCI_INT_VECTOR. Clear any
+    // its (level) INTx, which the kernel routes via the IOAPIC to our vector. Clear any
     // stale status first, then enable USB-interrupt + port-change. The poll loop still
     // processes reports (belt-and-suspenders); it also acks (clears USBSTS) + unmasks.
     mmio.write32(op + OP_USBSTS, STS_INT_BITS);
@@ -946,8 +947,8 @@ fn poll_devices(
     // Goldmont+ Wyse. 0 (QEMU, no USB HID) falls back to the ~2 GHz cycle counts.
     let mut kb_rep = godspeed_sdk::hid::KeyRepeat::new_calibrated(wait::ticks_per_10ms(ctx));
     let mut kb_caps = false; // Caps Lock latch (host-tracked toggle)
-    // The interrupt the kernel routed at spawn: `hwclass::EHCI` -> `EHCI_MSI_VECTOR`, the same 0x29 as
-    // `EHCI_INT_VECTOR` below. `rearm` unmasks it, as the raw unmask of `EHCI_INT_VECTOR` did.
+    // The interrupt the kernel routed at spawn: `hwclass::EHCI` -> `EHCI_MSI_VECTOR` (0x29). Its `wait`
+    // tells that vector's notice from any other message, and `rearm` unmasks it.
     let irq = gs::driver::irq::Irq::granted(ctx);
     let mut mouse = godspeed_sdk::hid::MouseTracker::new(); // mouse button/motion state
     loop {
@@ -1024,16 +1025,8 @@ fn poll_devices(
         // this controller's split-transaction keyboard works. It is pinned to its own core
         // (core 3, its spawn row in the supervisor) so the system core and the interrupt-driven
         // xHCI's core stay idle.
-        // (USBINTR + the drain/unmask below are belt-and-suspenders: if an INTx ever does post an
-        // IPC, we drain + ack it so it can't storm; the qTD scan above is what actually reads
-        // the keyboard.)
-        while gs::ipc::try_recv(ctx).is_some() {
-            let sts = mmio.read32(op + OP_USBSTS);
-            if sts & STS_INT_BITS != 0 {
-                mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS); // ack: clear W1C status bits
-            }
-            irq.rearm(ctx);
-        }
+        // (USBINTR, and the ack and re-arm after the wait below, are belt-and-suspenders: an INTx is
+        // acked so it cannot storm; the qTD scan above is what actually reads the keyboard.)
         // PACED POLL (was a bare `yield_cpu`). Everything above still holds: this controller's INTx
         // will not drive a block-and-wake loop, so the driver must keep its own self-driven re-arm
         // of the async schedule. But needing to POLL never meant needing to SPIN. `yield_cpu` does
@@ -1068,10 +1061,12 @@ fn poll_devices(
         // between keystrokes - the property the `sleep` above was reaching for and could not have,
         // because a task that must re-arm itself is never absent from the run queue for long.
         //
-        // The message is DISCARDED deliberately: the only thing that arrives here is the kernel's
-        // IRQ notification, and its content carries nothing this loop needs - the work is driven by
-        // reading the controller's status at the top of the pass, exactly as before. What changed is
-        // what wakes us, not what we do when woken.
+        // The wait is `gs::driver::irq`'s (2026-10-22): it tells the interrupt from anything else that
+        // arrives, so only the interrupt is acked and re-armed. Nothing sends this driver a request it
+        // answers, so a message that is not the interrupt is dropped, as the hand-written drain dropped
+        // it - one per wake, and each wake runs a pass, so a flood empties at the loop's own rate. The
+        // work is still driven by reading the controller at the top of the pass: what wakes us changed,
+        // not what we do when woken.
         // A report that turned up on a pass no interrupt woke means interrupts are NOT covering HID
         // completions on this controller, whatever the setup reported. The xHCI shipped a 500 ms idle
         // on precisely that assumption and cost half a second per keystroke on the machine where it
@@ -1096,10 +1091,18 @@ fn poll_devices(
                 passes, work_cycles / (wait::ticks_per_10ms(ctx) / 10).max(1),
                 if hid_needs_poll { "yes (interrupt does not cover HID)" } else { "no (interrupt-driven)" }));
         }
-        let woke = gs::ipc::recv_within_ms(ctx, deadline);
-        // Was this pass woken by our INTx, or did the deadline simply expire? The notification is a
-        // one-byte payload equal to the vector, exactly as the xHCI identifies its MSI.
-        irq_this_pass = woke.as_ref().is_some_and(|m| m.payload_bytes() == [EHCI_INT_VECTOR]);
+        // Was this pass woken by our INTx, or by something else, or did the deadline simply expire?
+        irq_this_pass = match irq.wait(ctx, Budget::ms(deadline)) {
+            Woke::Interrupt => {
+                let sts = mmio.read32(op + OP_USBSTS);
+                if sts & STS_INT_BITS != 0 {
+                    mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS); // ack: clear W1C status bits
+                }
+                irq.rearm(ctx);
+                true
+            }
+            Woke::Request(_) | Woke::Timeout => false,
+        };
     }
 }
 
@@ -1151,7 +1154,7 @@ const OP_USBINTR:    usize = 0x08; // Interrupt Enable register
 const OP_CONFIGFLAG: usize = 0x40;
 // USBINTR / USBSTS interrupt bits (E2, interrupt-driven §12). The interrupt qTDs already set
 // IOC, so a completed report sets USBSTS.USBINT; enabling it raises the controller's (level)
-// INTx, which the kernel routes via the IOAPIC to EHCI_INT_VECTOR. USBSTS bits are W1C.
+// INTx, which the kernel routes via the IOAPIC to the vector `Irq::granted` reads. USBSTS bits are W1C.
 const INT_USB:        u32 = 1 << 0; // USB Interrupt (a transfer with IOC completed)
 const INT_PCD:        u32 = 1 << 2; // Port Change Detect (hot-plug)
 const STS_INT_BITS:   u32 = 0x3F;   // the six W1C interrupt-status bits (0..5)
@@ -1186,7 +1189,6 @@ const POLL_DEADLINE_MS: u64 = 250;
 /// is now SLEPT rather than spun. Hot-plug latency is unchanged; a core is simply not held to get it.
 const HOTPLUG_POLL_MS: u64 = 50;
 
-const EHCI_INT_VECTOR: u8 = 0x29;   // matches kernel interrupts::EHCI_MSI_VECTOR
 
 // Typematic auto-repeat is CALIBRATED per-machine from the TSC rate at keyboard-poll setup
 // (`KeyRepeat::new_calibrated(wait::ticks_per_10ms(ctx))`); a held key sends no further reports, so

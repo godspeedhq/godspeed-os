@@ -279,7 +279,7 @@ a completion raises `USBINT` regardless of driver activity - which is what lets 
    (complete-split microframes) - a periodic split-interrupt transfer.
 4. Link the QH into the periodic tree at the polling interval, instead of the async reclamation ring.
 5. Keep IOC on the qTD (already done) so periodic completions raise `USBINT` autonomously; then the
-   driver can genuinely block on `EHCI_INT_VECTOR` (0x29).
+   driver can genuinely block on its interrupt (vector 0x29).
 
 This is a **medium-to-large** change - a second schedule engine, new DMA regions, split-interrupt S/C
 mask computation, periodic-tree linking - and every existing helper (`control`, `arm_int`,

@@ -35,6 +35,7 @@ mod regs;
 mod rtl;
 
 use godspeed as gs;
+use godspeed::driver::irq::{Irq, Woke};
 use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 
@@ -79,16 +80,12 @@ const IRQ_RX_ROUNDS: u32 = 8;
 /// a chip that a port reset does not bring back is not reset forever, and the operator is told to replug it.
 const REPLUG_MAX: u32 = 3;
 const REPLUG_WINDOW_MS: u64 = 600_000;
-/// The USB controller's vector. The kernel delivers it as the one-byte message `[USB_VECTOR]` with no reply
-/// cap, which is all that tells it apart from a request (`godspeed_wifi::usbfn` keeps the value free).
-const USB_VECTOR: u8 = 0x29;
-
-/// Is this message the USB interrupt? Asked BEFORE `dispatch`, which takes a reply cap a request has and an
-/// interrupt does not - and so dropped an interrupt as a capless request, leaving the vector masked for
-/// good. Only the disk drain asked this before R3b; no run had armed an IN, so the other two never met one.
-fn is_usb_irq(msg: &godspeed_sdk::Message) -> bool {
-    msg.payload_bytes() == [USB_VECTOR]
-}
+// The USB controller's interrupt arrives as the kernel's one-byte notice of the vector it routed at spawn
+// (`hwclass::DWC2` -> `DWC2_VECTORS`, 0x29 on arm), and `gs::driver::irq` tells it from a request: `Irq::take`
+// in the drains, `Irq::wait` at the end of a pass (2026-10-22). It is told apart BEFORE `dispatch`, which
+// takes a reply cap a request has and an interrupt does not - and so once dropped an interrupt as a capless
+// request, leaving the vector masked for good. This file used to name the vector and test it by hand in
+// each of its three receives; `godspeed_wifi::usbfn` still keeps the value free of its ops.
 
 /// THE INTERRUPT, HANDLED WHERE THE HARDWARE IS: harvest the NIC's receive (bounded by `IRQ_RX_ROUNDS`)
 /// and retire the radio's IN (`rtl::service`), then unmask. Serviced: the line is deasserted, so at once.
@@ -97,7 +94,7 @@ fn is_usb_irq(msg: &godspeed_sdk::Message) -> bool {
 /// places an interrupt can be received, so none of them can forget it again.
 #[allow(clippy::too_many_arguments)]
 fn usb_irq(
-    ctx: &ServiceContext, m: &godspeed::driver::Registers, d: &Parts,
+    ctx: &ServiceContext, irq: &Irq, m: &godspeed::driver::Registers, d: &Parts,
     nic: Option<&mut (net::Nic, chan::Target)>, radio: Option<&mut rtl::Radio>,
     irq_count: &mut u64, irq_frames: &mut u64,
 ) {
@@ -115,7 +112,7 @@ fn usb_irq(
     if got == 0 && !radio_halted {
         gs::task::sleep_ms(ctx, REARM_SERVICED_MS);
     }
-    gs::driver::irq::Irq::granted(ctx).rearm(ctx);
+    irq.rearm(ctx);
 }
 
 /// Tell the OPERATOR, not just the log.
@@ -567,7 +564,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Interrupts arrive as ordinary IPC on this service's receive endpoint: the kernel's neutral
     // router enqueues a one-byte message carrying the vector. That is the same delivery the `xhci`
     // service receives on the Pi 4, which is what makes this test meaningful - it exercises the
-    // shared path, not an arm32-only shim. The vector is `USB_VECTOR`, at the top of this file.
+    // shared path, not an arm32-only shim. The vector is the one the kernel routed at spawn.
+    let irq = Irq::granted(&ctx);
     let mut irqs: u64 = 0;
     let mut msgs: u64 = 0;
     let mut last_report = wait::Since::now(&ctx);
@@ -661,8 +659,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // about the hardware, and the `USB IRQ` counters below are what report it. A status line
         // that asserts the outcome is how a claim outlives the thing it described.
         // The vector the kernel routed at spawn: `hwclass::DWC2` -> `DWC2_VECTORS`, which on arm is
-        // `[USB_VECTOR]` - the same 0x29 this file names. `rearm` unmasks it.
-        gs::driver::irq::Irq::granted(&ctx).rearm(&ctx);
+        // 0x29. `rearm` unmasks it.
+        irq.rearm(&ctx);
         ctx.log("dwc2-svc: USB vector armed - see the 'USB IRQ' counters for whether it fires");
 
         loop {
@@ -685,12 +683,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
                         break;
                     }
-                    let Some(msg) = gs::ipc::try_recv(&ctx) else { break };
+                    let msg = match irq.take(&ctx) {
+                        Some(Woke::Request(msg)) => msg,
+                        Some(_) => {
+                            drained += 1;
+                            usb_irq(&ctx, &irq, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
+                            continue;
+                        }
+                        None => break,
+                    };
                     drained += 1;
-                    if is_usb_irq(&msg) {
-                        usb_irq(&ctx, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
-                        continue;
-                    }
                     // Routed by op, not answered as a block request: net and radio requests do not
                     // need a disk (see `dispatch`).
                     if !dispatch(&ctx, &m, &d, None, nic.as_mut(), radio.as_mut(), &msg, &mut capless) {
@@ -708,7 +710,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // is a sector read and catastrophic when each is a transmit that fails slowly, which
                 // is exactly what a NIC with a stuck receive path produces.
                 //
-                // The check sits here, not after `try_recv`, and the difference matters. `try_recv`
+                // The check sits here, not after `Irq::take`, and the difference matters. `take`
                 // CONSUMES: a budget tested after it would leave a taken request that must be answered
                 // with an error, which would report "this failed" about a request that was merely
                 // unlucky in its timing - and for a NET request it is not even the right shape of
@@ -724,7 +726,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the bottom of the pass, ONE per pass and only on a pass that served nothing else.
                 while !t_pass.passed(&ctx, Budget::ms(PASS_BUDGET_MS)) {
                     // THE COUNT BOUND IS TESTED BEFORE TAKING, like the time bound above it. Testing it
-                    // after `try_recv` meant answering a request it had already CONSUMED - first by
+                    // after `take` meant answering a request it had already CONSUMED - first by
                     // dropping it (its owner waited forever), then with `answer_no_disk`'s
                     // `STATUS_ERR`, which on a flush reads to `fs` as the DRIVE refusing the barrier
                     // while a disk was bound and no device had been asked (`backlog/57`). Declining to
@@ -733,8 +735,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");
                         break;
                     }
-                    let msg = match gs::ipc::try_recv(&ctx) {
-                        Some(m) => m,
+                    let msg = match irq.take(&ctx) {
+                        Some(Woke::Request(msg)) => msg,
+                        Some(_) => {
+                            drained += 1;
+                            // The interrupt: see below.
+                            usb_irq(&ctx, &irq, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
+                            continue;
+                        }
                         None => break,
                     };
                     drained += 1;
@@ -753,11 +761,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // arm's own comment anticipated a real driver would do.
                     //
                     // Bounded: at most IRQ_RX_ROUNDS harvests, stopping early on an empty round. The radio's
-                    // IN is retired there too (`usb_irq`).
-                    if is_usb_irq(&msg) {
-                        usb_irq(&ctx, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
-                        continue;
-                    }
+                    // IN is retired there too (`usb_irq`). It is taken out by `Irq::take` above, before the
+                    // request is.
                     if dispatch(&ctx, &m, &d, Some(&mut *bound_disk), nic.as_mut(), radio.as_mut(), &msg, &mut capless) {
                         served = served.wrapping_add(1);
                         served_this_pass += 1;
@@ -1271,11 +1276,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // gap costs a whole scheduler-stretched sleep before the next request is even LOOKED at.
             // The sleep was not conserving CPU during a quiet moment - it was inserting one.
             //
-            // `recv_within_ms` blocks on the ENDPOINT: an arriving message wakes it immediately because
+            // `Irq::wait` blocks on the ENDPOINT: an arriving message wakes it immediately because
             // that wake is event-driven, and the deadline still provides the keyboard's poll cadence
             // when nothing arrives. Same idle behaviour, none of the latency.
             //
-            // The message it returns must be SERVED, not dropped - `recv_within_ms` consumes. That is
+            // The message it returns must be SERVED, not dropped - the wait consumes. That is
             // the exact bug that made the keyboard report `0 USB IRQ(s)` on a boot where the kernel
             // had delivered the interrupt, and it is one `let _ =` away from happening again.
 
@@ -1287,10 +1292,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             if served_this_pass == 0 {
                 let t_sleep = wait::Since::now(&ctx);
-                if let Some(msg) = gs::ipc::recv_within_ms(&ctx, period_ms) {
-                    if is_usb_irq(&msg) {
-                        usb_irq(&ctx, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
-                    } else if let Some(bound_disk) = disk.as_mut() {
+                match irq.wait(&ctx, Budget::ms(period_ms)) {
+                    Woke::Timeout => {}
+                    Woke::Interrupt => {
+                        usb_irq(&ctx, &irq, &m, &d, nic.as_mut(), radio.as_mut(), &mut irq_count, &mut irq_frames);
+                    }
+                    Woke::Request(msg) => if let Some(bound_disk) = disk.as_mut() {
                         if dispatch(&ctx, &m, &d, Some(&mut *bound_disk), nic.as_mut(), radio.as_mut(), &msg, &mut capless) {
                             served = served.wrapping_add(1);
                         }
@@ -1317,10 +1324,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         //
         // COUNT WHAT THIS RETURNS. It was `let _ = ...`, and `recv_timeout` does not peek - it
         // CONSUMES the message. So the one interrupt that arrived was received here and thrown away,
-        // `try_recv` below then found an empty queue, and the service reported `0 USB IRQ(s)` on a
+        // the drain below then found an empty queue, and the service reported `0 USB IRQ(s)` on a
         // boot where the kernel's own `deliver() vector=0x29` line proves the interrupt had been
         // delivered. A discarded return value, reporting the opposite of what happened.
-        let mut first = gs::ipc::recv_within_ms(&ctx, REPORT_MS);
+        let mut first = Some(irq.wait(&ctx, Budget::ms(REPORT_MS)));
 
         let mut drained = 0u32;
         loop {
@@ -1330,11 +1337,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 ctx.log("dwc2-svc: message drain hit its bound - a sender is enqueuing as fast as we retire (storm?)");
                 break;
             }
-            let Some(m) = first.take().or_else(|| gs::ipc::try_recv(&ctx)) else { break };
+            let woke = match first.take() {
+                Some(Woke::Timeout) => break,
+                Some(w) => w,
+                None => match irq.take(&ctx) { Some(w) => w, None => break },
+            };
             drained += 1;
             msgs = msgs.wrapping_add(1);
-            let p = m.payload_bytes();
-            if p.len() == 1 && p[0] == USB_VECTOR {
+            if let Woke::Request(m) = woke {
+                // A REQUEST, which this loop has no hardware to serve: answered, not dropped.
+                answer_ungranted(&ctx, &m, &mut capless);
+            } else {
                 irqs = irqs.wrapping_add(1);
                 if !first_logged {
                     first_logged = true;
@@ -1358,7 +1371,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // deasserts the line. This is the cheapest way to ask "can it happen twice?" without
                 // writing the driver first.
                 gs::task::sleep_ms(&ctx, REARM_MS);
-                gs::driver::irq::Irq::granted(&ctx).rearm(&ctx);
+                irq.rearm(&ctx);
 
                 // (Retained for the record - the reasoning that made the previous build a proof of
                 // delivery rather than a livelock.)
@@ -1379,9 +1392,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Leaving the line masked costs nothing HERE, because one delivered interrupt is the
                 // entire question: it proves the arm32 route reaches userspace. Counting to a hundred
                 // would prove nothing further and cost the machine.
-            } else {
-                // A REQUEST, which this loop has no hardware to serve: answered, not dropped.
-                answer_ungranted(&ctx, &m, &mut capless);
             }
         }
 

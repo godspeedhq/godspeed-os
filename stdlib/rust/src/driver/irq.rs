@@ -135,11 +135,30 @@ impl Irq {
         let ticks = deadline_ticks(ctx.tsc_ticks_per_10ms(), within.as_us());
         match ctx.recv_timeout(ticks) {
             None => Woke::Timeout,
-            Some(m) if is_interrupt(m.payload_bytes(), self.vector) => {
-                self.seen.set(self.seen.get().saturating_add(1));
-                Woke::Interrupt
-            }
-            Some(m) => Woke::Request(m),
+            Some(m) => self.sort(m),
+        }
+    }
+
+    /// Take what is already waiting, without blocking: the interrupt, a request, or `None` when nothing
+    /// is queued. Never [`Woke::Timeout`].
+    ///
+    /// For a driver that DRAINS its endpoint in a bounded loop and blocks only at the end of a pass -
+    /// `dwc2` and `xhci` both do, so a burst of requests is served in one pass. Each drain used to tell
+    /// the interrupt apart by hand, and `dwc2` once dropped one as a capless request, leaving its line
+    /// masked for good; this is the same test [`Irq::wait`] makes, so the two cannot disagree.
+    #[inline(always)]
+    pub fn take(&self, ctx: &ServiceContext) -> Option<Woke> {
+        ctx.try_recv().map(|m| self.sort(m))
+    }
+
+    /// The interrupt, counted, or a request - the one test both waits make.
+    #[inline(always)]
+    fn sort(&self, m: Message) -> Woke {
+        if is_interrupt(m.payload_bytes(), self.vector) {
+            self.seen.set(self.seen.get().saturating_add(1));
+            Woke::Interrupt
+        } else {
+            Woke::Request(m)
         }
     }
 

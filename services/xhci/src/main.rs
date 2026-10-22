@@ -17,6 +17,7 @@
 
 use godspeed as gs;
 use godspeed::driver::delay;
+use godspeed::driver::irq::{Irq, Woke};
 use godspeed::driver::wait::{self, Budget};
 use godspeed::driver::{Arena, Part, Registers};
 use godspeed_sdk::ServiceContext;
@@ -4059,7 +4060,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // `None` means no interrupt was granted, and then NOTHING is an IRQ - which is the honest reading,
     // not a reason to guess. The loop's 10 ms poll already covers that case.
-    let msi_vector: Option<u8> = gs::driver::irq::Irq::granted(&ctx).vector();
+    //
+    // The main loop's wait is `Irq::wait` since 2026-10-22, which makes that same test - the one-byte notice
+    // of the granted vector, and nothing else - so the instrument and the wait cannot disagree. It never
+    // calls `rearm`, and neither did the hand-written wait: an MSI is an edge the kernel never masks.
+    let irq = Irq::granted(&ctx);
+    let msi_vector: Option<u8> = irq.vector();
     ctx.log_fmt(format_args!(
         "xhci: IRQ vector granted by the kernel: {}",
         match msi_vector { Some(v) => v, None => 0 }));
@@ -5153,19 +5159,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the probe spin lives and therefore the first place to look for the 4.7 ms.
                 seg_hub = seg_hub.wrapping_add(now.wrapping_sub(seg_mark));
             }
-            let woke = gs::ipc::recv_within_ms(&ctx, deadline_ms);
+            let woke = irq.wait(&ctx, Budget::ms(deadline_ms));
             work_t0 = wait::ticks(&ctx);
             // Delivered event = something is waking us. Timeout = it is not.
-            // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not.
+            // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not -
+            // `Irq::wait` makes that test and says which (`Woke`).
             //
             // `irq_seen` used to be set by ANY message, and this service receives block requests from
             // `block-driver` on the same endpoint - so with a disk attached it was set by disk I/O and
             // the "waking on interrupts (MSI)" line proved only that something had arrived. I read
             // that line off a hardware log and told the user interrupts were working. It was never
             // evidence. Now it means what it says.
-            let is_irq = msi_vector.is_some_and(|v| {
-                woke.as_ref().is_some_and(|m| m.payload_bytes() == [v])
-            });
+            let is_irq = matches!(woke, Woke::Interrupt);
             if is_irq { msi_count = msi_count.saturating_add(1); }
             // Assigned, not or-ed: this is a property of the pass, and it must CLEAR on a timeout.
             irq_this_pass = is_irq;
@@ -5175,25 +5180,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // times/sec. Roughly 32 wakes/sec are unaccounted for, and at ~3.6 ms of work each that
             // IS the service's remaining CPU. Guessing which sender it is has been the expensive move
             // this week; this makes the log say it.
-            if let Some(m) = woke.as_ref() {
-                if !is_irq {
-                    msg_count = msg_count.saturating_add(1);
-                    // Say WHAT it is, once. Either something really is sending ~32 messages/sec, or
-                    // `is_irq` is wrong and these ARE interrupts miscounted - the kernel's
-                    // notification carries the IRQ number, and if that is not `msi_vector` the test
-                    // above silently fails (it once was: a hard-coded 0x28 against a pool vector). One line settles which, and a wrong diagnostic that
-                    // ends an investigation is worse than none (see the "waking on interrupts" line
-                    // that cost this session a day).
-                    if msg_count == 1 {
-                        let p = m.payload_bytes();
-                        ctx.log_fmt(format_args!(
-                            "xhci: [wake] first non-IRQ message: len={} first={:#04x}",
-                            p.len(), p.first().copied().unwrap_or(0)));
-                    }
+            if let Woke::Request(m) = &woke {
+                msg_count = msg_count.saturating_add(1);
+                // Say WHAT it is, once. Either something really is sending ~32 messages/sec, or
+                // `is_irq` is wrong and these ARE interrupts miscounted - the kernel's
+                // notification carries the IRQ number, and if that is not `msi_vector` the test
+                // above silently fails (it once was: a hard-coded 0x28 against a pool vector). One line settles which, and a wrong diagnostic that
+                // ends an investigation is worse than none (see the "waking on interrupts" line
+                // that cost this session a day).
+                if msg_count == 1 {
+                    let p = m.payload_bytes();
+                    ctx.log_fmt(format_args!(
+                        "xhci: [wake] first non-IRQ message: len={} first={:#04x}",
+                        p.len(), p.first().copied().unwrap_or(0)));
                 }
             }
             if is_irq { irq_seen = true; }
-            if let Some(m) = woke {
+            if let Woke::Request(m) = woke {
                 // The radio's requests first (U2a): they carry their own op range, and anything else is
                 // the block server's to judge.
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
@@ -5260,8 +5263,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // into one struct first.
             let mut served = 0u32;
             while served < 1 {
-                let Some(m) = gs::ipc::try_recv(&ctx) else { break };
+                let Some(w) = irq.take(&ctx) else { break };
                 served += 1;
+                // An interrupt that arrived during the pass: counted, as the wait counts one. It used to
+                // reach the block server as a capless message and be dropped there as one.
+                let m = match w {
+                    Woke::Request(m) => m,
+                    _ => {
+                        msi_count = msi_count.saturating_add(1);
+                        irq_seen = true;
+                        continue;
+                    }
+                };
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
                     radio::Served::Reenumerate => {
