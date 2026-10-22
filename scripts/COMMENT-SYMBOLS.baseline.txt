@@ -672,3 +672,4 @@ FIF_BCN_PRBRESP_PROMISC            # Linux mac80211 filter flag, set while scann
 RCR_CHECK_BSSID_BEACON             # Linux rtl8xxxu_regs.h, RCR bit 7, which wifi-usb's RCR_CHECK_BSSID sets - external, 26.14
 RCR_CHECK_BSSID_MATCH              # Linux rtl8xxxu_regs.h, RCR bit 6, which wifi-usb's RCR_CHECK_BSSID sets - external, 26.14
 rtl8xxxu_configure_filter          # Linux rtl8xxxu_core.c, the receive filter wifi-usb's bssid_filter follows - external, 26.14
+DMA_DEFAULT_RX_SIZE                # Linux drivers/net/ethernet/stmicro/stmmac/common.h, 512 receive descriptors, cited by nic-driver's dwmac RX_DESCS - external, 26.14
