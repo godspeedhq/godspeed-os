@@ -248,6 +248,35 @@ On 2026-10-19 (item 12 has the figures since):
    | `742f6b00` | the whole core said beside a channel that never halted (instrument only) | wedged four times in four downloads (1-9%); `kill dwc2` alone recovered each |
    | `4cd3a01d` | the AHB burst length Linux sets for this core (`GAHBCFG_HBSTLEN_BCM`) | **136-161 KiB/s, 1 min to 1 min 11 s, six downloads in six**, with the keyboard re-plugged and the stick moved to another port between them; no stall. Disk 43-50 s of each, network 11-16 s |
    | `fac877e8` | a run of up to seven blocks to the stick as one WRITE(10), not seven | **286-338 KiB/s, 28-35 s, four downloads in four** (disk 16-19 s, network 8-12 s, decrypt 4.5-6.9 s); `drives check` clean |
+   | `fdc8fd6c` | a file's consecutive runs gathered into one 32 KiB WRITE(10) | 335-374 KiB/s (disk 9.6-11 s) |
+   | `f78b7b91` | the cable's received frames in one exchange (`OP_NET_RX_BATCH`); a backgrounded job says how to get back to it | **424-471 KiB/s, 20-23 s**; an ask of the driver 2,720 us to 1,590 us; no segment lost on the cable |
+   | `72a1f584` | a 96 KiB gather in a 128 KiB arena | 459 KiB/s, disk 10.6 s: no gain, the stick's own speed (about 1 MB/s through `dwc2`); back to 32 KiB at `422257cb` |
+   | `d48dbc01` | (the radio's; the cable unchanged) | **465-469 KiB/s, 20 s** (network 5.8 s, decrypt 5.3-5.4 s, disk 9.3 s) |
+
+   **Over the RTL8188CUS, the same day** (the cable out; 10 MB; `net-stack`'s segment and gap lines from
+   `f78b7b91` and `1eae207b`):
+
+   | Build | Change | Radio |
+   |-------|--------|-------|
+   | before | - | 16-36 KiB/s; 65% of the radio's USB transfers were other networks' beacons |
+   | `ffc440ec` | once joined, the chip hears only the joined network (RCR bits 6 and 7, as rtl8xxxu) | 72 KiB/s; beacons from about 118 a second to about 10 |
+   | `f78b7b91` | (instrument) | 48 KiB/s: 1,763 segments of 9,246 ahead of a gap, 476 retransmitted |
+   | `72a1f584` | (instrument) | 81 KiB/s: the data waited 33.7 s of 119 s behind 62 gaps; a received transfer uncollected for up to 708 ms |
+   | `422257cb` | `dwc2` holds a ring of eight received transfers, not one | no WiFi download: a notice owed only on empty-to-not left the ring full for good with the cable in (fixed `d7f4c6ad`) |
+   | `d7f4c6ad` | the ring's notice owed again while it holds more | 58 KiB/s: 9 gaps, 5.2 s behind them; 41 frames a second arrived, 87% of asks found none |
+   | `d48dbc01` | the transmit side of rtl8xxxu's init (response rates, SIFS, retries, EDCA, ACK timeout) | 79 KiB/s: 102 gaps, 61 s behind them, about 23 segments a gap; the ring full only 3 s of it |
+   | `91e9448e` | the radio's IN no longer stands aside for the disk's transfers | card owed |
+
+   The radio's losses come in bursts and land before `dwc2`'s ring, in the chip, while its receive is held
+   aside for the stick's writes (`91e9448e` tests that). The other cost seen throughout is `wifi-usb` running
+   without a reply mailbox (`backlog/74`): about 10,000 of the host's notices taken in place of answers in
+   three minutes, each resynchronised (`usbfn::OP_SYNC`).
+
+   **Recovery, the same day.** The dongle's first firmware block failed on the bus at boot on four boots and
+   every control read after it was NAKed until it was replugged by hand: `wifi-usb` asks for a software
+   replug now (`usbfn::OP_REPLUG`, `bab37ad0`; routed wrongly until `ae4805fb`, not yet seen working). And an
+   access point refused the boot rejoin once (reason 34), and nothing tried again until the dongle was
+   replugged: a refused rejoin is tried three more times since `d48dbc01`.
 
    **The wedge, as it was seen (fixed at `4cd3a01d`, by the burst length).** Both times the stick's WRITE(10) bulk OUT never halted first
    (`HCCHAR` with ChEna and ChDis both set), then every transfer to every device did; `block-driver` lost
