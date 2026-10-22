@@ -1060,7 +1060,7 @@ pub const CARRY_MAX: usize = 4 + FRAME_MAX + 4 + 4;
 pub const RXQ_BYTES: usize = RXQ_BURSTS * RXQ_PER_BURST;
 /// One IN transfer can carry SEVERAL frames, so the receive burst is larger than one frame.
 pub const RX_BURST: usize = 4096;   // 8 x 512, matching SMSC_BURST_PKTS and the in-kernel driver this replaced (Linux: 18944)
-// The RX burst must FIT the granted arena (64 KiB): a buffer that ran off its end would be a DMA write
+// The RX burst must FIT the granted arena (128 KiB, the supervisor's `dma_pages`): a buffer that ran off its end would be a DMA write
 // into whatever follows, made silently by the device. The layout refuses a part that does not fit, at
 // start, with the part named (`parts.rs`).
 

@@ -1008,8 +1008,9 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
         // driver zeroes both parts on every control transfer, and the xHCI-sized 1 MiB it once shared a
         // constant with regressed back-port enumeration.
         "ehci" => 16,
-        // 64 KiB: the Pi 2's channels, descriptors and the disk's transfer buffer (`services/dwc2`).
-        "dwc2" => 16,
+        // 128 KiB: the Pi 2's channels, descriptors and the disk's 96 KiB write gather (`services/dwc2`,
+        // `GATHER_BYTES`); 64 KiB until 2026-10-22, when the gather was 32 KiB.
+        "dwc2" => 32,
         // A page of DMA control blocks and a 128 KiB ring of PWM words (`services/pwm-audio`, 33 pages
         // laid out), and three spare.
         "pwm-audio" => 36,
