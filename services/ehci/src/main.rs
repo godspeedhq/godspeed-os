@@ -1055,7 +1055,7 @@ fn poll_devices(
         // `irq: FIRST delivery of vector 0x29 on core 0 (routed: yes)` - the interrupt arrives, and
         // it arrives at THIS endpoint.
         //
-        // So the wait is no longer a pace to be kept. `recv_within_ms` returns EARLY on the interrupt
+        // So the wait is no longer a pace to be kept. It returns EARLY on the interrupt
         // and otherwise at the deadline, which makes the deadline a hot-plug watchdog instead of a
         // 100-times-a-second heartbeat. Same worst-case latency, and the core can actually halt
         // between keystrokes - the property the `sleep` above was reaching for and could not have,

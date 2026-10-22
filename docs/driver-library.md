@@ -787,5 +787,22 @@ good; that test now lives in one place.
   message. It still never re-arms, as before: its interrupt is an MSI. The three idle drains where nothing is
   enumerated answer radio requests "no device" and never wait for an interrupt, so they stay `try_recv`.
 
-No kernel change and no new authority. Owed: a card on each board - `ehci` on the T630 (its keyboard),
-`dwc2` on the Pi 2 (keyboard, disk, cable), `xhci` on a board with a keyboard and a disk behind it.
+No kernel change and no new authority.
+
+**Hardware, 2026-10-22, all at `dff477a3`, each with `chaos max-carnage all-services 100` and `selfcheck`, no
+kernel panic on any:**
+
+- **VisionFive 2 Lite (`xhci`):** keyboard and stick through the hub, re-found after two port moves; cable
+  download 1.9 MiB/s, checked; 100 rounds; selfcheck 600/0, 1 skipped (registry not reachable). Its heartbeat
+  says `0 MSI`, as it did before: this port has no PLIC, so the card shows the timeout and request paths, not
+  the interrupt.
+- **Pi 2 (`dwc2`):** keyboard, disk, cable (`ping` answered, two downloads checked); the USB interrupt count
+  climbs past 50,000, so the interrupt path is the one taken; 100 rounds; selfcheck 659/0, 1 skipped (no PCI).
+- **Pi 4 (`xhci`):** MSI count 1,018 at 61 s and 4,530 at 121 s; three downloads checked; 100 rounds;
+  selfcheck 600/0, 1 skipped. It also printed the `polling input at the 10ms tick` line, which the card did
+  not predict; that line is decided by a report found on a pass no interrupt woke, which this step did not
+  change, and it has been printed on boots before it. Whether the Pi 4 printed it before is not checked.
+- **HP T630 (`ehci`, with `xhci` beside it):** `irq: FIRST delivery of vector 0x29` reaches `ehci`, so its
+  interrupt arm ran; its heartbeat still says `polling yes (interrupt does not cover HID)`, as it did on
+  2026-10-08 and 2026-10-10 - the low-speed keyboard behind the hub completes without the interrupt. Two
+  downloads checked (3.2 and 4.4 MiB/s); 100 rounds; selfcheck 666/0. `xhci` woke on MSI.
