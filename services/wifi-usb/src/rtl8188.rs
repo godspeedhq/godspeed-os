@@ -390,6 +390,10 @@ const RF_BW_20MHZ: u32 = 1 << 10;
 /// broadcast and management, append the PHY status and the decryption results - and NOT the BSSID checks, so
 /// any network's beacons pass.
 const RCR_SCAN: u32 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 13) | (1 << 14) | (1 << 28) | (1 << 29) | (1 << 30);
+/// `RCR_CHECK_BSSID_MATCH` and `RCR_CHECK_BSSID_BEACON` (bits 6 and 7): data and beacons only from the
+/// network in `REG_BSSID`. `rtl8xxxu_configure_filter` sets both whenever mac80211 is not scanning (no
+/// `FIF_BCN_PRBRESP_PROMISC`) - so joined, the chip drops every other network's beacons itself.
+const RCR_CHECK_BSSID: u32 = (1 << 6) | (1 << 7);
 /// The RF table's pseudo-register for a 50 ms pause (`rtl8xxxu_init_rf_regs`); the others are unused by this table.
 const RF_TABLE_PAUSE_50MS: u8 = 0xFE;
 
@@ -828,6 +832,15 @@ pub fn left(ctx: &ServiceContext, mbox: &mut u8) -> Result<(), &'static str> {
 
 /// `REG_BSSID`: the network the station is joining, six bytes.
 const REG_BSSID: u16 = 0x0618;
+
+/// Hear only the joined network (`on`), or every network for a scan (`RCR_CHECK_BSSID`).
+///
+/// **Why it matters to speed.** Each frame the chip passes is one bulk IN through the USB host and one
+/// exchange with this service, and with the scan-time filter kept after the join, a download over the Pi 2
+/// spent 1662 of 2560 transfers in 14 s on beacons, eight networks' worth (2026-10-22).
+pub fn bssid_filter(ctx: &ServiceContext, on: bool) -> Result<(), &'static str> {
+    if on { set32(ctx, REG_RCR, RCR_CHECK_BSSID, 0) } else { set32(ctx, REG_RCR, 0, RCR_CHECK_BSSID) }
+}
 
 /// R5b: the network being joined - `rtl8xxxu_set_bssid` for port 0, a byte at a time, which mac80211 has
 /// the driver do before the authentication (`BSS_CHANGED_BSSID`).

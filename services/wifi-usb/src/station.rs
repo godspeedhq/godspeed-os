@@ -294,6 +294,16 @@ impl<'l> Dongle<'l> {
         got
     }
 
+    /// Joined, hear only the joined network (`rtl8188::bssid_filter`); not joined, leave it open.
+    fn filter_to_joined(&self, ctx: &ServiceContext) {
+        if self.assoc.is_some() {
+            if let Err(why) = rtl8188::bssid_filter(ctx, true) {
+                ctx.log_fmt(format_args!(
+                    "wifi-usb: the receive filter was not narrowed to the joined network - {}; every network's beacons still arrive", why));
+            }
+        }
+    }
+
     /// Leave: a deauthentication to `bssid`, the BSSID cleared, and back on the channel the dongle rests on.
     fn leave(&mut self, ctx: &ServiceContext, bssid: &[u8; 6]) {
         let mut f = [0u8; mgmt::DEAUTH_LEN];
@@ -309,6 +319,10 @@ impl<'l> Dongle<'l> {
             }
         }
         let _ = rtl8188::set_bssid(ctx, &[0; 6]);
+        // Every network heard again, for the scan that finds the next one.
+        if let Err(why) = rtl8188::bssid_filter(ctx, false) {
+            ctx.log_fmt(format_args!("wifi-usb: the receive filter was not opened to every network - {}", why));
+        }
         self.drop_keys(ctx);
         self.assoc = None;
         {
@@ -570,6 +584,10 @@ impl<'l> Dongle<'l> {
 
 impl Station for Dongle<'_> {
     fn scan_start(&mut self, ctx: &ServiceContext) -> bool {
+        // A sweep hears every network, joined or not, as Linux's filter does while scanning.
+        if let Err(why) = rtl8188::bssid_filter(ctx, false) {
+            ctx.log_fmt(format_args!("wifi-usb: the receive filter was not opened for the sweep - {}", why));
+        }
         if !self.tune(ctx, FIRST) {
             return false;
         }
@@ -594,6 +612,7 @@ impl Station for Dongle<'_> {
             self.sweep = None;
             let home = self.home;
             let back = self.tune(ctx, home);
+            self.filter_to_joined(ctx);
             ctx.log_fmt(format_args!(
                 "wifi-usb: sweep done - {} network(s) on channels {} to {}, {} probe request(s) sent, {} not{}",
                 scan.count(), FIRST, LAST, self.probes_sent, self.probes_refused,
@@ -612,7 +631,9 @@ impl Station for Dongle<'_> {
     fn scan_abort(&mut self, ctx: &ServiceContext) -> bool {
         self.sweep = None;
         let home = self.home;
-        self.tune(ctx, home)
+        let back = self.tune(ctx, home);
+        self.filter_to_joined(ctx);
+        back
     }
 
     fn scan_empty_bound(&self) -> u32 {
@@ -669,6 +690,7 @@ impl Station for Dongle<'_> {
                 Err(why) => ctx.log_fmt(format_args!(
                     "wifi-usb: join - the firmware was not given the rates ({}) - data falls back to its own default", why)),
             }
+            self.filter_to_joined(ctx);
             ctx.log("wifi-usb: join - JOINED; frames to and from the network go through nic-driver when the cable is out (R6)");
             self.say_key_store(ctx, "after the join");
         } else {
