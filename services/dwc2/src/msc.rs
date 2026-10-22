@@ -74,6 +74,14 @@ pub struct Disk {
     pub busy_csw: u32,
     /// Commands that completed, so the counts above can be read as a rate rather than a total.
     pub commands: u32,
+    /// What the disk buffer holds of WRITE GATHERING (`GATHER_SECTORS`): `gather_n` sectors from
+    /// `gather_lba`, the last appended at `gather_at`. 0 sectors = nothing held.
+    pub gather_lba: u32,
+    pub gather_n: u32,
+    pub gather_at: Option<wait::Since>,
+    /// A gathered write failed since the last FLUSH, after its runs were answered as written: the next
+    /// FLUSH answers an error, so `fs` learns it at its barrier (6.1).
+    pub gather_lost: bool,
 }
 
 /// Walk a configuration descriptor for a Bulk-Only mass-storage interface and its endpoints.
@@ -166,12 +174,19 @@ pub fn bind(
         "dwc2-svc: MASS STORAGE bound - bulk IN {} OUT {} mps {} (ep0 mps {})",
         ep_in, ep_out, mps, t.mps));
     Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0, iface, fail_streak: 0,
-        busy_cbw: 0, busy_data: 0, busy_csw: 0, commands: 0 })
+        busy_cbw: 0, busy_data: 0, busy_csw: 0, commands: 0,
+        gather_lba: 0, gather_n: 0, gather_at: None, gather_lost: false })
 }
 
 /// The most one BOT command moves, the size of its data part of the arena. Its wrappers have parts of
 /// their own (`parts.rs`), so none of the three can land on another buffer.
-pub const DATA_MAX: usize = 4096;
+pub const DATA_MAX: usize = GATHER_BYTES;
+/// The disk buffer's size, and the most one WRITE(10) gathers: 32 KiB, nine of `fs`'s seven-block runs.
+/// The arena holds it beside everything else (`parts.rs`); xhci's two of 56 KiB do not fit 64 KiB here.
+pub const GATHER_BYTES: usize = 0x8000;
+pub const GATHER_SECTORS: u32 = (GATHER_BYTES / 512) as u32;
+/// How long a held run waits for the next before it is written.
+pub const GATHER_IDLE_MS: u64 = 10;
 
 /// Why a bulk transfer did not complete.
 ///
@@ -204,7 +219,9 @@ pub(crate) fn bulk_xfer(
     let mut xact_errs = 0u32;
     loop {
         chan::program(ctx, mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
-        match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100) {
+        // 100 ms, and 1 ms more for each 256 bytes: a gathered 32 KiB write is waited 228 ms, an estimate
+        // of how long a stick may take to take that much, not a measurement of it.
+        match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100 + len as u64 / 256) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 // HCTSIZ counts DOWN the bytes still outstanding, so what moved is the difference.
                 // Reading it is what makes a SHORT transfer detectable at all.
@@ -486,13 +503,13 @@ pub const OP_CAPACITY: u8 = 3;
 pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
 /// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]` (`block-driver`'s
-/// `OP_WRITE_BLOCKS`). Served here as ONE WRITE(10) of `count` blocks, which the disk buffer holds
-/// (`DATA_MAX`). The `xhci` host goes further and gathers consecutive runs into one command.
+/// `OP_WRITE_BLOCKS`). GATHERED with the runs it follows on from and written with them as ONE WRITE(10)
+/// (`GATHER_SECTORS`, `write_held`), as `xhci` does on the Pi 4.
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;
-// A run is written from the disk buffer whole, so the longest one must fit it.
-const _: () = assert!(WRITE_RUN_MAX * 512 <= DATA_MAX);
+// A run must fit the gather buffer, with room for the next before it is written.
+const _: () = assert!(WRITE_RUN_MAX * 512 <= GATHER_BYTES);
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device - the same value and meaning as
@@ -513,6 +530,49 @@ pub fn write_blocks(
         0, (count >> 8) as u8, count as u8, 0,
     ];
     bot(ctx, mmio, dma, t, disk, &cdb, false, count as usize * 512).is_some()
+}
+
+/// WRITE GATHERING. A stick answers each Bulk-Only command after its own turnaround, so a file written a
+/// seven-block run at a time paid it per run: on the Pi 2 a 10 MB download spent 16-19 s of its 28-35 s on
+/// the stick with each run one command (2026-10-22). Consecutive runs are kept in the disk buffer and
+/// written as ONE command when it is full, when a run that does not follow on arrives, before any other
+/// request (a read, a single write, a flush), and after `GATHER_IDLE_MS` with nothing new - the rules
+/// xhci's gather keeps on the Pi 4, without its overlap: this driver waits for each transfer.
+///
+/// **What a run's reply means, said plainly.** "Held, to be written", not "on the stick": the promise a
+/// device's own write cache already makes. Only file data comes as runs (`fs`'s direct path); the journal
+/// and metadata are single writes and pass straight through, after what is held. A gathered write that
+/// fails is said, and the next FLUSH answers an error (`gather_lost`). What is held when the stick is
+/// pulled is lost and said (`note_drop`).
+pub fn write_held(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk) {
+    let (lba, n) = (disk.gather_lba, disk.gather_n);
+    if n == 0 {
+        return;
+    }
+    disk.gather_n = 0;
+    disk.gather_at = None;
+    if !with_busy_retry(ctx, 30_000, || write_blocks(ctx, mmio, dma, t, disk, lba, n as u16)) {
+        disk.gather_lost = true;
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: a gathered WRITE(10) of {} sectors at lba {} FAILED - they were answered as written and are not on the stick; the next FLUSH fails",
+            n, lba));
+    }
+}
+
+/// Write what is held if nothing has joined it for `GATHER_IDLE_MS`. The main loop's, each pass.
+pub fn write_held_if_idle(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk) {
+    if disk.gather_n > 0 && disk.gather_at.map_or(true, |at| at.passed(ctx, Budget::ms(GATHER_IDLE_MS))) {
+        write_held(ctx, mmio, dma, t, disk);
+    }
+}
+
+/// Say what is lost when a disk is dropped holding gathered sectors. For every place that drops one.
+pub fn note_drop(ctx: &ServiceContext, disk: &Disk) {
+    if disk.gather_n > 0 {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: the disk was dropped holding {} gathered sectors at lba {} - they were answered as written and are LOST",
+            disk.gather_n, disk.gather_lba));
+    }
 }
 
 /// Retry a BOT command that handed back BUSY, bounded by the CLOCK.
@@ -560,6 +620,11 @@ pub fn serve(
     }
 
     let mut out = [0u8; 520];
+    // Anything but a run, or a capacity (no I/O), writes what is held first: a read then sees it, and a
+    // single write or a flush is ordered after it - `fs`'s barriers order everything before them.
+    if p[0] != OP_WRITE_BLOCKS && p[0] != OP_CAPACITY {
+        write_held(ctx, mmio, dma, t, disk);
+    }
     let n = match p[0] {
         OP_CAPACITY => {
             out[0] = STATUS_OK;
@@ -601,12 +666,29 @@ pub fn serve(
         OP_WRITE_BLOCKS if p.len() >= 10 => {
             let count = p[9] as usize;
             let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
-            let mut ok = (1..=WRITE_RUN_MAX).contains(&count) && p.len() >= 10 + count * 512;
+            let ok = (1..=WRITE_RUN_MAX).contains(&count) && p.len() >= 10 + count * 512
+                && (lba as u64).saturating_add(count as u64) <= sectors;
             if ok {
-                for i in 0..count * 512 {
-                    dma.disk.write8(i, p[10 + i]);
+                // A run that does not follow on, or does not fit, writes what is held first.
+                if disk.gather_n > 0
+                    && (lba != disk.gather_lba.wrapping_add(disk.gather_n)
+                        || disk.gather_n + count as u32 > GATHER_SECTORS)
+                {
+                    write_held(ctx, mmio, dma, t, disk);
                 }
-                ok = with_busy_retry(ctx, 30_000, || write_blocks(ctx, mmio, dma, t, disk, lba, count as u16));
+                if disk.gather_n == 0 {
+                    disk.gather_lba = lba;
+                }
+                let at = disk.gather_n as usize * 512;
+                for i in 0..count * 512 {
+                    dma.disk.write8(at + i, p[10 + i]);
+                }
+                disk.gather_n += count as u32;
+                disk.gather_at = Some(wait::Since::now(ctx));
+                // Full enough that the next run would not fit: written now rather than on the next request.
+                if disk.gather_n + WRITE_RUN_MAX as u32 > GATHER_SECTORS {
+                    write_held(ctx, mmio, dma, t, disk);
+                }
             }
             out[0] = if ok { STATUS_OK } else { STATUS_ERR };
             1
@@ -623,7 +705,16 @@ pub fn serve(
             // whichever way the device goes - a refusal is a fact about the device rather than an
             // error, and `fs` decides what a refusal means. Nothing here changes; the belief does.
             let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            out[0] = if bot(ctx, mmio, dma, t, disk, &cdb, false, 0).is_some() { STATUS_OK } else { STATUS_ERR };
+            // A held write that failed since the last barrier fails this one: `fs` was told the run was
+            // written, and the barrier is where it must learn otherwise (6.1).
+            out[0] = if core::mem::replace(&mut disk.gather_lost, false) {
+                ctx.log("dwc2-svc: FLUSH answered with an error - a gathered write failed since the last one");
+                STATUS_ERR
+            } else if bot(ctx, mmio, dma, t, disk, &cdb, false, 0).is_some() {
+                STATUS_OK
+            } else {
+                STATUS_ERR
+            };
             1
         }
         _ => {

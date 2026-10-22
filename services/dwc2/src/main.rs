@@ -756,6 +756,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         served_this_pass += 1;
                     }
                 }
+                // Gathered runs nothing has joined for a while go to the stick (`msc::write_held`).
+                let (dk, dt, _) = bound_disk;
+                msc::write_held_if_idle(&ctx, &m, &d, dt, dk);
             }
             // --- HOT-PLUG: the hub tells us what changed -------------------------------------
             //
@@ -851,6 +854,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     "usb: keyboard removed (port {}) - use serial until one is plugged in", port));
                             }
                             if disk.is_some() && disk_port == port {
+                                if let Some((dk, _, _)) = disk.as_ref() {
+                                    msc::note_drop(&ctx, dk);
+                                }
                                 disk = None;
                                 notify(&ctx, format_args!(
                                     "usb: storage removed (port {}) - drives will report no disk", port));
