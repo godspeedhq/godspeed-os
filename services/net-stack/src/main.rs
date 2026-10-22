@@ -2793,6 +2793,9 @@ fn report_spent(ctx: &ServiceContext, sp: &mut tcp::Spent) {
         ctx.log_fmt(format_args!(
             "net-stack: where the connection's time went (3/3) - {} frames sent from the polls, {} ms, {} us each; {} ms not in a read or a poll (waiting to be asked)",
             sp.sends, ms(sp.send_ticks), us(sp.send_ticks, sp.sends), ms(other)));
+        ctx.log_fmt(format_args!(
+            "net-stack: the connection's data segments - {} next in sequence, {} ahead of a gap ({} past the window), {} already had (a retransmission)",
+            sp.seg_next, sp.seg_ahead, sp.seg_past, sp.seg_old));
     }
     *sp = tcp::Spent::default();
 }

@@ -888,6 +888,13 @@ pub struct Spent {
     /// Of the polls: frames handed to the driver to send, and the round trips.
     pub sends: u32,
     pub send_ticks: u64,
+    /// The data segments that came, by where they fell: the next in sequence, ahead of a gap (something
+    /// before them was lost or is late) inside the window and past it, and already had (a retransmission
+    /// of what arrived). Counted, never acted on: they tell a slow sender from a lossy path.
+    pub seg_next: u32,
+    pub seg_ahead: u32,
+    pub seg_past: u32,
+    pub seg_old: u32,
 }
 
 impl Tcp {
@@ -906,7 +913,8 @@ impl Tcp {
             damaged: None, damaged_len: 0, damaged_seq: 0, damaged_from: ([0; 4], 0), damaged_at: 0, damaged_n: 0,
             tx_log: [0u8; 24], tx_n: 0,
             spent: Spent { since: 0, reads: 0, read_bytes: 0, read_ticks: 0, read_polls: 0, stashed: 0, polls: 0,
-                           poll_ticks: 0, drains: 0, drain_ticks: 0, frames: 0, empty: 0, sends: 0, send_ticks: 0 },
+                           poll_ticks: 0, drains: 0, drain_ticks: 0, frames: 0, empty: 0, sends: 0, send_ticks: 0,
+                           seg_next: 0, seg_ahead: 0, seg_past: 0, seg_old: 0 },
         }
     }
 
@@ -1875,7 +1883,12 @@ impl Tcp {
             return 0;
         }
 
-        let c = match self.find(lp, &rip, rp) { Some(c) => c, None => return 0 };
+        // By index into `conns` rather than through `find`, so `spent` - a field beside it - can be counted
+        // into while `c` is held (the data segments, below).
+        let Some(ci) = self.conns.iter().position(|c| {
+            c.state != State::Closed && c.local_port == lp && c.remote_port == rp && c.remote_ip == rip
+        }) else { return 0 };
+        let c = &mut self.conns[ci];
 
         // A RST ends the connection, and the reason is kept. Anything else about this segment is
         // moot once the peer has refused.
@@ -2064,6 +2077,20 @@ impl Tcp {
 
             // ---- data ----
             if !seg.payload.is_empty() && c.state != State::TimeWait {
+                if self.spent.since != 0 {
+                    let s = &mut self.spent;
+                    if seg.seq == c.rcv_nxt {
+                        s.seg_next = s.seg_next.saturating_add(1);
+                    } else if seq_gt(seg.seq, c.rcv_nxt) {
+                        if seq_lt(seg.seq, c.rcv_nxt.wrapping_add(c.window())) {
+                            s.seg_ahead = s.seg_ahead.saturating_add(1);
+                        } else {
+                            s.seg_past = s.seg_past.saturating_add(1);
+                        }
+                    } else {
+                        s.seg_old = s.seg_old.saturating_add(1);
+                    }
+                }
                 if seg.seq == c.rcv_nxt {
                     let had_hole = c.ooo_n > 0;
                     let before = c.rcv_nxt;
