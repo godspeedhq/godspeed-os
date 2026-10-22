@@ -24737,7 +24737,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     let secs: u64 = if kind == KIND_CHURN { args[2].parse().unwrap_or(30) } else { 0 };
     match start_job(ctx, kind, &slocal[..slen], &dlocal[..dlen], secs, true) {
         Ok(id) => {
-            gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", id));
+            say_backgrounded(ctx, id);
             Ok(())
         }
         Err(_) => Err(ShellError::Unknown),
@@ -24966,6 +24966,12 @@ fn drives_typed(ctx: &ShellCtx, args: &[&str], argc: usize) -> Result<(), ShellE
     }
 }
 
+/// The line a job gets when it leaves the console, saying the way back to it - all three places a job is
+/// backgrounded (`background`, `b` on a typed command, `b` while in the foreground) say the same.
+fn say_backgrounded(ctx: &ShellCtx, id: u32) {
+    gs::io::println_fmt(ctx, format_args!("[backgrounded] job {} - `foreground {}` brings it back", id, id));
+}
+
 /// A typed command's job is going on without the console: from here it is a job like any other, with a
 /// number `jobs` shows and `foreground` takes.
 fn reveal_job(ctx: &ShellCtx, id: u32) -> u32 {
@@ -25063,7 +25069,7 @@ fn attach_job(ctx: &ShellCtx, id: u32, kind: u8, mut start_owed: bool) -> Option
             if detach {
                 ctx.offer_b.set(false);
                 let shown = reveal_job(ctx, id);
-                gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", shown));
+                say_backgrounded(ctx, shown);
                 return Some(Ok(()));
             }
         }
@@ -25443,7 +25449,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         let key = if ctx.quit.get() { Some(b'q') } else { ctx.try_console_read() };
         if let Some(b) = key {
             if b == b'b' || b == b'B' {
-                gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", want));
+                say_backgrounded(ctx, want);
                 return Ok(());
             }
             if b == b'q' || b == b'Q' || b == 0x1b {

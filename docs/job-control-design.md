@@ -28,7 +28,7 @@ decide that in advance.
 
 ```
 gsh> background copy /usb/archive /data/archive
-[backgrounded] job 7
+[backgrounded] job 7 - `foreground 7` brings it back
 
 gsh> jobs
 JOB  STATE      COMMAND
