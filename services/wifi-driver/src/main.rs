@@ -328,14 +328,6 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed::driver::Registers) -> ! {
     ctx.log_fmt(format_args!(
         "wifi-driver: stage 3 - an SDIO card answered: {} I/O function(s), memory {}, OCR {:#010x}, RCA {:#06x}",
         card.funcs, card.memory, card.ocr, card.rca));
-    // THE IDENTIFICATION CLOCK HAS DONE ITS JOB, as on the Pi 4's path (`OPERATING_HZ`, SDIO default speed,
-    // which every card supports without a high-speed negotiation). This path never left it: the AIC8800 ran
-    // at 400 kHz on one data line for every firmware upload and every frame, about 50 KB/s, and a 10 MB
-    // download over it took 2-4 minutes at 37-60 KiB/s with the stack's queue no longer the limit
-    // (2026-10-22). A failure is said and not fatal: everything still works at 400 kHz, slowly.
-    if !h.set_operating_clock(OPERATING_HZ, ctx) {
-        ctx.log("wifi-driver: the operating clock would not stabilise - continuing at the identification clock, which is slow but correct");
-    }
     sd::report_cccr(&h, ctx);
     // ---- Stage 4: ask the PART what it is. --------------------------------------------------------
     let is_d80 = match sd::cis_pointer(&h, ctx).and_then(|p| sd::walk_cis(&h, p, ctx)) {
@@ -410,6 +402,18 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed::driver::Registers) -> ! {
                 } else {
                     "wifi-driver: stage 7 - the firmware was not started; the line above names the step"
                 });
+                // THE IDENTIFICATION CLOCK HAS DONE ITS JOB once the firmware runs, and only then. This path
+                // never left it, so every frame crossed the bus at 400 kHz on one data line, and a 10 MB
+                // download took 2-4 minutes at 37-60 KiB/s with the stack's queue no longer the limit. Raised
+                // at identification, as the Pi 4's path does, the uploads ran faster and the ROM then stopped
+                // answering in the patch table's Bluetooth power-on group (2026-10-22, `ae94e8a5`): the chip's
+                // ROM stage wants the slow clock, as StarFive's build keeps it slow for the upload (section 5
+                // of `docs/wifi-aic8800.md`). So the clock goes up here, to SDIO default speed, which every
+                // card supports without a high-speed negotiation. A failure is said and not fatal: everything
+                // still works at the identification clock, slowly.
+                if started && !h.set_operating_clock(OPERATING_HZ, ctx) {
+                    ctx.log("wifi-driver: the operating clock would not stabilise - continuing at the identification clock, which is slow but correct");
+                }
                 // ---- Stage 8 (V3, first card): the running firmware's bring-up, to its version and MAC. ----
                 if started {
                     match aic::bring_up(&h, ctx) {
