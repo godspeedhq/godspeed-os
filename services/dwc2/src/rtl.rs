@@ -88,6 +88,8 @@ pub struct Radio {
     sync_radio: bool,
     /// When the driver last asked anything, for that quiet.
     last_req: Option<wait::Since>,
+    /// When the transfer now held was taken, for `RxStats::held_ms`.
+    held_at: Option<wait::Since>,
     /// The driver asked for a replug (`usbfn::OP_REPLUG`); the main loop does it once the answer is sent.
     pub replug_asked: bool,
     /// Whether one may be done now - the main loop's bound (`REPLUG_MAX`), set when it binds the radio.
@@ -151,6 +153,10 @@ pub struct RxStats {
     pub notes_late: u32,
     /// `OP_SYNC`s: notices the driver received in place of an answer (it has no reply mailbox).
     pub syncs: u32,
+    /// The time transfers sat HELD - received, the IN not armed again - before the driver collected them, in
+    /// all and the longest, in ms: the chip holds what arrives meanwhile, and a full chip drops it.
+    pub held_ms: u64,
+    pub held_max_ms: u64,
 }
 
 // The radio's transfers land in `Parts::radio_rx`, and a frame to send is staged in `Parts::radio_tx`,
@@ -181,7 +187,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid
     let _ = probe(ctx, mmio, dma, t);
     Radio {
         t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
-        sync_bulk: false, sync_radio: false, last_req: None, replug_asked: false, replug_allowed: true,
+        sync_bulk: false, sync_radio: false, last_req: None, held_at: None, replug_asked: false, replug_allowed: true,
         errs_run: 0, stats: RxStats::default(),
         outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
         tx: TxStats::default(),
@@ -352,6 +358,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
         r.stats.transfers = r.stats.transfers.wrapping_add(1);
         r.stats.bytes = r.stats.bytes.wrapping_add(got as u32);
         r.rx = Rx::Held(got);
+        r.held_at = Some(wait::Since::now(ctx));
         if !tell_bulk(ctx) {
             r.note_owed = true;
             r.stats.notes_late = r.stats.notes_late.wrapping_add(1);
@@ -387,6 +394,11 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut 
         // A completion the interrupt has not been handled for yet is taken now rather than a pass later.
         let _ = service(ctx, mmio, dma, r);
         if let Rx::Held(len) = r.rx {
+            if let Some(at) = r.held_at.take() {
+                let ms = at.elapsed_us(ctx) / 1000;
+                r.stats.held_ms = r.stats.held_ms.saturating_add(ms);
+                r.stats.held_max_ms = r.stats.held_max_ms.max(ms);
+            }
             for (i, b) in out[2..2 + len].iter_mut().enumerate() {
                 *b = dma.radio_rx.read8(i);
             }
@@ -442,6 +454,9 @@ pub fn report(ctx: &ServiceContext, r: &Radio) {
     ctx.log_fmt(format_args!(
         "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late, {} taken as answers (OP_SYNC); {}; tx - {} frames {} bytes, {} failed",
         s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, s.syncs, state, r.tx.frames, r.tx.bytes, r.tx.failed));
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: radio rx held - {} ms in all before the driver collected a transfer, the longest {} ms",
+        s.held_ms, s.held_max_ms));
 }
 
 fn tell_bulk(ctx: &ServiceContext) -> bool {
