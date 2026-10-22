@@ -856,7 +856,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 }
 
 fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Registers>, d: Option<Arena>) -> Device<'a> {
-    let b = match ctx.probe_mode() {
+    let b = match gs::program::mode(&ctx) {
         2 => PI2,
         4 => PI4,
         other => {

@@ -11,7 +11,10 @@
 //! how to say the wait gave up, how long to hold still when no register can say, and how to wait for an
 //! interrupt without losing a request, describe neither - so they are here (`wait`, `delay`, `irq`). So are
 //! the two grants a driver names: its register window (`registers`) and its DMA arena, laid out by name
-//! (`arena`).
+//! (`arena`). And so are the calls a driver made to the SDK for what its grants carry with them: the input
+//! it hands the console (`input`), its device's power (`power`), and what the kernel knows about the device
+//! that the driver cannot read for itself (`device`) - each the SDK's own call, so that a driver is written
+//! on this module and nothing beside it (step 5).
 //!
 //! **There are no device CLASSES here, and there will not be.** No driver::wifi, driver::audio or
 //! driver::usb: a class API is a guess about what every device of that kind will need, made before
@@ -22,9 +25,9 @@
 //!
 //! By being REPEATED, not by being imagined. Each module here was found written out by hand in more
 //! than one driver, differently each time, and then moved here and the drivers converted to it. `irq`
-//! is the half-way case: its originals (`xhci`, `ehci`, `dwc2`) now take their vector from
-//! [`irq::Irq::granted`] and re-open it with `rearm`, but still run their own receive loops; its
-//! [`irq::Irq::wait`] is used by the two audio drivers so far. A
+//! was built from `xhci`, `ehci` and `dwc2`, tested by the two audio drivers, and since 2026-10-22 is
+//! the wait of all five. (`input`, `power` and `device` are the exception, recorded in step 5: each is
+//! one SDK call a driver must name, wrapped, not a mechanism found written out.) A
 //! second, independent kind of driver using it naturally is the test of whether it is general; one
 //! that has to be bent to fit it means the abstraction is shaped like the driver it came from.
 //!
@@ -41,7 +44,10 @@
 
 pub mod arena;
 pub mod delay;
+pub mod device;
+pub mod input;
 pub mod irq;
+pub mod power;
 pub mod registers;
 pub mod wait;
 

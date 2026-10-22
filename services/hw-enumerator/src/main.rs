@@ -138,7 +138,7 @@ fn cfg_read(ctx: &ServiceContext, bus: u8, dev: u8, func: u8, offset: u8) -> Opt
     // being asserted.
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
     let sel = ((bus as u32) << 20) | ((dev as u32) << 15) | ((func as u32) << 12);
-    ctx.pci_cfg_read(sel, offset as u16)
+    gs::driver::device::pci_cfg_read(&ctx, sel, offset as u16)
 }
 
 /// How many device slots to probe on a bus.

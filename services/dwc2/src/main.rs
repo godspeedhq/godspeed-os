@@ -147,7 +147,7 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // mechanism but its trigger - this is reachable only from a hot-plug event, which is a
     // person physically plugging something in. That cannot storm, and it is bounded by the
     // one thing no software defect can accelerate.
-    ctx.console_push(10);
+    gs::driver::input::push(&ctx, 10);
 }
 
 /// Answer a request `dispatch` could not route (an empty payload) with `STATUS_ERR`, instead of consuming

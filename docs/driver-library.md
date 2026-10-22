@@ -93,10 +93,25 @@ and why; read them for the reasoning, not to find out what the library contains.
   `Mmio` and `Dma`, so no `unsafe` moved. **Every compiled driver takes its grants this way** (2026-10-19),
   and `scripts/one_way_check.py` counts `ctx.mmio()`, `xhci_mmio`, `ehci_mmio` and `dma_region()`, so a new
   driver is held to zero of them from its first line.
+- **`input`, `power` and `device`** (step 5, 2026-10-22) - the rest of what a driver asked the SDK for,
+  each the SDK's own call wrapped. `input::push` and `input::ready` hand keystrokes to the console and say
+  input is up (`CONSOLE_PUSH`); `power::set` cuts and restores the granted device's power (`DevicePower`);
+  `device::board_mac`, `nic_vendor_device`, `emmc_base_clock_hz` and `pci_cfg_read` are what the kernel
+  knows about a device that the driver cannot read for itself. `gs::program::mode` beside them is the mode
+  a program was started in. All counted by `one_way_check.py`, every caller at zero.
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
 (1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet
 verified on hardware**). `audio-driver` and `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
+
+**What a driver still takes from the SDK, and why it is not here.** Two things, neither a hardware call:
+
+- **`godspeed_sdk::hid`** - the USB boot-protocol keyboard and mouse decoding, key repeat and the
+  Ctrl+Alt+Del signal that `xhci`, `ehci` and `dwc2` share. It describes a device CLASS, so it is a domain
+  library (like `sdk/wifi`) and never `gs::driver`. Its home is the SDK today.
+- **`ServiceContext` and `Message`** - every service imports them from the SDK, drivers or not. `gs`
+  re-exports `ServiceContext` already; moving every crate's imports is the whole-tree end state of
+  `backlog/71`, not a driver's.
 
 **Left by hand, each with its reason in its step.**
 
@@ -811,3 +826,26 @@ The operator hot-plugged the keyboard on every board, and each driver found it a
 - **Dell Wyse 5070 (`xhci`):** MSI count 648 and then 1,303 a minute later after the chaos run; three
   downloads checked (1.8 to 2.2 MiB/s); the keyboard re-found after two disconnects before the run and after
   each kill in it; 100 rounds; selfcheck 666/0. It printed the same 10 ms poll fallback line as the Pi 4.
+
+## Step 5: a driver's remaining SDK calls, wrapped (2026-10-22)
+
+**The operator's decision**, when the branch was to close: what a driver still called the SDK for directly
+comes through `gs::driver` as well - "just an interface that wraps the hard stuff" - so a driver has one API
+to learn. That is a different route from the one this document gives for a MECHANISM (found repeated, then
+built). These are not mechanisms a driver writes out; each is one kernel call that a driver must name and
+rely on, which is the test `gs` already applies (`backlog/71`), and the same reasoning that brought the
+grants in at step 3.
+
+- **`input`**: `push` (`console_push`, the keyboard drivers' 12 calls) and `ready` (`signal_input_ready`,
+  `xhci`'s 3).
+- **`power`**: `set` (`device_power`, `wifi-driver`'s 6). It keeps the SDK's answer: `true` only on a pin
+  read back at the level asked for.
+- **`device`**: `board_mac` (`dwc2`), `nic_vendor_device` (`nic-driver` 2, and the shell's `hardware` list),
+  `emmc_base_clock_hz` (`wifi-driver`, and `block-driver`'s uncompiled `sdhci.rs`), `pci_cfg_read`
+  (`hw-enumerator`).
+- **`gs::program::mode`** (`probe_mode`), for `pwm-audio`, `observe` and `probe`. Not a driver's: a mode is
+  any program's, so it is in `program`.
+
+Each wrapper is `#[inline(always)]` over the SDK call, so the code a driver runs is the code it ran.
+`one_way_check.py` counts all eight SDK methods from today: 34 call sites converted, every crate at zero, and
+a new crate held there. No kernel change, no new authority, no `unsafe`.

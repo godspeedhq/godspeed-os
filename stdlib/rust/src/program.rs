@@ -39,6 +39,14 @@ pub const ARGS_MAX: usize = 4096;
 /// as the program has its endpoint, so this is only reached when nothing started it with any.
 pub const ARGS_SECS: i64 = 10;
 
+/// The mode this program was started in: a number its spawn request carried, 0 for every ordinary start.
+/// A program that does more than one thing - `observe` once or live, `probe` one test or another - reads
+/// which here. What a mode means is the program's own.
+#[inline(always)]
+pub fn mode(ctx: &ServiceContext) -> u32 {
+    ctx.probe_mode()
+}
+
 /// The arguments this program was started with, as one line - or empty when it was given none.
 ///
 /// The first message on this program's endpoint, read once; the end byte that follows it is taken too.

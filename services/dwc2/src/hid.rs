@@ -439,7 +439,7 @@ pub fn poll(
                 && now.wrapping_sub(state.last_data) < state.repeat_window;
             if proven {
                 let n = &mut state.emitted_repeat;
-                state.repeat.poll(now, |ch| { *n = n.wrapping_add(1); ctx.console_push(ch) });
+                state.repeat.poll(now, |ch| { *n = n.wrapping_add(1); godspeed::driver::input::push(&ctx, ch) });
             } else if state.repeat.armed() {
                 state.repeat.cancel();
             }
@@ -460,7 +460,7 @@ pub fn poll(
         let rel = [0u8; 8];
         godspeed_sdk::hid::decode_keyboard(
             &rel, &mut state.last, &mut state.repeat, &mut state.caps,
-            wait::ticks(ctx), |ch| ctx.console_push(ch), |_| {});
+            wait::ticks(ctx), |ch| godspeed::driver::input::push(&ctx, ch), |_| {});
         // (a release report emits nothing; counted for symmetry only if it ever does)
         return false;
     }
@@ -487,7 +487,7 @@ pub fn poll(
         &mut state.repeat,
         &mut state.caps,
         wait::ticks(ctx),
-        |ch| { state_emitted += 1; ctx.console_push(ch) },
+        |ch| { state_emitted += 1; godspeed::driver::input::push(&ctx, ch) },
         |code| ctx.log_fmt(format_args!("dwc2-svc: unmapped HID key usage {:#04x}", code)),
     );
     state.emitted_report = state.emitted_report.wrapping_add(state_emitted);

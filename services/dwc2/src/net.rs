@@ -866,7 +866,7 @@ fn smsc_bring_up(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target) -> 
     // board, wrong the moment there are two on a network, and impossible to reconcile with a router that
     // has been told about the real one. It stays as the fallback because a NIC with no address at all is
     // worse, and it is logged as the compromise it is rather than passed off as normal.
-    let mac = if let Some(board) = ctx.board_mac() {
+    let mac = if let Some(board) = gs::driver::device::board_mac(&ctx) {
         ctx.log_fmt(format_args!(
             "dwc2-svc: NIC using the board MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
             board[0], board[1], board[2], board[3], board[4], board[5]));

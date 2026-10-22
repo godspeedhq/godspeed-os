@@ -13803,7 +13803,7 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // Diagnostic FIRST (independent of net-stack, so it shows even if net-stack is down): the NIC the
     // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
     // should be driving (Phase 4).
-    let vd = ctx.nic_vendor_device();
+    let vd = gs::driver::device::nic_vendor_device(&ctx);
     // vendor:device is a PCI fact, so a controller built into the SoC (the VisionFive's dwmac, the Pi 4's
     // GENET) has none, and this line used to print `(none)` above a driver that was working. Say what
     // the zero means instead: no PCI card, and where the kernel granted a window, a built-in controller.

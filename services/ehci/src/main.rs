@@ -977,12 +977,12 @@ fn poll_devices(
                     // reboot syscall from a driver, in any context) while restoring the UX, and
                     // grants the driver nothing new: a CONSOLE_PUSH holder can already type
                     // `reboot` (§6.4).
-                    ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
+                    gs::driver::input::push(&ctx, godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
                 } else {
                     if !irq_this_pass { hid_needs_poll = true; }
                     godspeed_sdk::hid::decode_keyboard(
                         &rep, &mut kb_last, &mut kb_rep, &mut kb_caps, wait::ticks(ctx),
-                        |ch| ctx.console_push(ch),
+                        |ch| gs::driver::input::push(&ctx, ch),
                         |code| ctx.log_fmt(format_args!(
                             "ehci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code)),
                     );
@@ -1003,7 +1003,7 @@ fn poll_devices(
         }
         // Typematic auto-repeat: a held key sends no further reports, so synthesise
         // repeats from the monotonic tick while the key stays down.
-        kb_rep.poll(wait::ticks(ctx), |ch| ctx.console_push(ch));
+        kb_rep.poll(wait::ticks(ctx), |ch| gs::driver::input::push(&ctx, ch));
         // Diagnostic (E2): does the controller actually ASSERT its interrupt? If USBSTS.USBINT
         // sets but no IPC arrives below, the controller is asserting INTx but the IOAPIC route
         // (GSI / destination) is wrong; if it never sets, the controller isn't completing
@@ -1123,7 +1123,7 @@ fn notify(ctx: &ServiceContext, msg: &str) {
     // 'U' of "USB:". (Serial is unaffected.)
     gs::io::print(ctx, "\n USB: ");
     gs::io::print(ctx, msg);
-    ctx.console_push(b'\n');
+    gs::driver::input::push(&ctx, b'\n');
 }
 
 // THE USB RESET TIMINGS are held PARKED by `gs::driver::delay::hold_parked`, which is this driver's

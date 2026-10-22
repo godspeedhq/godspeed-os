@@ -475,7 +475,7 @@ fn deliver_hid_report(
         mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
     } else if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
         // SEC-2: this driver holds no REBOOT. It SIGNALS the chord; the shell decides (§6.4).
-        ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
+        gs::driver::input::push(&ctx, godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
     } else {
         godspeed_sdk::hid::decode_keyboard(
             &rep,
@@ -483,7 +483,7 @@ fn deliver_hid_report(
             &mut kb_rep[d],
             &mut kb_caps[d],
             wait::ticks(ctx),
-            |ch| ctx.console_push(ch),
+            |ch| gs::driver::input::push(&ctx, ch),
             |code| {
                 ctx.log_fmt(format_args!(
                     "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code))
@@ -1078,14 +1078,14 @@ fn notify(ctx: &ServiceContext, msg: &str) {
     // 'U' of "USB:". (Serial is unaffected.)
     gs::io::print(ctx, "\n USB: ");
     gs::io::print(ctx, msg);
-    ctx.console_push(b'\n');
+    gs::driver::input::push(&ctx, b'\n');
 }
 
 fn idle(ctx: &ServiceContext) -> ! {
     // Degraded terminal path (no controller / no DMA / no keyboard). Still report
     // input-ready so the shell's boot-screen auto-clear fires - boot is "done" as
     // far as the input subsystem is concerned, even if there's no usable keyboard.
-    ctx.signal_input_ready();
+    gs::driver::input::ready(&ctx);
     // DRAIN our IPC endpoint forever, never just yield: a registered driver that idles here without
     // recv'ing lets a flood-storm (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER -
     // `events` stub bug, and the exact gap the flood-endpoint sweep missed for xhci's no-controller path.
@@ -4497,7 +4497,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the poll loop below. Still report input-ready once so the shell's
             // boot-screen clear fires (the keyboard may be on the other controller).
             if !signaled {
-                ctx.signal_input_ready();
+                gs::driver::input::ready(&ctx);
                 signaled = true;
             }
             // Nothing is bound, so forget the previous pass's bound devices: whatever binds next is a
@@ -4593,7 +4593,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         ctx.log_fmt(format_args!("xhci: {} HID device(s) bound", ndev));
         if !signaled {
-            ctx.signal_input_ready();
+            gs::driver::input::ready(&ctx);
             signaled = true;
         } // boot-screen clear, once
           // Announce only devices that weren't already bound on the previous pass. A
@@ -6151,7 +6151,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let now = wait::ticks(&ctx);
             for d in 0..ndev {
                 if !devs[d].is_mouse {
-                    kb_rep[d].poll(now, |ch| ctx.console_push(ch));
+                    kb_rep[d].poll(now, |ch| gs::driver::input::push(&ctx, ch));
                 }
             }
         }

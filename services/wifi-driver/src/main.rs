@@ -251,7 +251,7 @@ fn verify_hard_off(ctx: &ServiceContext, h: &dyn SdioHost) -> u8 {
 /// (docs/wifi.md 48: the park did not by itself make the start cold.)
 pub(crate) fn power_on_device(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
     h.park(ctx);
-    if !ctx.device_power(true) {
+    if !godspeed::driver::power::set(&ctx, true) {
         return false;
     }
     godspeed::task::sleep_ms(ctx, POWER_ON_SETTLE_MS);
@@ -261,7 +261,7 @@ pub(crate) fn power_on_device(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
 /// `power_cycle_device` with the hold-off chosen by the caller (`wifi radio powercycle` asks for a fixed
 /// 2 s): the shell decides how long, this decides how.
 pub(crate) fn power_cycle_device_ms(ctx: &ServiceContext, h: &dyn SdioHost, off_ms: u64) -> bool {
-    if !ctx.device_power(false) {
+    if !godspeed::driver::power::set(&ctx, false) {
         return false;
     }
     // THE HOST GOES QUIET FOR THE WHOLE OFF WINDOW (docs/wifi.md 48). Every earlier cycle left the card
@@ -309,9 +309,9 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed::driver::Registers) -> ! {
         h.verid(), h.hcon()));
     let why = scan::reply::DOWN_NOT_BUILT;
     h.park(ctx);
-    let off = ctx.device_power(false);
+    let off = godspeed::driver::power::set(&ctx, false);
     godspeed::task::sleep_ms(ctx, POWER_HOLD_MS);
-    let on = ctx.device_power(true);
+    let on = godspeed::driver::power::set(&ctx, true);
     godspeed::task::sleep_ms(ctx, POWER_HOLD_MS);
     ctx.log_fmt(format_args!(
         "wifi-driver: radio power cycled for a clean power-up - off {}, on {}",
@@ -566,7 +566,7 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
             5
         } else if op == scan::reply::OP_RADIO && mode == scan::reply::RADIO_HARD_OFF {
             match h {
-                Some(h) if ctx.device_power(false) => {
+                Some(h) if godspeed::driver::power::set(&ctx, false) => {
                     h.park(ctx);
                     powered_off = true;
                     ctx.log("wifi-driver: `wifi radio off hard` on a radio that is down - the chip's power is cut and stays cut until `wifi radio on`");
@@ -638,7 +638,7 @@ impl godspeed_wifi::serve::Host for SdioPower<'_> {
         true
     }
     fn cut_power(&mut self, ctx: &ServiceContext) -> bool {
-        if !ctx.device_power(false) {
+        if !godspeed::driver::power::set(&ctx, false) {
             return false;
         }
         self.h.park(ctx);
@@ -699,7 +699,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // a divider from a wrong base runs the identification clock at the wrong speed so that nothing
     // answers - silently, and on hardware only. 0 means the platform declined to say, and the host
     // layer refuses rather than guessing.
-    let base = ctx.emmc_base_clock_hz();
+    let base = godspeed::driver::device::emmc_base_clock_hz(&ctx);
     let h = host::Host::new(&ctx, &mmio, base);
     // Print the version register the KERNEL identified this controller by. If the two numbers
     // disagree, the grant is pointed somewhere other than where the census looked, and this is the one

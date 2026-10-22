@@ -100,6 +100,16 @@ REPLACEMENT = {
     "xhci_mmio": "gs::driver::registers",
     "ehci_mmio": "gs::driver::registers",
     "dma_region": "gs::driver::arena",
+    # Added 2026-10-22 (`docs/driver-library.md` step 5): the rest of what a driver asked the SDK for, so that
+    # a driver is written on `gs::driver` and nothing beside it. Each is the SDK's own call, wrapped.
+    "console_push": "gs::driver::input::push",
+    "signal_input_ready": "gs::driver::input::ready",
+    "device_power": "gs::driver::power::set",
+    "board_mac": "gs::driver::device::board_mac",
+    "nic_vendor_device": "gs::driver::device::nic_vendor_device",
+    "emmc_base_clock_hz": "gs::driver::device::emmc_base_clock_hz",
+    "pci_cfg_read": "gs::driver::device::pci_cfg_read",
+    "probe_mode": "gs::program::mode",
 }
 CALL = re.compile(r"(?:\bctx|\.ctx)\s*\.\s*(" + "|".join(sorted(REPLACEMENT, key=len, reverse=True)) + r")\s*\(")
 COMMENT = re.compile(r"//[^\n]*")

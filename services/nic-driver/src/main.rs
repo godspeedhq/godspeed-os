@@ -993,7 +993,7 @@ const E1000_82540EM: u32 = 0x100E_8086;
 /// when it is not, a line naming what it is instead (backlog/fixed/80 D2). It asks the DEVICE, so it needs
 /// no ISA test: only x86 reaches the e1000 path, every other port's backend having diverged first.
 fn known_e1000(ctx: &ServiceContext, mmio: Option<Registers>) -> Option<Registers> {
-    let vd = ctx.nic_vendor_device();
+    let vd = godspeed::driver::device::nic_vendor_device(&ctx);
     if mmio.is_some() && vd != E1000_82540EM {
         ctx.log_fmt(format_args!(
             "nic-driver: the network controller is {:04x}:{:04x}, which this driver does not know (it drives the Intel 82540EM, 8086:100e, and the Realtek RTL8168, 10ec:8168) - not driving it",
@@ -1522,7 +1522,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // excluded because each has already taken the call above; left in, this arm would compile as
     // unreachable code, which is a warning today and a misleading read of the dispatch forever.
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
-    if ctx.nic_vendor_device() == 0x8168_10EC {
+    if godspeed::driver::device::nic_vendor_device(&ctx) == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }
 

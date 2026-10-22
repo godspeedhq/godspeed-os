@@ -351,7 +351,7 @@ const MODE_BRUTAL_ID_13_KIL: u32 = 103; // T13: yields then kills brutal-id-13-r
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
-    match ctx.probe_mode() {
+    match gs::program::mode(&ctx) {
         MODE_ECHO_RECV       => mode_echo_recv(&ctx),
         MODE_ECHO_SEND       => mode_echo_send(&ctx),
         MODE_NO_SEND_RIGHT   => mode_no_send_right(&ctx),

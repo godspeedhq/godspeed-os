@@ -474,7 +474,7 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: gs::cap::Cap) {
 /// Entry point: initialise the EMMC + serve block I/O to `fs`.
 pub fn run(ctx: &ServiceContext, mmio: &Registers) -> ! {
     let mut sd = Sd { m: mmio, rca: 0, sdhc: false, sectors: 0,
-                      base_clock: ctx.emmc_base_clock_hz(), last_int: core::cell::Cell::new(0) };
+                      base_clock: gs::driver::device::emmc_base_clock_hz(&ctx), last_int: core::cell::Cell::new(0) };
     if !sd.init(ctx) {
         ctx.log("block-driver: no usable SD card - serving errors so fs never hangs");
         loop {
