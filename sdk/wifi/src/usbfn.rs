@@ -92,6 +92,15 @@ pub const NOTE_BULK_IN: u8 = 0x2E;
 /// a host that cannot (`xhci`, which does not take it yet).
 pub const OP_REPLUG: u8 = 0x27;
 
+/// Is `op` a request a driver sends its host - `OP_INFO` to `OP_SYNC`, and `OP_REPLUG`? Every host routes by
+/// this and by nothing else, so a new op cannot fall into another protocol's range. `OP_REPLUG` did: `dwc2`
+/// routed `OP_INFO..=OP_SYNC` here and everything above 0x10 to the network, whose answer to an op it does not
+/// know is `[op, 0]` - and 0 is `ST_OK`, so a driver was told its dongle was being reset and nothing was
+/// (Pi 2, 2026-10-22).
+pub fn is_request(op: u8) -> bool {
+    (OP_INFO..=OP_SYNC).contains(&op) || op == OP_REPLUG
+}
+
 // 0x29 is NOT free in this range: `dwc2` receives the USB interrupt as the one-byte message `[0x29]`, told
 // apart from a request only by carrying no reply cap, so no op may take that value. Nor is 0x26: it is
 // `godspeed_sdk::service_context::usbdev::ASK`, the supervisor asking a USB host for its device report.

@@ -483,7 +483,7 @@ pub fn serve(
         return Served::Done;
     }
     let op = p.first().copied().unwrap_or(0);
-    if !(usbfn::OP_INFO..=usbfn::OP_SYNC).contains(&op) {
+    if !usbfn::is_request(op) {
         return Served::NotOurs;
     }
     let Some(reply) = gs::ipc::take_sent_cap(ctx) else { return Served::Done };
@@ -592,7 +592,7 @@ pub fn answer_absent(ctx: &ServiceContext, msg: &Message) -> bool {
         return true;
     }
     let op = p.first().copied().unwrap_or(0);
-    if !(usbfn::OP_INFO..=usbfn::OP_SYNC).contains(&op) {
+    if !usbfn::is_request(op) {
         return false;
     }
     if let Some(reply) = gs::ipc::take_sent_cap(ctx) {

@@ -208,7 +208,7 @@ fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: 
     };
     if op == godspeed_wifi::usbfn::OP_SYNC {
         gs::cap::remove(ctx, reply);
-    } else if (godspeed_wifi::usbfn::OP_INFO..godspeed_wifi::usbfn::OP_SYNC).contains(&op) {
+    } else if godspeed_wifi::usbfn::is_request(op) {
         let _ = gs::ipc::reply(ctx, reply,
             &godspeed_sdk::Message::from_bytes(&[op, godspeed_wifi::usbfn::ST_NO_DEVICE]));
     } else if op >= net::OP_NET_INFO {
@@ -254,7 +254,7 @@ fn dispatch(
     };
     // The radio's function protocol FIRST: its ops (0x20 up) are above the net ops' floor, so the net
     // test below would take them.
-    if (godspeed_wifi::usbfn::OP_INFO..=godspeed_wifi::usbfn::OP_SYNC).contains(&p[0]) {
+    if godspeed_wifi::usbfn::is_request(p[0]) {
         rtl::serve(ctx, m, d, radio, msg, reply);
         return true;
     }
