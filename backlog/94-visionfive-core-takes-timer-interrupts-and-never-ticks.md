@@ -1,6 +1,7 @@
 # 94. VisionFive: a core takes timer interrupts, about 1,450 a second, and never reaches the tick
 
-**Status: OPEN - seen once, 2026-10-22, on the VisionFive 2 Lite at `6bfd508d`; not investigated.**
+**Status: OPEN - FIX BUILT, owed a card. Seen twice, 2026-10-22, on the VisionFive 2 Lite (`6bfd508d` and
+`860fe372`), both during `drives check`; the cause is found (below) and the fix is in `arch/riscv64`.**
 Recorded at the operator's choice, as its own entry rather than under `backlog/49`, because the evidence says
 the core was stuck rather than late.
 
@@ -47,3 +48,33 @@ deadline judged not yet due, a re-arm that fires at once, or a stage that return
 numbers above (15 is past-drain, pick_next), then reproduce: the cable downloads followed by `drives check`.
 CLAUDE.md 22's rule applies (the kernel must not panic on what runs above it), so this is a fix, not a
 tuning of the watchdog.
+
+## Seen again, and the cause (2026-10-22, `860fe372`)
+
+```
+LIVENESS WEDGE: core 1 made NO progress for 40032401 counter ticks (1x the 39998000 allowed); it was running
+task slot 9 'fs'; since its last stamp it has taken 13295 timer interrupts and halted 13205 times in idle
+(83288 timer interrupts since boot, last vector 0x00000001); detected by core 0.
+fs: op 27 took 34761698 us, 111 block ops, 0% of it inside them
+```
+
+**They were not timer interrupts.** On this port `note_irq` counts EVERY interrupt the trap takes, before it
+is dispatched (`trap.rs`), and the last one was code 1, a supervisor SOFTWARE interrupt: another hart waking
+this one. The panic's wording, "timer interrupts", is the neutral watchdog's and is wrong for this port.
+
+**What happened.** The scheduler re-arms the timer on every pass through idle and every switch out of it
+(`rearm_idle_timer`, `rearm_quantum_timer`), and on RISC-V that set the deadline to `now + 10 ms` each time.
+`fs` on core 1, answering `drives check` while `block-driver` and `xhci` on other harts woke it about 1,300
+times a second, went in and out of idle faster than every 10 ms - so its deadline was moved forward before it
+ever arrived. The tick never ran, nothing stamped the core's progress, and the watchdog panicked on a core
+that was busy and healthy. The first sighting is the same pattern (core 1 IDLE, 1,450 interrupts a second,
+last vector 1). It also means that core took no preemption tick for those 10 s.
+
+**The fix (`arch/riscv64/mod.rs`).** `rearm_quantum_timer` never moves an armed deadline later: it keeps
+the one already armed when that is sooner, and every arm - the tick, the boot arms, the re-arm - goes through
+`arm_timer`, which records what the firmware holds. An early tick is an ordinary one, and a deadline already
+past is a tick pending until interrupts are unmasked. No neutral change.
+
+**What the card should show:** `drives check` after cable downloads finishing with no panic. **Not checked:**
+whether the x86, AArch64 or ARMv7 re-arms can starve a tick the same way; the same neutral calls reach them.
+

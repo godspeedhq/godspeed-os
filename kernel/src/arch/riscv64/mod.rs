@@ -1777,22 +1777,33 @@ pub mod boot {
         rearm_quantum_timer();
     }
 
-    /// Re-arm at the 10 ms scheduler quantum (CLAUDE.md 9.1).
+    /// Re-arm at the 10 ms scheduler quantum (CLAUDE.md 9.1) - but NEVER LATER than the deadline
+    /// already armed.
     ///
     /// There is no periodic mode to fall back on: the supervisor timer fires when `time` passes the
     /// deadline and then stays asserted, so every tick MUST set the next one or the machine
-    /// live-locks in the handler. This is the same call the tick itself makes; it exists separately
-    /// because the scheduler re-arms on LEAVING idle, before it has taken a tick to do it in.
+    /// live-locks in the handler. The tick sets it itself (`arm_timer`); this exists because the
+    /// scheduler re-arms on entering and LEAVING idle, before it has taken a tick to do it in.
+    ///
+    /// **Only ever earlier, and that is the fix for `backlog/94`.** This used to set `now + 10 ms`
+    /// every time it was called, and the scheduler calls it on every pass through idle and every
+    /// switch out of it. A core woken by other harts more often than every 10 ms - `fs` on core 1
+    /// during `drives check`, about 1,300 software interrupts a second, `last vector 0x00000001` -
+    /// therefore had its deadline moved forward before it ever arrived: the tick never ran, nothing
+    /// stamped the core's progress, and the liveness watchdog panicked on a core that was busy and
+    /// healthy. Twice on the VisionFive (2026-10-22). Keeping an earlier deadline costs nothing (an
+    /// early tick is an ordinary one), and a deadline already past is a tick that is pending and will
+    /// be taken as soon as interrupts are unmasked.
     pub fn rearm_quantum_timer() {
         let interval = super::TICK_INTERVAL.load(Ordering::Relaxed) as u64;
         if interval != 0 {
             let when = super::sbi::time().wrapping_add(interval);
-            // RECORDED, and the return value is no longer discarded. `set_timer` reports whether the
-            // firmware accepted the call, and this threw that away - so a refused arm and a
-            // successful one were the same line of code. A core that halts on a deadline the
-            // firmware never took is a core that does not wake, which is the shape being hunted.
-            let ok = super::sbi::set_timer(when);
-            super::note_deadline(if ok { when } else { 0 });
+            let armed = super::armed_deadline();
+            // Zero is "nothing recorded" (or the firmware refused the last arm): arm, do not trust it.
+            if armed != 0 && (armed.wrapping_sub(when) as i64) <= 0 {
+                return;
+            }
+            super::arm_timer(when);
         }
     }
 
@@ -2832,10 +2843,31 @@ pub(super) fn note_idle_sample(sie: u64, sip: u64, now: u64) {
     }
 }
 
+/// Set this hart's timer deadline and RECORD it, every time: the tick, the boot arms and the
+/// scheduler's re-arm all go through here, so `armed_deadline` is the deadline the firmware holds
+/// rather than one of several. The return value of `set_timer` is kept, because a refused arm and a
+/// successful one must not be the same line of code: a refused one records zero.
+fn arm_timer(when: u64) -> bool {
+    let ok = sbi::set_timer(when);
+    note_deadline(if ok { when } else { 0 });
+    ok
+}
+
+/// This hart's id, for the deadline record: one read of `tp` shared by the two functions below.
+fn deadline_hart() -> usize {
+    // SAFETY: reads `tp`; see `note_stage` for why that is this hart's id.
+    unsafe { boot::get_lapic_id() as usize }
+}
+
+/// The deadline this hart last armed through `arm_timer`, or zero.
+fn armed_deadline() -> u64 {
+    let hart = deadline_hart();
+    if hart < MAX_HART_ID { IDLE_DEADLINE[hart].load(Ordering::Relaxed) } else { 0 }
+}
+
 /// Record the deadline this hart just armed, so a halt can be checked against it.
 pub(super) fn note_deadline(when: u64) {
-    // SAFETY: reads `tp`; see `note_stage` for why that is this hart's id.
-    let hart = unsafe { boot::get_lapic_id() } as usize;
+    let hart = deadline_hart();
     if hart < MAX_HART_ID {
         IDLE_DEADLINE[hart].store(when, Ordering::Relaxed);
     }
@@ -3792,7 +3824,7 @@ fn timer_tick(frame: &mut trap::TrapFrame) {
     note_stage(stage::TIMER_ENTER);
     let n = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     let interval = TICK_INTERVAL.load(Ordering::Relaxed) as u64;
-    sbi::set_timer(sbi::time().wrapping_add(interval));
+    arm_timer(sbi::time().wrapping_add(interval));
     note_stage(stage::TIMER_REARMED);
 
     // A tick taken while user mode was running is the preemption path, and the user-mode selftest is
@@ -3967,7 +3999,7 @@ fn drain_ipis() {
 fn start_timer_this_hart() {
     let interval = TICK_INTERVAL.load(Ordering::Relaxed) as u64;
     if interval != 0 {
-        sbi::set_timer(sbi::time().wrapping_add(interval));
+        arm_timer(sbi::time().wrapping_add(interval));
         trap::enable_timer_interrupts();
     }
 }
@@ -3987,7 +4019,7 @@ fn start_timer(hz: u32) -> bool {
     TICK_INTERVAL.store(interval, Ordering::Relaxed);
     TIMEBASE_HZ.store(hz, Ordering::Relaxed);
     BOOT_TIME.store(sbi::time(), Ordering::Relaxed);
-    if !sbi::set_timer(sbi::time().wrapping_add(interval as u64)) {
+    if !arm_timer(sbi::time().wrapping_add(interval as u64)) {
         return false;
     }
     trap::enable_timer_interrupts();
