@@ -42,6 +42,12 @@ panic = "abort"
 
 [features]
 kill-abandon-test = []
+# Diagnostic only, OFF by default. Counts cross-core wake IPIs sent and taken per core (taken, and so the
+# delivery time, on x86 only: only its wake stub reports the vector), times their
+# delivery and the woken task's wait to run, and how far the tick clock moves, printed by core 0 every
+# 500 ticks (`task::scheduler::wake_trace`, backlog/93). Built for a perf-brutal card with
+# `KERNEL_FEATURES=wake-trace`.
+wake-trace = []
 # The ROUTINE half of the name-directory trace - every register and every clear. OFF by default,
 # because it is ~1,200-2,000 lines per chaos run on every port and its question has been answered:
 # it caught the `block-driver` "no disk" latch on a Pi 4 by putting the name's clear and re-register

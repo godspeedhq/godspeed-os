@@ -208,30 +208,13 @@ pub static DWC2_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU6
 pub static AUDIO_PWM_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static EHCI_DMA_PHYS: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 pub static NIC_DMA_PHYS:  portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
-/// Pages of contiguous DMA memory for the **xHCI** driver. The first 32 pages
-/// hold the control structures (command/event rings, DCBAA, ERST) and the six
-/// per-device 4-page slices, plus the scratchpad buffer array at page 31; the
-/// remaining 256 pages are the scratchpad buffers the controller DMAs into (real
-/// AMD xHCI reports MaxScratchpadBufs=256 - 1 MiB - and malfunctions without
-/// them). Six slices (up from two) so hub enumeration can address the hub AND its
-/// downstream devices at once (docs/usb-hub.md). Confined identity-mapped, so the
-/// device reaches all of it (§12, H1).
-/// Plus 4 pages at the tail for the USB MASS-STORAGE region (`services/xhci/src/msc.rs`
-/// `DISK_BASE`): the two bulk transfer rings, the CBW/CSW page, and one data page. They sit past the
-/// scratchpad rather than sharing any earlier page ON PURPOSE - the Pi 4 port lost days to one DMA
-/// page owned by a keyboard report, a hub's port status AND the disk's CBW at once, where an armed
-/// interrupt endpoint overwrote a command mid-flight on every keypress. Four pages of arena buys
-/// that class of bug being unrepresentable.
-const XHCI_DMA_PAGES:      u64 = 32 + 256 + 4;
-/// Pages of contiguous DMA memory for the **EHCI** driver - 64 KiB, as on main.
-/// EHCI has no scratchpad concept, and its driver zeroes the whole arena on every
-/// control transfer; giving it the xHCI-sized 1 MiB arena (a leftover of sharing
-/// one constant) regressed back-port enumeration. Keep it small and separate.
-const EHCI_DMA_PAGES:      u64 = 16;
-/// `pwm-audio`: a page of DMA control blocks and a 128 KiB ring of PWM words - 16 periods of 8 KiB,
-/// about 370 ms at 44.1 kHz, which is the margin a POLLED refill needs (no interrupt is routed). That is
-/// 33 pages (`ARENA_NEEDED` in `services/pwm-audio`); 36 leaves three spare, and nothing records why.
-const AUDIO_PWM_DMA_PAGES: u64 = 36;
+/// THE SIZE OF A DRIVER'S DMA ARENA IS THE DRIVER'S FACT, stated in its spawn request (`dma_pages`)
+/// for every class, and the kernel holds none of them (2026-10-21). Four per-class constants lived here
+/// - xHCI's rings and scratchpad, EHCI's 64 KiB, the PWM jack's ring, a fixed NIC's ring - and each was
+/// a driver's buffer written into the kernel, so a driver that grew one needed a kernel rebuild and a
+/// kernel re-verification. Two were added on 2026-10-21 alone. The kernel still decides WHERE an arena
+/// lives, bounds its size (`MAX_DMA_PAGES`, the syscall) and keeps it across a driver's restarts; it no
+/// longer knows what any driver keeps in one.
 
 /// Maximum named send peers per service.
 /// Send peers a service may be wired with.
@@ -644,19 +627,11 @@ impl HwClass {
         self != HwClass::None && self != HwClass::Framebuffer && self != HwClass::TestIrq
             && self != HwClass::WifiSdio && self.found()
     }
-    /// Arena size: a PCI spawn states its own (xHCI's room for its 256-buffer scratchpad among them); the
-    /// PWM audio jack gets `AUDIO_PWM_DMA_PAGES`; every other named class 64 KiB.
-    fn dma_pages(self) -> u64 {
-        match self {
-            // The CALLER states it: how much DMA a driver needs is the driver's fact, and the
-            // xHCI-needs-more special case was the last per-class size in the kernel.
-            HwClass::Pci { dma_pages, .. } => dma_pages as u64,
-            HwClass::Xhci => XHCI_DMA_PAGES,
-            HwClass::AudioPwm => AUDIO_PWM_DMA_PAGES,
-            _ => EHCI_DMA_PAGES,
-        }
-    }
     /// The permanent per-class DMA phys reservation, reused across respawns (§12 DMA permanent-reserve).
+    ///
+    /// The word holds the arena's physical base, page-aligned, with its size in pages in the low 12 bits,
+    /// which the alignment leaves free and `MAX_DMA_PAGES` (2,048) fits: so a restart is handed the arena
+    /// reserved, and refused if it asks for more than that (the arena step of `spawn_service_with_image`).
     fn dma_phys_slot(self) -> &'static portable_atomic::AtomicU64 {
         match self {
             HwClass::Dwc2 => &DWC2_DMA_PHYS,
@@ -1425,7 +1400,7 @@ pub fn spawn_from_image(
     }
     let result = spawn_service_with_image(name, image, core_id, has_recv_endpoint, peers, mode,
                                           peers_grant, mem, irqs, has_console_read,
-                                          Some(privileges), Some(hw), installs, watched);
+                                          Some(privileges), Some(hw), dma_pages, installs, watched);
     if let Err(ref e) = result {
         crate::kprintln!("task: SpawnImage '{}' failed: {:?}", name, e);
     }
@@ -1520,6 +1495,9 @@ fn spawn_service_with_image(
     // `Some(class)` = the SPAWNER named the device this service drives. `None` = resolve it by name
     // from `service_hw`, the catalogue path, which goes away with the catalogue.
     hw_override:       Option<HwClass>,
+    // The DMA arena's size in pages, from the spawn request: the driver's fact, never the kernel's. 0 for
+    // a spawn with no device (the supervisor's own).
+    dma_asked:         u32,
     // Phase 0b (docs/naming-design.md): if `Some`, wire the child's send-peers from these
     // caller-supplied `(label, cap)` entries instead of resolving `send_peers` against the kernel
     // name table. The kernel installs each cap and records `label → slot` in the child's send-peer
@@ -2282,24 +2260,46 @@ fn spawn_service_with_image(
     // Grant a physically-contiguous DMA arena to a USB driver (xhci or ehci) for
     // its queue structures. Shared VA/fields, separate address spaces (§12).
     let dma_for_driver = hw.needs_dma();
-    // Per-driver arena size: xHCI needs room for its 256 scratchpad buffers;
-    // EHCI gets the small 64 KiB arena it had on main; the AHCI block driver needs
-    // only its command list/FIS/command table + a data buffer - 64 KiB is plenty.
-    let dma_pages = hw.dma_pages();
+    // The arena's size is the REQUEST's (`dma_asked`): what a driver keeps in DMA memory is the driver's
+    // fact, and the kernel holds no size for any class.
+    let dma_pages = dma_asked as u64;
+    if dma_for_driver && dma_pages == 0 {
+        // Loud, never a default: a driver given an arena the kernel guessed the size of lays its parts
+        // out in memory it may not have, and says so far from here.
+        crate::kprintln!(
+            "spawn[dma]: '{}' refused - its device DMAs and the request names no arena size (the driver states it, the kernel does not)",
+            name);
+        cleanup_partial_spawn(task_slot, name, own_endpoint);
+        return Err(SpawnError::MapFailed);
+    }
     let (xhci_dma_va, xhci_dma_phys, xhci_dma_len) = if dma_for_driver {
         // DMA permanent-reserve (§12): allocate this driver's arena ONCE, then reuse the same physical
         // frames across every respawn. `alloc_dma_arena` reserves the run out of the general pool (so it
         // is never recycled into a page table); keeping the phys keeps the reservation bounded - one
         // arena per driver, not one per spawn. So a stray DMA (if the kill-path bus-master quiesce ever
         // fails) always lands in DMA-reserved memory, never a PTE or kernel struct.
+        //
+        // THE SIZE IS KEPT WITH IT (`dma_phys_slot`), because the size is the request's now: a restart
+        // that asked for more than was reserved would otherwise be mapped frames past the reservation,
+        // which belong to someone else. It is refused instead, and said.
         let kept = hw.dma_phys_slot();
         let arena = match kept.load(core::sync::atomic::Ordering::Relaxed) {
             0 => {
                 let p = crate::memory::allocator::alloc_dma_arena(dma_pages as usize);
-                if let Some(phys) = p { kept.store(phys, core::sync::atomic::Ordering::Relaxed); }
+                if let Some(phys) = p { kept.store(phys | dma_pages, core::sync::atomic::Ordering::Relaxed); }
                 p
             }
-            p => Some(p), // reuse the permanent arena allocated on a prior spawn
+            word => {
+                let reserved = word & 0xFFF;
+                if dma_pages > reserved {
+                    crate::kprintln!(
+                        "spawn[dma]: '{}' refused - it asks for a {}-page arena and the one reserved for its device at its first spawn is {} pages",
+                        name, dma_pages, reserved);
+                    cleanup_partial_spawn(task_slot, name, own_endpoint);
+                    return Err(SpawnError::MapFailed);
+                }
+                Some(word & !0xFFF) // reuse the permanent arena allocated on a prior spawn
+            }
         };
         match arena {
             Some(phys) => {
@@ -2559,7 +2559,7 @@ fn spawn_service_with_image(
 // supervisor up, which is the thing that has to work anyway. If that ever proves too large a first
 // step, the answer is a smaller supervisor - not a second spawn path in the kernel.
 pub fn spawn_supervisor() {
-    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None, None, false) {
+    match spawn_service_with_image("supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false, 64 * 1024 * 1024, &[], false, None, None, 0, None, false) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => panic!("supervisor spawn failed: {:?}", e),
     }
@@ -2662,7 +2662,7 @@ pub fn poll_supervisor_respawn() {
     // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
     match spawn_service_with_image(
         "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,
-        64 * 1024 * 1024, &[], false, None, None, None, false,
+        64 * 1024 * 1024, &[], false, None, None, 0, None, false,
     ) {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => {

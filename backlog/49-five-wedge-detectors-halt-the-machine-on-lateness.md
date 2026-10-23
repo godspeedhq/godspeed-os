@@ -122,6 +122,20 @@ row (`task/scheduler.rs:1616` when the table was written, line 1871 now) has bee
 (`backlog/fixed/16`).
 Recorded, not fixed: the serial log is not kept in the tree.
 
+**And again, 2026-10-19, the same test and the same line**, on `feat/gs-driver` (the `gs::driver` grants,
+AHCI and GENET on them, and net-stack's subnet mask - all userspace): `7787690401` ticks against
+`7770659700` allowed, 1.0022x, core 0 running `shell`, during the second of four supervisor kills. Twenty
+checks after it then failed because the machine had halted, so one late vCPU read as 21 failures. The
+rerun, on the same build: 276 passed, 0 failed, 2 skipped, and no panic.
+
+**A third time, 2026-10-21, the same test, the same line and the same shape**, on `feat/gs-driver` (the shell's
+history load, the console's blink and comment corrections - all userspace): `7785467269` ticks against
+`7769721900` allowed, 1.0020x, core 0 running `shell`, at the second of four supervisor kills, and 21 checks
+failed behind it (255 passed). Three sightings, each at 1.002x and each in this one test, suggest that a
+supervisor respawn here comes close to the allowance whenever it fires on this host, so a small delay is enough;
+not measured. The rerun on the same build: 276 passed, 0 failed, 2 skipped, no panic. The serial log is kept
+with the session, not in the tree.
+
 ## Next step
 
 The operator's call on scope. `backlog/fixed/48`'s instance is the one with a measurement behind it and the

@@ -1842,6 +1842,9 @@ the shell), `trace_as`, `metric`, `resource_revoke`, `last_recv_badge` and `send
 Recorded as evidence, not as a plan (26.2):
 
 1. **Hardware**: `Mmio`, `Dma`, `device_power`, `cpu_clock`. `gs::driver` gaps (`docs/driver-library.md`).
+   *(Note 2026-10-22: no longer true of the first three. `Mmio` and `Dma` come through `gs::driver::registers`
+   and `arena` (step 3) and `device_power` through `gs::driver::power` (step 5), and the one-way ratchet counts
+   the SDK calls. `cpu_clock` is the `power` service's, not a driver's, and is still the SDK's.)*
 2. **Spawning** and the supervisor's name map, which flows into `spawn_with_caps`.
 3. **The delegated-resource invoke** (`resource_invoke` + `recv_abortable_deadline`) in the shell's
    `fcap` and `examples/holder`. `gs::resource::invoke` exists and is better, but `pub(crate)`.

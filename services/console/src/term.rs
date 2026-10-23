@@ -408,6 +408,17 @@ impl Term {
         (n, used, total, aged)
     }
 
+    /// Draw (`on`) or lift (`!on`) the underline cursor where it stands, and show it: the idle blink
+    /// that says the console is live rather than frozen (the service loop). Nothing for a hidden
+    /// cursor, so a full-screen app that hid it is left alone. Most output draws the cursor solid again by
+    /// itself (`cursor_on`; not a bare `\r`), and the service loop draws it for any message that finds it
+    /// lifted, so a blink never outlasts the next message.
+    pub fn blink(&mut self, on: bool) {
+        if !self.s.cursor_visible { return; }
+        if on { draw_cursor(&mut self.s) } else { erase_cursor(&mut self.s) }
+        self.flush();
+    }
+
     /// Show everything written since the last flush.
     ///
     /// Separate from `put_bytes` so a caller that has several messages in hand can apply them all and

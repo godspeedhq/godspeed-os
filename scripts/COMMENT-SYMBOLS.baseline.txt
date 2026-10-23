@@ -97,6 +97,7 @@ hub_is_superspeed                  # Linux usbcore (drivers/usb/core/hub.c, hub.
 hub_port_connect                   # Linux usbcore (drivers/usb/core/hub.c), cited by xhci for how Linux power-cycles and frees a port whose device will not enumerate (backlog/fixed/83) - external, 26.14
 hub_port_debounce                  # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by dwc2 for the attach debounce and the port reset bound (docs/wifi-usb.md 46) - external, 26.14
 hub_port_reset                     # Linux usbcore (drivers/usb/core/hub.c, hub.h), cited by xhci for how a SuperSpeed hub is recognised, told its depth and its devices given their speed (docs/wifi-usb.md 44) - external, 26.14
+mii_resolve_flowctrl_fdx           # Linux include/linux/mii.h, the 802.3 pause resolution, cited by dwc2 for the smsc95xx flow control - external, 26.14
 rtl8xxxu_parse_usb                 # Linux rtl8xxxu_core.c, cited by dwc2 rtl::bulk_in for taking the one bulk IN endpoint (R3b) - external, 26.14
 rtl8xxxu_submit_rx_urb             # Linux rtl8xxxu_core.c, cited by usbfn::BULK_IN_MAX for how Linux sizes the receive buffer (R3b) - external, 26.14
 dwc2_release_channel
@@ -150,6 +151,7 @@ scroll_view
 setup_display
 setup_display_ex
 smsc95xx_mac_update_fullduplex
+smsc95xx_phy_initialize            # Linux smsc95xx (v4.19), where the PHY advertisement is written, cited by dwc2 - external, 26.14
 smsc95xx_phy_update_flowcontrol
 smsc95xx_reset
 smsc95xx_set_multicast
@@ -661,3 +663,13 @@ NameOp                             # ACPI Machine Language opcode 0x08, named in
 PackageOp                          # ACPI Machine Language opcode 0x12, named in the ACPI specification; cited by arch/x86_64/acpi.rs - external, 26.14
 PM_RSTS_RASPBERRYPI_HALT           # Linux drivers/watchdog/bcm2835_wdt.c, the halt partition (0x555) the Pi firmware reads; cited by the Pis' power_off - external, 26.14
 bcm2835_power_off                  # Linux drivers/watchdog/bcm2835_wdt.c, the Pi power-off path the Pis' power_off follows (docs/shutdown.md 5) - external, 26.14
+CPU_ONDEMAND_DOWN_SAMPLING_FACTOR  # raspi-config debian/raspi-config.init, the variable power's SAMPLING_DOWN_FACTOR copies (50) - external, 26.14
+CPU_ONDEMAND_SAMPLING_RATE         # raspi-config debian/raspi-config.init, the variable power's SAMPLE_MS copies (100000 us) - external, 26.14
+CPU_ONDEMAND_UP_THRESHOLD          # raspi-config debian/raspi-config.init, the variable power's UP_THRESHOLD copies (50) - external, 26.14
+od_update                          # Linux drivers/cpufreq/cpufreq_ondemand.c, the ondemand rule power's governor follows - external, 26.14
+SO_BUSY_POLL                       # Linux socket option, socket(7), the bounded busy-poll godspeed-pm's SPIN_US is modelled on - external, 26.14
+FIF_BCN_PRBRESP_PROMISC            # Linux mac80211 filter flag, set while scanning; wifi-usb's bssid_filter follows it - external, 26.14
+RCR_CHECK_BSSID_BEACON             # Linux rtl8xxxu_regs.h, RCR bit 7, which wifi-usb's RCR_CHECK_BSSID sets - external, 26.14
+RCR_CHECK_BSSID_MATCH              # Linux rtl8xxxu_regs.h, RCR bit 6, which wifi-usb's RCR_CHECK_BSSID sets - external, 26.14
+rtl8xxxu_configure_filter          # Linux rtl8xxxu_core.c, the receive filter wifi-usb's bssid_filter follows - external, 26.14
+DMA_DEFAULT_RX_SIZE                # Linux drivers/net/ethernet/stmicro/stmmac/common.h, 512 receive descriptors, cited by nic-driver's dwmac RX_DESCS - external, 26.14

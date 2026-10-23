@@ -28,7 +28,8 @@
 //! owned, bounded and reported is ours (26.14).
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Part, Registers};
+use godspeed_sdk::ServiceContext;
 
 // ---- DMA block. `dwmac4_dma.h`. -----------------------------------------------------------------
 const DMA_BUS_MODE: usize = 0x1000;
@@ -267,7 +268,16 @@ const GMAC_ADDR_ENABLE: u32 = 1 << 31;
 /// deep ring buys nothing that the caller's own pacing does not already provide, and every extra
 /// descriptor is arena that something else could be using.
 const TX_DESCS: usize = 4;
-/// Receive descriptors. **Twenty-four, and this number is a MITIGATION, not a fix.**
+/// Receive descriptors. **256, since 2026-10-22: what the 528 KiB arena holds beside the transmit side, as
+/// GENET's ring of 256 on the Pi 4 is.** At 24 a 10 MB download on the VisionFive ran the ring dry 237 times
+/// in 30 s (`RBU`), 4,270 of 10,084 segments arrived after a gap with the data waiting up to 15 s behind
+/// one, two downloads in three failed to connect, and the one that finished ran at 271 KiB/s - while the
+/// stick took 2.1 s of it and decryption 1.1 s. GENET went from 24 to 256 on the same evidence and its cable
+/// from 192 to 655 KiB/s (`backlog/93`). Linux's stmmac defaults to 512 (`DMA_DEFAULT_RX_SIZE`).
+///
+/// (The paragraphs below were written at twenty-four; the arena they name was 64 KiB then.)
+///
+/// **Twenty-four, and this number is a MITIGATION, not a fix.**
 ///
 /// Four was a bug and sixteen was a guess; the actual bug was the tail pointer (see `receive`), which
 /// made every one of those values behave as ONE. With that fixed the ring is genuinely as deep as it
@@ -304,22 +314,55 @@ const TX_DESCS: usize = 4;
 /// frames per tick" into "sixteen" - the same 10 ms exposure with four times the headroom. It is a
 /// mitigation rather than a cure: the real fix for a polled receive path is to be woken by the
 /// controller's interrupt, which this port cannot do until the PLIC is wired.
-pub const RX_DESCS: usize = 24;
+pub const RX_DESCS: usize = 256;
 /// A descriptor is four 32-bit words.
 const DESC_BYTES: usize = 16;
 /// One buffer per descriptor. 2048 rather than 1536 because `RBSZ` wants a multiple of the bus width
 /// and because it matches the FIFO the part reported.
 const BUF_BYTES: usize = 2048;
 
-/// Arena layout. Written out as constants rather than computed inline so the whole map is visible in
-/// one place and cannot drift between the register writes and the copies.
-const TX_RING_OFF: usize = 0x0000;
-const RX_RING_OFF: usize = 0x0100;
-const TX_BUF_OFF: usize = 0x1000;
-const RX_BUF_OFF: usize = 0x3000;
-/// What the layout above needs. Asserted at compile time against nothing here - the arena's real
-/// size is a spawn-time grant - so it is checked at bring-up and reported rather than assumed.
-const ARENA_NEEDED: usize = RX_BUF_OFF + RX_DESCS * BUF_BYTES;
+/// The arena, in the four parts the engine is given, taken by name through `gs::driver::arena`
+/// (`docs/driver-library.md` step 3): the transmit ring at 0x0, the receive ring at 0x100, the transmit
+/// buffers from 0x1000 and the receive buffers from 0x3000 - where the offset constants this replaced put
+/// them. The arena's real size is a spawn-time grant, so the layout's refusal, said with the part that did
+/// not fit, replaces the size check bring-up used to make. `Copy`, so a MAC that will not come up hands the
+/// parts back with the window (`Dwmac::bring_up`).
+#[derive(Clone, Copy)]
+pub struct Parts {
+    tx_ring: Part,
+    rx_ring: Part,
+    tx_bufs: Part,
+    rx_bufs: Part,
+}
+
+impl Parts {
+    /// Lay the arena out, said once; `None`, said with the part that did not fit, is no arena.
+    pub fn lay_out(ctx: &ServiceContext, a: Arena) -> Option<Parts> {
+        let mut l = a.layout();
+        let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>(Parts {
+            tx_ring: l.take("tx ring", TX_DESCS * DESC_BYTES, 4096)?,
+            rx_ring: l.take("rx ring", RX_DESCS * DESC_BYTES, 0x100)?,
+            tx_bufs: l.take("tx buffers", TX_DESCS * BUF_BYTES, 4096)?,
+            rx_bufs: l.take("rx buffers", RX_DESCS * BUF_BYTES, 4096)?,
+        }))();
+        match laid {
+            Ok(p) => {
+                ctx.log_fmt(format_args!(
+                    "nic-driver: dwmac arena laid out - tx ring at {:#x}, rx ring at {:#x}, tx buffers at {:#x}, rx buffers at {:#x} ({} of {} bytes)",
+                    p.tx_ring.offset(), p.rx_ring.offset(), p.tx_bufs.offset(), p.rx_bufs.offset(), l.used(), l.len()));
+                Some(p)
+            }
+            Err(e) => {
+                ctx.log_fmt(format_args!("nic-driver: dwmac {} - not bringing the MAC up", e));
+                None
+            }
+        }
+    }
+
+    fn zero(&self) {
+        for p in [&self.tx_ring, &self.rx_ring, &self.tx_bufs, &self.rx_bufs] { p.zero(); }
+    }
+}
 
 // ---- Descriptor bits. `dwmac4_descs.h`. ---------------------------------------------------------
 const TDES2_IOC: u32 = 1 << 31;
@@ -376,8 +419,8 @@ const RESET_US: u64 = 1_000_000;
 const TX_US: u64 = 20_000;
 
 pub struct Dwmac {
-    pub m: Mmio,
-    pub a: Dma,
+    pub m: Registers,
+    pub a: Parts,
     pub mac: [u8; 6],
     /// The last TDES3 the hardware wrote back, kept so the serve loop can report WHY a transmit
     /// failed rather than only that it did.
@@ -413,23 +456,14 @@ impl Dwmac {
     /// clause-22 registers rather than a vendor one - see `dwmac::link`.
     pub fn bring_up(
         ctx: &ServiceContext,
-        m: Mmio,
-        a: Dma,
+        m: Registers,
+        a: Parts,
         mac: [u8; 6],
         speed: u32,
         full_duplex: bool,
-    ) -> Result<Self, (Mmio, Dma)> {
+    ) -> Result<Self, (Registers, Parts)> {
         // A failure HANDS THE GRANT BACK: the caller keeps the window, serves the radio without the MAC,
         // and tries again when a cable arrives (`dwmac::serve`).
-        if a.len() < ARENA_NEEDED {
-            ctx.log_fmt(format_args!(
-                "nic-driver: dwmac needs {} bytes of DMA arena and was granted {} - not bringing the MAC up",
-                ARENA_NEEDED,
-                a.len()
-            ));
-            return Err((m, a));
-        }
-
         let mut d = Dwmac { m, a, mac, last_tx_status: 0, rbu: 0, tx_next: 0, rx_next: 0 };
         if !wait::calibrated(ctx) {
             // Said once, here, rather than letting every bound below quietly change meaning. The
@@ -440,11 +474,7 @@ impl Dwmac {
         // about it: the DMA block lives at 0x1000 and MTL at 0xd00, so a window shorter than 0x1180
         // would make this whole file address nothing, and that failure is invisible from the
         // register values alone.
-        ctx.log_fmt(format_args!(
-            "nic-driver: dwmac window {} bytes, arena {} bytes",
-            d.m.len(),
-            d.a.len()
-        ));
+        ctx.log_fmt(format_args!("nic-driver: dwmac window {} bytes", d.m.len()));
 
         // RESET THE DMA FIRST. Everything below programs registers whose reset values this then
         // guarantees; doing it after would undo the configuration, which is a bug that presents as
@@ -476,11 +506,11 @@ impl Dwmac {
         Ok(d)
     }
 
-    fn desc_write(&self, off: usize, word: usize, v: u32) {
-        self.a.write32(off + word * 4, v);
+    fn desc_write(ring: &Part, off: usize, word: usize, v: u32) {
+        ring.write32(off + word * 4, v);
     }
-    fn desc_read(&self, off: usize, word: usize) -> u32 {
-        self.a.read32(off + word * 4)
+    fn desc_read(ring: &Part, off: usize, word: usize) -> u32 {
+        ring.read32(off + word * 4)
     }
 
     /// Hand every receive descriptor to the engine, pointing at its own buffer.
@@ -491,20 +521,20 @@ impl Dwmac {
     /// being filled in.
     fn arm_rx_ring(&mut self) {
         for i in 0..RX_DESCS {
-            let off = RX_RING_OFF + i * DESC_BYTES;
-            let buf = self.a.phys_at(RX_BUF_OFF + i * BUF_BYTES);
-            self.desc_write(off, 0, (buf & 0xffff_ffff) as u32);
-            self.desc_write(off, 1, (buf >> 32) as u32);
-            self.desc_write(off, 2, 0);
-            self.desc_write(off, 3, RDES3_OWN | RDES3_BUF1V | RDES3_IOC);
+            let off = i * DESC_BYTES;
+            let buf = self.a.rx_bufs.phys_at(i * BUF_BYTES);
+            Self::desc_write(&self.a.rx_ring, off, 0, (buf & 0xffff_ffff) as u32);
+            Self::desc_write(&self.a.rx_ring, off, 1, (buf >> 32) as u32);
+            Self::desc_write(&self.a.rx_ring, off, 2, 0);
+            Self::desc_write(&self.a.rx_ring, off, 3, RDES3_OWN | RDES3_BUF1V | RDES3_IOC);
         }
         self.rx_next = 0;
     }
 
     fn program(&self, speed: u32, full_duplex: bool) {
         let m = &self.m;
-        let tx_ring = self.a.phys_at(TX_RING_OFF);
-        let rx_ring = self.a.phys_at(RX_RING_OFF);
+        let tx_ring = self.a.tx_ring.phys();
+        let rx_ring = self.a.rx_ring.phys();
 
         // Ring bases. The HIGH halves are written because this part reported 40-bit addressing;
         // they are zero on this board and would be a silent corruption if the part ever sat behind
@@ -758,31 +788,31 @@ impl Dwmac {
             return false;
         }
         let i = self.tx_next;
-        let off = TX_RING_OFF + i * DESC_BYTES;
-        let buf_off = TX_BUF_OFF + i * BUF_BYTES;
+        let off = i * DESC_BYTES;
+        let buf_off = i * BUF_BYTES;
         // A descriptor still owned by the engine means the ring is full, which with four descriptors
         // and a request/reply caller means the previous frame has not gone out yet. Report rather
         // than overwrite: overwriting sends a frame that is half one packet and half another.
-        if self.desc_read(off, 3) & TDES3_OWN != 0 {
+        if Self::desc_read(&self.a.tx_ring, off, 3) & TDES3_OWN != 0 {
             return false;
         }
         // Byte at a time, as the GENET backend does: the arena is an uncached device mapping on
         // this port, so there is no wide-copy helper that is safe to reach for here.
         for (k, b) in frame.iter().enumerate() {
-            self.a.write8(buf_off + k, *b);
+            self.a.tx_bufs.write8(buf_off + k, *b);
         }
-        let buf = self.a.phys_at(buf_off);
+        let buf = self.a.tx_bufs.phys_at(buf_off);
         let len = frame.len() as u32;
-        self.desc_write(off, 0, (buf & 0xffff_ffff) as u32);
-        self.desc_write(off, 1, (buf >> 32) as u32);
-        self.desc_write(off, 2, TDES2_IOC | (len & 0x3fff));
+        Self::desc_write(&self.a.tx_ring, off, 0, (buf & 0xffff_ffff) as u32);
+        Self::desc_write(&self.a.tx_ring, off, 1, (buf >> 32) as u32);
+        Self::desc_write(&self.a.tx_ring, off, 2, TDES2_IOC | (len & 0x3fff));
         // OWN last, again: it is the handover.
-        self.desc_write(off, 3, TDES3_OWN | TDES3_FD | TDES3_LD | (len & 0x7fff));
+        Self::desc_write(&self.a.tx_ring, off, 3, TDES3_OWN | TDES3_FD | TDES3_LD | (len & 0x7fff));
 
         // Tell the engine where the ring now ends - one past the descriptor just filled. This is the
         // write that actually starts the transmission; without it the descriptor sits there owned by
         // hardware that has not been told to look.
-        let tail = self.a.phys_at(TX_RING_OFF + ((i + 1) % TX_DESCS) * DESC_BYTES);
+        let tail = self.a.tx_ring.phys_at(((i + 1) % TX_DESCS) * DESC_BYTES);
         self.m.write32(DMA_CH_TX_END, (tail & 0xffff_ffff) as u32);
         self.tx_next = (i + 1) % TX_DESCS;
 
@@ -794,7 +824,7 @@ impl Dwmac {
         // the separate uncalibrated loop this replaced returned without recording it.
         let mut deadline = wait::Deadline::start(ctx, Budget::us(TX_US));
         loop {
-            let d3 = self.desc_read(off, 3);
+            let d3 = Self::desc_read(&self.a.tx_ring, off, 3);
             if d3 & TDES3_OWN == 0 {
                 // KEEP THE WRITE-BACK. Returning `true` on the OWN bit alone reports "sent" for a
                 // frame the hardware may have just told us it could not send.
@@ -828,8 +858,8 @@ impl Dwmac {
         // bookkeeping survives the engine stopping and restarting at every `RBU`, and this is not a
         // place frames go missing. Recorded here so the next reader does not have to re-derive it.
         let i = self.rx_next;
-        let off = RX_RING_OFF + i * DESC_BYTES;
-        let d3 = self.desc_read(off, 3);
+        let off = i * DESC_BYTES;
+        let d3 = Self::desc_read(&self.a.rx_ring, off, 3);
         if d3 & RDES3_OWN != 0 {
             return 0; // still the engine's
         }
@@ -843,26 +873,26 @@ impl Dwmac {
             let len = len.saturating_sub(RX_FCS_BYTES);
             n = len.min(out.len()).min(BUF_BYTES);
             if n > 0 {
-                let base = RX_BUF_OFF + i * BUF_BYTES;
+                let base = i * BUF_BYTES;
                 for (k, b) in out[..n].iter_mut().enumerate() {
-                    *b = self.a.read8(base + k);
+                    *b = self.a.rx_bufs.read8(base + k);
                 }
             }
         }
         // Give the descriptor straight back, whether the frame was good or not - a descriptor left
         // in our hands is one the engine cannot use, and a ring of those is a receiver that stops.
-        let buf = self.a.phys_at(RX_BUF_OFF + i * BUF_BYTES);
-        self.desc_write(off, 0, (buf & 0xffff_ffff) as u32);
-        self.desc_write(off, 1, (buf >> 32) as u32);
-        self.desc_write(off, 2, 0);
-        self.desc_write(off, 3, RDES3_OWN | RDES3_BUF1V | RDES3_IOC);
+        let buf = self.a.rx_bufs.phys_at(i * BUF_BYTES);
+        Self::desc_write(&self.a.rx_ring, off, 0, (buf & 0xffff_ffff) as u32);
+        Self::desc_write(&self.a.rx_ring, off, 1, (buf >> 32) as u32);
+        Self::desc_write(&self.a.rx_ring, off, 2, 0);
+        Self::desc_write(&self.a.rx_ring, off, 3, RDES3_OWN | RDES3_BUF1V | RDES3_IOC);
         // THIS DESCRIPTOR'S OWN ADDRESS, NOT THE NEXT ONE. See the note in `program`: the receive
         // tail is inclusive where the transmit tail is exclusive, and `eqos_free_pkt` writes the
         // address of the descriptor it just refilled with `rx_desc_idx` advanced only afterwards.
         // Writing `+ DESC_BYTES` here handed the engine a tail equal to its own next position, so a
         // sixteen-deep ring behaved as a one-deep one: every frame that arrived before the driver
         // came back round was met with no descriptor and counted at `rbu`.
-        let tail = self.a.phys_at(RX_RING_OFF + i * DESC_BYTES);
+        let tail = self.a.rx_ring.phys_at(i * DESC_BYTES);
         self.m.write32(DMA_CH_RX_END, (tail & 0xffff_ffff) as u32);
         self.rx_next = (i + 1) % RX_DESCS;
         n

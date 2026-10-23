@@ -50,7 +50,7 @@ kprintln! / ctx.log (syscall 5) / ctx.print (syscall 22)
 
 **Input** - kernel-owned ring:
 ```
-USB keyboard → xhci driver → ctx.console_push (syscall 20)
+USB keyboard → xhci driver → gs::driver::input::push (syscall 20)
     → console_push_byte → console input ring (+ echo to the console) + wake
 shell → ConsoleRead (syscall 17) → reads the ring
 ```

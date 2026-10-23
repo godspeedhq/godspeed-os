@@ -6,7 +6,7 @@
 //! `mmcnr@7e300000`, bus-width 4, `sdio_pins`). The kernel grants this service that one page of
 //! registers at spawn, by device kind (`WIFI_SDIO`) and only when its boot census saw the controller
 //! answer, so every
-//! access below goes through the SDK's safe `Mmio` wrapper and this crate contains no `unsafe`
+//! access below goes through `gs::driver`'s `Registers` and this crate contains no `unsafe`
 //! (§18.1/§18.2).
 //!
 //! ## Why this is a second SDHCI implementation and not a shared one
@@ -34,7 +34,8 @@
 //! moment of failure is captured BEFORE the line reset clears it - without that, a caller logging
 //! `INTERRUPT` after a failure always reads 0 and cannot tell a timeout from an error.
 
-use godspeed_sdk::{Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed_sdk::ServiceContext;
 use godspeed::driver::wait::{self, Budget};
 
 // Register offsets from the controller base. SDHCI-standard; the BCM2711's Arasan is a conforming
@@ -137,15 +138,15 @@ const CONTROL_WAIT: Budget = Budget::ms(500);
 /// completing. Twice `CONTROL_WAIT`, as the two million looks it replaces were twice the million.
 const CARD_WAIT: Budget = Budget::ms(1_000);
 
-/// A short delay. Spins rather than sleeps because these are microsecond-scale hardware settling gaps
-/// on a path that holds no lock and serves nobody yet; a count is not a duration (`arch/CLAUDE.md`),
-/// which is why nothing here uses one as a TIMEOUT - the timeouts below are separate bounded loops on
-/// a register condition, and this is only ever a minimum gap.
-fn spin() {
-    for _ in 0..2000 {
-        core::hint::spin_loop();
-    }
-}
+// THE SETTLING GAPS BELOW ARE HELD BY THE CLOCK (`gs::driver::delay::hold`), AND WERE A COUNT, which was
+// the cost of every radio read. `spin()` ran `spin_loop()` 2,000 times and was taken to be "about 2 us
+// on this machine". On AArch64 `spin_loop()` is an `isb`, whose cost follows the core clock and the
+// pipeline, and a read of the chip that found no frame measured 4,653 us on the Pi 4: a command makes
+// about six register writes of four spins each and ends on ten more, 34 spins, so a spin was about
+// 137 us - seventy times what it was written as. Every frame paid it twice (the header, then the body),
+// 10.1 ms a frame, and a 10 MB download over the radio spent 107 s of its 146 there (backlog/93,
+// 2026-10-21). A count is not a duration (`arch/CLAUDE.md`); these gaps are minimums the references
+// state in microseconds, so they are held as microseconds, at the 2 us a spin was written to be.
 
 /// The gap this controller requires after a register write, quoted from the driver written for it.
 ///
@@ -163,22 +164,19 @@ fn spin() {
 ///
 /// **The worst case is used rather than the current clock's**: the formula's largest value is at the
 /// 400 kHz floor, which is 6 us. The card clock is not tracked here, and the requirement is a MINIMUM gap,
-/// so overshooting removes the need to know the clock and cannot err in the unsafe direction.
-///
-/// `spin()` is about 2 us on this machine, so four of them clear 6 us with room. A count is not a duration
-/// (`arch/CLAUDE.md`) - which is exactly why this is only ever used as a minimum gap and never as a
-/// timeout.
-fn write_settle() {
-    for _ in 0..4 {
-        spin();
-    }
-}
+/// so overshooting removes the need to know the clock and cannot err in the unsafe direction. 8 us, the
+/// four 2 us spins this was, so the margin over 6 us is what it was meant to be.
+const WRITE_SETTLE: Budget = Budget::us(8);
+
+/// Ncc, the SD spec's eight card-clock cycles between one command's end and the next's start: 20 us at
+/// the 400 kHz identification clock, the slowest this bus runs.
+const NCC: Budget = Budget::us(20);
 
 pub struct Host<'a> {
     /// For the clock that bounds the command and data waits (`godspeed::driver::wait`), which take no
     /// `ctx` of their own. `park`, `reset` and `set_clock` are handed one and use that.
     ctx: &'a ServiceContext,
-    m: &'a Mmio,
+    m: &'a Registers,
     /// The controller's base clock in Hz, from the platform. **0 means refuse**, never guess: every
     /// card clock derives from this, the Arasan reports it wrongly in CAPS on this family, and a
     /// divider from a wrong base runs the identification clock at the wrong speed - so nothing
@@ -220,7 +218,7 @@ pub struct Host<'a> {
 }
 
 impl<'a> Host<'a> {
-    pub fn new(ctx: &'a ServiceContext, m: &'a Mmio, base_clock: u32) -> Self {
+    pub fn new(ctx: &'a ServiceContext, m: &'a Registers, base_clock: u32) -> Self {
         Host {
             ctx,
             m,
@@ -254,7 +252,7 @@ impl<'a> Host<'a> {
     /// here mirrors the split there rather than being a judgement about which writes "need" it.
     fn wr(&self, off: usize, v: u32) {
         self.wr_raw(off, v);
-        write_settle();
+        godspeed::driver::delay::hold(self.ctx, WRITE_SETTLE);
     }
 
     /// Write a register with NO settling gap - the FIFO data port only.
@@ -359,9 +357,7 @@ impl<'a> Host<'a> {
     /// Program the card clock. Returns false if it never reports stable.
     fn set_clock(&self, divisor: u32, ctx: &ServiceContext) -> bool {
         self.wr(CONTROL1, self.rd(CONTROL1) & !C1_CLK_EN);
-        for _ in 0..5 {
-            spin();
-        }
+        godspeed::driver::delay::hold(ctx, Budget::us(10));
         let c1 = (self.rd(CONTROL1) & !0x0000_FFE0)
             | C1_CLK_INTLEN
             | ((divisor & 0xFF) << 8) // divider low 8 bits  [15:8]
@@ -371,9 +367,7 @@ impl<'a> Host<'a> {
         // The Arasan loses successive writes to the same register that land within two card-clock
         // cycles of each other - a clock-domain-crossing erratum Linux's `sdhci-iproc` spaces out
         // explicitly. At 400 kHz two cycles is ~5 us, so the CONTROL1 writes are spaced generously.
-        for _ in 0..40 {
-            spin();
-        }
+        godspeed::driver::delay::hold(ctx, Budget::us(80));
         if wait::until(ctx, CONTROL_WAIT, || self.rd(CONTROL1) & C1_CLK_STABLE != 0).is_err() {
             ctx.log_fmt(format_args!(
                 "wifi-driver: card clock never reported stable (divisor={}, CONTROL1={:#010x})",
@@ -383,9 +377,7 @@ impl<'a> Host<'a> {
             return false;
         }
         self.wr(CONTROL1, self.rd(CONTROL1) | C1_CLK_EN);
-        for _ in 0..40 {
-            spin();
-        }
+        godspeed::driver::delay::hold(ctx, Budget::us(80));
         true
     }
 
@@ -556,9 +548,7 @@ impl<'a> Host<'a> {
         // start of the next. At 400 kHz that is 20 us, and issuing back-to-back can catch the card
         // still driving CMD - which the controller reports as a line conflict (timeout AND CRC
         // together), the exact signature that cost the Pi 2's card a debugging session.
-        for _ in 0..10 {
-            spin();
-        }
+        godspeed::driver::delay::hold(self.ctx, NCC);
         Some(self.rd(RESP0))
     }
 
@@ -710,9 +700,7 @@ impl<'a> Host<'a> {
         }
         self.wait_done.set(self.wait_done.get() + t as u64);
         self.wr(INTERRUPT, INT_DATA_DONE);
-        for _ in 0..10 {
-            spin(); // Ncc, as in `cmd_inner`
-        }
+        godspeed::driver::delay::hold(self.ctx, NCC); // as in `cmd_inner`
         Ok(())
     }
 

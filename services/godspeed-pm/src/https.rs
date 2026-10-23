@@ -33,10 +33,37 @@ const OUT_MAX: usize = 4096;
 /// The status line and headers of one answer. The registry's are about 900 bytes, most of it a reporting
 /// header; an answer whose head is larger is refused rather than cut.
 pub(crate) const HEAD_MAX: usize = 4096;
-/// A pause between reads that found nothing. `net-stack` keeps taking a download's frames in while this
+/// The pause after a read that found nothing, once `SPIN_US` of yielding has found nothing too. `net-stack` keeps taking a download's frames in while this
 /// waits (it polls every millisecond while frames arrive, into a 256 KiB window), so the pause costs the
-/// download nothing but a little latency; it is short so that latency stays small.
+/// download nothing but a little latency; it is short so that latency stays small. Measured, it is longer than
+/// asked: the kernel ends a short sleep on the next scheduler tick, so each costs about 9 ms on the T630 (the
+/// `time` row's waits, 2026-10-20).
 pub(crate) const IDLE_MS: u64 = 2;
+
+/// How long a read that finds nothing YIELDS and asks again before it parks for `IDLE_MS`: busy-polling, as
+/// Linux's sockets can (`SO_BUSY_POLL`), bounded so that a quiet connection still parks. Parking was all there
+/// was, and because the kernel ends a short sleep on the next scheduler tick (only the Pi 2 has a sub-tick
+/// timer) every empty read cost a tick: over the Pi 4's radio, 3,818 of them were 33 s of a 51 s download
+/// (8.7 ms each), where over the cable 43 were 0.4 s (`backlog/93`, 2026-10-21). A frame that arrives within
+/// this is read within an ask of it.
+pub(crate) const SPIN_US: u64 = 2_000;
+
+/// Where a session's time went, in counter ticks: what a download reports so the stage that holds it back is
+/// measured rather than guessed (`backlog/93`). The handshake is in it, in both the reads and the decrypting
+/// (its records are opened by `read_record` too, the certificate checks with them). Single-threaded, so the
+/// parts do not overlap: what is left of a download's time beside them is the disk, the screen, the HTTP
+/// framing, and what comes before a session or is sent in one - the name lookup, the TCP connect and the sends.
+#[derive(Clone, Copy, Default)]
+pub struct Timing {
+    /// In `net-stack` reads that brought bytes, and how many there were.
+    pub recv: u64,
+    pub recvs: u32,
+    /// Reads that found nothing yet, and the pauses after them: a yield inside `SPIN_US`, an `IDLE_MS` park after.
+    pub empty: u32,
+    pub idle: u64,
+    /// Opening records (TLS's `read_record`).
+    pub decrypt: u64,
+}
 
 /// Where it ended, when it did not succeed.
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +115,7 @@ pub struct Session<'c, 'b, 'n, 's> {
     rec_len: usize,
     read_len: usize,
     broken: bool,
+    pub timing: Timing,
 }
 
 /// Open a session to `host:port`, the server checked against `roots` at `now_secs`, and run `f` on it.
@@ -110,7 +138,7 @@ pub fn session<T>(ctx: &ServiceContext, host: &str, port: u16, roots: &[&[u8]], 
         let (tls, n) = Client::start(hello, verifier, &mut handshake, &mut out).map_err(Fail::Tls)?;
         let mut s = Session {
             ctx, host, ip: ip.0, timeout_secs, moved_at: gs::task::uptime_secs(ctx), tls, stream: &mut stream, out: &mut out, rec: &mut rec,
-            answered: 0, broken: false, rec_len: 0, read_len: 0,
+            answered: 0, broken: false, rec_len: 0, read_len: 0, timing: Timing::default(),
         };
         s.send_out(n)?;
         // The handshake, to the point where application data may be sent.
@@ -170,31 +198,48 @@ impl Session<'_, '_, '_, '_> {
         let mut have = self.read_len - self.rec_len;
         self.rec_len = 0;
         self.read_len = have;
+        // Since when the reads have found nothing: the start of the `SPIN_US` before a park.
+        let mut quiet: Option<gs::driver::wait::Since> = None;
         loop {
             // One whole record: its header says how long. READ AHEAD past it, as much as there is room for: a
             // read is a round trip to `net-stack`, and asking for a record's 5-byte header on its own was one
             // round trip for five bytes, for every 16 KiB of a download.
             let need = if have < 5 { 5 } else { record_len(&self.rec[..5]).map_err(Fail::Framing)? };
             if have < need {
+                let t = gs::driver::wait::ticks(self.ctx);
                 let got = match self.stream.recv(&mut self.rec[have..]) {
                     Ok(n) => n,
                     Err(_) if have == 0 => return Ok(None),
                     Err(_) => return Err(Fail::Transport),
                 };
+                let t2 = gs::driver::wait::ticks(self.ctx);
                 if got > 0 {
+                    self.timing.recv += t2.wrapping_sub(t);
+                    self.timing.recvs += 1;
                     self.moved();
+                    quiet = None;
                 } else {
                     if self.stalled() {
                         return Err(Fail::Timeout);
                     }
-                    gs::task::sleep_ms(self.ctx, IDLE_MS);
+                    let since = *quiet.get_or_insert_with(|| gs::driver::wait::Since::now(self.ctx));
+                    if since.passed(self.ctx, gs::driver::wait::Budget::us(SPIN_US)) {
+                        gs::task::sleep_ms(self.ctx, IDLE_MS);
+                    } else {
+                        gs::task::yield_now(self.ctx);
+                    }
+                    self.timing.empty += 1;
+                    self.timing.idle += gs::driver::wait::ticks(self.ctx).wrapping_sub(t);
                 }
                 have += got;
                 self.read_len = have;
                 continue;
             }
             self.rec_len = need;
-            let (event, n) = match self.tls.read_record(&mut self.rec[..need], self.out) {
+            let t = gs::driver::wait::ticks(self.ctx);
+            let opened = self.tls.read_record(&mut self.rec[..need], self.out);
+            self.timing.decrypt += gs::driver::wait::ticks(self.ctx).wrapping_sub(t);
+            let (event, n) = match opened {
                 Ok(r) => r,
                 Err(e) => {
                     // Tell the server why before going, as RFC 8446 6.2 asks; a courtesy, so a failure to

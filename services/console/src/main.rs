@@ -217,6 +217,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         per_10ms.saturating_mul(PAINT_DEADLINE_MAX_MS) / 10
     };
     let mut paint_ewma: u64 = 0;
+    // THE CURSOR BLINKS WHILE NOTHING ARRIVES, so a live console looks live: an operator asked, because
+    // a still underline cannot be told from a frozen machine. Half a second each way. The wait for the
+    // first message is bounded by that instead of blocking, and an empty one toggles the cursor; output
+    // draws it solid, so typing shows it steady. Not where the clock is uncalibrated, where the bound
+    // would be one quantum: there the wait blocks as before.
+    const BLINK_MS: u64 = 500;
+    let mut blink_on = true;
     loop {
         // TAKE THE WHOLE QUEUE, THEN PAINT ONCE.
         //
@@ -231,7 +238,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // frame and then another. Draining the backlog first and painting once ends all three, because
         // the queue empties at the speed of the copy into the shadow rather than the speed of the pixels.
         //
-        // Blocking `recv` for the first message (idle costs nothing), then `try_recv` for whatever else
+        // A `recv` bounded at `BLINK_MS` for the first message (an idle console wakes twice a second to
+        // blink the cursor; where the clock is uncalibrated it blocks), then `try_recv` for whatever else
         // has already arrived - until the pass reaches its paint deadline (`paint_deadline`, a clock),
         // or, where the clock is uncalibrated, `DRAIN_BOUND` messages (§26.6 - a bound that is stated
         // must also be enforced).
@@ -249,14 +257,32 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // 60% of its core while its own accounting - taken at the loop's tail - recorded exactly
         // zero, because the tail was unreachable).
         //
-        // Bounding the pass bounds the work per pass, paints at least once per bound, and returns to a
-        // blocking recv so the core goes to whoever is waiting for it. A producer that keeps writing
+        // Bounding the pass bounds the work per pass, paints at least once per bound, and returns to the
+        // wait for the next message so the core goes to whoever is waiting for it. A producer that keeps writing
         // cannot hold this loop here.
         //
         // (Two diagnostics that once sat here are gone: cumulative paint and busy CYCLES, reported as
         // a percentage of the window. What remains is the per-paint timing and the adaptive deadline
         // below, which is what those measurements were used to choose.)
-        let mut msg = gs::ipc::recv(&ctx);
+        let mut msg = if per_10ms == 0 {
+            gs::ipc::recv(&ctx)
+        } else {
+            match gs::ipc::recv_within_ms(&ctx, BLINK_MS) {
+                // A message finds the cursor solid: drawn here if the blink had lifted it, because not
+                // every message redraws it (a bare `\r`, a request), and one left lifted would read as
+                // off for a whole second (Audit 19).
+                Some(m) => {
+                    if !blink_on { term.blink(true); }
+                    blink_on = true;
+                    m
+                }
+                None => {
+                    blink_on = !blink_on;
+                    term.blink(blink_on);
+                    continue;
+                }
+            }
+        };
         // Pass start, for the paint deadline below. Not diagnostics: this is what bounds the drain.
         let t_pass0 = gs::driver::wait::Since::now(&ctx);
         let mut drained: usize = 0;

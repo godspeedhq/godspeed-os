@@ -14,7 +14,7 @@
 //! name or vendor - and all device logic lives here. Its one spawn row today
 //! (`examples-test`) names NO class, because `nic-driver` already owns the NIC, so
 //! what actually runs is the degrade path below. It writes NO `unsafe`: every register
-//! read goes through the SDK's safe `Mmio` wrapper (Commandment X / §18.1).
+//! read goes through `gs::driver::registers` (Commandment X / §18.1).
 //!
 //! Read-only: it reports the link state and the MAC address the NIC loaded from its
 //! EEPROM. A full driver would also build TX/RX descriptor rings in a DMA arena and
@@ -39,7 +39,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // bus scan finds one (Commandment VII: hardware reach is an explicit, kernel-granted
     // capability). With no grant there is no mapping, so we DEGRADE rather than crash
     // (Commandment V: no service is special).
-    let mmio = match ctx.mmio() {
+    let mmio = match gs::driver::registers(&ctx) {
         Some(m) => m,
         None => {
             ctx.log("e1000: no Intel e1000 mapped (absent, or a different NIC) - idling");
@@ -51,8 +51,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         }
     };
 
-    // Read-only bring-up: report link + MAC. Reads go through the safe SDK `Mmio`
-    // wrapper, so this driver is `unsafe`-free (Commandment X / §18.1).
+    // Read-only bring-up: report link + MAC. Reads go through `gs::driver`'s
+    // `Registers`, so this driver is `unsafe`-free (Commandment X / §18.1).
     let status  = mmio.read32(REG_STATUS);
     let link_up = (status >> 1) & 1 == 1;
     let ral = mmio.read32(REG_RAL0);

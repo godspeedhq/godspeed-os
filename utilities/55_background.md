@@ -17,7 +17,7 @@ A long command should not own the prompt for its whole life.
 
 ```
 gsh> background copy /big.bin /backup/big.bin
-[backgrounded] job 1
+[backgrounded] job 1 - `foreground 1` brings it back
 
 gsh> jobs
 JOB  STATE    PROGRESS  COMMAND
@@ -53,7 +53,7 @@ can work. `b` leaves the job running and gives the prompt back:
 ```
 gsh> drives check
   [q] quit   [b] background
-[backgrounded] job 3
+[backgrounded] job 3 - `foreground 3` brings it back
 ```
 
 `q` stops it where it can be stopped: a copy is cancelled between its chunks and its incomplete
@@ -183,7 +183,7 @@ capability: `copier` holds `log_write`, and printing is `log_write`. See §4.)
 
 ```
 gsh> background drives check
-[backgrounded] job 4
+[backgrounded] job 4 - `foreground 4` brings it back
 
 gsh> jobs
 JOB  STATE    PROGRESS  COMMAND

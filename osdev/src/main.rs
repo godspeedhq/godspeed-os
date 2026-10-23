@@ -1748,6 +1748,8 @@ fn cmd_test(suite: &str) {
         "jobs"           => run_jobs_test(),
         "godspeed"       => run_godspeed_test(),
         "gsp"            => run_gsp_test(),
+        "deps"           => run_deps_test(),
+        "kinds"          => run_kinds_test(),
         "download"       => run_download_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
@@ -3194,7 +3196,7 @@ fn run_fs_check_test() {
     stamp(&mut data, 0);                                   // primary @ LBA 0
     stamp(&mut data, ((total - 1) as usize) * 512);        // backup @ last LBA
     std::fs::write(persist, &data).unwrap();
-    println!("fs-check: drifted free count {} -> {} (both copies), correct value is {}", bogus, bogus, correct_free);
+    println!("fs-check: drifted free count {} -> {} (both copies), correct value is {}", correct_free, bogus, correct_free);
 
     crate::shell_test::run_fs_check(&image_path, persist, correct_free, 4);
 }
@@ -3966,6 +3968,55 @@ fn run_godspeed_test() {
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
     format_superblock(persist);
     crate::shell_test::run_godspeed(&image_path, persist, 2);
+}
+
+/// `osdev test deps`: a package that requires another (`docs/developer-services-design.md` 16), from two unpublished
+/// package files signed by the fixtures' test key.
+fn run_deps_test() {
+    println!("\n=== deps: a package that needs another ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_deps.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    for f in ["dep-store-0.1.0.gsp", "dep-user-0.1.0.gsp"] {
+        let path = format!("osdev/fixtures/{f}");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        gsfs_add_file(persist, f, &bytes);
+    }
+    gsfs_layout(persist);
+    crate::shell_test::run_deps(&image_path, persist, 2);
+}
+
+/// `osdev test kinds`: one package of every kind a developer makes - service, utility, app and driver - each made by
+/// `godspeed new` and `godspeed package --local`, installed from its file and seen doing its job. The four files are
+/// fixtures (`osdev/fixtures/README.md`); the driver drives QEMU's `edu`, which this suite adds.
+fn run_kinds_test() {
+    println!("
+=== kinds: a service, a utility, an app and a driver, as the CLI makes them ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_kinds.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    for k in crate::shell_test::KINDS {
+        let f = format!("kind-{k}-0.1.0.gsp");
+        let path = format!("osdev/fixtures/{f}");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        gsfs_add_file(persist, &f, &bytes);
+    }
+    gsfs_layout(persist);
+    crate::shell_test::run_kinds(&image_path, persist, 2);
 }
 
 /// `osdev test gsp`: a package carried as one `.gsp` file, made on the machine and installed with no network.

@@ -10,15 +10,17 @@
 //! connected port and binds up to `MAX_HID` boot-protocol HID devices (a
 //! keyboard AND a mouse) on the SAME controller at once, then polls all of them
 //! from one loop, demultiplexing transfer events by slot id. All hardware access
-//! is via the SDK's audited Mmio / Dma wrappers (§18); no `unsafe` here.
+//! is through `gs::driver`'s `Registers` and the arena's named parts (`Parts`, §18); no `unsafe` here.
 
 #![no_std]
 #![no_main]
 
 use godspeed as gs;
 use godspeed::driver::delay;
+use godspeed::driver::irq::{Irq, Woke};
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Arena, Part, Registers};
+use godspeed_sdk::ServiceContext;
 
 /// USB mass storage (Bulk-Only Transport + SCSI). Split out because it is a self-contained protocol
 /// on top of the bulk endpoints this file configures - and because it is the capability whose absence
@@ -68,29 +70,87 @@ const PORT_PED: u32 = 1 << 1;
 const PORT_PR: u32 = 1 << 4;
 const PORT_RW1C: u32 = 0x00FE_0000; // change bits 17..23 (write 0 to preserve)
 
-// DMA arena layout (its first 0x1F000 bytes; the scratchpad and the disk's region follow - see
-// below and `msc::DISK_BASE`). Shared controller structures up front, then a
-// per-device 4-page slice (device context + EP0 ring + interrupt ring + report
-// buffer) for each HID device we bind - so a keyboard AND a mouse can run on the
-// same controller at once. Device i occupies [DEV_BASE + i*DEV_STRIDE, +STRIDE).
-const DCBAA_OFF: usize = 0x0000;
-const CMD_RING_OFF: usize = 0x1000;
-const EVENT_RING_OFF: usize = 0x2000;
-const ERST_OFF: usize = 0x3000;
-const INPUT_CTX_OFF: usize = 0x4000; // transient: built per device for Address/Configure
-/// Transient: control-transfer data during enumeration - and, inside the poll loop, the WiFi dongle's
-/// outgoing frame for the length of one synchronous send (U2c). Only the enumeration functions touch it
-/// otherwise, and a send never overlaps an enumeration: both run on this one task, each to completion.
-pub(crate) const DATA_BUF_OFF: usize = 0x5000;
-const CONFIG_BUF_OFF: usize = 0x6000; // transient: config descriptor during enumeration
-/// The hub port-status probe's OWN 4-byte landing area.
-///
-/// It used to share `DATA_BUF_OFF` "unused by the poll loop, so safe to reuse here". That stopped
-/// being true once a probe's completion could be collected a pass after it was posted: an in-flight
-/// probe's data must survive whatever else runs in between. This sits in the ERST page, which the
-/// controller reads once at init (a single 16-byte segment entry) and never touches again, so the
-/// tail of that page is permanently free.
-const PROBE_BUF_OFF: usize = 0x3F00;
+/// The DMA arena, laid out by name through `gs::driver::arena` (`docs/driver-library.md` step 3): the
+/// controller's own structures up front, then the device slices, the scratchpad and the disk's region,
+/// each a part, at the offsets the constants they replaced gave them (the log line `lay_out` prints).
+/// An access past a part ends the driver naming it. `Copy`: views of the same bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct Parts {
+    /// The Device Context Base Address Array: entry 0 the scratchpad array, then one per slot.
+    pub(crate) dcbaa: Part,
+    pub(crate) cmd_ring: Part,
+    pub(crate) event_ring: Part,
+    /// The Event Ring Segment Table, one 16-byte entry the controller reads once at init.
+    pub(crate) erst: Part,
+    /// The hub port-status probe's OWN 4-byte landing area. It used to share the data buffer, "unused
+    /// by the poll loop, so safe to reuse here", which stopped being true once a probe's completion
+    /// could be collected a pass after it was posted: an in-flight probe's data must survive whatever
+    /// else runs in between. It sits at the tail of the ERST's page, which the controller never
+    /// touches after reading the one entry.
+    pub(crate) probe: Part,
+    /// Transient: built per device for Address and Configure (`clear_input_ctx`).
+    pub(crate) input_ctx: Part,
+    /// Transient: control-transfer data during enumeration - and, inside the poll loop, the WiFi
+    /// dongle's outgoing frame for the length of one synchronous send (U2c). Only the enumeration
+    /// functions touch it otherwise, and a send never overlaps an enumeration: both run on this one
+    /// task, each to completion.
+    pub(crate) data_buf: Part,
+    /// Transient: a configuration descriptor during enumeration.
+    pub(crate) config_buf: Part,
+    /// `MAX_SLICES` per-device slices of `DEV_STRIDE` (device context, EP0 ring, interrupt ring,
+    /// report page), addressed within this part by `device_ctx_off` and its neighbours - so a keyboard
+    /// AND a mouse, and a hub's own slice beside each downstream device's, can run at once.
+    pub(crate) slices: Part,
+    /// The Scratchpad Buffer Array, and the `MAX_SCRATCHPAD` page-aligned buffers it points at.
+    pub(crate) sba: Part,
+    pub(crate) scratch: Part,
+    /// The disk's own region (`msc`): its two rings, its command page and its data buffer.
+    pub(crate) disk: Part,
+}
+
+impl Parts {
+    /// Every part, as the whole arena was zeroed before.
+    fn zero(&self) {
+        for p in [&self.dcbaa, &self.cmd_ring, &self.event_ring, &self.erst, &self.probe, &self.input_ctx,
+                  &self.data_buf, &self.config_buf, &self.slices, &self.sba, &self.scratch, &self.disk] {
+            p.zero();
+        }
+    }
+}
+
+/// Lay the arena out, said once; `None`, said with the part that did not fit, is no arena.
+fn lay_out(ctx: &ServiceContext, a: Arena) -> Option<Parts> {
+    const PAGE: usize = 0x1000;
+    let mut l = a.layout();
+    let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>(Parts {
+        dcbaa: l.take("DCBAA", PAGE, PAGE)?,
+        cmd_ring: l.take("command ring", PAGE, PAGE)?,
+        event_ring: l.take("event ring", PAGE, PAGE)?,
+        erst: l.take("ERST", 0xF00, PAGE)?,
+        probe: l.take("hub probe", 4, 0x100)?,
+        input_ctx: l.take("input context", PAGE, PAGE)?,
+        data_buf: l.take("data buffer", PAGE, PAGE)?,
+        config_buf: l.take("config buffer", PAGE, PAGE)?,
+        slices: l.take("device slices", MAX_SLICES * DEV_STRIDE, PAGE)?,
+        sba: l.take("scratchpad array", PAGE, PAGE)?,
+        scratch: l.take("scratchpad", MAX_SCRATCHPAD * PAGE, PAGE)?,
+        disk: l.take("disk", msc::DISK_REGION_BYTES, PAGE)?,
+    }))();
+    match laid {
+        Ok(p) => {
+            ctx.log_fmt(format_args!(
+                "xhci: arena laid out - DCBAA {:#x}, command ring {:#x}, event ring {:#x}, ERST {:#x}, probe {:#x}, input context {:#x}, data {:#x}, config {:#x}, slices {:#x}, scratchpad array {:#x}, scratchpad {:#x}, disk {:#x} ({} of {} bytes)",
+                p.dcbaa.offset(), p.cmd_ring.offset(), p.event_ring.offset(), p.erst.offset(), p.probe.offset(),
+                p.input_ctx.offset(), p.data_buf.offset(), p.config_buf.offset(), p.slices.offset(),
+                p.sba.offset(), p.scratch.offset(), p.disk.offset(), l.used(), l.len()));
+            Some(p)
+        }
+        Err(e) => {
+            ctx.log_fmt(format_args!("xhci: {} - idling", e));
+            None
+        }
+    }
+}
 
 /// A completion mailbox, one entry per xHCI slot id.
 ///
@@ -156,6 +216,15 @@ impl EvMail {
         }
     }
 
+    /// Forget every filed completion but `keep`'s - the start of a pass, for all but the disk (its gather
+    /// write in flight finishes across passes).
+    pub(crate) fn keep_only(&mut self, keep: Option<u32>) {
+        let mask = match keep { Some(s) if s < 32 => 1u32 << s, _ => 0 };
+        self.have &= mask;
+        self.ep0_have &= mask;
+        self.bulk_have &= mask;
+    }
+
     /// Collect this slot's EP0 completion, if one was filed - never an endpoint's beside it.
     pub(crate) fn take_ep0(&mut self, sid: u32) -> Option<u32> {
         if sid < 32 && self.ep0_have & (1 << sid) != 0 {
@@ -207,18 +276,14 @@ impl EvMail {
 // Scratchpad Buffer Array (SBA) - an array of physical pointers to N page-aligned
 // scratchpad buffers, where N = HCSPARAMS2.MaxScratchpadBufs. Real AMD xHCI needs
 // 256 of them and malfunctions (devices drop, re-enumerate) without them. The SBA
-// lives at arena page 15; the buffers occupy pages 16.. (the arena's tail, sized
-// for this in the arena size: the kernel's XHCI_DMA_PAGES, and the supervisor's `dma_pages` for `xhci`
-// on PCI).
-// Device slices sit first (DEV_BASE .. DEV_BASE + MAX_SLICES*DEV_STRIDE), then the SBA + scratchpad.
+// and the buffers are parts after the device slices (`Parts`), sized in the arena's
+// size: the supervisor's `dma_pages` for `xhci`, which is the only statement of it.
 // Hub enumeration needs several slices live at once - the hub's own slice plus each downstream
-// device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). Keep these offsets in step with
-// the arena size (32 + 256 + 4 pages): control(7) + 6 slices*4 pages(24) + SBA(1) = 32, then 256, then
-// the disk's 4 (`msc::DISK_BASE`).
+// device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). The arena is 320 pages:
+// the controller's 7 + 6 slices of 4 (24) + the SBA (1) = 32, then 256 of scratchpad, then the
+// disk's 32 (`msc::DISK_REGION_BYTES`); `lay_out` refuses, naming the part, an arena that is short.
 const MAX_SLICES: usize = 6; // per-device DMA slices (bound HIDs + transient hub/enum)
-const SCRATCHPAD_SBA_OFF: usize = 0x1F000; // = DEV_BASE + MAX_SLICES*DEV_STRIDE (0x7000 + 6*0x4000)
-const SCRATCHPAD_BUF_BASE: usize = 0x20000; // = SCRATCHPAD_SBA_OFF + 0x1000
-const MAX_SCRATCHPAD: usize = 256; // arena room = 292 pages - 32 - the disk's 4
+const MAX_SCRATCHPAD: usize = 256; // arena room = 320 pages - 32 - the disk's 32
 
 /// Counter ticks in `ms` milliseconds, exactly as the SDK's `duration_cycles` computes them: never 0,
 /// and 1 on a machine whose counter the kernel could not calibrate. For the tick-domain instruments
@@ -238,13 +303,12 @@ const MAX_HID: usize = 2;
 // hardware-proven to advance (perf §22); `wait::ticks_per_10ms` is the kernel's PIT-calibrated rate.
 // The four timing budgets that used to live here are now MILLISECONDS, next to `spin` below, because
 // the cycle counts they were could not survive leaving x86. See `RESET_RECOVERY_MS` and friends.
-const DEV_BASE: usize = 0x7000;
-const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report
+const DEV_STRIDE: usize = 0x4000; // 4 pages: device ctx, EP0 ring, int ring, report; within `Parts::slices`
 pub(crate) fn device_ctx_off(i: usize) -> usize {
-    DEV_BASE + i * DEV_STRIDE
+    i * DEV_STRIDE
 }
 pub(crate) fn ep0_tr_off(i: usize) -> usize {
-    DEV_BASE + i * DEV_STRIDE + 0x1000
+    i * DEV_STRIDE + 0x1000
 }
 
 /// Where the CONTROLLER thinks this device's EP0 ring has been consumed to, and with which cycle
@@ -270,18 +334,18 @@ pub(crate) fn ep0_tr_off(i: usize) -> usize {
 /// A caller that gets `None` should fall back to its recorded offset, because a plausible cursor beats
 /// a fabricated one: the whole bug was a number nobody checked against the hardware.
 pub(crate) fn ep0_hw_dequeue(
-    dma: &Dma,
+    dma: &Parts,
     dev: usize,
     ctx_size: usize,
     ring_bytes: usize,
 ) -> Option<(usize, u32)> {
-    let deq = dma.read64(device_ctx_off(dev) + ctx_size + 0x08);
+    let deq = dma.slices.read64(device_ctx_off(dev) + ctx_size + 0x08);
     let cycle = (deq & 1) as u32;
     let phys = deq & !0xf;
     if phys == 0 {
         return None;
     }
-    let base = dma.phys_at(ep0_tr_off(dev));
+    let base = dma.slices.phys_at(ep0_tr_off(dev));
     let off = phys.wrapping_sub(base) as usize;
     if off >= ring_bytes || off % TRB_SIZE != 0 {
         return None;
@@ -292,10 +356,10 @@ pub(crate) fn ep0_hw_dequeue(
 /// whatever produced it was not a dequeue pointer.
 pub(crate) const EP0_RING_BYTES: usize = 0x1000;
 pub(crate) fn int_tr_off(i: usize) -> usize {
-    DEV_BASE + i * DEV_STRIDE + 0x2000
+    i * DEV_STRIDE + 0x2000
 }
 pub(crate) fn report_off(i: usize) -> usize {
-    DEV_BASE + i * DEV_STRIDE + 0x3000
+    i * DEV_STRIDE + 0x3000
 }
 
 /// Fixed pool of the MAX_SLICES per-device DMA slices (§26.6, no heap - a bitmap). A bound HID and an
@@ -336,8 +400,8 @@ impl SliceAlloc {
 #[allow(clippy::too_many_arguments)]
 fn disable_slot(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     slot: u32,
@@ -345,7 +409,7 @@ fn disable_slot(
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
 ) {
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let done = run_command(
         ctx,
@@ -389,7 +453,7 @@ fn disable_slot(
 #[allow(clippy::too_many_arguments)]
 fn deliver_hid_report(
     ctx: &ServiceContext,
-    dma: &Dma,
+    dma: &Parts,
     d: usize,
     devs: &[Hid; MAX_HID],
     kb_last: &mut [[u8; 6]; MAX_HID],
@@ -400,7 +464,7 @@ fn deliver_hid_report(
     let dev = devs[d].idx;
     let mut rep = [0u8; 8];
     for (j, b) in rep.iter_mut().enumerate() {
-        *b = dma.read8(report_off(dev) + j);
+        *b = dma.slices.read8(report_off(dev) + j);
     }
     // An all-0xff report is a failed/stale DMA read from a device that vanished mid-transaction;
     // decoding it would push 0xff "keystrokes". The real disconnect is caught by the CCS check.
@@ -411,7 +475,7 @@ fn deliver_hid_report(
         mouse[d].feed(&rep, |_mask, _down| {}, |_dx, _dy| {});
     } else if godspeed_sdk::hid::is_ctrl_alt_del(&rep) {
         // SEC-2: this driver holds no REBOOT. It SIGNALS the chord; the shell decides (§6.4).
-        ctx.console_push(godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
+        gs::driver::input::push(&ctx, godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL);
     } else {
         godspeed_sdk::hid::decode_keyboard(
             &rep,
@@ -419,7 +483,7 @@ fn deliver_hid_report(
             &mut kb_rep[d],
             &mut kb_caps[d],
             wait::ticks(ctx),
-            |ch| ctx.console_push(ch),
+            |ch| gs::driver::input::push(&ctx, ch),
             |code| {
                 ctx.log_fmt(format_args!(
                     "xhci: unmapped HID key usage {:#04x} (add to sdk hid_to_ascii)", code))
@@ -443,8 +507,8 @@ fn deliver_hid_report(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reset_endpoint(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     slot: u32,
@@ -468,11 +532,11 @@ pub(crate) fn reset_endpoint(
     // 6.2.3), sitting in memory we already own. Reading it costs one load and ends the guessing:
     // 0 Disabled, 1 Running, 2 Halted, 3 Stopped, 4 Error. The endpoint context for DCI n lives at
     // index n of the device context (the slot context is index 0).
-    let ep_state = dma.read32(dev_ctx_off + dci as usize * ctx_size) & 0x7;
+    let ep_state = dma.slices.read32(dev_ctx_off + dci as usize * ctx_size) & 0x7;
     let cc = match ep_state {
         // Halted: Reset Endpoint is the command that clears it.
         2 => {
-            let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+            let cmd_off = *cmd_idx * TRB_SIZE;
             *cmd_idx += 1;
             run_command(
                 ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
@@ -482,7 +546,7 @@ pub(crate) fn reset_endpoint(
         }
         // Running: quiesce it, because Set TR Dequeue is legal only from Stopped.
         1 => {
-            let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+            let cmd_off = *cmd_idx * TRB_SIZE;
             *cmd_idx += 1;
             run_command(
                 ctx, dma, mmio, dboff, ir0, cmd_off, 0, 0, 0,
@@ -515,8 +579,8 @@ pub(crate) fn reset_endpoint(
     }
     // Resume at the ring BASE with Dequeue Cycle State = 1, the state a fresh ring is in. The caller
     // resets its producer cursor to the same place, so both sides agree again.
-    let bp = dma.phys_at(ring_off);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let bp = dma.slices.phys_at(ring_off);
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let cc = run_command(
         ctx, dma, mmio, dboff, ir0, cmd_off,
@@ -546,52 +610,52 @@ pub(crate) fn reset_endpoint(
 /// context, which no endpoint fetches TRBs from. The slot context is built as `bind_msc` builds it.
 #[allow(clippy::too_many_arguments)]
 fn configure_radio_bulk(
-    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, dboff: usize, ir0: usize, ctx_size: usize,
+    ctx: &ServiceContext, dma: &Parts, mmio: &Registers, dboff: usize, ir0: usize, ctx_size: usize,
     slot: u32, dev_idx: usize, speed: u32, route: u32, root_port: u32, in_dci: u32, mps: u16,
     out_dci: &[u32], out_mps: u16,
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
 ) -> bool {
     let ring = report_off(dev_idx) + radio::IN_RING_AT;
     for i in (0..radio::IN_RING_BYTES).step_by(4) {
-        dma.write32(ring + i, 0);
+        dma.slices.write32(ring + i, 0);
     }
-    let islot = INPUT_CTX_OFF + ctx_size;
+    let islot = ctx_size;
     clear_input_ctx(dma, ctx_size);
-    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
+    dma.input_ctx.write32(0, 0); // Drop flags
     let mut add = 1 | (1 << in_dci);
     let mut max_dci = in_dci;
     for &d in out_dci {
         add |= 1 << d;
         max_dci = max_dci.max(d);
     }
-    dma.write32(INPUT_CTX_OFF + 4, add);
-    dma.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
-    dma.write32(islot + 4, root_port << 16);
-    dma.write32(islot + 8, 0); // a high-speed device: no transaction translator
-    let rp = dma.phys_at(ring);
-    let iep = INPUT_CTX_OFF + (1 + in_dci as usize) * ctx_size;
-    dma.write32(iep, 0);
-    dma.write32(iep + 4, (3 << 1) | (6 << 3) | ((mps as u32) << 16)); // CErr 3, bulk IN (6)
-    dma.write32(iep + 8, (rp as u32 & !0xF) | 1);
-    dma.write32(iep + 12, (rp >> 32) as u32);
-    dma.write32(iep + 16, mps as u32);
+    dma.input_ctx.write32(4, add);
+    dma.input_ctx.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
+    dma.input_ctx.write32(islot + 4, root_port << 16);
+    dma.input_ctx.write32(islot + 8, 0); // a high-speed device: no transaction translator
+    let rp = dma.slices.phys_at(ring);
+    let iep = (1 + in_dci as usize) * ctx_size;
+    dma.input_ctx.write32(iep, 0);
+    dma.input_ctx.write32(iep + 4, (3 << 1) | (6 << 3) | ((mps as u32) << 16)); // CErr 3, bulk IN (6)
+    dma.input_ctx.write32(iep + 8, (rp as u32 & !0xF) | 1);
+    dma.input_ctx.write32(iep + 12, (rp >> 32) as u32);
+    dma.input_ctx.write32(iep + 16, mps as u32);
     // The OUTs: bulk OUT is endpoint type 2 (xHCI 6.2.3). Each ring zeroed, its cycle starting at 1.
     for (i, &d) in out_dci.iter().enumerate() {
         let oring = report_off(dev_idx) + radio::out_ring_at(i);
         for b in (0..radio::OUT_RING_BYTES).step_by(4) {
-            dma.write32(oring + b, 0);
+            dma.slices.write32(oring + b, 0);
         }
-        let op = dma.phys_at(oring);
-        let oep = INPUT_CTX_OFF + (1 + d as usize) * ctx_size;
-        dma.write32(oep, 0);
-        dma.write32(oep + 4, (3 << 1) | (2 << 3) | ((out_mps as u32) << 16));
-        dma.write32(oep + 8, (op as u32 & !0xF) | 1);
-        dma.write32(oep + 12, (op >> 32) as u32);
-        dma.write32(oep + 16, out_mps as u32);
+        let op = dma.slices.phys_at(oring);
+        let oep = (1 + d as usize) * ctx_size;
+        dma.input_ctx.write32(oep, 0);
+        dma.input_ctx.write32(oep + 4, (3 << 1) | (2 << 3) | ((out_mps as u32) << 16));
+        dma.input_ctx.write32(oep + 8, (op as u32 & !0xF) | 1);
+        dma.input_ctx.write32(oep + 12, (op >> 32) as u32);
+        dma.input_ctx.write32(oep + 16, out_mps as u32);
     }
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let in_phys = dma.input_ctx.phys();
     let ce = run_command(
         ctx, dma, mmio, dboff, ir0, cmd_off, in_phys as u32, (in_phys >> 32) as u32, 0,
         (TRB_CONFIGURE_ENDPOINT << 10) | (slot << 24) | 1, ev_idx, ev_cycle,
@@ -628,6 +692,23 @@ struct Hid {
     hub_off: usize,
     hub_nports: u32, // parent hub's downstream port count (0 = root device); for the new-device re-scan
 }
+
+/// A hub this enumeration pass configured: its slot, its DMA slice (its EP0 ring) and its port count.
+///
+/// Kept so the poll loop can ask EVERY hub about its empty ports, whatever is bound behind it
+/// (`backlog/78`, 2026-10-20). A device plugged in behind a hub changes no root register, so it is seen only
+/// by asking the hub; the loop asked the hubs a HID was behind, and with no HID the disk's hub alone - on
+/// the Wyse the back ports' hub was neither once the keyboard left it, and a replug there was never seen,
+/// though enumeration had said it was KEEPING the hub "so an arrival can be seen".
+#[derive(Clone, Copy)]
+struct KeptHub {
+    slot: u32,
+    dev: usize,
+    nports: u32,
+}
+const KEPT_HUB_NONE: KeptHub = KeptHub { slot: 0, dev: 0, nports: 0 };
+/// Hubs recorded per pass: one per slice at most, since every hub holds one.
+const MAX_HUBS: usize = MAX_SLICES;
 
 /// A position signature unique per PHYSICAL device location, for telling a genuinely new plug from a
 /// survivor the re-init merely re-bound. A root device keys on its root port; a device behind a hub also
@@ -897,7 +978,7 @@ const IDLE_WAIT_MS: u64 = 5;
 /// that was NOT connected becomes connected - otherwise an always-present non-HID
 /// device would make the hot-plug loop spin (re-scan → not a keyboard → wait →
 /// still connected → re-scan …).
-fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
+fn wait_for_port(ctx: &ServiceContext, mmio: &Registers, op: usize, max_ports: u32) {
     let connected =
         |p: u32| mmio.read32(op + OP_PORTSC_BASE + (p as usize - 1) * 0x10) & PORT_CCS != 0;
     let mut base = 0u32;
@@ -959,7 +1040,7 @@ fn wait_for_port(ctx: &ServiceContext, mmio: &Mmio, op: usize, max_ports: u32) {
 /// `kill xhci`.
 #[allow(clippy::too_many_arguments)]
 fn contain_radio(
-    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, op: usize, dboff: usize, ir0: usize,
+    ctx: &ServiceContext, dma: &Parts, mmio: &Registers, op: usize, dboff: usize, ir0: usize,
     radio: &mut Option<radio::Radio>, hub_tried: &mut u64,
     ev_idx: &mut usize, ev_cycle: &mut u32, cmd_idx: &mut usize,
 ) {
@@ -997,14 +1078,14 @@ fn notify(ctx: &ServiceContext, msg: &str) {
     // 'U' of "USB:". (Serial is unaffected.)
     gs::io::print(ctx, "\n USB: ");
     gs::io::print(ctx, msg);
-    ctx.console_push(b'\n');
+    gs::driver::input::push(&ctx, b'\n');
 }
 
 fn idle(ctx: &ServiceContext) -> ! {
     // Degraded terminal path (no controller / no DMA / no keyboard). Still report
     // input-ready so the shell's boot-screen auto-clear fires - boot is "done" as
     // far as the input subsystem is concerned, even if there's no usable keyboard.
-    ctx.signal_input_ready();
+    gs::driver::input::ready(&ctx);
     // DRAIN our IPC endpoint forever, never just yield: a registered driver that idles here without
     // recv'ing lets a flood-storm (or any stray send) fill its 16-deep queue and sit at 16/16 FOREVER -
     // `events` stub bug, and the exact gap the flood-endpoint sweep missed for xhci's no-controller path.
@@ -1043,8 +1124,8 @@ fn idle(ctx: &ServiceContext) -> ! {
 /// read, a MISATTRIBUTED one - which is also why the two-consecutive-reads guard never caught it. Two
 /// stale answers are as easy to get as one.
 pub(crate) fn next_event_at(
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     ir0: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
@@ -1053,19 +1134,19 @@ pub(crate) fn next_event_at(
     let mut tries = 0u32;
     while tries < max_tries {
         tries += 1;
-        let off = EVENT_RING_OFF + *ev_idx * TRB_SIZE;
-        let ctrl = dma.read32(off + 12);
+        let off = *ev_idx * TRB_SIZE;
+        let ctrl = dma.event_ring.read32(off + 12);
         if (ctrl & 1) != *ev_cycle {
             continue;
         }
         let trb_type = (ctrl >> 10) & 0x3F;
-        let completion = dma.read32(off + 8) >> 24;
+        let completion = dma.event_ring.read32(off + 8) >> 24;
         // A transfer event's residual (bits 23:0) and endpoint ID (bits 20:16 of the control word):
         // which endpoint of the slot completed, and how much of its TD did not transfer (U2b).
-        let residual = dma.read32(off + 8) & 0x00FF_FFFF;
+        let residual = dma.event_ring.read32(off + 8) & 0x00FF_FFFF;
         let ep_id = (ctrl >> 16) & 0x1F;
         let slot_id = (ctrl >> 24) & 0xFF;
-        let ptr = (dma.read32(off) as u64) | ((dma.read32(off + 4) as u64) << 32);
+        let ptr = (dma.event_ring.read32(off) as u64) | ((dma.event_ring.read32(off + 4) as u64) << 32);
         *ev_idx += 1;
         if *ev_idx == EVENT_RING_TRBS {
             *ev_idx = 0;
@@ -1074,7 +1155,7 @@ pub(crate) fn next_event_at(
         wr64(
             mmio,
             ir0 + 0x18,
-            dma.phys_at(EVENT_RING_OFF + *ev_idx * TRB_SIZE) | (1 << 3),
+            dma.event_ring.phys_at(*ev_idx * TRB_SIZE) | (1 << 3),
         );
         return Some((trb_type, completion, slot_id, ptr, ep_id, residual));
     }
@@ -1093,8 +1174,8 @@ pub(crate) fn next_event_at(
 /// The three fields every other caller wants. Delegates, so there is ONE event-ring walk: two copies
 /// of a ring dequeue that must advance exactly once is a bug waiting for the second one to drift.
 pub(crate) fn next_event(
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     ir0: usize,
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
@@ -1108,8 +1189,8 @@ pub(crate) fn next_event(
 #[allow(clippy::too_many_arguments)]
 fn run_command(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     cmd_trb_off: usize,
@@ -1120,10 +1201,10 @@ fn run_command(
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
 ) -> Option<(u32, u32)> {
-    dma.write32(cmd_trb_off, d0);
-    dma.write32(cmd_trb_off + 4, d1);
-    dma.write32(cmd_trb_off + 8, d2);
-    dma.write32(cmd_trb_off + 12, d3);
+    dma.cmd_ring.write32(cmd_trb_off, d0);
+    dma.cmd_ring.write32(cmd_trb_off + 4, d1);
+    dma.cmd_ring.write32(cmd_trb_off + 8, d2);
+    dma.cmd_ring.write32(cmd_trb_off + 12, d3);
     mmio.write32(dboff, 0); // command doorbell: DB Target must be 0 (the command ring), NOT a DCI like the slot doorbells (dboff + slot*4, target = endpoint DCI) elsewhere in this file
 
     // MATCH THE COMPLETION TO THIS COMMAND. A Command Completion Event carries the address of the
@@ -1133,7 +1214,7 @@ fn run_command(
     // reported "REFUSED (completion=4)", which Enable Slot cannot return and a dead dongle's late
     // Address Device would, and the keyboard on the next port was lost in the same walk
     // (docs/wifi-usb.md 32). `hub_port_status` matches its transfers the same way.
-    let want = dma.phys_at(cmd_trb_off) & !0xF;
+    let want = dma.cmd_ring.phys_at(cmd_trb_off) & !0xF;
     for _ in 0..8 {
         match next_event_at(dma, mmio, ir0, ev_idx, ev_cycle, 10_000_000) {
             Some((TRB_CMD_COMPLETION, completion, slot, ptr, _, _)) if ptr & !0xF == want => {
@@ -1167,7 +1248,7 @@ fn run_command(
 
 /// Clear the whole Input Context before building one.
 ///
-/// `INPUT_CTX_OFF` is a SINGLE buffer reused for every device and every command. Each path writes
+/// The input context (`Parts::input_ctx`) is a SINGLE buffer reused for every device and every command. Each path writes
 /// only the dwords it cares about, so everything it does not write keeps whatever the PREVIOUS
 /// device left there - `islot+12`, the endpoint contexts' dword0, the tail of the Input Control
 /// Context. The xHCI spec requires unused fields to be zero and the xHC VALIDATES them, so a stale
@@ -1179,9 +1260,9 @@ fn run_command(
 /// addressed AFTER the stick and the hub, so it is the one that inherits the most debris.
 ///
 /// One Input Control Context + 32 endpoint contexts is the most any command here uses.
-fn clear_input_ctx(dma: &Dma, ctx_size: usize) {
+fn clear_input_ctx(dma: &Parts, ctx_size: usize) {
     for off in (0..(33 * ctx_size)).step_by(4) {
-        dma.write32(INPUT_CTX_OFF + off, 0);
+        dma.input_ctx.write32(off, 0);
     }
 }
 
@@ -1222,8 +1303,8 @@ fn ep0_max_packet(speed: u32) -> u32 {
 /// Returns true on success/short-packet completion.
 #[allow(clippy::too_many_arguments)]
 fn control(
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     slot: u32,
@@ -1239,28 +1320,28 @@ fn control(
     data_off: usize,
 ) -> bool {
     let tr = ep0_tr_off(dev) + ep0_off;
-    dma.write32(tr, bmreq | (breq << 8) | (wval << 16));
-    dma.write32(tr + 4, widx | (wlen << 16));
-    dma.write32(tr + 8, 8);
+    dma.slices.write32(tr, bmreq | (breq << 8) | (wval << 16));
+    dma.slices.write32(tr + 4, widx | (wlen << 16));
+    dma.slices.write32(tr + 8, 8);
     let trt = if wlen > 0 { 3 } else { 0 }; // 3 = IN data stage, 0 = no data
-    dma.write32(
+    dma.slices.write32(
         tr + 12,
         1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (trt << 16),
     );
     let mut off = tr + 16;
     if wlen > 0 {
-        let dp = dma.phys_at(data_off);
-        dma.write32(off, dp as u32);
-        dma.write32(off + 4, (dp >> 32) as u32);
-        dma.write32(off + 8, wlen);
-        dma.write32(off + 12, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // DIR=IN
+        let dp = dma.data_buf.phys_at(data_off);
+        dma.slices.write32(off, dp as u32);
+        dma.slices.write32(off + 4, (dp >> 32) as u32);
+        dma.slices.write32(off + 8, wlen);
+        dma.slices.write32(off + 12, 1 | (TRB_DATA_STAGE << 10) | (1 << 16)); // DIR=IN
         off += 16;
     }
     let sdir = if wlen > 0 { 0 } else { 1 }; // status dir opposite of data; no-data → IN
-    dma.write32(off, 0);
-    dma.write32(off + 4, 0);
-    dma.write32(off + 8, 0);
-    dma.write32(
+    dma.slices.write32(off, 0);
+    dma.slices.write32(off + 4, 0);
+    dma.slices.write32(off + 8, 0);
+    dma.slices.write32(
         off + 12,
         1 | (1 << 5) | (TRB_STATUS_STAGE << 10) | (sdir << 16),
     );
@@ -1286,8 +1367,8 @@ fn control(
 #[allow(clippy::too_many_arguments)]
 fn hub_port_status(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     hub_slot: u32,
@@ -1316,11 +1397,11 @@ fn hub_port_status(
     // pointing back to base with Toggle Cycle, then reset the cursor + flip the producer cycle. The
     // `>=` keeps the cursor strictly below RING, so the Link (16 bytes) always fits at the tail.
     if *cur + 3 * 0x10 >= RING {
-        let bp = dma.phys_at(base);
-        dma.write32(base + *cur, bp as u32);
-        dma.write32(base + *cur + 4, (bp >> 32) as u32);
-        dma.write32(base + *cur + 8, 0);
-        dma.write32(base + *cur + 12, (TRB_LINK << 10) | (1 << 1) | *pcs);
+        let bp = dma.slices.phys_at(base);
+        dma.slices.write32(base + *cur, bp as u32);
+        dma.slices.write32(base + *cur + 4, (bp >> 32) as u32);
+        dma.slices.write32(base + *cur + 8, 0);
+        dma.slices.write32(base + *cur + 12, (TRB_LINK << 10) | (1 << 1) | *pcs);
         *cur = 0;
         *pcs ^= 1;
     }
@@ -1342,25 +1423,25 @@ fn hub_port_status(
     let c = *pcs;
     // Setup: GET_STATUS(port) - bmRequestType 0xA3 (class, other, IN), bRequest 0, wValue 0,
     // wIndex = port, wLength 4.
-    dma.write32(tr, 0xA3);
-    dma.write32(tr + 4, hub_port | (4 << 16));
-    dma.write32(tr + 8, 8);
-    dma.write32(tr + 12, c | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16)); // IDT, TRT=IN
-                                                                              // Data: 4 bytes IN into PROBE_BUF_OFF, the probe's own landing area.
-    let dp = dma.phys_at(PROBE_BUF_OFF);
-    dma.write32(tr + 16, dp as u32);
-    dma.write32(tr + 20, (dp >> 32) as u32);
-    dma.write32(tr + 24, 4);
-    dma.write32(tr + 28, c | (TRB_DATA_STAGE << 10) | (1 << 16)); // DIR=IN
+    dma.slices.write32(tr, 0xA3);
+    dma.slices.write32(tr + 4, hub_port | (4 << 16));
+    dma.slices.write32(tr + 8, 8);
+    dma.slices.write32(tr + 12, c | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16)); // IDT, TRT=IN
+                                                                              // Data: 4 bytes IN into the probe's own landing area (`Parts::probe`).
+    let dp = dma.probe.phys();
+    dma.slices.write32(tr + 16, dp as u32);
+    dma.slices.write32(tr + 20, (dp >> 32) as u32);
+    dma.slices.write32(tr + 24, 4);
+    dma.slices.write32(tr + 28, c | (TRB_DATA_STAGE << 10) | (1 << 16)); // DIR=IN
                                                                   // Status: OUT (opposite of the IN data stage), IOC.
-    dma.write32(tr + 32, 0);
-    dma.write32(tr + 36, 0);
-    dma.write32(tr + 40, 0);
-    dma.write32(tr + 44, c | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    dma.slices.write32(tr + 32, 0);
+    dma.slices.write32(tr + 36, 0);
+    dma.slices.write32(tr + 40, 0);
+    dma.slices.write32(tr + 44, c | (1 << 5) | (TRB_STATUS_STAGE << 10));
     // THE ADDRESS OF THE TRB THAT WILL COMPLETE. IOC is on the status stage, so the Transfer Event
     // this probe is waiting for carries exactly this pointer - and matching on it is what tells our
     // answer apart from the previous port's. See `next_event_at`.
-    let want_trb = dma.phys_at(tr + 32);
+    let want_trb = dma.slices.phys_at(tr + 32);
     *cur += 3 * 0x10;
     mmio.write32(dboff + hub_slot as usize * 4, 1); // ring the hub's EP0 doorbell (DCI 1)
     for _ in 0..8 {
@@ -1443,7 +1524,7 @@ fn hub_port_status(
             // misattributed answers are no harder to get than one.
             Some((TRB_TRANSFER_EVENT, cc, sid, ptr, _, _)) if sid == hub_slot && ptr == want_trb => {
                 if cc == 1 || cc == 13 {
-                    return Some(dma.read16(PROBE_BUF_OFF) & 1 != 0); // wPortStatus bit0 = connect
+                    return Some(dma.probe.read16(0) & 1 != 0); // wPortStatus bit0 = connect
                 }
                 // The transfer came back FAILED, and this used to return a bare `None` - identical
                 // to "no answer arrived", which is a completely different fact (§26.7: a failure
@@ -1557,8 +1638,8 @@ fn hub_port_status(
 #[allow(clippy::too_many_arguments)]
 fn configure_as_hub(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -1574,29 +1655,29 @@ fn configure_as_hub(
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
 ) -> bool {
-    let islot = INPUT_CTX_OFF + ctx_size;
-    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    let islot = ctx_size;
+    let iep0 = 2 * ctx_size;
     clear_input_ctx(dma, ctx_size);
-    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
-    dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add: slot + EP0
+    dma.input_ctx.write32(0, 0); // Drop flags
+    dma.input_ctx.write32(4, 0b11); // Add: slot + EP0
                                           // Slot dword0: Context Entries=1, Hub=1 (bit 26), MTT (bit 25), Speed (bits 23:20), Route (19:0).
-    dma.write32(
+    dma.input_ctx.write32(
         islot,
         (1 << 27) | (1 << 26) | (if mtt { 1 << 25 } else { 0 }) | (speed << 20) | (route & 0xFFFFF),
     );
     // Slot dword1: Number of Ports [31:24], Root Hub Port Number [23:16].
-    dma.write32(islot + 4, ((nports as u32) << 24) | (root_port << 16));
+    dma.input_ctx.write32(islot + 4, ((nports as u32) << 24) | (root_port << 16));
     // Slot dword2: TT Think Time [17:16].
-    dma.write32(islot + 8, (ttt & 0x3) << 16);
+    dma.input_ctx.write32(islot + 8, (ttt & 0x3) << 16);
     // Re-specify EP0 (Add A1 set) so the command carries a valid endpoint-0 context.
-    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
+    let ep0_tr = dma.slices.phys_at(ep0_tr_off(dev_idx));
     let max_packet = ep0_max_packet(speed);
-    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
-    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
-    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
-    dma.write32(iep0 + 16, 8);
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    dma.input_ctx.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.input_ctx.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.input_ctx.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.input_ctx.write32(iep0 + 16, 8);
+    let in_phys = dma.input_ctx.phys();
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let ce = run_command(
         ctx,
@@ -1630,8 +1711,8 @@ fn configure_as_hub(
 #[allow(clippy::too_many_arguments)]
 fn address_downstream(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -1647,7 +1728,7 @@ fn address_downstream(
     cmd_idx: &mut usize,
 ) -> Option<(u32, u16, u16, u8)> {
     // Enable Slot.
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let (comp, slot) = run_command(
         ctx,
@@ -1683,15 +1764,15 @@ fn address_downstream(
         return None;
     }
     // Input context: Add slot + EP0.
-    let islot = INPUT_CTX_OFF + ctx_size;
-    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    let islot = ctx_size;
+    let iep0 = 2 * ctx_size;
     clear_input_ctx(dma, ctx_size);
-    dma.write32(INPUT_CTX_OFF, 0);
-    dma.write32(INPUT_CTX_OFF + 4, 0b11);
+    dma.input_ctx.write32(0, 0);
+    dma.input_ctx.write32(4, 0b11);
     // Slot dword0: Context Entries=1, Speed [23:20], Route String [19:0]. (Not a hub, no MTT.)
-    dma.write32(islot, (1 << 27) | (speed << 20) | (route & 0xFFFFF));
+    dma.input_ctx.write32(islot, (1 << 27) | (speed << 20) | (route & 0xFFFFF));
     // Slot dword1: Root Hub Port Number [23:16] (the root port the whole chain hangs off).
-    dma.write32(islot + 4, root_port << 16);
+    dma.input_ctx.write32(islot + 4, root_port << 16);
     // Slot dword2: TT fields for a low/full-speed device (speed 1 or 2) behind a high-speed hub -
     // TT Hub Slot ID [7:0], TT Port Number [15:8], TT Think Time [17:16].
     // TT Hub Slot ID [7:0] and TT Port Number [15:8] name the high-speed hub that translates for this
@@ -1716,21 +1797,21 @@ fn address_downstream(
     } else {
         0
     };
-    dma.write32(islot + 8, tt);
+    dma.input_ctx.write32(islot + 8, tt);
     // EP0 context.
-    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
+    let ep0_tr = dma.slices.phys_at(ep0_tr_off(dev_idx));
     let max_packet = ep0_max_packet(speed);
-    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
-    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
-    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
-    dma.write32(iep0 + 16, 8);
-    dma.write64(
-        DCBAA_OFF + slot as usize * 8,
-        dma.phys_at(device_ctx_off(dev_idx)),
+    dma.input_ctx.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.input_ctx.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.input_ctx.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.input_ctx.write32(iep0 + 16, 8);
+    dma.dcbaa.write64(
+        slot as usize * 8,
+        dma.slices.phys_at(device_ctx_off(dev_idx)),
     );
     // Address Device.
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let in_phys = dma.input_ctx.phys();
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let (comp, _) = match run_command(
         ctx,
@@ -1765,12 +1846,12 @@ fn address_downstream(
         // dwords carry route/speed/context-entries, the root port, and the TT triple that only a
         // low/full-speed device behind a high-speed hub uses - which is precisely the case that fails
         // here while a high-speed device on the same hub succeeds.
-        let islot = INPUT_CTX_OFF + ctx_size;
-        let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+        let islot = ctx_size;
+        let iep0 = 2 * ctx_size;
         ctx.log_fmt(format_args!(
             "xhci:   input ctrl add={:#010x} drop={:#010x} | slot {:#010x} {:#010x} {:#010x} {:#010x}",
-            dma.read32(INPUT_CTX_OFF + 4), dma.read32(INPUT_CTX_OFF),
-            dma.read32(islot), dma.read32(islot + 4), dma.read32(islot + 8), dma.read32(islot + 12)));
+            dma.input_ctx.read32(4), dma.input_ctx.read32(0),
+            dma.input_ctx.read32(islot), dma.input_ctx.read32(islot + 4), dma.input_ctx.read32(islot + 8), dma.input_ctx.read32(islot + 12)));
         ctx.log_fmt(format_args!(
             // Print what was WRITTEN, decoded from the slot context - not the arguments that went
             // in. The first version printed `ttt` the parameter beside the dumped dwords, and I read
@@ -1778,11 +1859,11 @@ fn address_downstream(
             // night believing a fix had not applied when it had. A diagnostic that mixes inputs with
             // observations is worse than one that omits them.
             "xhci:   ep0 {:#010x} {:#010x} {:#010x} {:#010x} {:#010x} | written tt_slot={} tt_port={} ttt={} (hub's own ttt={})",
-            dma.read32(iep0), dma.read32(iep0 + 4), dma.read32(iep0 + 8),
-            dma.read32(iep0 + 12), dma.read32(iep0 + 16),
-            dma.read32(islot + 8) & 0xFF,
-            (dma.read32(islot + 8) >> 8) & 0xFF,
-            (dma.read32(islot + 8) >> 16) & 0x3,
+            dma.input_ctx.read32(iep0), dma.input_ctx.read32(iep0 + 4), dma.input_ctx.read32(iep0 + 8),
+            dma.input_ctx.read32(iep0 + 12), dma.input_ctx.read32(iep0 + 16),
+            dma.input_ctx.read32(islot + 8) & 0xFF,
+            (dma.input_ctx.read32(islot + 8) >> 8) & 0xFF,
+            (dma.input_ctx.read32(islot + 8) >> 16) & 0x3,
             ttt));
         // RELEASE THE SLOT. Enable Slot succeeded, so the controller holds one for this device. With three
         // attempts per port, a failed port held three slots until the next controller reset, and a hub with
@@ -1807,7 +1888,7 @@ fn address_downstream(
         0x0100,
         0,
         18,
-        DATA_BUF_OFF,
+        0,
     ) {
         // Addressed but silent: the same slot, released for the same reason.
         ctx.log_fmt(format_args!(
@@ -1816,8 +1897,8 @@ fn address_downstream(
         disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
         return None;
     }
-    let ids = dma.read32(DATA_BUF_OFF + 8);
-    let class = dma.read8(DATA_BUF_OFF + 4);
+    let ids = dma.data_buf.read32(8);
+    let class = dma.data_buf.read8(4);
     Some((slot, (ids & 0xFFFF) as u16, (ids >> 16) as u16, class))
 }
 
@@ -1837,8 +1918,8 @@ fn address_downstream(
 #[allow(clippy::too_many_arguments)]
 fn read_config_and_bind(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -1859,20 +1940,20 @@ fn read_config_and_bind(
 ) -> (Option<Hid>, Option<msc::Disk>, Option<radio::Radio>, u8) {
     // Get Configuration Descriptor (64 bytes) at EP0 ring offset 48 - contiguous after the 3-TRB
     // device-descriptor read at offset 0 - then walk it for the boot-HID interrupt-IN endpoint.
-    let cfg_phys = dma.phys_at(CONFIG_BUF_OFF);
+    let cfg_phys = dma.config_buf.phys();
     let tr = ep0_tr_off(dev_idx) + 48;
-    dma.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16));
-    dma.write32(tr + 4, 64 << 16);
-    dma.write32(tr + 8, 8);
-    dma.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
-    dma.write32(tr + 16, cfg_phys as u32);
-    dma.write32(tr + 20, (cfg_phys >> 32) as u32);
-    dma.write32(tr + 24, 64);
-    dma.write32(tr + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
-    dma.write32(tr + 32, 0);
-    dma.write32(tr + 36, 0);
-    dma.write32(tr + 40, 0);
-    dma.write32(tr + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    dma.slices.write32(tr, 0x80 | (6 << 8) | (0x0200 << 16));
+    dma.slices.write32(tr + 4, 64 << 16);
+    dma.slices.write32(tr + 8, 8);
+    dma.slices.write32(tr + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
+    dma.slices.write32(tr + 16, cfg_phys as u32);
+    dma.slices.write32(tr + 20, (cfg_phys >> 32) as u32);
+    dma.slices.write32(tr + 24, 64);
+    dma.slices.write32(tr + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
+    dma.slices.write32(tr + 32, 0);
+    dma.slices.write32(tr + 36, 0);
+    dma.slices.write32(tr + 40, 0);
+    dma.slices.write32(tr + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
     mmio.write32(dboff + slot as usize * 4, 1);
     let mut cfg_ok = false;
     for _ in 0..8 {
@@ -1891,7 +1972,7 @@ fn read_config_and_bind(
     }
     // Walk config -> interface -> endpoint; bind the boot keyboard (class 3, proto 1) or mouse
     // (proto 2) interface's interrupt-IN endpoint, not whichever endpoint comes last.
-    let total = ((dma.read32(CONFIG_BUF_OFF) >> 16) & 0xFFFF) as usize;
+    let total = ((dma.config_buf.read32(0) >> 16) & 0xFFFF) as usize;
     let mut i = 0usize;
     let mut ep_addr = 0u8;
     let mut ep_mps = 0u16;
@@ -1905,32 +1986,32 @@ fn read_config_and_bind(
     // had to be reported rather than dropped.
     let mut first_iclass: Option<u8> = None;
     while i + 2 <= total && i < 200 {
-        let blen = dma.read8(CONFIG_BUF_OFF + i) as usize;
-        let dtype = dma.read8(CONFIG_BUF_OFF + i + 1);
+        let blen = dma.config_buf.read8(i) as usize;
+        let dtype = dma.config_buf.read8(i + 1);
         if blen == 0 {
             break;
         }
         match dtype {
-            2 => cfg_val = dma.read8(CONFIG_BUF_OFF + i + 5),
+            2 => cfg_val = dma.config_buf.read8(i + 5),
             4 => {
-                let iclass = dma.read8(CONFIG_BUF_OFF + i + 5);
-                let iproto = dma.read8(CONFIG_BUF_OFF + i + 7);
+                let iclass = dma.config_buf.read8(i + 5);
+                let iproto = dma.config_buf.read8(i + 7);
                 if first_iclass.is_none() {
                     first_iclass = Some(iclass);
                 }
                 cur_hid = iclass == 3 && (iproto == 1 || iproto == 2);
                 if cur_hid {
                     hid_proto = iproto;
-                    kbd_iface = dma.read8(CONFIG_BUF_OFF + i + 2);
+                    kbd_iface = dma.config_buf.read8(i + 2);
                 }
             }
             5 => {
-                let addr = dma.read8(CONFIG_BUF_OFF + i + 2);
-                let attr = dma.read8(CONFIG_BUF_OFF + i + 3);
+                let addr = dma.config_buf.read8(i + 2);
+                let attr = dma.config_buf.read8(i + 3);
                 if cur_hid && attr & 0x3 == 0x3 && addr & 0x80 != 0 && ep_addr == 0 {
                     ep_addr = addr;
-                    ep_mps = dma.read16(CONFIG_BUF_OFF + i + 4);
-                    ep_interval = dma.read8(CONFIG_BUF_OFF + i + 6);
+                    ep_mps = dma.config_buf.read16(i + 4);
+                    ep_interval = dma.config_buf.read8(i + 6);
                 }
             }
             _ => {}
@@ -1958,7 +2039,7 @@ fn read_config_and_bind(
                 // TRBs may still fill. It was added for the Pi 4's TRB Error at the wrap and did
                 // NOT cure it (the cause is below); kept because the overfetch is documented for this part.
                 for i in (0..0x1000).step_by(4) {
-                    dma.write32(int_tr_off(dev_idx) + i, 0);
+                    dma.slices.write32(int_tr_off(dev_idx) + i, 0);
                 }
                 // AND THE REST OF ITS OWN EP0 RING, from where `radio.rs` starts writing to the page's
                 // end. A ring's unwritten slots must read as not yet given to the controller - cycle 0
@@ -1969,14 +2050,14 @@ fn read_config_and_bind(
                 // on it with a TRB Error - its dequeue pointer at 0xff0, cycle 1. Every other device's
                 // EP0 ring stays near its start, which is why only the dongle, the one that wraps, met it.
                 for i in (radio::EP0_RUNTIME_START..0x1000).step_by(4) {
-                    dma.write32(ep0_tr_off(dev_idx) + i, 0);
+                    dma.slices.write32(ep0_tr_off(dev_idx) + i, 0);
                 }
                 let mut r = radio::Radio::new(slot, dev_idx, port, ids);
                 // U2b: its bulk IN, found in the configuration descriptor read above and configured, so
                 // frames can be received. Bound either way: `wifi-usb` reaches the chip over EP0 without
                 // it, and says itself that receive did not start.
                 // U2c: and its bulk OUTs, in the same Configure Endpoint, so frames can be sent.
-                let eps = radio::parse_eps(dma, CONFIG_BUF_OFF, 64);
+                let eps = radio::parse_eps(&dma.config_buf, 0, 64);
                 if eps.in_addr == 0 {
                     ctx.log("xhci: the WiFi dongle's configuration names no bulk IN - receive will not start");
                 } else {
@@ -2004,7 +2085,7 @@ fn read_config_and_bind(
         // No boot-HID interrupt-IN endpoint. Before giving up on the device, check whether it is a
         // MASS-STORAGE one - that is the capability whose absence kept a USB stack in the kernel, so
         // "not a keyboard" must no longer mean "not ours".
-        if let Some(m) = msc::parse_msc(dma, CONFIG_BUF_OFF, 64) {
+        if let Some(m) = msc::parse_msc(&dma.config_buf, 0, 64) {
             let disk = bind_msc(
                 ctx,
                 dma,
@@ -2074,13 +2155,13 @@ fn read_config_and_bind(
     // Configure Endpoint (add the interrupt-IN endpoint). The slot context is re-supplied with the
     // updated Context Entries AND this device's route/speed/root-port/TT, so a downstream device keeps
     // routing (a root-port device passes route=0 / parent_*=0, reducing to the plain form).
-    let int_tr = dma.phys_at(int_tr_off(dev_idx));
-    let islot = INPUT_CTX_OFF + ctx_size;
+    let int_tr = dma.slices.phys_at(int_tr_off(dev_idx));
+    let islot = ctx_size;
     clear_input_ctx(dma, ctx_size);
-    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
-    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
-    dma.write32(islot, (dci << 27) | (speed << 20) | (route & 0xFFFFF)); // Context Entries=dci, speed, route
-    dma.write32(islot + 4, root_port << 16);
+    dma.input_ctx.write32(0, 0); // Drop flags
+    dma.input_ctx.write32(4, 1 | (1 << dci)); // Add: slot + interrupt endpoint
+    dma.input_ctx.write32(islot, (dci << 27) | (speed << 20) | (route & 0xFFFFF)); // Context Entries=dci, speed, route
+    dma.input_ctx.write32(islot + 4, root_port << 16);
     // TT Hub Slot ID [7:0] and TT Port Number [15:8] name the high-speed hub that translates for this
     // low/full-speed device. TT Think Time [17:16] is deliberately NOT set here.
     //
@@ -2103,8 +2184,8 @@ fn read_config_and_bind(
     } else {
         0
     };
-    dma.write32(islot + 8, tt);
-    let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
+    dma.input_ctx.write32(islot + 8, tt);
+    let iep = (1 + dci as usize) * ctx_size;
     // xHCI Endpoint Context Interval encoding is speed-dependent (xHCI 6.2.3.6).
     let xhci_interval = match speed {
         1 | 2 => {
@@ -2123,14 +2204,14 @@ fn read_config_and_bind(
             }
         }
     };
-    dma.write32(iep, xhci_interval << 16);
-    dma.write32(iep + 4, (3 << 1) | (7 << 3) | ((ep_mps as u32) << 16));
-    dma.write32(iep + 8, (int_tr as u32 & !0xF) | 1);
-    dma.write32(iep + 12, (int_tr >> 32) as u32);
-    dma.write32(iep + 16, ep_mps as u32 | ((ep_mps as u32) << 16));
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    dma.input_ctx.write32(iep, xhci_interval << 16);
+    dma.input_ctx.write32(iep + 4, (3 << 1) | (7 << 3) | ((ep_mps as u32) << 16));
+    dma.input_ctx.write32(iep + 8, (int_tr as u32 & !0xF) | 1);
+    dma.input_ctx.write32(iep + 12, (int_tr >> 32) as u32);
+    dma.input_ctx.write32(iep + 16, ep_mps as u32 | ((ep_mps as u32) << 16));
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let in_phys = dma.input_ctx.phys();
     let ce = run_command(
         ctx,
         dma,
@@ -2198,12 +2279,12 @@ fn read_config_and_bind(
     }
 
     // Arm the interrupt transfer ring: the Link TRB closes the 16-entry ring.
-    let ring_phys = dma.phys_at(int_tr_off(dev_idx));
+    let ring_phys = dma.slices.phys_at(int_tr_off(dev_idx));
     let link = int_tr_off(dev_idx) + 15 * 16;
-    dma.write32(link, ring_phys as u32);
-    dma.write32(link + 4, (ring_phys >> 32) as u32);
-    dma.write32(link + 8, 0);
-    dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1);
+    dma.slices.write32(link, ring_phys as u32);
+    dma.slices.write32(link + 4, (ring_phys >> 32) as u32);
+    dma.slices.write32(link + 8, 0);
+    dma.slices.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | 1);
 
     // hub_* default to 0/direct; the downstream caller patches them for a device behind a hub.
     (
@@ -2240,8 +2321,8 @@ fn read_config_and_bind(
 #[allow(clippy::too_many_arguments)]
 fn serve_if_block(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     disk: &mut Option<msc::Disk>,
@@ -2322,6 +2403,7 @@ fn serve_if_block(
     let is_block_op = matches!(
         op,
         msc::OP_READ_BLOCK | msc::OP_WRITE_BLOCK | msc::OP_CAPACITY | msc::OP_WRITE_ZEROS | msc::OP_FLUSH
+            | msc::OP_WRITE_BLOCKS
     );
     if !is_block_op {
         return true; // not a block request; the disk is unaffected
@@ -2369,7 +2451,8 @@ fn serve_if_block(
     // OP_CAPACITY is NOT one: it does no device I/O (see `serve_block`), so it cannot report that
     // the device stopped answering, and treating its failure that way dropped a live disk.
     let was_data_op = matches!(msg.payload_bytes().first(),
-        Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS));
+        Some(&msc::OP_READ_BLOCK) | Some(&msc::OP_WRITE_BLOCK) | Some(&msc::OP_WRITE_ZEROS)
+            | Some(&msc::OP_WRITE_BLOCKS));
     // ... AND only while a disk is still bound.
     //
     // Once it has been dropped, `serve_block` answers STATUS_NO_DISK for the honest reason "no disk" -
@@ -2398,8 +2481,8 @@ fn serve_if_block(
 #[allow(clippy::too_many_arguments)]
 fn bind_msc(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     ctx_size: usize,
@@ -2417,7 +2500,7 @@ fn bind_msc(
     ev_cycle: &mut u32,
     cmd_idx: &mut usize,
 ) -> Option<msc::Disk> {
-    let mut disk = msc::Disk::new(slot, m.out_ep, m.in_ep, port);
+    let mut disk = msc::Disk::new(slot, m.out_ep, m.in_ep, port, m.mps as u32);
     let (out_dci, in_dci) = (disk.out_dci(), disk.in_dci());
     let max_dci = out_dci.max(in_dci);
     ctx.log_fmt(format_args!(
@@ -2426,12 +2509,12 @@ fn bind_msc(
     ));
 
     // Input context: add the slot plus BOTH bulk endpoints.
-    let islot = INPUT_CTX_OFF + ctx_size;
+    let islot = ctx_size;
     clear_input_ctx(dma, ctx_size);
-    dma.write32(INPUT_CTX_OFF, 0); // Drop flags
-    dma.write32(INPUT_CTX_OFF + 4, 1 | (1 << out_dci) | (1 << in_dci));
-    dma.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
-    dma.write32(islot + 4, root_port << 16);
+    dma.input_ctx.write32(0, 0); // Drop flags
+    dma.input_ctx.write32(4, 1 | (1 << out_dci) | (1 << in_dci));
+    dma.input_ctx.write32(islot, (max_dci << 27) | (speed << 20) | (route & 0xFFFFF));
+    dma.input_ctx.write32(islot + 4, root_port << 16);
     // TT Hub Slot ID [7:0] and TT Port Number [15:8] name the high-speed hub that translates for this
     // low/full-speed device. TT Think Time [17:16] is deliberately NOT set here.
     //
@@ -2454,7 +2537,7 @@ fn bind_msc(
     } else {
         0
     };
-    dma.write32(islot + 8, tt);
+    dma.input_ctx.write32(islot + 8, tt);
 
     // Endpoint contexts. Interval is 0 for bulk (it is not a periodic endpoint); CErr = 3 is the
     // standard retry count; Average TRB Length is the max packet size, which is what BOT transfers
@@ -2465,18 +2548,18 @@ fn bind_msc(
         } else {
             disk.in_ring_phys(dma)
         };
-        let iep = INPUT_CTX_OFF + (1 + dci as usize) * ctx_size;
-        dma.write32(iep, 0);
-        dma.write32(iep + 4, (3 << 1) | (ep_type << 3) | ((m.mps as u32) << 16));
+        let iep = (1 + dci as usize) * ctx_size;
+        dma.input_ctx.write32(iep, 0);
+        dma.input_ctx.write32(iep + 4, (3 << 1) | (ep_type << 3) | ((m.mps as u32) << 16));
         // Bit 0 is the Dequeue Cycle State, which must match the ring's initial producer cycle (1).
-        dma.write32(iep + 8, (ring as u32 & !0xF) | 1);
-        dma.write32(iep + 12, (ring >> 32) as u32);
-        dma.write32(iep + 16, m.mps as u32);
+        dma.input_ctx.write32(iep + 8, (ring as u32 & !0xF) | 1);
+        dma.input_ctx.write32(iep + 12, (ring >> 32) as u32);
+        dma.input_ctx.write32(iep + 16, m.mps as u32);
     }
 
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
+    let in_phys = dma.input_ctx.phys();
     let ce = run_command(
         ctx,
         dma,
@@ -2593,7 +2676,7 @@ fn bind_msc(
 #[allow(clippy::too_many_arguments)]
 /// Write a 64-bit xHCI register as TWO 32-BIT WRITES, low half first.
 ///
-/// The SDK's `Mmio::write64` emits a single 64-bit store. The in-kernel driver this replaced (deleted 2026-08-09; read it in git history) - the one that had
+/// `Registers::write64` (the SDK's `Mmio::write64` beneath it) emits a single 64-bit store. The in-kernel driver this replaced (deleted 2026-08-09; read it in git history) - the one that had
 /// always driven this exact VL805 on the Pi 4 - has never done that: its `wr64` is two 32-bit writes,
 /// and the difference had never been tested because QEMU accepts either.
 ///
@@ -2604,7 +2687,7 @@ fn bind_msc(
 ///
 /// Low half first is required, not stylistic: several of these registers (CRCR especially) latch on
 /// the write of the HIGH half, so writing high-then-low latches a half-updated pointer.
-fn wr64(mmio: &Mmio, off: usize, val: u64) {
+fn wr64(mmio: &Registers, off: usize, val: u64) {
     mmio.write32(off, val as u32);
     mmio.write32(off + 4, (val >> 32) as u32);
 }
@@ -2629,28 +2712,28 @@ const DIAG_HINT: &str = "command diagnosis - CRR=0 means the controller never st
 /// choose between the three. Measure, do not guess.
 #[allow(clippy::too_many_arguments)]
 fn dump_ring_state(
-    ctx: &ServiceContext, dma: &Dma, mmio: &Mmio, op: usize, ir0: usize,
+    ctx: &ServiceContext, dma: &Parts, mmio: &Registers, op: usize, ir0: usize,
     cmd_off: usize, ev_idx: usize, ev_cycle: u32,
 ) {
     let crcr_lo = mmio.read32(op + OP_CRCR);
     let dcbaap_lo = mmio.read32(op + OP_DCBAAP);
     ctx.log_fmt(format_args!(
         "xhci: CRCR={:#010x} (CRR={}) DCBAAP={:#010x} cmd_ring_phys={:#x}",
-        crcr_lo, (crcr_lo & (1 << 3) != 0) as u8, dcbaap_lo, dma.phys_at(CMD_RING_OFF)));
+        crcr_lo, (crcr_lo & (1 << 3) != 0) as u8, dcbaap_lo, dma.cmd_ring.phys()));
     ctx.log_fmt(format_args!(
         "xhci: cmd TRB @{:#x} readback {:#010x} {:#010x} {:#010x} {:#010x}",
         cmd_off,
-        dma.read32(cmd_off), dma.read32(cmd_off + 4),
-        dma.read32(cmd_off + 8), dma.read32(cmd_off + 12)));
+        dma.cmd_ring.read32(cmd_off), dma.cmd_ring.read32(cmd_off + 4),
+        dma.cmd_ring.read32(cmd_off + 8), dma.cmd_ring.read32(cmd_off + 12)));
     ctx.log_fmt(format_args!(
         "xhci: ERSTSZ={} ERSTBA={:#010x} erst_phys={:#x} erst[0]={:#010x} size={}",
-        mmio.read32(ir0 + 0x08), mmio.read32(ir0 + 0x10), dma.phys_at(ERST_OFF),
-        dma.read32(ERST_OFF), dma.read32(ERST_OFF + 8)));
-    let ev = EVENT_RING_OFF + ev_idx * TRB_SIZE;
+        mmio.read32(ir0 + 0x08), mmio.read32(ir0 + 0x10), dma.erst.phys(),
+        dma.erst.read32(0), dma.erst.read32(8)));
+    let ev = ev_idx * TRB_SIZE;
     ctx.log_fmt(format_args!(
         "xhci: EVT[{}] @{:#x} ctrl={:#010x} (want cycle {}) ERDP={:#010x} ev_ring_phys={:#x}",
-        ev_idx, ev, dma.read32(ev + 12), ev_cycle,
-        mmio.read32(ir0 + 0x18), dma.phys_at(EVENT_RING_OFF)));
+        ev_idx, ev, dma.event_ring.read32(ev + 12), ev_cycle,
+        mmio.read32(ir0 + 0x18), dma.event_ring.phys()));
 }
 
 /// After a command failed or got no completion, read USBSTS and log it (HCH/HSE/HCE/CNR), returning
@@ -2659,7 +2742,7 @@ fn dump_ring_state(
 /// caller must poison the offending port and re-initialise the controller rather than issue more doomed
 /// commands. Pure diagnosis when it returns false (e.g. a device-level Transaction Error with the HC
 /// still running); the log is the breadcrumb that tells us, on the Wyse, which case a port hit.
-fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize, hint_said: &mut bool) -> bool {
+fn hc_wedged_now(ctx: &ServiceContext, mmio: &Registers, op: usize, hint_said: &mut bool) -> bool {
     let sts = mmio.read32(op + OP_USBSTS);
     let wedged = sts & STS_WEDGED != 0;
     // ONCE. This is 200 characters of FIXED explanatory text - it says what the numbers below mean,
@@ -2700,7 +2783,7 @@ fn hc_wedged_now(ctx: &ServiceContext, mmio: &Mmio, op: usize, hint_said: &mut b
 /// enumerate loop's `1..=max_ports`). Bounded walk: a malformed Next-pointer chain can neither loop
 /// forever nor read far outside the cap region (§26.6). Returns 0 if there is no xECP list (all ports
 /// enumerated as before).
-fn usb3_port_mask(mmio: &Mmio, hcc1: u32, max_ports: u32) -> u64 {
+fn usb3_port_mask(mmio: &Registers, hcc1: u32, max_ports: u32) -> u64 {
     let mut mask = 0u64;
     let mut ptr = ((hcc1 >> 16) & 0xFFFF) as usize; // xECP, in dwords from the MMIO base (0 = none)
     let mut guard = 0u32;
@@ -2744,8 +2827,8 @@ fn usb3_port_mask(mmio: &Mmio, hcc1: u32, max_ports: u32) -> u64 {
 /// rings via the mutable bookkeeping refs.
 fn enumerate_one(
     ctx: &ServiceContext,
-    dma: &Dma,
-    mmio: &Mmio,
+    dma: &Parts,
+    mmio: &Registers,
     dboff: usize,
     ir0: usize,
     op: usize,
@@ -2778,6 +2861,9 @@ fn enumerate_one(
     // Whether the fixed command-failure hint has been said (`hc_wedged_now`). Owned above `'reenum`
     // with `diag_dumped`, not a static (Invariant 9, backlog/fixed/80 D9).
     hint_said: &mut bool,
+    // Every hub this pass keeps (`KeptHub`), for the poll loop's arrival watch.
+    hubs: &mut [KeptHub; MAX_HUBS],
+    nhubs: &mut usize,
 ) {
     *hc_wedged = false;
     *enum_failed = false;
@@ -2824,7 +2910,7 @@ fn enumerate_one(
     ));
 
     // Enable Slot.
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let (comp, slot) = match run_command(
         ctx,
@@ -2878,24 +2964,24 @@ fn enumerate_one(
     // 15, enumerated in the same position, got no completion at all and blocked every later command;
     // the Wyse card confirmed it was the same cause (`docs/wifi-usb.md` 41). On the T630 the
     // dongle was always the first device found, so nothing before it had written the word.
-    let islot = INPUT_CTX_OFF + ctx_size;
-    let iep0 = INPUT_CTX_OFF + 2 * ctx_size;
+    let islot = ctx_size;
+    let iep0 = 2 * ctx_size;
     clear_input_ctx(dma, ctx_size);
-    dma.write32(INPUT_CTX_OFF, 0); // Drop Context flags: none
-    dma.write32(INPUT_CTX_OFF + 4, 0b11); // Add Context flags: slot + EP0
-    dma.write32(islot, (1 << 27) | (speed << 20));
-    dma.write32(islot + 4, port << 16);
-    let ep0_tr = dma.phys_at(ep0_tr_off(dev_idx));
-    dma.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
-    dma.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
-    dma.write32(iep0 + 12, (ep0_tr >> 32) as u32);
-    dma.write32(iep0 + 16, 8);
-    dma.write64(
-        DCBAA_OFF + slot as usize * 8,
-        dma.phys_at(device_ctx_off(dev_idx)),
+    dma.input_ctx.write32(0, 0); // Drop Context flags: none
+    dma.input_ctx.write32(4, 0b11); // Add Context flags: slot + EP0
+    dma.input_ctx.write32(islot, (1 << 27) | (speed << 20));
+    dma.input_ctx.write32(islot + 4, port << 16);
+    let ep0_tr = dma.slices.phys_at(ep0_tr_off(dev_idx));
+    dma.input_ctx.write32(iep0 + 4, (3 << 1) | (4 << 3) | (max_packet << 16));
+    dma.input_ctx.write32(iep0 + 8, (ep0_tr as u32 & !0xF) | 1);
+    dma.input_ctx.write32(iep0 + 12, (ep0_tr >> 32) as u32);
+    dma.input_ctx.write32(iep0 + 16, 8);
+    dma.dcbaa.write64(
+        slot as usize * 8,
+        dma.slices.phys_at(device_ctx_off(dev_idx)),
     );
-    let in_phys = dma.phys_at(INPUT_CTX_OFF);
-    let cmd_off = CMD_RING_OFF + *cmd_idx * TRB_SIZE;
+    let in_phys = dma.input_ctx.phys();
+    let cmd_off = *cmd_idx * TRB_SIZE;
     *cmd_idx += 1;
     let (comp, _) = match run_command(
         ctx,
@@ -2946,20 +3032,20 @@ fn enumerate_one(
     ));
 
     // Get Device Descriptor (18 bytes) over EP0 at ring offset 0 - for the device class (0x09 = hub).
-    let data_phys = dma.phys_at(DATA_BUF_OFF);
+    let data_phys = dma.data_buf.phys();
     let tr0 = ep0_tr_off(dev_idx);
-    dma.write32(tr0, 0x80 | (6 << 8) | (0x0100 << 16));
-    dma.write32(tr0 + 4, 18 << 16);
-    dma.write32(tr0 + 8, 8);
-    dma.write32(tr0 + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
-    dma.write32(tr0 + 16, data_phys as u32);
-    dma.write32(tr0 + 20, (data_phys >> 32) as u32);
-    dma.write32(tr0 + 24, 18);
-    dma.write32(tr0 + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
-    dma.write32(tr0 + 32, 0);
-    dma.write32(tr0 + 36, 0);
-    dma.write32(tr0 + 40, 0);
-    dma.write32(tr0 + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
+    dma.slices.write32(tr0, 0x80 | (6 << 8) | (0x0100 << 16));
+    dma.slices.write32(tr0 + 4, 18 << 16);
+    dma.slices.write32(tr0 + 8, 8);
+    dma.slices.write32(tr0 + 12, 1 | (1 << 6) | (TRB_SETUP_STAGE << 10) | (3 << 16));
+    dma.slices.write32(tr0 + 16, data_phys as u32);
+    dma.slices.write32(tr0 + 20, (data_phys >> 32) as u32);
+    dma.slices.write32(tr0 + 24, 18);
+    dma.slices.write32(tr0 + 28, 1 | (TRB_DATA_STAGE << 10) | (1 << 16));
+    dma.slices.write32(tr0 + 32, 0);
+    dma.slices.write32(tr0 + 36, 0);
+    dma.slices.write32(tr0 + 40, 0);
+    dma.slices.write32(tr0 + 44, 1 | (1 << 5) | (TRB_STATUS_STAGE << 10));
     mmio.write32(dboff + slot as usize * 4, 1);
     let mut ok = false;
     for _ in 0..8 {
@@ -2978,9 +3064,9 @@ fn enumerate_one(
         disable_slot(ctx, dma, mmio, dboff, ir0, slot, ev_idx, ev_cycle, cmd_idx);
         return;
     }
-    let ids = dma.read32(DATA_BUF_OFF + 8);
-    let dclass = dma.read8(DATA_BUF_OFF + 4); // bDeviceClass: 0x09 = Hub
-    let dproto = dma.read8(DATA_BUF_OFF + 6); // bDeviceProtocol: on a hub, 2 = multi-TT
+    let ids = dma.data_buf.read32(8);
+    let dclass = dma.data_buf.read8(4); // bDeviceClass: 0x09 = Hub
+    let dproto = dma.data_buf.read8(6); // bDeviceProtocol: on a hub, 2 = multi-TT
     ctx.log_fmt(format_args!(
         "xhci: DEVICE DESCRIPTOR class={:#04x} VID={:#06x} PID={:#06x}",
         dclass,
@@ -3080,9 +3166,9 @@ fn enumerate_one(
         0x29 << 8,
         0,
         8,
-        DATA_BUF_OFF,
+        0,
     );
-    let mut nports = if hub_ok { dma.read8(DATA_BUF_OFF + 2) } else { 0 };
+    let mut nports = if hub_ok { dma.data_buf.read8(2) } else { 0 };
     // A SUPERSPEED hub answers descriptor type 0x2A, not 0x29, and returns nothing for the 0x29 we
     // just asked for. The Pi 4's USB-A sockets are the SuperSpeed side of its internal hub, so
     // refusing to walk one meant nothing plugged into a blue port was ever seen - not a regression,
@@ -3098,10 +3184,10 @@ fn enumerate_one(
         retried = true;
         let ok2 = control(
             dma, mmio, dboff, ir0, slot, dev_idx, 176,
-            ev_idx, ev_cycle, 0xA0, 6, 0x2A << 8, 0, 12, DATA_BUF_OFF,
+            ev_idx, ev_cycle, 0xA0, 6, 0x2A << 8, 0, 12, 0,
         );
         if ok2 {
-            nports = dma.read8(DATA_BUF_OFF + 2);
+            nports = dma.data_buf.read8(2);
             ss_hub = nports != 0;
         }
     }
@@ -3114,7 +3200,7 @@ fn enumerate_one(
     if dproto == 3 {
         ss_hub = true;
     }
-    let whubchar = dma.read16(DATA_BUF_OFF + 3); // wHubCharacteristics
+    let whubchar = dma.data_buf.read16(3); // wHubCharacteristics
     // A SuperSpeed hub has NO transaction translator - a TT exists to carry low/full-speed traffic
     // across a high-speed link, and there is no such thing below a SuperSpeed one. Reporting a TT it
     // does not have is the same class of illegal field that made the low-speed keyboard fail
@@ -3128,7 +3214,7 @@ fn enumerate_one(
     // A SuperSpeed hub's descriptor has the same two bits, but it is treated as ganged here: its ports are
     // not cut one at a time until a card has shown how one answers.
     let per_port_power = !ss_hub && whubchar & 0x3 == 0x1;
-    let pwr_good_ms = dma.read8(DATA_BUF_OFF + 5) as u64 * 2;
+    let pwr_good_ms = dma.data_buf.read8(5) as u64 * 2;
     ctx.log_fmt(format_args!(
         "xhci: USB{} hub on port {} (slot {}, {} downstream ports, mtt={}, ttt={}, port power {}, power good after {} ms)",
         if ss_hub { "3 SuperSpeed" } else { "2" }, port, slot, nports, mtt, ttt,
@@ -3211,11 +3297,11 @@ fn enumerate_one(
             }
             let ok = control(
                 dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0, dp as u32, 4,
-                DATA_BUF_OFF,
+                0,
             );
             hoff += 48;
             if ok {
-                let st = dma.read16(DATA_BUF_OFF);
+                let st = dma.data_buf.read16(0);
                 read += 1;
                 unpowered += (st & power_bit == 0) as u32;
                 connected += (st & 1 != 0) as u32;
@@ -3286,7 +3372,7 @@ fn enumerate_one(
             0,
             dp as u32,
             4,
-            DATA_BUF_OFF,
+            0,
         ); // Get_Status(port)
         hoff += 48;
         // A failed read is not an empty port, and it used to be skipped as one in silence: the keyboard
@@ -3296,7 +3382,7 @@ fn enumerate_one(
                 "xhci: hub port {} status read failed - not scanned this pass", dp));
             inconclusive = true;
         }
-        let st = if ok { dma.read16(DATA_BUF_OFF) } else { 0 };
+        let st = if ok { dma.data_buf.read16(0) } else { 0 };
         if st & 1 == 0 {
             continue; // nothing connected on this downstream port
         }
@@ -3331,7 +3417,7 @@ fn enumerate_one(
             gs::task::sleep_ms(ctx, 20);
             let ok = control(
                 dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0,
-                dp as u32, 4, DATA_BUF_OFF,
+                dp as u32, 4, 0,
             );
             hoff += 48;
             // Ring exhausted. Say so - this used to break out silently, and a port skipped for lack
@@ -3342,7 +3428,7 @@ fn enumerate_one(
                 break;
             }
             if !ok { break; }
-            pstatus = dma.read16(DATA_BUF_OFF);
+            pstatus = dma.data_buf.read16(0);
             if pstatus & 0x2 != 0 { break; } // PORT_ENABLE
         }
         let _ = control(
@@ -3392,10 +3478,10 @@ fn enumerate_one(
             0,
             dp as u32,
             4,
-            DATA_BUF_OFF,
+            0,
         ); // Get_Status again (post-reset, for speed)
         hoff += 48;
-        let pst = dma.read16(DATA_BUF_OFF);
+        let pst = dma.data_buf.read16(0);
         // Port-status speed bits: bit 9 = low-speed, bit 10 = high-speed; neither = full-speed.
         // Map to the xHCI slot-context speed value (1=Full, 2=Low, 3=High).
         //
@@ -3568,10 +3654,10 @@ fn enumerate_one(
                 // is in the wrong state after the dongle's download fault.
                 let now = if hoff + 64 <= 0xF00 && control(
                     dma, mmio, dboff, ir0, slot, dev_idx, hoff, ev_idx, ev_cycle, 0xA3, 0, 0, dp as u32, 4,
-                    DATA_BUF_OFF,
+                    0,
                 ) {
                     hoff += 48;
-                    Some(dma.read16(DATA_BUF_OFF))
+                    Some(dma.data_buf.read16(0))
                 } else {
                     None
                 };
@@ -3585,10 +3671,10 @@ fn enumerate_one(
                 ctx.log_fmt(format_args!(
                     "xhci: DIAG hub port {}: status before reset {:#06x}, after {:#06x}, now {}, speed {}; hub slot {} state {} ports {} hub-flag {} ep0 state {}",
                     dp, st, pstatus, Now(now), dspeed, slot,
-                    dma.read32(hub_ctx + 12) >> 27,
-                    dma.read32(hub_ctx + 4) >> 24,
-                    (dma.read32(hub_ctx) >> 26) & 1,
-                    dma.read32(hub_ctx + ctx_size) & 0x7));
+                    dma.slices.read32(hub_ctx + 12) >> 27,
+                    dma.slices.read32(hub_ctx + 4) >> 24,
+                    (dma.slices.read32(hub_ctx) >> 26) & 1,
+                    dma.slices.read32(hub_ctx + ctx_size) & 0x7));
                 // STOP KNOCKING ON IT. A device that three Address Devices did not reach is left disabled
                 // at its port, so nothing more is sent to it this pass, and named in `unanswered` for the
                 // cold start below. Its slot was released by `address_downstream`. Not on a SuperSpeed hub:
@@ -3683,6 +3769,11 @@ fn enumerate_one(
     //
     // The slice cost is one, bounded and constant - a hub is infrastructure, not a device that comes
     // and goes, and the pool exists to bound growth rather than to reclaim the machine's own wiring.
+    // Recorded, whatever is behind it: the poll loop watches each kept hub's empty ports (`KeptHub`).
+    if *nhubs < MAX_HUBS {
+        hubs[*nhubs] = KeptHub { slot, dev: dev_idx, nports: nports as u32 };
+        *nhubs += 1;
+    }
     if *ndev == ndev_before && disk.is_some() == disk_before {
         ctx.log_fmt(format_args!(
             "xhci: hub on port {} has nothing behind it yet - KEEPING it so an arrival can be seen",
@@ -3733,15 +3824,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "xhci");
     ctx.log("xhci: driver starting");
 
-    let mmio = match ctx.xhci_mmio() {
+    // Both grants through `gs::driver` (`docs/driver-library.md` step 3), the arena laid out by name in
+    // `lay_out` and reached only through its parts.
+    let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
         None => {
             ctx.log("xhci: no controller MMIO granted - idling");
             idle(&ctx);
         }
     };
-    let dma = match ctx.dma_region() {
-        Some(d) => d,
+    let dma = match godspeed::driver::arena(&ctx) {
+        Some(a) => match lay_out(&ctx, a) {
+            Some(p) => p,
+            None => idle(&ctx),
+        },
         None => {
             ctx.log("xhci: no DMA arena granted - idling");
             idle(&ctx);
@@ -3964,7 +4060,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     //
     // `None` means no interrupt was granted, and then NOTHING is an IRQ - which is the honest reading,
     // not a reason to guess. The loop's 10 ms poll already covers that case.
-    let msi_vector: Option<u8> = gs::driver::irq::Irq::granted(&ctx).vector();
+    //
+    // The main loop's wait is `Irq::wait` since 2026-10-22, which makes that same test - the one-byte notice
+    // of the granted vector, and nothing else - so the instrument and the wait cannot disagree. It never
+    // calls `rearm`, and neither did the hand-written wait: an MSI is an edge the kernel never masks.
+    let irq = Irq::granted(&ctx);
+    let msi_vector: Option<u8> = irq.vector();
     ctx.log_fmt(format_args!(
         "xhci: IRQ vector granted by the kernel: {}",
         match msi_vector { Some(v) => v, None => 0 }));
@@ -3979,6 +4080,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut reenums_at_report: u64 = 0;
     let mut last_pass_report = wait::Since::now(&ctx);
 
+    // Something answered as written that a re-scan or a drop lost (`msc::note_drop`,
+    // `msc::settle_before_rescan`): carried to the disk bound next, whose first FLUSH then fails (Audit 20).
+    let mut disk_lost_carry = false;
     'reenum: loop {
         reenums += 1;
         // Stop + reset the controller. The Wyse `chaos max-carnage` all-core freeze lands
@@ -4075,20 +4179,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let n_scratch = max_scratch as usize;
         if n_scratch > 0 {
             for i in 0..n_scratch {
-                dma.write64(
-                    SCRATCHPAD_SBA_OFF + i * 8,
-                    dma.phys_at(SCRATCHPAD_BUF_BASE + i * 0x1000),
+                dma.sba.write64(
+                    i * 8,
+                    dma.scratch.phys_at(i * 0x1000),
                 );
             }
-            dma.write64(DCBAA_OFF, dma.phys_at(SCRATCHPAD_SBA_OFF));
+            dma.dcbaa.write64(0, dma.sba.phys());
         }
-        wr64(&mmio, op + OP_DCBAAP, dma.phys_at(DCBAA_OFF));
-        wr64(&mmio, op + OP_CRCR, dma.phys_at(CMD_RING_OFF) | 1);
-        dma.write64(ERST_OFF, dma.phys_at(EVENT_RING_OFF));
-        dma.write32(ERST_OFF + 8, EVENT_RING_TRBS as u32);
+        wr64(&mmio, op + OP_DCBAAP, dma.dcbaa.phys());
+        wr64(&mmio, op + OP_CRCR, dma.cmd_ring.phys() | 1);
+        dma.erst.write64(0, dma.event_ring.phys());
+        dma.erst.write32(8, EVENT_RING_TRBS as u32);
         mmio.write32(ir0 + 0x08, 1);
-        wr64(&mmio, ir0 + 0x10, dma.phys_at(ERST_OFF));
-        wr64(&mmio, ir0 + 0x18, dma.phys_at(EVENT_RING_OFF));
+        wr64(&mmio, ir0 + 0x10, dma.erst.phys());
+        wr64(&mmio, ir0 + 0x18, dma.event_ring.phys());
         mmio.write32(op + OP_CONFIG, max_slots);
         // P2 (interrupt-driven, §12): enable the interrupter so the controller raises its
         // MSI/MSI-X (kernel-programmed to the vector allocated at spawn, `msi_vector` above) when it posts an event. IMAN: IE on, write
@@ -4181,6 +4285,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         let mut ndev = 0usize;
         let mut sa = SliceAlloc::new();
         let mut saw_hub = false;
+        // The hubs this pass keeps (`KeptHub`), re-made per pass for the reason the HIDs are.
+        let mut hubs = [KEPT_HUB_NONE; MAX_HUBS];
+        let mut nhubs = 0usize;
         // Re-declared per enumeration pass, alongside the HID array and the slice allocator, for the
         // same reason they are: a pass re-inits the controller, so every slot, ring and context from
         // the previous one is gone. Carrying a Disk across would leave it pointing at a slot the
@@ -4247,6 +4354,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     &mut enum_failed,
                     &mut hub_cut,
                     &mut diag_hint_said,
+                    &mut hubs,
+                    &mut nhubs,
                 );
                 // BOUND THE RETRY, AND SPEND THE ATTEMPTS IN THIS PASS.
                 //
@@ -4272,7 +4381,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             &ctx, &dma, &mmio, dboff, ir0, op, ctx_size, p, &mut sa, &mut devs,
                             &mut ndev, &mut saw_hub, &mut disk, &mut radio, &mut ev_idx, &mut ev_cycle,
                             &mut cmd_idx, &mut hc_wedged, &mut diag_dumped, &mut enum_failed, &mut hub_cut,
-                            &mut diag_hint_said,
+                            &mut diag_hint_said, &mut hubs, &mut nhubs,
                         );
                         if !enum_failed { break; }
                         strikes += 1;
@@ -4388,7 +4497,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the poll loop below. Still report input-ready once so the shell's
             // boot-screen clear fires (the keyboard may be on the other controller).
             if !signaled {
-                ctx.signal_input_ready();
+                gs::driver::input::ready(&ctx);
                 signaled = true;
             }
             // Nothing is bound, so forget the previous pass's bound devices: whatever binds next is a
@@ -4484,7 +4593,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         ctx.log_fmt(format_args!("xhci: {} HID device(s) bound", ndev));
         if !signaled {
-            ctx.signal_input_ready();
+            gs::driver::input::ready(&ctx);
             signaled = true;
         } // boot-screen clear, once
           // Announce only devices that weren't already bound on the previous pass. A
@@ -4679,7 +4788,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             //
             // Once per hub per session, and bounded by the ring size (§26.6).
             for off in (0..0x1000).step_by(4) {
-                dma.write32(ep0_tr_off(hd) + off, 0);
+                dma.slices.write32(ep0_tr_off(hd) + off, 0);
             }
             if reset_endpoint(
                 &ctx, &dma, &mmio, dboff, ir0, devs[d].hub_slot, 1,
@@ -4691,6 +4800,47 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             }
             // On failure the seeded `hub_off` value stands - no worse than before, and the probe
             // failure path still repairs. Never silently assume the re-point happened (§26.7).
+        }
+        // THE HUBS NOBODY ELSE WATCHES (`KeptHub`). A hub with a HID behind it is probed by the HID-driven
+        // scan, and the disk's hub by the disk scan when no HID is bound; each keeps its own cursor on that
+        // hub's one EP0 ring, so a second scanner there would desync it. The disk's and the WiFi dongle's
+        // hubs are left out here too, which leaves two cases no scan covers (`backlog/78`, not fixed): the
+        // disk's hub while a HID is bound elsewhere, and a hub with only the dongle behind it, which those
+        // two scans reach only where they share it. Every OTHER kept hub is watched below, from a ring made coherent here exactly
+        // as the HID hubs' rings are above: cleared, its dequeue re-pointed at the base, its cursor at 0.
+        let mut watch = [false; MAX_HUBS];
+        let mut kh_cur = [0usize; MAX_HUBS];
+        let mut kh_pcs = [1u32; MAX_HUBS];
+        // Each watched hub's OWN confirmation state, by hub and port. The shared `hub_seen` and
+        // `hub_tried` are kept by port NUMBER alone, so on the Wyse layout - the keyboard on port 1 of
+        // one hub, the stick on port 1 of another - the disk scan's every unanswered probe of its port 1
+        // reset the keyboard's count too, and the arrival read "connected (1/2)" for ever (QEMU,
+        // 2026-10-20). These are re-made every pass, where theirs persist: a pass re-makes the hubs, so there
+        // is nothing to carry.
+        let mut kh_seen = [[0u8; 64]; MAX_HUBS];
+        let mut kh_tried = [0u64; MAX_HUBS];
+        for h in 0..nhubs {
+            let hs = hubs[h].slot;
+            let by_hid = devs[..ndev].iter().any(|d| d.hub_slot == hs);
+            let by_disk = disk.as_ref().is_some_and(|dk| dk.hub_slot == hs);
+            let by_radio = radio.as_ref().is_some_and(|r| r.hub_slot == hs);
+            if hs == 0 || by_hid || by_disk || by_radio { continue; }
+            let hd = hubs[h].dev;
+            for off in (0..0x1000).step_by(4) {
+                dma.slices.write32(ep0_tr_off(hd) + off, 0);
+            }
+            if reset_endpoint(
+                &ctx, &dma, &mmio, dboff, ir0, hs, 1,
+                ep0_tr_off(hd), device_ctx_off(hd), ctx_size,
+                &mut ev_idx, &mut ev_cycle, &mut cmd_idx,
+            ) {
+                watch[h] = true;
+            } else {
+                // Not watched, and said: a hub nobody asks is the bug this record exists to end.
+                ctx.log_fmt(format_args!(
+                    "xhci: the hub on slot {} could not be readied for watching - a device plugged in behind it will not be seen until a root port changes",
+                    hs));
+            }
         }
         let mut last_hub_poll = wait::Since::now(&ctx);
         // LIVENESS HEARTBEAT. The driver must be able to say "I am still running".
@@ -4749,6 +4899,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 present |= 1 << p;
             }
         }
+        // The mailbox for completions one consumer dequeues on another's behalf (`EvMail`). Cleared at the
+        // top of every pass, EXCEPT the disk's entry: a gather write in flight (`msc`, OVERLAP) finishes
+        // while nothing waits for it, and its completion is collected on a later pass. Re-made each pass,
+        // as it was, it threw that completion away and the write was waited out for 30 s (QEMU, RISC-V,
+        // 2026-10-21).
+        let mut eaten = EvMail::new();
         'poll: loop {
             // THE PASS COUNTER, first statement of the pass and ahead of every exit from it.
             //
@@ -4805,16 +4961,16 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     continue;
                 }
                 let dev = devs[d].idx;
-                let report_phys = dma.phys_at(report_off(dev));
+                let report_phys = dma.slices.phys_at(report_off(dev));
                 let link = int_tr_off(dev) + 15 * 16;
                 let t = int_tr_off(dev) + int_idx[d] * 16;
-                dma.write32(t, report_phys as u32);
-                dma.write32(t + 4, (report_phys >> 32) as u32);
-                dma.write32(t + 8, 8);
-                dma.write32(t + 12, int_cycle[d] | (1 << 5) | (TRB_NORMAL << 10));
+                dma.slices.write32(t, report_phys as u32);
+                dma.slices.write32(t + 4, (report_phys >> 32) as u32);
+                dma.slices.write32(t + 8, 8);
+                dma.slices.write32(t + 12, int_cycle[d] | (1 << 5) | (TRB_NORMAL << 10));
                 int_idx[d] += 1;
                 if int_idx[d] == 15 {
-                    dma.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | int_cycle[d]);
+                    dma.slices.write32(link + 12, (TRB_LINK << 10) | (1 << 1) | int_cycle[d]);
                     int_idx[d] = 0;
                     int_cycle[d] ^= 1;
                 }
@@ -4830,21 +4986,29 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // cores - the destination/placement drift that made the earlier attempt lag
             // (docs/power.md §11). A held key emits no new USB reports, so while one is armed we
             // wake briskly (one 10 ms tick, `base`) to synthesise typematic auto-repeat below; when idle we sleep
-            // ~250 ms as the hot-plug watchdog. Never pass 0 (recv_timeout(0) blocks FOREVER).
+            // ~250 ms as the hot-plug watchdog. Never 0: the kernel's recv_timeout(0) blocks FOREVER, which is
+            // why `Irq::wait` never asks for it.
             // In MILLISECONDS: one 10 ms tick, which is what `rep_ticks.max(1)` (ticks per 10 ms) was
-            // in counter ticks - `recv_within_ms` converts it back to exactly that, and never to 0.
+            // in counter ticks - `Irq::wait` converts it back to exactly that, and never to 0.
             let base: u64 = 10;
             // HID slots whose transfer events something else consumed this pass. BOTH the block
             // server below and the hub status checks further down can swallow a keyboard completion,
-            // and either one owes the endpoint a re-arm - so the set spans them.
-            let mut eaten = EvMail::new();
+            // and either one owes the endpoint a re-arm - so the set spans them. Per pass, but the disk's
+            // entry is kept (above).
+            eaten.keep_only(disk.as_ref().map(|d| d.slot));
+            if disk_lost_carry {
+                if let Some(d) = disk.as_mut() {
+                    d.mark_lost();
+                    disk_lost_carry = false;
+                }
+            }
             // Set by the hub scan when the disk's own port reports DISCONNECTED. Acted on AFTER the
             // scan rather than inside it, so the scan's borrow of `disk` and the clearing of it do
             // not overlap.
             let mut disk_gone = false;
             // How long to wait before looking at the event ring ourselves.
             //
-            // Where the controller's MSI reaches us, `recv_within_ms` returns EARLY on the interrupt
+            // Where the controller's MSI reaches us, `Irq::wait` returns EARLY on the interrupt
             // and this is only a lost-wake safety net, so 250 ms costs nothing. When this was written
             // nothing programmed the Pi 4 VL805's MSI, so this timeout WAS the polling interval - and
             // 250 ms per keystroke is a quarter-second of lag on every character typed. (Note
@@ -4867,7 +5031,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the 250 ms idle deadline. Typing was slower WITH interrupts working than without, and
             // the "quiet - polling" line never printed to say so.
             //
-            // An interrupt that arrives makes `recv_within_ms` return early regardless, so the short
+            // An interrupt that arrives makes `Irq::wait` return early regardless, so the short
             // deadline costs nothing where MSI is reliable and rescues latency where it is not. The
             // 250 ms deadline is now only for a controller with NO input device bound, where there is
             // nothing whose latency a human can feel.
@@ -4974,6 +5138,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             } else {
                 base.saturating_mul(25)
             };
+            // Held writes are written once nothing joins them for `GATHER_IDLE_MS`, so the wait is no
+            // longer than that while any are held.
+            let deadline_ms = if disk.as_ref().is_some_and(|d| d.gathered() > 0) {
+                deadline_ms.min(msc::GATHER_IDLE_MS)
+            } else {
+                deadline_ms
+            };
             // This is the driver's idle point, and therefore where block requests are answered.
             // Both the timed wait and the drain below used to DISCARD whatever arrived, which was
             // right when every message was an interrupt wakeup carrying no information. A block
@@ -4989,19 +5160,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // the probe spin lives and therefore the first place to look for the 4.7 ms.
                 seg_hub = seg_hub.wrapping_add(now.wrapping_sub(seg_mark));
             }
-            let woke = gs::ipc::recv_within_ms(&ctx, deadline_ms);
+            let woke = irq.wait(&ctx, Budget::ms(deadline_ms));
             work_t0 = wait::ticks(&ctx);
             // Delivered event = something is waking us. Timeout = it is not.
-            // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not.
+            // An IRQ notification is a ONE-BYTE payload equal to the vector; a block request is not -
+            // `Irq::wait` makes that test and says which (`Woke`).
             //
             // `irq_seen` used to be set by ANY message, and this service receives block requests from
             // `block-driver` on the same endpoint - so with a disk attached it was set by disk I/O and
             // the "waking on interrupts (MSI)" line proved only that something had arrived. I read
             // that line off a hardware log and told the user interrupts were working. It was never
             // evidence. Now it means what it says.
-            let is_irq = msi_vector.is_some_and(|v| {
-                woke.as_ref().is_some_and(|m| m.payload_bytes() == [v])
-            });
+            let is_irq = matches!(woke, Woke::Interrupt);
             if is_irq { msi_count = msi_count.saturating_add(1); }
             // Assigned, not or-ed: this is a property of the pass, and it must CLEAR on a timeout.
             irq_this_pass = is_irq;
@@ -5011,25 +5181,23 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // times/sec. Roughly 32 wakes/sec are unaccounted for, and at ~3.6 ms of work each that
             // IS the service's remaining CPU. Guessing which sender it is has been the expensive move
             // this week; this makes the log say it.
-            if let Some(m) = woke.as_ref() {
-                if !is_irq {
-                    msg_count = msg_count.saturating_add(1);
-                    // Say WHAT it is, once. Either something really is sending ~32 messages/sec, or
-                    // `is_irq` is wrong and these ARE interrupts miscounted - the kernel's
-                    // notification carries the IRQ number, and if that is not `msi_vector` the test
-                    // above silently fails (it once was: a hard-coded 0x28 against a pool vector). One line settles which, and a wrong diagnostic that
-                    // ends an investigation is worse than none (see the "waking on interrupts" line
-                    // that cost this session a day).
-                    if msg_count == 1 {
-                        let p = m.payload_bytes();
-                        ctx.log_fmt(format_args!(
-                            "xhci: [wake] first non-IRQ message: len={} first={:#04x}",
-                            p.len(), p.first().copied().unwrap_or(0)));
-                    }
+            if let Woke::Request(m) = &woke {
+                msg_count = msg_count.saturating_add(1);
+                // Say WHAT it is, once. Either something really is sending ~32 messages/sec, or
+                // `is_irq` is wrong and these ARE interrupts miscounted - the kernel's
+                // notification carries the IRQ number, and if that is not `msi_vector` the test
+                // above silently fails (it once was: a hard-coded 0x28 against a pool vector). One line settles which, and a wrong diagnostic that
+                // ends an investigation is worse than none (see the "waking on interrupts" line
+                // that cost this session a day).
+                if msg_count == 1 {
+                    let p = m.payload_bytes();
+                    ctx.log_fmt(format_args!(
+                        "xhci: [wake] first non-IRQ message: len={} first={:#04x}",
+                        p.len(), p.first().copied().unwrap_or(0)));
                 }
             }
             if is_irq { irq_seen = true; }
-            if let Some(m) = woke {
+            if let Woke::Request(m) = woke {
                 // The radio's requests first (U2a): they carry their own op range, and anything else is
                 // the block server's to judge.
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
@@ -5046,6 +5214,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         if !serve_if_block(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &m, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut no_cap_drops, &mut no_disk_said) {
                             ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
                             notify(&ctx, "storage disconnected (xhci)");
+                            disk_lost_carry |= msc::note_drop(&ctx, &disk);
                             disk = None;
                             continue 'reenum;
                         }
@@ -5095,8 +5264,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // into one struct first.
             let mut served = 0u32;
             while served < 1 {
-                let Some(m) = gs::ipc::try_recv(&ctx) else { break };
+                let Some(w) = irq.take(&ctx) else { break };
                 served += 1;
+                // An interrupt that arrived during the pass: counted, as the wait counts one. It used to
+                // reach the block server as a capless message and be dropped there as one.
+                let m = match w {
+                    Woke::Request(m) => m,
+                    _ => {
+                        msi_count = msi_count.saturating_add(1);
+                        irq_seen = true;
+                        continue;
+                    }
+                };
                 let hc = radio::Hc { dma: &dma, mmio: &mmio, dboff, ir0, ctx_size };
                 match radio::serve(&ctx, &hc, radio.as_mut(), &m, &mut ev_idx, &mut ev_cycle, &mut cmd_idx, &mut eaten) {
                     radio::Served::Reenumerate => {
@@ -5112,8 +5291,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     }
                 }
             }
+            msc::flush_gather_if_idle(&ctx, &dma, &mmio, dboff, ir0, &mut disk, &mut ev_idx, &mut ev_cycle, &mut eaten);
             if !disk_alive {
                 ctx.log("xhci: the USB disk stopped answering - dropping it and re-scanning (unplugged?)");
+                disk_lost_carry |= msc::note_drop(&ctx, &disk);
                 disk = None;
                 continue 'reenum;
             }
@@ -5157,6 +5338,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                &mut kb_rep, &mut kb_caps, &mut mouse);
                             if !irq_this_pass { hid_needs_poll = true; }   // harvested without an interrupt: polling is load-bearing here
                             need_queue[d] = true;
+                        } else if disk.as_ref().is_some_and(|d| d.slot == slot_id) {
+                            // The disk's gather write, finished while nothing was waiting for it
+                            // (`msc`, OVERLAP). Filed, so `msc::try_finish` or the next wait collects it.
+                            eaten.put(slot_id, ep, cc, res, ptr);
                         } else if devs[..ndev].iter().any(|h| h.hub_slot == slot_id) {
                             // A hub's completion, dequeued here with no probe waiting - it arrived
                             // after the probe that asked gave up. FILE IT rather than discard it, so
@@ -5202,7 +5387,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // it, which is the required order: ack the assertion, service the ring, then release the
             // handler-busy interlock.
             wr64(&mmio, ir0 + 0x18,
-                 dma.phys_at(EVENT_RING_OFF + ev_idx * TRB_SIZE) | (1 << 3));
+                 dma.event_ring.phys_at(ev_idx * TRB_SIZE) | (1 << 3));
 
             // Unplug detection. A device DIRECTLY on a root port is gone when its root-port CCS drops
             // (cheap MMIO read, every pass). A device BEHIND a hub changes no root PORTSC when it
@@ -5624,6 +5809,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 if !ok {
                                     ctx.log("xhci: not repairable in place - re-enumerating to rebuild the endpoint");
                                     announce = false;
+                                    disk_lost_carry |= msc::settle_before_rescan(&ctx, &dma, &mmio, dboff, ir0, &mut disk,
+                                                                                 &mut ev_idx, &mut ev_cycle, &mut eaten);
                                     continue 'reenum;
                                 }
                             }
@@ -5813,6 +6000,67 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     disk_hub_pcs = pcs;
                 }
             }
+            // EVERY OTHER KEPT HUB, on the hub tick (`watch`, above): a connected port on a hub with nothing
+            // bound behind it is a device plugged in there. Two consecutive connected reads and not already
+            // tried, the confirmation every arrival arm uses, kept per hub here (`kh_seen`, `kh_tried`).
+            if hub_due {
+                'hubs: for h in 0..nhubs {
+                    if !watch[h] { continue; }
+                    let (hs, hd, hn) = (hubs[h].slot, hubs[h].dev, hubs[h].nports);
+                    let (mut cur, mut pcs) = (kh_cur[h], kh_pcs[h]);
+                    for hp in 1..=hn {
+                        let mut abandoned = false;
+                        let st = hub_port_status(
+                            &ctx,
+                            &dma, &mmio, dboff, ir0, hs, hd, hp,
+                            &mut cur, &mut pcs, &mut ev_idx, &mut ev_cycle, &mut eaten, &mut abandoned,
+                            &mut hub_cc_logged, &mut probe_fails,
+                        );
+                        hub_posted = hub_posted.wrapping_add(1);
+                        if st.is_some() && !abandoned {
+                            hub_ok = hub_ok.wrapping_add(1);
+                        }
+                        topo.note(&ctx, hs, hp, st);
+                        // Each connected read on an untried port is said, as the disk's port says each
+                        // disconnected one: an arrival that never confirms is then visible, not silent.
+                        if st == Some(true) && hp < 64 && kh_tried[h] & (1u64 << hp) == 0 {
+                            ctx.log_fmt(format_args!(
+                                "xhci: hub slot {} port {} reads connected ({}/2)",
+                                hs, hp, kh_seen[h][hp as usize].saturating_add(1).min(2)));
+                        }
+                        if st.is_none() && hp < 64 && kh_seen[h][hp as usize] > 0 {
+                            ctx.log_fmt(format_args!(
+                                "xhci: hub slot {} port {} gave no answer{} - its arrival count starts again",
+                                hs, hp, if abandoned { " (the probe was abandoned)" } else { "" }));
+                        }
+                        match st {
+                            Some(true) if hp < 64 && kh_tried[h] & (1u64 << hp) == 0
+                                && { kh_seen[h][hp as usize] = kh_seen[h][hp as usize].saturating_add(1);
+                                     kh_seen[h][hp as usize] >= 2 } => {
+                                kh_tried[h] |= 1u64 << hp;
+                                ctx.log_fmt(format_args!(
+                                    "xhci: device arrived on hub slot {} port {} (a hub nothing was bound behind) - re-enumerating",
+                                    hs, hp));
+                                announce = true;
+                                kh_cur[h] = cur;
+                                kh_pcs[h] = pcs;
+                                break 'poll;
+                            }
+                            Some(false) if hp < 64 => {
+                                kh_seen[h][hp as usize] = 0;
+                                kh_tried[h] &= !(1u64 << hp);
+                            }
+                            None if hp < 64 => {
+                                kh_seen[h][hp as usize] = 0;
+                                if abandoned { kh_cur[h] = cur; kh_pcs[h] = pcs; continue 'hubs; }
+                            }
+                            _ => {}
+                        }
+                    }
+                    kh_cur[h] = cur;
+                    kh_pcs[h] = pcs;
+                }
+            }
             // The dongle's bulk IN: a completion another consumer dequeued and filed this pass, and a
             // `NOTE_BULK_IN` its driver's queue refused, sent again (U2b).
             if let Some(r) = radio.as_mut() {
@@ -5825,6 +6073,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // Drop it and re-scan. The filesystem above sees its next request fail and
                 // reacquires when the stick returns (§14.3) - the same recovery a service restart
                 // already asks of it.
+                disk_lost_carry |= msc::note_drop(&ctx, &disk);
                 disk = None;
                 announce = true;
                 continue 'reenum;
@@ -5903,9 +6152,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let now = wait::ticks(&ctx);
             for d in 0..ndev {
                 if !devs[d].is_mouse {
-                    kb_rep[d].poll(now, |ch| ctx.console_push(ch));
+                    kb_rep[d].poll(now, |ch| gs::driver::input::push(&ctx, ch));
                 }
             }
         }
+        // Every `break 'poll` lands here, ahead of a re-scan, with the disk still bound and answering.
+        disk_lost_carry |= msc::settle_before_rescan(&ctx, &dma, &mmio, dboff, ir0, &mut disk,
+                                                     &mut ev_idx, &mut ev_cycle, &mut eaten);
     } // end 'reenum loop
 }

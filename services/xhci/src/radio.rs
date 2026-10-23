@@ -16,7 +16,7 @@
 //! and a dongle has no interrupt endpoint to use the slice's last two pages for: the EP0 ring is the
 //! slice's EP0 page; the report page holds a control transfer's data stage, the bulk OUT rings and the
 //! bulk IN ring (`OUT_RINGS_AT`, `IN_RING_AT`); the interrupt-ring page is the bulk IN's receive buffer.
-//! A frame to send is staged in `DATA_BUF_OFF`, which only enumeration otherwise uses. No new arena, so no
+//! A frame to send is staged in the data buffer (`Parts::data_buf`), which only enumeration otherwise uses. No new arena, so no
 //! kernel change.
 //!
 //! **Matched by slot AND endpoint (U2b).** EP0 and the armed bulk IN share the dongle's slot, so every
@@ -27,7 +27,9 @@
 //! path files it, so the caller re-arms that endpoint.
 
 use godspeed as gs;
-use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed::driver::{Part, Registers};
+use crate::Parts;
+use godspeed_sdk::{Message, ServiceContext};
 use godspeed_sdk::service_context::usbdev;
 use godspeed_wifi::usbfn;
 use gs::driver::wait::{self, Budget};
@@ -35,7 +37,6 @@ use gs::driver::wait::{self, Budget};
 use crate::msc::POLL_GRANULARITY;
 use crate::{
     device_ctx_off, ep0_hw_dequeue, ep0_tr_off, EP0_RING_BYTES, int_tr_off, next_event_at, report_off, reset_endpoint, EvMail,
-    DATA_BUF_OFF,
     TRB_DATA_STAGE, TRB_LINK, TRB_NORMAL, TRB_SETUP_STAGE, TRB_SIZE, TRB_STATUS_STAGE, TRB_TRANSFER_EVENT,
 };
 
@@ -60,7 +61,7 @@ pub fn out_ring_at(i: usize) -> usize {
 }
 const _: () = assert!(usbfn::CONTROL_MAX <= OUT_RINGS_AT);
 const _: () = assert!(OUT_RINGS_AT + MAX_OUT * OUT_STRIDE <= IN_RING_AT);
-/// A frame is staged in `DATA_BUF_OFF`, one page.
+/// A frame is staged in the data buffer (`Parts::data_buf`), one page.
 const OUT_FRAME_MAX: usize = if usbfn::BULK_OUT_MAX < 0x1000 { usbfn::BULK_OUT_MAX } else { 0x1000 };
 /// How long one frame may take to send - `dwc2`'s budget for the same frame (`RADIO_TX_BUDGET_MS`).
 const OUT_MS: u64 = 200;
@@ -78,7 +79,7 @@ pub struct Eps {
 
 /// Walk a configuration descriptor at `off` (`len` bytes) for its bulk endpoints. Every length is from
 /// the device and distrusted: a zero length ends the walk, and nothing is read past `len`.
-pub fn parse_eps(dma: &Dma, off: usize, len: usize) -> Eps {
+pub fn parse_eps(dma: &Part, off: usize, len: usize) -> Eps {
     let mut e = Eps { in_addr: 0, in_mps: 0, outs: [0; 3], n_out: 0, out_mps: 0 };
     let mut i = 0usize;
     while i + 2 <= len {
@@ -232,8 +233,8 @@ const MAX_REPAIRS: u32 = 8;
 
 /// The controller state a radio request needs, gathered so the calls stay readable.
 pub struct Hc<'a> {
-    pub dma: &'a Dma,
-    pub mmio: &'a Mmio,
+    pub dma: &'a Parts,
+    pub mmio: &'a Registers,
     pub dboff: usize,
     pub ir0: usize,
     pub ctx_size: usize,
@@ -250,43 +251,43 @@ fn control_once(
     let buf = report_off(r.dev_idx);
     if !data_in {
         for (i, b) in data[..len].iter().enumerate() {
-            hc.dma.write8(buf + i, *b);
+            hc.dma.slices.write8(buf + i, *b);
         }
     }
     // Three TRBs and the Link that may follow them must fit before the page ends; otherwise the Link goes
     // at the cursor, the controller follows it to the page's start and flips its cycle with ours.
     let ring = ep0_tr_off(r.dev_idx);
     if r.cur + 4 * TRB_SIZE > RING_BYTES {
-        let bp = hc.dma.phys_at(ring);
-        hc.dma.write32(ring + r.cur, bp as u32);
-        hc.dma.write32(ring + r.cur + 4, (bp >> 32) as u32);
-        hc.dma.write32(ring + r.cur + 8, 0);
-        hc.dma.write32(ring + r.cur + 12, (TRB_LINK << 10) | (1 << 1) | r.pcs);
+        let bp = hc.dma.slices.phys_at(ring);
+        hc.dma.slices.write32(ring + r.cur, bp as u32);
+        hc.dma.slices.write32(ring + r.cur + 4, (bp >> 32) as u32);
+        hc.dma.slices.write32(ring + r.cur + 8, 0);
+        hc.dma.slices.write32(ring + r.cur + 12, (TRB_LINK << 10) | (1 << 1) | r.pcs);
         r.cur = 0;
         r.pcs ^= 1;
     }
     let t = ring + r.cur;
     // Setup: the 8-byte packet inline (IDT, bit 6), TRT 0 no data, 2 OUT, 3 IN.
     let trt = if len == 0 { 0 } else if data_in { 3 } else { 2 };
-    hc.dma.write32(t, u32::from_le_bytes([setup[0], setup[1], setup[2], setup[3]]));
-    hc.dma.write32(t + 4, u32::from_le_bytes([setup[4], setup[5], setup[6], setup[7]]));
-    hc.dma.write32(t + 8, 8);
-    hc.dma.write32(t + 12, r.pcs | (1 << 6) | (TRB_SETUP_STAGE << 10) | (trt << 16));
+    hc.dma.slices.write32(t, u32::from_le_bytes([setup[0], setup[1], setup[2], setup[3]]));
+    hc.dma.slices.write32(t + 4, u32::from_le_bytes([setup[4], setup[5], setup[6], setup[7]]));
+    hc.dma.slices.write32(t + 8, 8);
+    hc.dma.slices.write32(t + 12, r.pcs | (1 << 6) | (TRB_SETUP_STAGE << 10) | (trt << 16));
     let mut off = t + TRB_SIZE;
     if len > 0 {
-        let dp = hc.dma.phys_at(buf);
-        hc.dma.write32(off, dp as u32);
-        hc.dma.write32(off + 4, (dp >> 32) as u32);
-        hc.dma.write32(off + 8, len as u32);
-        hc.dma.write32(off + 12, r.pcs | (TRB_DATA_STAGE << 10) | ((data_in as u32) << 16));
+        let dp = hc.dma.slices.phys_at(buf);
+        hc.dma.slices.write32(off, dp as u32);
+        hc.dma.slices.write32(off + 4, (dp >> 32) as u32);
+        hc.dma.slices.write32(off + 8, len as u32);
+        hc.dma.slices.write32(off + 12, r.pcs | (TRB_DATA_STAGE << 10) | ((data_in as u32) << 16));
         off += TRB_SIZE;
     }
     // Status: the direction opposite the data stage, IN when there is none; Interrupt On Completion.
     let status_in = len == 0 || !data_in;
-    hc.dma.write32(off, 0);
-    hc.dma.write32(off + 4, 0);
-    hc.dma.write32(off + 8, 0);
-    hc.dma.write32(off + 12, r.pcs | (1 << 5) | (TRB_STATUS_STAGE << 10) | ((status_in as u32) << 16));
+    hc.dma.slices.write32(off, 0);
+    hc.dma.slices.write32(off + 4, 0);
+    hc.dma.slices.write32(off + 8, 0);
+    hc.dma.slices.write32(off + 12, r.pcs | (1 << 5) | (TRB_STATUS_STAGE << 10) | ((status_in as u32) << 16));
     r.cur = off + TRB_SIZE - ring;
     // THE LINK GOES IN NOW, not when the next transfer finds no room: written before the doorbell, the
     // controller follows it while it is busy with this TD and comes to rest at the ring's start, never ON
@@ -298,11 +299,11 @@ fn control_once(
     // proof. The FIX is confirmed: with the Link written here the bring-up passed the wrap on the Pi 4
     // (`docs/wifi-usb.md` 27). The check above stays for a cursor that starts near the end.
     if r.cur + 4 * TRB_SIZE > RING_BYTES {
-        let bp = hc.dma.phys_at(ring);
-        hc.dma.write32(ring + r.cur, bp as u32);
-        hc.dma.write32(ring + r.cur + 4, (bp >> 32) as u32);
-        hc.dma.write32(ring + r.cur + 8, 0);
-        hc.dma.write32(ring + r.cur + 12, (TRB_LINK << 10) | (1 << 1) | r.pcs);
+        let bp = hc.dma.slices.phys_at(ring);
+        hc.dma.slices.write32(ring + r.cur, bp as u32);
+        hc.dma.slices.write32(ring + r.cur + 4, (bp >> 32) as u32);
+        hc.dma.slices.write32(ring + r.cur + 8, 0);
+        hc.dma.slices.write32(ring + r.cur + 12, (TRB_LINK << 10) | (1 << 1) | r.pcs);
         r.cur = 0;
         r.pcs ^= 1;
     }
@@ -343,7 +344,7 @@ fn finish(hc: &Hc, r: &Radio, data: &mut [u8], len: usize, data_in: bool, cc: u3
     if data_in && (cc == 1 || cc == 13) {
         let buf = report_off(r.dev_idx);
         for (i, b) in data[..len].iter_mut().enumerate() {
-            *b = hc.dma.read8(buf + i);
+            *b = hc.dma.slices.read8(buf + i);
         }
     }
     Some(cc)
@@ -363,7 +364,7 @@ fn repair(
     r.repairs += 1;
     let ring = ep0_tr_off(r.dev_idx);
     for off in (0..RING_BYTES).step_by(4) {
-        hc.dma.write32(ring + off, 0);
+        hc.dma.slices.write32(ring + off, 0);
     }
     if !reset_endpoint(
         ctx, hc.dma, hc.mmio, hc.dboff, hc.ir0, r.slot, 1, ring, device_ctx_off(r.dev_idx), hc.ctx_size,
@@ -383,7 +384,7 @@ fn repair(
 
 /// EP0's state field (xHCI 6.2.3): 0 disabled, 1 running, 2 halted, 3 stopped, 4 error.
 fn ep0_state(hc: &Hc, r: &Radio) -> u32 {
-    hc.dma.read32(device_ctx_off(r.dev_idx) + hc.ctx_size) & 0x7
+    hc.dma.slices.read32(device_ctx_off(r.dev_idx) + hc.ctx_size) & 0x7
 }
 
 /// `OP_CONTROL` / `OP_CONTROL_ONCE`, as `dwc2` answers them: `p` is `[op, setup(8), data out...]`, the
@@ -482,7 +483,7 @@ pub fn serve(
         return Served::Done;
     }
     let op = p.first().copied().unwrap_or(0);
-    if !(usbfn::OP_INFO..=usbfn::OP_SYNC).contains(&op) {
+    if !usbfn::is_request(op) {
         return Served::NotOurs;
     }
     let Some(reply) = gs::ipc::take_sent_cap(ctx) else { return Served::Done };
@@ -591,7 +592,7 @@ pub fn answer_absent(ctx: &ServiceContext, msg: &Message) -> bool {
         return true;
     }
     let op = p.first().copied().unwrap_or(0);
-    if !(usbfn::OP_INFO..=usbfn::OP_SYNC).contains(&op) {
+    if !usbfn::is_request(op) {
         return false;
     }
     if let Some(reply) = gs::ipc::take_sent_cap(ctx) {
@@ -680,7 +681,7 @@ fn bulk_in_request(
         Rx::Held(len) => {
             let buf = int_tr_off(r.dev_idx);
             for (i, b) in out[2..2 + len].iter_mut().enumerate() {
-                *b = hc.dma.read8(buf + i);
+                *b = hc.dma.slices.read8(buf + i);
             }
             n = 2 + len;
             r.rx = Rx::Off;
@@ -708,19 +709,19 @@ fn bulk_in_request(
 /// eagerly, as EP0's is (the VL805, `control_once`).
 fn arm(hc: &Hc, r: &mut Radio) {
     let ring = report_off(r.dev_idx) + IN_RING_AT;
-    let bp = hc.dma.phys_at(int_tr_off(r.dev_idx));
+    let bp = hc.dma.slices.phys_at(int_tr_off(r.dev_idx));
     let t = ring + r.in_cur;
-    hc.dma.write32(t, bp as u32);
-    hc.dma.write32(t + 4, (bp >> 32) as u32);
-    hc.dma.write32(t + 8, usbfn::BULK_IN_MAX as u32);
-    hc.dma.write32(t + 12, r.in_pcs | (1 << 2) | (1 << 5) | (TRB_NORMAL << 10));
+    hc.dma.slices.write32(t, bp as u32);
+    hc.dma.slices.write32(t + 4, (bp >> 32) as u32);
+    hc.dma.slices.write32(t + 8, usbfn::BULK_IN_MAX as u32);
+    hc.dma.slices.write32(t + 12, r.in_pcs | (1 << 2) | (1 << 5) | (TRB_NORMAL << 10));
     r.in_cur += TRB_SIZE;
     if r.in_cur + 2 * TRB_SIZE > IN_RING_BYTES {
-        let base = hc.dma.phys_at(ring);
-        hc.dma.write32(ring + r.in_cur, base as u32);
-        hc.dma.write32(ring + r.in_cur + 4, (base >> 32) as u32);
-        hc.dma.write32(ring + r.in_cur + 8, 0);
-        hc.dma.write32(ring + r.in_cur + 12, (TRB_LINK << 10) | (1 << 1) | r.in_pcs);
+        let base = hc.dma.slices.phys_at(ring);
+        hc.dma.slices.write32(ring + r.in_cur, base as u32);
+        hc.dma.slices.write32(ring + r.in_cur + 4, (base >> 32) as u32);
+        hc.dma.slices.write32(ring + r.in_cur + 8, 0);
+        hc.dma.slices.write32(ring + r.in_cur + 12, (TRB_LINK << 10) | (1 << 1) | r.in_pcs);
         r.in_cur = 0;
         r.in_pcs ^= 1;
     }
@@ -793,7 +794,7 @@ fn repair_in(
     r.in_repairs += 1;
     let ring = report_off(r.dev_idx) + IN_RING_AT;
     for off in (0..IN_RING_BYTES).step_by(4) {
-        hc.dma.write32(ring + off, 0);
+        hc.dma.slices.write32(ring + off, 0);
     }
     if !reset_endpoint(
         ctx, hc.dma, hc.mmio, hc.dboff, hc.ir0, r.slot, r.in_dci, ring, device_ctx_off(r.dev_idx), hc.ctx_size,
@@ -807,7 +808,7 @@ fn repair_in(
 }
 
 /// `OP_BULK_OUT`: `p` is `[op, out, transfer...]`, `out` the OUT endpoint's position in the configuration
-/// descriptor. The frame is staged in `DATA_BUF_OFF`, one Normal TRB queued on that endpoint's ring (the
+/// descriptor. The frame is staged in the data buffer (`Parts::data_buf`), one Normal TRB queued on that endpoint's ring (the
 /// Link written eagerly), and its completion waited for, up to `OUT_MS` - one frame at a time, as `dwc2`
 /// sends. A failed or unanswered transfer leaves the endpoint repaired (its ring cleared, the endpoint
 /// reset to the ring's start) before the status goes back, so the next frame starts clean; a TD that never
@@ -823,24 +824,24 @@ fn bulk_out(
         return usbfn::ST_BAD_REQUEST;
     }
     for (i, &b) in data.iter().enumerate() {
-        hc.dma.write8(DATA_BUF_OFF + i, b);
+        hc.dma.data_buf.write8(i, b);
     }
     let dci = r.out_dci[idx];
     let ring = report_off(r.dev_idx) + out_ring_at(idx);
-    let bp = hc.dma.phys_at(DATA_BUF_OFF);
+    let bp = hc.dma.data_buf.phys();
     let t = ring + r.out_cur[idx];
-    hc.dma.write32(t, bp as u32);
-    hc.dma.write32(t + 4, (bp >> 32) as u32);
-    hc.dma.write32(t + 8, data.len() as u32);
-    hc.dma.write32(t + 12, r.out_pcs[idx] | (1 << 5) | (TRB_NORMAL << 10));
+    hc.dma.slices.write32(t, bp as u32);
+    hc.dma.slices.write32(t + 4, (bp >> 32) as u32);
+    hc.dma.slices.write32(t + 8, data.len() as u32);
+    hc.dma.slices.write32(t + 12, r.out_pcs[idx] | (1 << 5) | (TRB_NORMAL << 10));
     r.out_cur[idx] += TRB_SIZE;
     if r.out_cur[idx] + 2 * TRB_SIZE > OUT_RING_BYTES {
-        let base = hc.dma.phys_at(ring);
+        let base = hc.dma.slices.phys_at(ring);
         let l = ring + r.out_cur[idx];
-        hc.dma.write32(l, base as u32);
-        hc.dma.write32(l + 4, (base >> 32) as u32);
-        hc.dma.write32(l + 8, 0);
-        hc.dma.write32(l + 12, (TRB_LINK << 10) | (1 << 1) | r.out_pcs[idx]);
+        hc.dma.slices.write32(l, base as u32);
+        hc.dma.slices.write32(l + 4, (base >> 32) as u32);
+        hc.dma.slices.write32(l + 8, 0);
+        hc.dma.slices.write32(l + 12, (TRB_LINK << 10) | (1 << 1) | r.out_pcs[idx]);
         r.out_cur[idx] = 0;
         r.out_pcs[idx] ^= 1;
     }
@@ -879,7 +880,7 @@ fn bulk_out(
         ctx.log_fmt(format_args!(
             "xhci: the WiFi dongle's bulk OUT {} failed - cc={} (0 = no completion within {} ms), {} byte(s); endpoint state {} ({} so far)",
             idx, cc.unwrap_or(0), OUT_MS, data.len(),
-            hc.dma.read32(device_ctx_off(r.dev_idx) + dci as usize * hc.ctx_size) & 0x7, r.tx_failed));
+            hc.dma.slices.read32(device_ctx_off(r.dev_idx) + dci as usize * hc.ctx_size) & 0x7, r.tx_failed));
     }
     if !repair_out(ctx, hc, r, idx, ev_idx, ev_cycle, cmd_idx) && r.tx_failed <= 3 {
         ctx.log("xhci: the WiFi dongle's bulk OUT could not be repaired - the next frame may not go out");
@@ -900,7 +901,7 @@ fn repair_out(
     r.out_repairs += 1;
     let ring = report_off(r.dev_idx) + out_ring_at(idx);
     for off in (0..OUT_RING_BYTES).step_by(4) {
-        hc.dma.write32(ring + off, 0);
+        hc.dma.slices.write32(ring + off, 0);
     }
     if !reset_endpoint(
         ctx, hc.dma, hc.mmio, hc.dboff, hc.ir0, r.slot, r.out_dci[idx], ring, device_ctx_off(r.dev_idx),

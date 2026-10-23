@@ -5,7 +5,7 @@
 //! peripheral + 0x30_0000. **The kernel no longer grants that window** (the EMMC is the Pi 2's boot card;
 //! `arch/arm`'s `map_fixed_device` dropped it on 2026-10-03), and this backend is not compiled in; a board
 //! that used it would need a device kind and a `map_fixed_device` entry. When granted, the driver reached the
-//! registers through the SDK `Mmio` wrapper - **no `unsafe` in the service** (§18.1/§18.2).
+//! registers through `gs::driver`'s `Registers` - **no `unsafe` in the service** (§18.1/§18.2).
 //!
 //! PIO, not DMA: the CPU reads/writes each 512-byte block word-by-word through `EMMC_DATA`. This
 //! sidesteps the two ARM blockers - DMA cache coherence (SEC-28) and the missing device-IRQ-to-userspace
@@ -15,7 +15,8 @@
 //! raspi tutorial `sd.c`) + the BCM2835 peripherals datasheet section 5 (EMMC); no code copied.
 
 use godspeed as gs;
-use godspeed_sdk::{Message, Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed_sdk::{Message, ServiceContext};
 
 // Register offsets from the EMMC base.
 const BLKSIZECNT: usize = 0x04;
@@ -80,7 +81,7 @@ fn spin() {
 }
 
 struct Sd<'a> {
-    m: &'a Mmio,
+    m: &'a Registers,
     rca: u32,
     sdhc: bool,
     sectors: u64,
@@ -471,9 +472,9 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: gs::cap::Cap) {
 }
 
 /// Entry point: initialise the EMMC + serve block I/O to `fs`.
-pub fn run(ctx: &ServiceContext, mmio: &Mmio) -> ! {
+pub fn run(ctx: &ServiceContext, mmio: &Registers) -> ! {
     let mut sd = Sd { m: mmio, rca: 0, sdhc: false, sectors: 0,
-                      base_clock: ctx.emmc_base_clock_hz(), last_int: core::cell::Cell::new(0) };
+                      base_clock: gs::driver::device::emmc_base_clock_hz(&ctx), last_int: core::cell::Cell::new(0) };
     if !sd.init(ctx) {
         ctx.log("block-driver: no usable SD card - serving errors so fs never hangs");
         loop {

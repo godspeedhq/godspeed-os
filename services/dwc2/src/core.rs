@@ -2,7 +2,7 @@
 //! Core bring-up: soft reset, host mode, FIFO sizing, root-port power and reset.
 //!
 //! Slice 1a of the port (`docs/arm32-usb-userspace.md`). This is `dwc2::init()`'s first half, moved
-//! out of ring 0 and rewritten against the SDK's safe `Mmio` wrapper - so the service reaches its
+//! out of ring 0 and rewritten against a safe register wrapper (now `gs::driver`'s `Registers`) - so the service reaches its
 //! registers with no `unsafe` anywhere in `services/` (§18.2), where the kernel version needed a
 //! raw-pointer `read_volatile`/`write_volatile` pair.
 //!
@@ -13,7 +13,8 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed_sdk::ServiceContext;
 
 use crate::regs::*;
 
@@ -30,7 +31,7 @@ use crate::regs::*;
 ///
 /// The wait is `gs::driver::wait` (`docs/driver-library.md`). Built by hand from `duration_cycles` it
 /// floored to one counter tick on an uncalibrated clock, so every core reset gave up after one look.
-fn wait_until(ctx: &ServiceContext, mmio: &Mmio, off: usize, mask: u32, want_set: bool, ms: u64) -> bool {
+fn wait_until(ctx: &ServiceContext, mmio: &Registers, off: usize, mask: u32, want_set: bool, ms: u64) -> bool {
     wait::until(ctx, Budget::ms(ms), || ((mmio.read32(off) & mask) != 0) == want_set).is_ok()
 }
 
@@ -38,7 +39,7 @@ fn wait_until(ctx: &ServiceContext, mmio: &Mmio, off: usize, mask: u32, want_set
 ///
 /// Reported loudly and treated as fatal by the caller: a driver that cannot find its controller must
 /// say so rather than proceed to program whatever is at that address (invariant 12).
-pub fn identify(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
+pub fn identify(ctx: &ServiceContext, mmio: &Registers) -> Option<u32> {
     let id = mmio.read32(GSNPSID);
     // The Synopsys OTG core IDs read "OT2"/"OT3" in the high half (0x4F54_xxxx).
     if (id & 0xFFFF_F000) != 0x4F54_2000 && (id & 0xFFFF_F000) != 0x4F54_3000 {
@@ -55,7 +56,7 @@ pub fn identify(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
 /// Returns false if any step timed out. Each timeout is reported individually, because "the core did
 /// not reset" and "the core never entered host mode" are different faults with different causes, and
 /// a single "init failed" would merge them.
-pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
+pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Registers) -> bool {
     let mut ok = true;
 
     // 1. Mask + disable global interrupts while we reset.
@@ -227,13 +228,20 @@ pub fn reset_and_host_mode(ctx: &ServiceContext, mmio: &Mmio) -> bool {
     // 6. DMA mode. The BCM2836 core is internal-DMA capable and this driver depends on it: the CPU
     //    never touches a FIFO, which is why only one page of registers is mapped and the data FIFO
     //    window at 0x1000 is deliberately absent from the grant.
-    mmio.write32(GAHBCFG, mmio.read32(GAHBCFG) | GAHBCFG_DMAEN);
+    //
+    //    THE BURST LENGTH IS THE SILICON'S, as Linux sets it for this core (`GAHBCFG_HBSTLEN_BCM`). This
+    //    driver left it at the reset value, single transfers, and on the Pi 2 a download at 180 KiB/s with
+    //    the stick writing hung the AHB master twice, at about 5%: the network's receive channel stopped
+    //    part way through its DMA (3072 of 4096 bytes in) and every other channel with it (2026-10-22).
+    //    Whether the burst length is why is what the next card shows; it is recorded as Linux's value,
+    //    not as a fix.
+    mmio.write32(GAHBCFG, (mmio.read32(GAHBCFG) & !GAHBCFG_HBSTLEN_MASK) | GAHBCFG_HBSTLEN_BCM | GAHBCFG_DMAEN);
 
     ok
 }
 
 /// Power the root port and reset whatever is attached. Returns the settled HPRT, or `None` on timeout.
-pub fn port_bring_up(ctx: &ServiceContext, mmio: &Mmio) -> Option<u32> {
+pub fn port_bring_up(ctx: &ServiceContext, mmio: &Registers) -> Option<u32> {
     // HPRT has write-1-to-clear bits mixed in with control bits, so every write must mask the W1C
     // set off first or reading-modifying-writing silently acknowledges events. This is the register
     // that punishes a naive read-modify-write.
@@ -293,7 +301,7 @@ pub fn speed_name(hprt: u32) -> &'static str {
 /// Safe to call from here because this service is SINGLE-THREADED: no other transfer can be mid-flight
 /// while a transmit is executing, and the receive path uses the RX FIFO, not this one. The AHB-idle
 /// wait is required by the programming guide and is the one precondition that is not structural.
-pub fn flush_np_tx_fifo(ctx: &ServiceContext, mmio: &Mmio) -> bool {
+pub fn flush_np_tx_fifo(ctx: &ServiceContext, mmio: &Registers) -> bool {
     if !wait_until(ctx, mmio, GRSTCTL, GRSTCTL_AHBIDLE, true, 100) {
         ctx.log("dwc2-svc: WARN AHB not idle - skipping TX FIFO flush rather than flushing mid-burst");
         return false;

@@ -53,8 +53,9 @@ pub const OP_CONTROL_ONCE: u8 = 0x22;
 /// one, and the host's IN armed again; `ST_OK` with no bytes when it holds none, which also arms the IN if it
 /// was not armed - so the driver's first ask, once the chip's receive is set up, is what starts receiving.
 /// The host keeps one IN armed in the background and takes its completion on the USB interrupt, then sends
-/// `NOTE_BULK_IN`; it does not arm again until the transfer is collected, so the chip holds what arrives
-/// meanwhile and nothing is dropped between the two. `ST_FAILED` when the radio has no bulk IN endpoint, or the host could not repair it
+/// `NOTE_BULK_IN`. `xhci` does not arm again until the transfer is collected, so the chip holds what arrives
+/// meanwhile; `dwc2` arms again at once into a ring of eight (`rtl::RX_SLOTS`), and holds the chip only when
+/// all eight wait. Either way nothing is dropped between the host and the driver. `ST_FAILED` when the radio has no bulk IN endpoint, or the host could not repair it
 /// after a failed transfer.
 pub const OP_BULK_IN: u8 = 0x23;
 /// `[op, out, transfer...]` -> `[op, status]`: one bulk OUT transfer to the radio - a frame with the chip's
@@ -79,8 +80,27 @@ pub const OP_SYNC: u8 = 0x25;
 
 /// `[NOTE_BULK_IN]`, sent BY the host TO the driver, no reply expected: a bulk IN transfer is held, ask
 /// `OP_BULK_IN`. Sent with `try_send`; one the driver's full queue refused is sent again on the host's next
-/// pass, because the host arms nothing until the transfer is collected and a lost notice would stop receive.
+/// pass, because a lost notice would stop receive: `xhci` arms nothing until the transfer is collected, and
+/// `dwc2`'s ring is emptied only as the driver is told it holds something.
 pub const NOTE_BULK_IN: u8 = 0x2E;
+
+/// `[op]` -> `[op, status]`: REPLUG the radio - reset its port and bind it afresh, what unplugging and plugging
+/// it back does short of cutting its power. For a chip that has stopped answering its driver: on the Pi 2 the
+/// RTL8188CUS's first firmware block can fail on the bus at boot, and every control read after it is NAKed
+/// until the dongle is replugged (2026-10-22). `ST_OK`: the host will, after answering - it reports the radio
+/// gone and then bound again, so the supervisor stops this driver and starts a fresh one, as for a real
+/// replug. `ST_FAILED`: it has already done so as often as its bound allows, and says so. `ST_BAD_REQUEST`:
+/// a host that cannot (`xhci`, which does not take it yet).
+pub const OP_REPLUG: u8 = 0x27;
+
+/// Is `op` a request a driver sends its host - `OP_INFO` to `OP_SYNC`, and `OP_REPLUG`? Every host routes by
+/// this and by nothing else, so a new op cannot fall into another protocol's range. `OP_REPLUG` did: `dwc2`
+/// routed `OP_INFO..=OP_SYNC` here and everything above 0x10 to the network, whose answer to an op it does not
+/// know is `[op, 0]` - and 0 is `ST_OK`, so a driver was told its dongle was being reset and nothing was
+/// (Pi 2, 2026-10-22).
+pub fn is_request(op: u8) -> bool {
+    (OP_INFO..=OP_SYNC).contains(&op) || op == OP_REPLUG
+}
 
 // 0x29 is NOT free in this range: `dwc2` receives the USB interrupt as the one-byte message `[0x29]`, told
 // apart from a request only by carrying no reply cap, so no op may take that value. Nor is 0x26: it is

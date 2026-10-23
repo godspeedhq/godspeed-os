@@ -55,7 +55,8 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   this arch (`arch/arm/mod.rs`), because no frame passes through the kernel any more. **The device it
   drives is the Pi 2's onboard LAN9514 (`smsc95xx`) and nothing else**: DHCP, ARP and internet ping all
   work on real hardware, with RX **client-polled**: a bulk-IN
-  is kept armed, and `rx()` harvests the completed burst and re-arms it when a client asks for frames.
+  is kept armed, and `rx()` harvests the completed burst and re-arms it when a client asks for frames
+  and on the USB interrupt.
   The DWC2 core auto-retries NAKs in hardware, so an idle device costs nothing.
 
   **There is no network under QEMU on this port.** QEMU's `usb-net` is a CDC-ECM device, and the
@@ -75,7 +76,11 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   the host-channel interrupt is enabled at the device), and interrupts now do arrive - but they harvest
   almost nothing, because the client poll path reaches each completion first. Receive is therefore still
   poll-driven in practice, and the honest claim is the one above. The `USB IRQ` counters (once `net IRQ`) report it
-  rather than leaving it to be inferred. Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
+  rather than leaving it to be inferred.
+
+  *(Note 2026-10-22: under a download that is no longer true. On 2026-10-21 the interrupt harvested often
+  enough to overrun a receive queue of one burst, which lost 169 of 600 frames; the queue holds four now,
+  and a burst is taken only when it fits (`backlog/93` item 12, the Pi 2).)* Link state is read from the PHY (MII BMSR), so an unplugged cable reports as unplugged.
 - **Multiple USB devices coexist:** `enumerate_downstream` walks *every* hub port, gives each device a
   distinct address, and configures all of them; the single DWC2 host channel is time-shared by having each
   transfer carry a `Target` (address / max-packet / speed). Hot-plug in both directions is watched through

@@ -1,7 +1,11 @@
 # The driver library: `gs::driver`
 
-**Status: adopted 2026-10-02, from the operator's design guidance. Three mechanisms built (`wait`,
-`delay`, `irq`); nine drivers converted across all four ports. "Current state" below says what exists; the
+**Status: adopted 2026-10-02, from the operator's design guidance. Five mechanisms built (`wait`,
+`delay`, `irq`, and since 2026-10-19 the two grants, `registers` and `arena` with its layout); nine drivers
+converted to the first three across all four ports; and since 2026-10-19 every compiled driver on the grants
+(step 3), the one-way ratchet holding a new driver to them, and since 2026-10-20 every compiled driver's
+arena laid out by name - no driver reaches its arena at an offset from the arena's start any more; the
+offsets that remain are within a named, bounds-checked part. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -46,7 +50,7 @@ test for `gs` is whether a contributor must NAME a thing and rely on it. A drive
 window and its DMA arena, so those types come through `gs::driver` too, over the SDK's `Mmio` and `Dma`;
 the end state is no service or driver crate depending on the SDK directly (`backlog/71`).
 
-## Current state (2026-10-09)
+## Current state (2026-10-22)
 
 What exists now. The dated steps after the method sections are the record of how each piece got here,
 and why; read them for the reasoning, not to find out what the library contains.
@@ -73,17 +77,43 @@ and why; read them for the reasoning, not to find out what the library contains.
 - **`irq`** - waiting for a device's interrupt on the endpoint its clients also send to. `Irq::granted`,
   `routed`, `seen`; `wait(budget)` returns `Interrupt`, `Request(message)` or `Timeout`, so a request is
   handed back to be served and never dropped; `rearm` re-opens a level-triggered line (a no-op for MSI).
-  With no interrupt routed the same loop is a timed wait that still serves requests. Its users are
-  `audio-driver` (step 2) and `pwm-audio`, which runs on the no-interrupt path. `ehci` and `dwc2` re-arm
-  through it (2026-10-09): each used to unmask a vector NUMBER of its own, and each number was proven
-  equal to the one the kernel grants it (0x29, `hw_irqs_for`), so `Irq::granted(..).rearm` is the same
-  unmask without a driver naming a vector. `xhci` reads its MSI vector through `Irq::vector`. Their WAIT
-  loops are still hand-written - moving those onto `Irq::wait` changes a driver's structure and is owed
-  its own hardware card on each board.
+  With no interrupt routed the same loop is a timed wait that still serves requests. `take` (2026-10-22)
+  is the same sorting without blocking, for a driver that drains its endpoint in a bounded loop. Its
+  users are `audio-driver` (step 2), `pwm-audio`, which runs on the no-interrupt path, and since step 4
+  (2026-10-22) `ehci`, `dwc2` and `xhci`, whose waits were hand-written until then: every driver in `services/` that
+  takes an interrupt now waits for it through `irq`. The teaching example `examples/driver-skeleton` does
+  not yet: its serve loop still receives with `gs::ipc::recv` and tells the interrupt apart with a stub
+  `is_interrupt` of its own (recorded by Audit 23, `audits/documentation-audit.md`).
 
-**Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f), `sdk/wifi`
-(1d), `dwc2` (1g, 1h), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l - **not yet
+- **`registers` and `arena`** (step 3, 2026-10-19) - the two grants a driver names and relies on.
+  `registers(ctx)` is the device's register window (`Registers`: `read8`..`read64`, `write8`..`write64`,
+  `len`); `arena(ctx)` is its DMA arena (`Arena`: the same accesses, `phys_at`, `zero`, `len`). Both answer
+  `None` when the spawn granted none. `Arena::layout` TAKES the arena and hands out named `Part`s
+  (`Layout::take(name, len, align)`), each aligned on its PHYSICAL address, never overlapping, every access
+  bounded to the part and a part that does not fit refused with its name (`NoRoom`). The placement is a
+  pure function pinned by host tests (`cargo test --lib` in `stdlib/rust`). Both wrap the SDK's audited
+  `Mmio` and `Dma`, so no `unsafe` moved. **Every compiled driver takes its grants this way** (2026-10-19),
+  and `scripts/one_way_check.py` counts `ctx.mmio()`, `xhci_mmio`, `ehci_mmio` and `dma_region()`, so a new
+  driver is held to zero of them from its first line.
+- **`input`, `power` and `device`** (step 5, 2026-10-22) - the rest of what a driver asked the SDK for,
+  each the SDK's own call wrapped. `input::push` and `input::ready` hand keystrokes to the console and say
+  input is up (`CONSOLE_PUSH`); `power::set` cuts and restores the granted device's power (`DevicePower`);
+  `device::board_mac`, `nic_vendor_device`, `emmc_base_clock_hz` and `pci_cfg_read` are what the kernel
+  knows about a device that the driver cannot read for itself. `gs::program::mode` beside them is the mode
+  a program was started in. All counted by `one_way_check.py`, every caller at zero.
+
+**Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
+(1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet
 verified on hardware**). `audio-driver` and `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
+
+**What a driver still takes from the SDK, and why it is not here.** Two things, neither a hardware call:
+
+- **`godspeed_sdk::hid`** - the USB boot-protocol keyboard and mouse decoding, key repeat and the
+  Ctrl+Alt+Del signal that `xhci`, `ehci` and `dwc2` share. It describes a device CLASS, so it is a domain
+  library (like `sdk/wifi`) and never `gs::driver`. Its home is the SDK today.
+- **`ServiceContext` and `Message`** - every service imports them from the SDK, drivers or not. `gs`
+  re-exports `ServiceContext` already; moving every crate's imports is the whole-tree end state of
+  `backlog/71`, not a driver's.
 
 **Left by hand, each with its reason in its step.**
 
@@ -91,7 +121,7 @@ verified on hardware**). `audio-driver` and `pwm-audio` were written on the libr
 |---|---|---|---|
 | `dwc2`'s complete-split NYET retry | Pi 2 | a retry count of sleeps on the keyboard path | 1g |
 | `dwmac`'s `rgmii_loopback_sweep` | VisionFive | compiled but never run | 1i |
-| `block-driver` `sdhci.rs` | none | not compiled | 1b |
+| `block-driver` `sdhci.rs` | none | not compiled, so its count-bounded loops stay (1b); its window type moved to `Registers` on 2026-10-20, checked by compiling it once for the Pi 2 and taking the `mod` line back out | 1b, 3 |
 
 **Open gaps, recorded rather than hidden.**
 
@@ -632,3 +662,197 @@ short of the tone, and that is a hypothesis until the position at each interrupt
 **Not done: `xhci`, `ehci` and `dwc2` are still hand-written.** Converting them is the step that proves
 the library replaced its sources rather than joined them, and each needs its own hardware (the T630
 and the Pi 2), so it is its own work, one driver per step.
+
+## Step 3: the grants - `registers`, `arena` and its layout (2026-10-19)
+
+**Why now.** `backlog/71` put `gs::driver` inside the v1 promise, grow-only, and named the end of step 2:
+no driver reaching past the standard library for its grants. Eleven drivers still took them with the
+SDK's `ctx.mmio()` and `ctx.dma_region()`, 22 call sites, and the CLI's `driver` template did too.
+
+**What was repeated, measured.** Across those drivers: about 640 arena accesses, 107 `phys_at` calls
+turning an offset into the address a device is given, 33 hand-kept offset constants and TWO asserts
+between them checking that nothing overlapped. The day this was built, the RTL8168's 24 receive buffers
+filled its arena to the last 4 KiB and one of those two asserts was all that kept its counters out of a
+buffer. That is a mechanism written out by hand seven times, which is this library's test for membership.
+
+**Decided by the operator, 2026-10-19.**
+
+- **The names are what the grants are to a driver author: `Registers` and `Arena`.** Not `Window` (the
+  kernel's word for how a grant is made) and not `Mmio` / `Dma` (the SDK's, which would make the
+  mechanism's name the promise).
+- **The arena comes with its layout, on this branch,** rather than after every driver had its grants.
+
+**The decisions inside it, and why.**
+
+- **Alignment is of the PHYSICAL address**, because that is what the device checks. On a page-aligned
+  arena the two agree up to 4 KiB; past that, or on an arena that is not page-aligned, only the physical
+  one is right. A host test pins an arena whose base is only 64-aligned.
+- **`layout` takes the arena.** Once laid out, it is reached only through its parts, so the parts are the
+  only description of where things are. `Arena` is not `Copy` for the same reason; a `Part` is, because
+  copies of a part are views of the same bytes.
+- **Every part access is bounded to the part,** and an access past it ends the driver naming the part -
+  as an access past the arena always did (SEC-4), one boundary earlier. A ring index running off its
+  ring is caught at the ring.
+- **A refusal is a sentence the driver can log as it stands**: ``the arena (64 KiB) has no room for
+  `tally` (64 bytes, aligned to 64, after 64 KiB)``. What to do then stays the driver's.
+- **A physical end that would wrap the address space is refused.** No real grant looks like that; the
+  host test that found the gap is why the check exists.
+
+**AHCI first** (x86; GENET on the Pi 4 is the second, unlike, driver). Its four parts - the command list,
+the received FIS, the command table and the data - are taken with AHCI's alignments and land exactly
+where its hand-placed offsets were: `command list at 0x0, received FIS at 0x400, command table at 0x500,
+data at 0x1000 (36864 of 65536 bytes)`, logged once at start. One check was added while converting it:
+a command's byte count is now checked against the data part before the PRDT tells the device to move
+that many, because nothing on the CPU side can stop the device once it is told. QEMU: `osdev test files`
+270/0, `fs-restart` 11/0, `fs-ioretry` 5/0, `fs-journal` 11/0. Seen on the T630 at `27201c83` (the layout line
+above, the disk mounted and a `godspeed fetch` written to it); owed: a card on the Wyse.
+
+**GENET second** (the Pi 4, `4e0c733d`). Its arena is two page-aligned parts, the receive buffers at 0x0 and
+the transmit buffers at 0xC000 of its 64 KiB, where the hand-placed offsets put them; the layout's refusal
+replaces the const assert that checked they fit, and an arena that does not fit is said with the part's name
+and served as no arena at all. Owed: a card on the Pi 4.
+
+**The e1000 and the RTL8168 third** (`nic-driver`, one arena shape for both). Five parts - the TX ring, one
+TX frame buffer, the RX ring, the 24 RX buffers and the tally - page-aligned but the tally (64), landing where
+the offsets were: `tx ring at 0x0, tx buffer at 0x1000, rx ring at 0x2000, rx buffers at 0x3000, tally at
+0xf000 (61504 of 65536 bytes)`, logged once. The assert that the buffers and the tally fit went with the
+offsets, and four entries left Commandment III's duplicate-constant debt with them (`dwmac` keeps its own).
+QEMU (the e1000): `osdev test download` 13/0, `godspeed` 166/0, `shell` 276/0. Owed: the RTL8168 on the T630
+and the Wyse.
+
+**`audio-driver` fourth.** Four parts at HDA's 128-byte alignment, the sound page-aligned: `CORB at 0x0, RIRB
+at 0x400, buffer descriptors at 0xc00, sound at 0x1000 (69632 of 98304 bytes)`. Its own size check
+(`ARENA_NEEDED`) is the layout's refusal now, so an arena too small says which part did not fit. QEMU: `osdev
+test audio` 69/0, the WAV read back. Owed: a card on the Wyse and the T630.
+
+**`xhci` fifth, its grants only.** Its register window and arena come through `gs::driver` (`Registers`,
+`Arena`) on every port, and the arena is still reached at its offset constants: its layout - shared controller
+structures, six per-device slices, the scratchpad and the disk's region, with the hub probe deliberately
+inside the ERST page - is the next step, and the largest of any driver. QEMU: `osdev test iommu` 1/1 (the
+keyboard bound through the confined domain) and, on RISC-V `virt` with a USB disk behind `qemu-xhci`, `drives
+flash data`, a write read back and `drives check` with 0 bad. Built for the Pi 4 and the VisionFive. Owed:
+a card on any board with a USB keyboard - every board but the Pi 2 has one behind `xhci`.
+
+**`dwc2` sixth, its grants only** (the Pi 2). The same change as `xhci`'s, across its nine files; its arena,
+whose layout is per channel and per device, stays at its offsets for now. It found a gap in a build check:
+`scripts/arm_build.py` proves a hardware image carries the VideoCore bus alias by finding the `orr` that
+applies it, and it matched three fixed bytes - one register allocation, `orr r2, r2, #0xC0000000`. Moved onto
+`gs::driver`, the compiler chose `orr r3, r0, ...` and the check said the alias was missing. It now matches
+the instruction by its fields, any registers and condition; a `--qemu` build still verifies as having none.
+QEMU (`raspi2b`, `arm_run.py --usb --usbdisk`): the keyboard connected, `drives flash data`, a write read back,
+`drives check` 0 bad. Owed: a card on the Pi 2.
+
+**`ehci` seventh, its grants only** (x86; the T630's keyboard sits behind its hub). No suite attaches an EHCI
+controller, so it was booted by hand on q35 with QEMU's `usb-ehci` and a `usb-kbd`: the reset, the port reset
+and the control transfers through the arena (the device descriptor, the address, the configuration) ran, and
+the log matched the code before the change line for line, both stopping at `Get_Hub_Descriptor failed`
+because the driver takes the high-speed device for the hub the T630 has. QEMU cannot model that hub: its
+`usb-hub` is full speed and will not attach to EHCI. Owed: a card on the T630, with step 1l's.
+
+**`pwm-audio`, `dwmac` and `wifi-driver` last, their grants only.** The same type change; none of them runs
+in QEMU (no jack, no dwmac, no radio is granted there), so each is built for its boards - the Pis, the
+VisionFive, the Pi 4 and the VisionFive - and owes its card. With them no compiled service or example takes a
+grant from the SDK, and `one_way_check.py` counts the four grant calls, shown to fail on a `ctx.mmio()`
+planted in `examples/e1000` and pass once it was removed.
+
+**The remaining five arenas laid out by name (2026-10-20).** Each logs its layout once at start, and each
+part landed where its constant was, with one exception, said below.
+
+- **`pwm-audio`**: two parts, the control blocks at 0x0 and the ring at 0x1000. Its size check (`ARENA_NEEDED`)
+  is the layout's refusal; the bus address the DMA engine is given is computed from a part's physical address.
+  QEMU `raspi2b`: the layout line, then the pacing check refusing QEMU's unpaced DMA model as before.
+- **`dwmac`**: four parts, the rings at 0x0 and 0x100, the buffers from 0x1000 and 0x3000. A MAC that will not
+  come up hands its grant back to try again on a cable; the parts are `Copy`, so it hands the parts back.
+  Built only: QEMU has no dwmac.
+- **`ehci`**: two parts, one control transfer's structures (its QH, three qTDs, the setup packet and the
+  data buffer, at their offsets within the part) at 0x0, and the poll slots at 0x400. Booted by hand as
+  before: the same lines, stopping at the same `Get_Hub_Descriptor failed`.
+- **`dwc2`**: eleven parts in a new `parts.rs`, one per buffer the controller is pointed at, so the pairwise
+  const asserts between them are gone. **The exception:** the hub's status buffer sat at 0x300, on the
+  mass-storage CBW, which none of those asserts covered; it is at 0x280 now, since two parts cannot share
+  bytes. QEMU `raspi2b`: the keyboard, a USB disk written and read back, `drives check` ok.
+- **`xhci`**: twelve parts - the DCBAA, the command and event rings, the ERST with the hub probe in its own
+  part at the tail of the ERST's page (0x3f00, where it was), the input context, the data and config buffers,
+  the six device slices as one part (the slice helpers address within it), the scratchpad array and its
+  256 pages, and the disk's region, which `msc` reaches as its own part. They fill the 292-page arena
+  exactly. QEMU: `osdev test iommu` 1/1, the keyboard bound; RISC-V `virt` with a USB disk, `drives flash
+  data`, a write read back, `drives check` 0 bad.
+
+Each owes the card its grants step already owed; none adds one.
+
+## Step 4: the interrupt waits of `ehci`, `dwc2` and `xhci` on `irq` (2026-10-22)
+
+Step 2 built `irq` from these three drivers' hand-written copies and left the copies in place: a driver's
+wait is its structure, and changing one is owed a card on its board. This step moves them.
+
+**One addition first, found in two of them.** `dwc2` and `xhci` both drain their endpoint without blocking -
+a bounded loop of `try_recv` - and block only at the end of a pass, so a burst of requests is served in one
+pass. Each drain picked the interrupt out by hand. `Irq::take` is that drain's receive: the interrupt or a
+request, or `None` when nothing is queued, sorted by the same test `Irq::wait` makes, so the two cannot
+disagree. `dwc2` once dropped an interrupt in a drain as a capless request and left its line masked for
+good; that test now lives in one place.
+
+- **`ehci`**: its interrupt-driven wait is `Irq::wait`. Only the interrupt is acked and re-armed; the drain
+  that acked and re-armed on any message is gone, and a message that is not the interrupt is dropped as it
+  was, since nothing sends this driver a request it answers. Its vector constant is deleted: the driver names
+  no vector.
+- **`dwc2`**: all three receives - the no-disk drain, the block drain and the end-of-pass wait - go through
+  one `Irq` (`take`, `take`, `wait`), and so does the loop a `dwc2` with no hardware runs. Its vector constant
+  and its hand-written test of it are deleted.
+- **`xhci`**: the main loop's wait is `Irq::wait`, and the one-request drain after it is `Irq::take`, which
+  now counts an interrupt that arrives mid-pass instead of handing it to the block server as a capless
+  message. It still never re-arms, as before: its interrupt is an MSI. The three idle drains where nothing is
+  enumerated answer radio requests "no device" and never wait for an interrupt, so they stay `try_recv`.
+
+No kernel change and no new authority.
+
+**Hardware, 2026-10-22, all at `dff477a3`, each with `chaos max-carnage all-services 100` and `selfcheck`, no
+kernel panic on any:**
+
+The operator hot-plugged the keyboard on every board, and each driver found it again.
+
+- **VisionFive 2 Lite (`xhci`):** keyboard and stick through the hub, re-found after two port moves; cable
+  download 1.9 MiB/s, checked; 100 rounds; selfcheck 600/0, 1 skipped (registry not reachable). Its heartbeat
+  says `0 MSI`, as it did before: this port has no PLIC, so the card shows the timeout and request paths, not
+  the interrupt.
+- **Pi 2 (`dwc2`):** keyboard, disk, cable (`ping` answered, two downloads checked); the USB interrupt count
+  climbs past 50,000, so the interrupt path is the one taken; 100 rounds; selfcheck 659/0, 1 skipped (no PCI).
+- **Pi 4 (`xhci`):** MSI count 1,018 at 61 s and 4,530 at 121 s; three downloads checked; 100 rounds;
+  selfcheck 600/0, 1 skipped. It also printed the `polling input at the 10ms tick` line, which the card did
+  not predict; that line is decided by a report found on a pass no interrupt woke, which this step did not
+  change, and it has been printed on boots before it. Whether the Pi 4 printed it before is not checked.
+- **HP T630 (`ehci`, with `xhci` beside it):** `irq: FIRST delivery of vector 0x29` reaches `ehci`, so its
+  interrupt arm ran; its heartbeat still says `polling yes (interrupt does not cover HID)`, as it did on
+  2026-10-08 and 2026-10-10 - the low-speed keyboard behind the hub completes without the interrupt. Two
+  downloads checked (3.2 and 4.4 MiB/s); 100 rounds; selfcheck 666/0. `xhci` woke on MSI.
+- **Dell Wyse 5070 (`xhci`):** MSI count 648 and then 1,303 a minute later after the chaos run; three
+  downloads checked (1.8 to 2.2 MiB/s); the keyboard re-found after two disconnects before the run and after
+  each kill in it; 100 rounds; selfcheck 666/0. It printed the same 10 ms poll fallback line as the Pi 4.
+
+## Step 5: a driver's remaining SDK calls, wrapped (2026-10-22)
+
+**The operator's decision**, when the branch was to close: what a driver still called the SDK for directly
+comes through `gs::driver` as well - "just an interface that wraps the hard stuff" - so a driver has one API
+to learn. That is a different route from the one this document gives for a MECHANISM (found repeated, then
+built). These are not mechanisms a driver writes out; each is one kernel call that a driver must name and
+rely on, which is the test `gs` already applies (`backlog/71`), and the same reasoning that brought the
+grants in at step 3.
+
+- **`input`**: `push` (`console_push`, the keyboard drivers' 12 calls) and `ready` (`signal_input_ready`,
+  `xhci`'s 3).
+- **`power`**: `set` (`device_power`, `wifi-driver`'s 6). It keeps the SDK's answer: `true` only on a pin
+  read back at the level asked for.
+- **`device`**: `board_mac` (`dwc2`), `nic_vendor_device` (`nic-driver` 2, and the shell's `hardware` list),
+  `emmc_base_clock_hz` (`wifi-driver`, and `block-driver`'s uncompiled `sdhci.rs`), `pci_cfg_read`
+  (`hw-enumerator`).
+- **`gs::program::mode`** (`probe_mode`), for `pwm-audio`, `observe` and `probe`. Not a driver's: a mode is
+  any program's, so it is in `program`.
+
+Each wrapper is `#[inline(always)]` over the SDK call, so the code a driver runs is the code it ran.
+`one_way_check.py` counts all eight SDK methods from today: 34 call sites converted, every crate at zero, and
+a new crate held there. No kernel change, no new authority, no `unsafe`.
+
+**And the CLI's driver template, conformed the same day.** `godspeed new driver` generated a driver on the SDK's
+`ctx.mmio()` with a wait counted in sleeps; it is on `gs::driver::registers` and `wait::until` now
+(`godspeed-cli`). `osdev test kinds` installs one package of each kind the CLI makes - service, utility, app, driver,
+built from the templates untouched - and sees each do its job, the driver driving QEMU's `edu`: 19/0.

@@ -23,7 +23,8 @@ Unlike ATA PIO (port I/O), AHCI is **MMIO + DMA**, exactly like the USB drivers:
   0x06, progif 0x01), records its **ABAR** (BAR5) + BDF (`pci.rs`), and at spawn
   maps the ABAR (HBA registers) into `block-driver` and grants it a small
   physically-contiguous **DMA arena** (`task/mod.rs`, the same path as xhci/ehci).
-  The driver reads the window via `ctx.mmio()` and the arena via `ctx.dma_region()`.
+  The driver takes the window with `gs::driver::registers` and the arena with `gs::driver::arena`,
+  laid out in four named parts (`docs/driver-library.md` step 3).
 - Per-port DMA structures the driver builds in its arena: a **command list** (32
   command headers), a **received-FIS** area, and per-command a **command table**
   (a command FIS + a **PRDT** - physical region descriptors pointing at the data

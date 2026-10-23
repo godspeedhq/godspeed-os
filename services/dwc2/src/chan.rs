@@ -2,8 +2,8 @@
 //! Host channels and control transfers.
 //!
 //! Slice 1b of the port (`docs/arm32-usb-userspace.md`): program a host channel, run a DMA transfer,
-//! and compose the three of them into a USB control transfer. Everything here goes through the SDK's
-//! safe `Mmio`/`Dma` wrappers, so the service still carries no `unsafe` (§18.2).
+//! and compose the three of them into a USB control transfer. Everything here goes through
+//! `gs::driver`'s `Registers` and arena parts (`parts.rs`), so the service still carries no `unsafe` (§18.2).
 //!
 //! **No cache maintenance, and that is a property of the grant rather than an omission.** The
 //! in-kernel driver this replaced (`arch/arm/dwc2.rs`, since deleted) bracketed every transfer with a
@@ -15,7 +15,9 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
+use godspeed_sdk::ServiceContext;
 
 use crate::regs::*;
 
@@ -60,13 +62,8 @@ pub const PID_DATA0: u32 = 0;
 pub const PID_DATA1: u32 = 2;
 pub const PID_SETUP: u32 = 3;
 
-/// Where in the DMA arena each control-transfer buffer lives.
-///
-/// Fixed offsets rather than an allocator: the arena is 64 KiB, this slice needs two small buffers,
-/// and a bump allocator would be machinery for a problem that does not exist yet (§26.2). Slice 3
-/// will need real sectors and can carve the rest then.
-pub const SETUP_OFF: usize = 0x0000; // 8 bytes
-pub const DATA_OFF: usize = 0x0040;  // scratch for descriptors
+/// The size of a control transfer's data stage, its own part of the arena (`parts.rs`), as the setup
+/// packet is.
 pub const DATA_LEN: usize = 256;
 
 /// The device this driver is currently talking to. Control transfers address whoever is selected.
@@ -81,7 +78,7 @@ pub struct Target {
 ///
 /// An abandoned transfer leaves both set, and the next user of that channel would otherwise read a
 /// previous transfer's completion as its own.
-pub fn release(mmio: &Mmio, ch: u32) {
+pub fn release(mmio: &Registers, ch: u32) {
     mmio.write32(hcintmsk_at(ch), 0);
     mmio.write32(hcint_at(ch), 0xFFFF_FFFF);
 }
@@ -104,7 +101,7 @@ pub const HCTSIZ_DOPNG: u32 = 1 << 31;
 /// high-speed OUT endpoint and must be false for everything else.
 #[allow(clippy::too_many_arguments)]
 pub fn program_ping(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target, ch: u32, dir_in: bool, pid: u32,
     len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32, ping: bool,
 ) {
     let mps = t.mps as u32;
@@ -114,8 +111,9 @@ pub fn program_ping(
     // retried by the core in hardware, and every retry takes an entry in the NON-PERIODIC REQUEST QUEUE that
     // control and bulk transfers on every other channel need - `net::tx` found it starving a transmit, with
     // GNPTXSTS reporting zero entries free. Whether it starves a control transfer too has not been measured
-    // on this board (no run has had the NIC's IN armed), and a SETUP takes the same queue, so it stands
-    // aside for both. `rtl::service` puts it back, from where it stopped, with its data toggle. The NIC's own
+    // on this board, and a SETUP takes the same queue, so it stands aside for both. (This said "no run has had
+    // the NIC's IN armed", which was true of the radio's first logs and not since: the NIC's IN is armed in
+    // every run with a cable.) `rtl::service` puts it back, from where it stopped, with its data toggle. The NIC's own
     // background IN is left alone: arming it is not a transfer that has to complete. Periodic transfers - the
     // keyboard, the hub's status - ride the periodic queue and are not affected. A no-op when it is not armed.
     if ch != CH_RADIO_RX && ch != crate::regs::CH_NET_RX && (ep_type == 0 || ep_type == 2) {
@@ -161,7 +159,7 @@ pub fn program_ping(
 /// Program a channel with no PING. The shape every caller but a high-speed bulk OUT wants.
 #[allow(clippy::too_many_arguments)]
 pub fn program(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target, ch: u32, dir_in: bool, pid: u32,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target, ch: u32, dir_in: bool, pid: u32,
     len: u32, buf_phys: u32, ep: u32, ep_type: u32, hcsplt: u32,
 ) {
     program_ping(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, ep, ep_type, hcsplt, false);
@@ -172,7 +170,7 @@ pub fn program(
 /// The hardware owns this toggle. Tracking it in software works only until the two disagree, and
 /// when they do the failure is silent: the device retransmits its previous packet rather than
 /// erroring, so a keystroke is delivered twice.
-pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
+pub fn pid_from_hctsiz(mmio: &Registers, ch: u32) -> u32 {
     (mmio.read32(hctsiz_at(ch)) >> 29) & 0x3
 }
 
@@ -200,7 +198,7 @@ pub fn pid_from_hctsiz(mmio: &Mmio, ch: u32) -> u32 {
 /// [`HALT_WAIT`] is an upper estimate of the time the count took, so it should not be SHORTER than the
 /// count was (uncalibrated it is 200,000 looks, which is not): a budget that ran out before a halt that
 /// used to land would abandon the channel, the failure this function exists to prevent.
-pub fn halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32) {
+pub fn halt(ctx: &ServiceContext, mmio: &Registers, ch: u32) {
     let hcchar = mmio.read32(hcchar_at(ch));
     if hcchar & HCCHAR_CHENA == 0 {
         return;                       // already idle - nothing queued to retire
@@ -220,7 +218,7 @@ pub fn halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32) {
 const HALT_WAIT: Budget = Budget::ms(50);
 
 /// Wait for a channel to halt, bounded by the CLOCK. Returns the latched HCINT, or `None` on timeout.
-pub fn wait_halt(ctx: &ServiceContext, mmio: &Mmio, ch: u32, ms: u64) -> Option<u32> {
+pub fn wait_halt(ctx: &ServiceContext, mmio: &Registers, ch: u32, ms: u64) -> Option<u32> {
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(ms));
     loop {
         let hcint = mmio.read32(hcint_at(ch));
@@ -258,7 +256,7 @@ const STAGE_XACTERR_TRIES: u32 = 3;
 /// single-packet stage that halts on a transaction error alone is run again (`STAGE_XACTERR_TRIES`).
 #[allow(clippy::too_many_arguments)]
 fn stage(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
 ) -> bool {
     let one_packet = len <= t.mps as u32;
@@ -300,11 +298,33 @@ fn log_failed(ctx: &ServiceContext, what: &str, hcint: u32) {
         if hcint & HCINT_NAK != 0 { " NAK" } else { "" }));
 }
 
+/// THE WHOLE CORE, said beside a channel that never halted: whether the AHB master (the core's DMA) is
+/// idle, and every host channel's HCCHAR, HCINT, HCTSIZ and HCDMA. On the Pi 2 a download at 180 KiB/s
+/// writing to the stick left every channel failing to halt, and the next instance found the AHB master
+/// not idle at its reset (2026-10-21); which channel's DMA was in flight, and where, is what these show.
+/// Three lines, because a log line is rendered into a fixed buffer.
+pub fn say_core(ctx: &ServiceContext, mmio: &Registers) {
+    let rst = mmio.read32(GRSTCTL);
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: core at the stall - GRSTCTL={:#010x} (AHB idle {}), GAHBCFG={:#010x}, GINTSTS={:#010x}, HAINT={:#06x}",
+        rst, rst & GRSTCTL_AHBIDLE != 0, mmio.read32(GAHBCFG), mmio.read32(GINTSTS), mmio.read32(HAINT)));
+    for half in 0..2u32 {
+        let c = |i: u32| {
+            let ch = half * 4 + i;
+            (ch, mmio.read32(hcchar_at(ch)), mmio.read32(hcint_at(ch)), mmio.read32(hctsiz_at(ch)), mmio.read32(hcdma_at(ch)))
+        };
+        let (a, b, d, e) = (c(0), c(1), c(2), c(3));
+        ctx.log_fmt(format_args!(
+            "dwc2-svc:   ch{} {:08x} {:08x} {:08x} {:08x} | ch{} {:08x} {:08x} {:08x} {:08x} | ch{} {:08x} {:08x} {:08x} {:08x} | ch{} {:08x} {:08x} {:08x} {:08x} (HCCHAR HCINT HCTSIZ HCDMA)",
+            a.0, a.1, a.2, a.3, a.4, b.0, b.1, b.2, b.3, b.4, d.0, d.1, d.2, d.3, d.4, e.0, e.1, e.2, e.3, e.4));
+    }
+}
+
 /// One attempt at a stage: `Ok` on transfer-complete, `Err(Some(hcint))` on a halt with anything else
 /// latched, `Err(None)` when the channel never halted (already logged, with the core's state).
 #[allow(clippy::too_many_arguments)]
 fn stage_once(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, what: &str,
 ) -> Result<(), Option<u32>> {
     program(ctx, mmio, t, ch, dir_in, pid, len, buf_phys, 0, 0, 0);
@@ -336,6 +356,7 @@ fn stage_once(
                 nptx, (nptx >> 16) & 0xFF,
                 mmio.read32(crate::regs::GINTSTS),
                 mmio.read32(hcchar_at(ch))));
+            say_core(ctx, mmio);
             Err(None)
         }
         Some(hcint) if hcint & HCINT_XFERCOMPL != 0 => Ok(()),
@@ -370,7 +391,7 @@ pub fn hcsplt(hub_addr: u8, hub_port: u8) -> u32 {
 // keyboard-owned struct through `wait_halt` is wrong too, because every transfer type shares it, so
 // a measurement worth keeping would need its own home rather than a parameter on a shared path.
 
-fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
+fn wait_for_uframe(ctx: &ServiceContext, mmio: &Registers, target: u32) {
     // PACED, though it sleeps its own sub-millisecond gaps below rather than calling `pause`: what the
     // pace buys is the uncalibrated bound. That sleep is a whole scheduler quantum on such a machine, so
     // the polling bound of 200,000 looks would be minutes; paced, it is the two looks a 2 ms budget holds.
@@ -429,7 +450,7 @@ fn wait_for_uframe(ctx: &ServiceContext, mmio: &Mmio, target: u32) {
 /// endpoint, so it was faced on its own, in Slice 2.
 #[allow(clippy::too_many_arguments)]
 fn stage_split_one(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, splt: u32, what: &str,
 ) -> bool {
     const SS_TRIES: u32 = 24;
@@ -510,7 +531,7 @@ fn stage_split_one(
 /// within its frame - and that is the whole defect: a 3-bit target RECURS EVERY MILLISECOND, so
 /// "microframe 3" names eight different instants a second and there is no way to tell which one you
 /// are looking at.
-fn uframe_now(mmio: &Mmio) -> u32 {
+fn uframe_now(mmio: &Registers) -> u32 {
     mmio.read32(HFNUM) & 0x3FFF
 }
 
@@ -524,7 +545,7 @@ fn uframe_now(mmio: &Mmio) -> u32 {
 /// "Reached or passed", not "equals", because being a microframe late is recoverable (the translator
 /// still holds the result for a few) while waiting for an exact value we have already gone by would
 /// cost a whole frame. False means too far past to be worth asking.
-fn wait_until_at_least(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> bool {
+fn wait_until_at_least(ctx: &ServiceContext, mmio: &Registers, target: u32) -> bool {
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(2));
     loop {
         let ahead = target.wrapping_sub(uframe_now(mmio)) & 0x3FFF;
@@ -562,7 +583,7 @@ enum Uframe {
 ///
 /// Wrapping-safe: the counter is 14 bits, so a distance of more than half the range is read as the past
 /// rather than an eight-second wait.
-fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
+fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Registers, target: u32) -> Uframe {
     // Bounded: a few microframes is all a legitimate wait ever needs; anything longer means the target
     // is gone and spinning cannot bring it back.
     let mut deadline = wait::Deadline::start(ctx, Budget::ms(2));
@@ -589,7 +610,7 @@ fn wait_uframe_abs(ctx: &ServiceContext, mmio: &Mmio, target: u32) -> Uframe {
 /// microframe scheduling the keyboard needs applies: there is no transaction translator in the path,
 /// so the transfer is programmed and waited on like any other.
 pub fn interrupt_in(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32,
 ) -> u32 {
     program(ctx, mmio, t, ch, true, pid, len, buf_phys, ep, 3, 0); // ep_type 3 = interrupt, no HCSPLT
@@ -620,7 +641,7 @@ pub fn interrupt_in(
 /// OUGHT to do; this is what it DOES. Bounded to a handful of polls after each bind so it cannot
 /// flood, and silent thereafter.
 pub fn periodic_split_in(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target,
     ch: u32, pid: u32, buf_phys: u32, len: u32, ep: u32, splt: u32, diag: bool,
 ) -> u32 {
     // SYNCHRONISE TO A MICROFRAME BOUNDARY before the start-split.
@@ -789,7 +810,7 @@ pub fn periodic_split_in(
 /// chunk of 0, which is why the loop tests `off >= len` AFTER advancing rather than before.
 #[allow(clippy::too_many_arguments)]
 fn stage_split(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target,
     ch: u32, dir_in: bool, pid: u32, buf_phys: u32, len: u32, splt: u32, what: &str,
 ) -> bool {
     let mps = (t.mps as u32).max(1);
@@ -816,7 +837,7 @@ fn stage_split(
 /// `data` is filled on an IN transfer and sent on an OUT one. Returns false if any stage failed, with
 /// the failing stage already reported.
 pub fn control(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target,
     setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize,
 ) -> bool {
     control_split(ctx, mmio, dma, t, setup, data, data_in, dlen, 0)
@@ -828,15 +849,15 @@ pub fn control(
 /// regression here cannot break what slices 1a-1c-ii proved.
 #[allow(clippy::too_many_arguments)]
 pub fn control_split(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target,
     setup: &[u8; 8], data: &mut [u8], data_in: bool, dlen: usize, splt: u32,
 ) -> bool {
     let ch = CH_BULK;
-    let setup_phys = dma.phys_at(SETUP_OFF) as u32;
-    let data_phys = dma.phys_at(DATA_OFF) as u32;
+    let setup_phys = dma.setup.phys() as u32;
+    let data_phys = dma.ctl_data.phys() as u32;
 
     for (i, b) in setup.iter().enumerate() {
-        dma.write8(SETUP_OFF + i, *b);
+        dma.setup.write8(i, *b);
     }
     let run = |ctx: &ServiceContext, dir_in, pid, phys, len, what| {
         if splt == 0 {
@@ -860,20 +881,20 @@ pub fn control_split(
             // this reply's data. Harmless while a reply is only logged; not harmless once one DECIDES
             // something, and a hub port-status short read decides connect or disconnect.
             for i in 0..want {
-                dma.write8(DATA_OFF + i, 0);
+                dma.ctl_data.write8(i, 0);
             }
             if !run(ctx, true, PID_DATA1, data_phys, want as u32, "DATA-IN") {
                 return false;
             }
             let n = want.min(data.len());
             for i in 0..n {
-                data[i] = dma.read8(DATA_OFF + i);
+                data[i] = dma.ctl_data.read8(i);
             }
         } else {
             // Send only what fits in BOTH the scratch buffer and the source slice.
             let n = dlen.min(DATA_LEN).min(data.len());
             for i in 0..n {
-                dma.write8(DATA_OFF + i, data[i]);
+                dma.ctl_data.write8(i, data[i]);
             }
             if !run(ctx, false, PID_DATA1, data_phys, n as u32, "DATA-OUT") {
                 return false;
@@ -895,7 +916,7 @@ pub fn control_split(
 
 /// GET_DESCRIPTOR, the first thing worth asking a device.
 pub fn get_descriptor(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target,
     dtype: u8, dindex: u8, buf: &mut [u8], len: usize,
 ) -> bool {
     let setup = [

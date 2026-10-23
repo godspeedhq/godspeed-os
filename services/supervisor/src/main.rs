@@ -588,7 +588,9 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // operator's, so the shell holds it, and `power` only reads the deadline the kernel keeps (docs/shutdown.md).
     // Peers for the shutdown's tidy-up alone, three seconds before it: `fs` to flush and stop writes, `copier` to stop a copy.
     ("power", POWER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 8 * 1024 * 1024, u32::MAX, &["fs", "copier"],
-     godspeed_sdk::service_context::privbits::CPU_CLOCK, 0, 0),
+     // INTROSPECT (2026-10-21): the per-core busy ticks the governor reads (docs/power.md 15.7); the
+     // counters `observe` shows, and nothing it can act on.
+     godspeed_sdk::service_context::privbits::CPU_CLOCK | godspeed_sdk::service_context::privbits::INTROSPECT, 0, 0),
     // Hardware discovery, in USERSPACE (step D2). Carries PCI_CFG, which grants exactly one
     // operation: READ one configuration register, select-and-fetch indivisibly. It cannot write
     // config space at all - that would be write access to every BAR and command register of every
@@ -689,7 +691,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // already owns the NIC by PCI class, and two drivers on one controller is the footgun 6.4's
     // 2026-08-09 amendment records. So these two prove their DEGRADE path - log and idle, never
     // crash (Commandment V) - and not their MMIO path, which `nic-driver` covers on every boot
-    // through the same `Mmio::read32` wrapper.
+    // through the same `Registers::read32`.
     #[cfg(feature = "examples-test")]
     ("e1000", E1000_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     #[cfg(feature = "examples-test")]
@@ -985,19 +987,37 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
             ask_bdf_for_class(ctx, hw & 0x00FF_FFFF)
         } else { 0 };
     }
-    // The DMA arena a PCI driver needs, in 4 KiB pages. A SIZE, not an address - the kernel still
-    // decides WHERE the arena lives; this says only how big. Zero for a register-only driver.
+    // The DMA arena a driver needs, in 4 KiB pages - for EVERY class, PCI or fixed: the kernel holds no
+    // size of its own (2026-10-21), and refuses a DMA device whose request names none. A SIZE, not an
+    // address - the kernel still decides WHERE the arena lives; this says only how big. Zero for a
+    // register-only driver.
     //
-    // Kept beside the table rather than as a tenth column: it applies to the handful of rows that
-    // name a PCI class code, and widening every row to carry a field that is 0 for twenty of them
-    // would be noise. Folds into the row if that stops being true.
+    // Kept beside the table rather than as a tenth column: it applies to the seven rows whose device
+    // DMAs, and widening every row to carry a field that is 0 for twenty of them would be noise. Folds into the row if that stops being true.
     req.dma_pages    = match name {
         // 64 KiB - the size `HwClass::Ahci` implied before the class had a name in the kernel.
         "block-driver" => 16,
-        // 32 rings + a 256-buffer scratchpad + 4 - the size `XHCI_DMA_PAGES` held in the kernel.
-        "xhci" => 32 + 256 + 4,
-        // 64 KiB - the `_ => EHCI_DMA_PAGES` default the NIC used to fall through to.
-        "nic-driver" => 16,
+        // 32 pages of control structures (command and event rings, DCBAA, ERST, six per-device slices so a
+        // hub and what is behind it can be addressed at once), 256 scratchpad buffers (the T630's AMD xHCI
+        // asks for 256 and malfunctions without them), and the disk's 32 pages (its rings, its command
+        // page, its data page and two 56 KiB gather buffers, `services/xhci/src/msc.rs`), kept apart ON
+        // PURPOSE: the Pi 4 lost days to one page shared by a keyboard report, a hub's port status and the
+        // disk's CBW. The kernel held these sizes as a constant of its own until 2026-10-21.
+        "xhci" => 32 + 256 + 32,
+        // 64 KiB: the control transfer and the poll slots (`services/ehci`), as main had it. Not more: the
+        // driver zeroes both parts on every control transfer, and the xHCI-sized 1 MiB it once shared a
+        // constant with regressed back-port enumeration.
+        "ehci" => 16,
+        // 128 KiB: the Pi 2's channels, descriptors, the disk's 32 KiB write gather and the radio's receive
+        // ring of eight transfers (`services/dwc2`, `GATHER_BYTES`, `rtl::RX_SLOTS`); 64 KiB until 2026-10-22.
+        "dwc2" => 32,
+        // A page of DMA control blocks and a 128 KiB ring of PWM words (`services/pwm-audio`, 33 pages
+        // laid out), and three spare.
+        "pwm-audio" => 36,
+        // The rings and a receive ring of 256 x 2 KiB, to hold a whole 256 KiB receive window as it arrives
+        // (`RX_RING_COUNT` for the e1000 and the RTL8168, `RX_RING_DESCS` for GENET: 256 + 8 buffers of 2 KiB,
+        // 528 KiB exactly; `backlog/93`). It was 16, the EHCI default the NIC fell to.
+        "nic-driver" => 132,
         // 68 KiB used, rounded up: the command rings (CORB 1 KiB, RIRB 2 KiB), the buffer descriptor
         // list, and a 64 KiB ring of sound - about a third of a second at 48 kHz stereo (docs/audio.md).
         "audio-driver" => 24,

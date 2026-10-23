@@ -564,19 +564,21 @@ fn parse_results(payload: &[u8], scan: &mut Scan, ctx: &ServiceContext) {
 /// Advance a running sweep by ONE frame. This is the body `collect` used to loop over, split out so the
 /// serve loop can do the same one frame at a time and still answer requests between frames - which is what
 /// lets `wifi list`, `wifi status` and an abort be heard mid-sweep (rule 11), and a background sweep exist
-/// at all. `frame` is the caller's buffer, so the serve loop does not put 2 KiB on its stack per turn.
+/// at all. `rx` is the station's receive region (`ctrl::RX_REGION`), owned by the caller, so the serve loop puts
+/// no frame buffer on its stack per turn.
 pub fn step(
     h: &dyn SdioHost,
     w: &mut Window,
     s: &mut ctrl::Session,
     scan: &mut Scan,
-    frame: &mut [u8; ctrl::FRAME],
+    rx: &mut godspeed::memory::Region,
     ctx: &ServiceContext,
 ) -> Step {
-    let f = match ctrl::read_frame(h, w, frame, ctx) {
+    let f = match ctrl::read_frame_region(h, w, rx, ctx) {
         Some(f) => f,
         None => return Step::Empty,
     };
+    let frame = rx.bytes();
     s.note_frame(ctx, &f, frame, false);
     if f.chanflag & CHANNEL_MASK == CHANNEL_GLOM {
         // A superframe is READ now, its sub-frames handled below like any other frame; the descriptor that
@@ -665,9 +667,9 @@ pub fn collect(
     s: &mut ctrl::Session,
     scan: &mut Scan,
     max_empty_polls: u32,
+    rx: &mut godspeed::memory::Region,
     ctx: &ServiceContext,
 ) {
-    let mut frame = [0u8; ctrl::FRAME];
     // THE TRUTH ENDS THE WAIT; THE COUNT ONLY BOUNDS IT. The firmware announces a finished scan with an
     // ESCAN_RESULT carrying SUCCESS - observed on hardware after twelve PARTIAL batches - and the loop used
     // to ignore that and run to a fixed iteration count instead. That count was named `ms` and was not
@@ -677,7 +679,7 @@ pub fn collect(
     let mut empty = 0u32;
     let mut ended_by = "the poll bound - the firmware never said the scan was over";
     while empty < max_empty_polls {
-        match step(h, w, s, scan, &mut frame, ctx) {
+        match step(h, w, s, scan, rx, ctx) {
             Step::Frame => {}
             Step::Empty => {
                 empty += 1;
@@ -794,13 +796,14 @@ pub fn scan_once(
     h: &dyn SdioHost,
     w: &mut Window,
     s: &mut ctrl::Session,
+    rx: &mut godspeed::memory::Region,
     ctx: &ServiceContext,
 ) -> Option<Scan> {
     let mut scan = Scan::new();
     if !start(h, w, s, ctx) {
         return None;
     }
-    collect(h, w, s, &mut scan, MAX_EMPTY_POLLS, ctx);
+    collect(h, w, s, &mut scan, MAX_EMPTY_POLLS, rx, ctx);
 
     ctx.log_fmt(format_args!(
         "wifi-driver: the scan window saw {} event/data frame(s), {} escan-result event(s), {} glommed \
@@ -815,13 +818,13 @@ pub fn scan_once(
 /// Returns the session on ANY outcome past bring-up, because a scan that found nothing - or whose results
 /// did not parse - is still a radio that is up and can be asked again by the shell. Only a failed bring-up
 /// returns `None`, and then there is genuinely nothing to serve.
-pub fn run(h: &dyn SdioHost, w: &mut Window, adopted: bool, ctx: &ServiceContext) -> Option<ctrl::Session> {
+pub fn run(h: &dyn SdioHost, w: &mut Window, adopted: bool, rx: &mut godspeed::memory::Region, ctx: &ServiceContext) -> Option<ctrl::Session> {
     // The "UNVERIFIED ON HARDWARE" banner that stood here was true when written and would have been a
     // lie from the first successful boot on. Ten networks, names and all, on 2026-09-28.
     ctx.log("wifi-driver: stage 14 - scanning");
 
     let mut session = bring_up(h, w, adopted, ctx)?;
-    let scan = match scan_once(h, w, &mut session, ctx) {
+    let scan = match scan_once(h, w, &mut session, rx, ctx) {
         Some(s) => s,
         None => return Some(session),
     };

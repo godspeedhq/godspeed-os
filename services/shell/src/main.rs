@@ -917,13 +917,18 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if !line_reads_secret(line.bytes()) {
                         hist.push(line.bytes());
                         // Write-through to the fs (best-effort). Not while a job holds `fs` inside one
-                        // request (a check, a scrub, a tree delete): the save would wait its 2 s for
-                        // nothing, before the command had begun. The ring is written whole, so the next
-                        // save carries this line. Looked at again first (a short look, `copier_status`), so a
-                        // job that has ended does not go on stopping the save.
+                        // request (a check, a scrub, a tree delete): the load and the save would each wait
+                        // their 2 s for nothing, before the command had begun. The ring is written whole, so
+                        // the next save carries this line. Looked at again first (a short look,
+                        // `copier_status`), so a job that has ended does not go on stopping the save.
                         if fs_held_by_job(&ctx) { refresh_jobs(&ctx); }
                         if !fs_held_by_job(&ctx) {
-                            hist.save(&ctx);
+                            // The file is merged in BEFORE the first save, and a save never runs until it
+                            // has been: the ring is written whole, so a save over an unmerged file replaces
+                            // it with this boot's lines - every boot's first command used to wipe the
+                            // history it was meant to add to (`History::load`).
+                            if !hist.loaded { hist.load(&ctx); }
+                            if hist.loaded { hist.save(&ctx); }
                         }
                     }
                     // The command clock runs from Enter to the prompt (`begin_command_at`): every wait the
@@ -1079,8 +1084,8 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
                 // session history - do the bounded disk load (at most once, the `loaded` gate). It merges
                 // /users/default/history BEHIND the session, so `added` older lines land at the front; step into the
                 // newest of them and continue the up-nav. A wedged/absent/empty file adds nothing -> stay put.
-                // Consequence: startup never touches fs; a session that already fills HIST_MAX never loads
-                // (this arm's guard is false); the disk is read at most once, only on running out of history.
+                // Startup never touches fs, and the first command entered usually loads it first (`load`);
+                // a session that already fills HIST_MAX never loads here (this arm's guard is false).
                 let before = hist.len();
                 hist.load(ctx);
                 let added = hist.len() - before;
@@ -1105,15 +1110,27 @@ fn handle_csi(ctx: &ShellCtx, line: &mut Line, hist: &mut History, nav: &mut usi
         b'~' => match param {    // navigation cluster: ESC[<n>~
             1 | 7 => line.home(ctx),   // Home
             4 | 8 => line.end(ctx),    // End
-            3     => line.delete(ctx), // Delete (forward delete)
+            // Delete (forward delete). It was logged with where the cursor stood while the operator's
+            // report of it doing nothing on the T630 was open (2026-10-20); the next card showed it working,
+            // so a keystroke no longer writes a log line.
+            3     => line.delete(ctx),
             // PageUp OPENS `scrollback`, one page back - the key does what it was pressed for.
             // PageDown from a live prompt stays inert: you are already at the bottom, and opening a
             // viewer already scrolled to the end is a no-op dressed as an action.
             5     => { let _ = scrollback_view(ctx, 0, true); line.reprint(ctx); }
             // 2 = Insert, 6 = PageDown, 11.. = F-keys: no shell action, ignored.
-            _ => { let _ = have_param; }
+            2 | 6 | 11..=24 => { let _ = have_param; }
+            n => ctx.log_fmt(format_args!("shell: key sequence ESC[{}~ not recognised", n)),
         },
-        _ => {} // unknown final byte - already consumed, do nothing
+        // An unknown final byte, already consumed: nothing is done, and the log says what it was.
+        // The parameter only if one was typed, and a final byte that does not print as its value, so the
+        // line never shows `ESC[0x` for `ESC[x` or carries a control character (Audit 19).
+        f => match (have_param, (0x20..0x7f).contains(&f)) {
+            (true, true)   => ctx.log_fmt(format_args!("shell: key sequence ESC[{}{} not recognised", param, f as char)),
+            (false, true)  => ctx.log_fmt(format_args!("shell: key sequence ESC[{} not recognised", f as char)),
+            (true, false)  => ctx.log_fmt(format_args!("shell: key sequence ESC[{} with final byte {:#04x} not recognised", param, f)),
+            (false, false) => ctx.log_fmt(format_args!("shell: key sequence ESC[ with final byte {:#04x} not recognised", f)),
+        },
     }
 }
 
@@ -1216,7 +1233,7 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("selfcheck", &SELFCHECK_WORDS),
     ("observe", &["now"]),
     ("ask",     &["evidence"]),
-    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "uninstall", "upgrade", "cleanup", "trust", "registry", "config", "check"]),
+    ("godspeed", &["search", "info", "inspect", "fetch", "list", "verify", "remove", "install", "plan", "resolve", "uninstall", "upgrade", "cleanup", "trust", "registry", "config", "check"]),
     // `cores ticks` and `fcap reuse`/`gsreuse` were in no completion table (`backlog/fixed/80` H21).
     ("cores",   &["ticks"]),
     ("fcap",    &["reuse", "gsreuse"]),
@@ -1887,10 +1904,12 @@ struct History {
     /// this flag ensures that happens exactly once - success OR bounded-miss - so every later up-arrow
     /// is instant and never re-touches fs.
     loaded: bool,
+    /// When a load last missed its bound (`epoch_secs_monotonic`), or 0: what spaces the retries.
+    missed_at: i64,
 }
 impl History {
     fn new() -> Self {
-        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0, loaded: false }
+        History { lines: [[0u8; MAX_LINE]; HIST_MAX], lens: [0; HIST_MAX], n: 0, loaded: false, missed_at: 0 }
     }
     fn len(&self) -> usize { self.n }
     fn get(&self, i: usize) -> &[u8] { &self.lines[i][..self.lens[i]] }
@@ -1910,28 +1929,53 @@ impl History {
     }
     /// Best-effort persistence to `/users/default/history` (§15: history is shell-OWNED state, externalized to the
     /// fs so a `kill shell` respawn reconstructs it). History is an ENHANCEMENT, never a requirement, so
-    /// neither path may hang the prompt on a slow/down fs (§26.7): the LOAD is lazy (only when the user
-    /// runs out of session history) and bounded, the SAVE is deadline-bounded (a true fire-and-forget save
+    /// neither path may hang the prompt on a slow/down fs (§26.7): the LOAD is lazy (at the first command
+    /// entered, or on running out of session history) and bounded, the SAVE is deadline-bounded (a true fire-and-forget save
     /// is blocked by fs's single-endpoint block-driver multiplexing - see `save`). A rug-pulled fs is then a
     /// non-event - no recall this session, shell fully usable - and both resume when fs heals.
     ///
-    /// LAZY + one-shot + merge-behind. Not called at startup, and not merely on the first up-arrow - only
-    /// when the user navigates PAST their last session command (up-arrow at the oldest in-memory entry) AND
-    /// there is room (len < HIST_MAX), so a session that already fills the ring never touches fs at all. Runs
-    /// at most once (the `loaded` gate, set even on a bounded miss so later up-arrows never re-touch fs).
-    /// Bounded: a wedged/absent fs just leaves the session's own commands. The file's lines are OLDER than
+    /// LAZY + one-shot + merge-behind. Not called at startup. It runs at whichever comes first: the first
+    /// command entered (before its write-through, which saves the ring WHOLE - unmerged, that save replaced
+    /// the file with this boot's lines alone and lost every earlier one, 2026-10-20), or an up-arrow PAST the
+    /// session's commands while there is room (len < HIST_MAX). Succeeds at most once (the `loaded` gate),
+    /// and `loaded` is set only on an answer: the file read, or `fs` saying there is none. A bounded MISS
+    /// leaves it clear, so no save replaces a file that was never merged (Audit 19), and is tried again no
+    /// sooner than `HIST_RETRY_SECS`, so a down fs costs one bounded wait per half minute, not per command.
+    /// Bounded: a wedged fs just leaves the session's own commands. The file's lines are OLDER than
     /// anything typed this session, so they merge BEHIND the session commands (newest, kept); `push` drops
     /// the oldest - a file line - if the merge exceeds HIST_MAX. `#[inline(never)]` keeps its ~4 KiB frame
     /// off the interactive key path (the shell's user stack is tight).
     #[inline(never)]
     fn load(&mut self, ctx: &ShellCtx) {
         if self.loaded { return; }
-        self.loaded = true;
+        let now = gs::task::epoch_secs_monotonic(ctx);
+        if self.missed_at != 0 && now - self.missed_at < HIST_RETRY_SECS { return; }
         let path = HISTORY;
-        let sz = match fs_stat_bounded(ctx, path, HIST_LOAD_SECS) { Some((s, false)) if s > 0 => s as usize, _ => return };
+        let st = {
+            let mut g = ctx.fs().patience_secs(HIST_LOAD_SECS);
+            let r = g.stat(path);
+            ctx.fs_tag.set(g.tag());
+            r
+        };
+        let sz = match st {
+            Ok(st) if !st.is_dir && st.size > 0 => st.size as usize,
+            // An answer: an empty file, a directory there, no file, or no filesystem to hold one (the disk not
+            // yet formatted, or one `fs` refuses). Nothing to merge, and a save is safe or refused on its own.
+            Ok(_) | Err(gs::Error::NotFound | gs::Error::NoFilesystem | gs::Error::Foreign | gs::Error::PermissionDenied) => {
+                self.loaded = true;
+                return;
+            }
+            // No answer, or one that leaves the file's bytes unknown (unreadable, damaged, not parsed): a save
+            // now could replace lines that are still on the disk.
+            Err(_) => { self.missed_at = now.max(1); return; }
+        };
         let sz = sz.min(HIST_MAX * (MAX_LINE + 1));
         let mut buf = [0u8; HIST_MAX * (MAX_LINE + 1)];
-        if !read_file_exact_bounded(ctx, path, 0, &mut buf[..sz], HIST_LOAD_SECS) { return; }
+        if !read_file_exact_bounded(ctx, path, 0, &mut buf[..sz], HIST_LOAD_SECS) {
+            self.missed_at = now.max(1);
+            return;
+        }
+        self.loaded = true;
         // Snapshot the session lines (newest, must survive), rebuild the ring as [file lines..., session
         // lines], so up-arrow walks the session first and the file underneath, oldest dropped first.
         let mut sess = [[0u8; MAX_LINE]; HIST_MAX];
@@ -6171,8 +6215,20 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
             ("godspeed install <file>.gsp [yes] [accept-old]", "a package file, with no network: checked through its chain as of the day it was made (or, unpublished, by a key `godspeed trust add` trusts), then asked about as any package; a file older than offline-max-age-days is asked about first, and only `accept-old` answers that", "godspeed install hello.gsp"),
             ("godspeed install <publisher/name> grant <peer>,... | grant none", "give only some of the peers its contract requests, without the question", "godspeed install godspeed/hello grant none"),
             ("what it is given", "the send peers its contract requests and you approve, never `supervisor`, and no privilege", ""),
+            ("what it needs", "a package that requires others is planned first: they are fetched, listed in one question, and installed first", "godspeed plan godspeed/hello"),
+            ("godspeed plan <publisher/name>[@version]", "what installing it takes - what it requires, in the order to install - without installing", "godspeed plan godspeed/hello"),
+            ("godspeed resolve <publisher/name> <range>", "the newest release on the registry in a range, such as ^1.2.0", "godspeed resolve godspeed/hello ^0.3.0"),
             ("what is checked", "the copy on disk, again, by the supervisor, before every start: signature, key, contract, binary", ""),
             ("if it dies", "restarted from the disk, up to 5 times a boot, then left down and said so", ""),
+        ], false),
+        ("godspeed", "plan") => help_block(ctx, "godspeed plan", "what installing a package takes, without installing it", &[
+            ("godspeed plan <publisher/name>[@version]", "one row per package, in the order to install them: package, version, kind, asks and state", "godspeed plan godspeed/hello"),
+            ("state", "`install, needed by ...` (fetched and checked), `fetch, needed by ...` (not here yet; version is the range), and `install` for the package asked for, last", ""),
+            ("a report", "it pipes, as records", "godspeed plan godspeed/hello | where state=install"),
+        ], false),
+        ("godspeed", "resolve") => help_block(ctx, "godspeed resolve", "the newest release on the registry in a range", &[
+            ("godspeed resolve <publisher/name> <range>", "a range is ^, = or >= and a whole version", "godspeed resolve godspeed/hello ^0.3.0"),
+            ("a report", "it pipes, as records", "godspeed resolve godspeed/hello ^0.3.0 | where item=version"),
         ], false),
         ("godspeed", "upgrade") => help_block(ctx, "godspeed upgrade", "the newest release of what is installed, in its place", &[
             ("godspeed upgrade <publisher/name>[,...] [yes]", "fetch and verify the newest release, then install it; asks [y/N], naming the version change and what it asks for", "godspeed upgrade godspeed/hello"),
@@ -13747,7 +13803,7 @@ fn net_status(ctx: &ShellCtx, out: &mut Out) -> Result<(), ShellError> {
     // Diagnostic FIRST (independent of net-stack, so it shows even if net-stack is down): the NIC the
     // KERNEL discovered - vendor:device and which register BAR it mapped. This is which chip nic-driver
     // should be driving (Phase 4).
-    let vd = ctx.nic_vendor_device();
+    let vd = gs::driver::device::nic_vendor_device(&ctx);
     // vendor:device is a PCI fact, so a controller built into the SoC (the VisionFive's dwmac, the Pi 4's
     // GENET) has none, and this line used to print `(none)` above a driver that was working. Say what
     // the zero means instead: no PCI card, and where the kernel granted a window, a built-in controller.
@@ -15436,12 +15492,12 @@ fn cmd_ask(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 /// `timeout-secs`, at most 100 (`services/godspeed-pm`), and this leaves it room to say why one ended.
 const GODSPEED_WAIT_SECS: i64 = 120;
 
-/// `godspeed <command>` as a record table (`item`, `value`, `note`) whose last row is `status`. Like `ask`, a
-/// FOREGROUND PROGRAM: started for one command, its answer read, then ended. Its peers are its supervisor
-/// row's (`fs`, `net-stack`, `time`, and this shell), never passed from here.
 /// The marker that begins a progress frame from `godspeed-pm` (`services/godspeed-pm/src/main.rs`, `PROGRESS`).
 const PROGRESS_FRAME: &[u8] = b"\x01GSPROG1";
 
+/// `godspeed <command>` as a record table (`item`, `value`, `note`) whose last row is `status`. Like `ask`, a
+/// FOREGROUND PROGRAM: started for one command, its answer read, then ended. Its peers are its supervisor
+/// row's (`fs`, `net-stack`, `time`, and this shell), never passed from here.
 fn build_godspeed_table(ctx: &ShellCtx, arg: &str, show: Option<&dyn Fn(&[u8])>) -> Option<Table> {
     let line = arg.trim();
     let mut cap = Cap::new();
@@ -15915,6 +15971,9 @@ fn install_asks(ctx: &ShellCtx, spec: &str, q: &mut [u8; 512]) -> Option<([u8; 5
 }
 
 fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> bool {
+    // A PACKAGE THAT NEEDS OTHERS is planned first and asked about once, for all of them
+    // (`docs/developer-services-design.md` 16.4). One that needs nothing goes on below, as it always has.
+    if let Some(done) = install_plan(ctx, spec, from, yes, q) { return done; }
     let Some((note_b, nl, peers_b, pn)) = install_asks(ctx, spec, q) else {
         // Not fetched, or the copy did not check out: the answer says which.
         let _ = godspeed_show(ctx, fmt_into(q, format_args!("install {}", spec)));
@@ -15958,6 +16017,132 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
     godspeed_show(ctx, cmd).is_ok()
 }
 
+/// The most packages one plan installs, its own included (the package manager's `PLAN_MAX` and the package).
+const PLAN_ROWS: usize = 9;
+
+/// One row of a plan, copied out of the package manager's table.
+#[derive(Clone, Copy)]
+struct PlanRow { pkg: [u8; 128], pl: usize, ver: [u8; 24], vl: usize, kind: [u8; 16], kl: usize, asks: [u8; 192], al: usize, by: [u8; 128], bl: usize, fetch: bool }
+
+impl PlanRow {
+    const EMPTY: PlanRow = PlanRow { pkg: [0; 128], pl: 0, ver: [0; 24], vl: 0, kind: [0; 16], kl: 0, asks: [0; 192], al: 0, by: [0; 128], bl: 0, fetch: false };
+    fn pkg(&self) -> &str { core::str::from_utf8(&self.pkg[..self.pl]).unwrap_or("") }
+    fn ver(&self) -> &str { core::str::from_utf8(&self.ver[..self.vl]).unwrap_or("") }
+    fn kind(&self) -> &str { core::str::from_utf8(&self.kind[..self.kl]).unwrap_or("") }
+    fn asks(&self) -> &str { core::str::from_utf8(&self.asks[..self.al]).unwrap_or("") }
+    fn by(&self) -> &str { core::str::from_utf8(&self.by[..self.bl]).unwrap_or("") }
+}
+
+fn copy_cell(dst: &mut [u8], src: &[u8]) -> usize {
+    let n = src.len().min(dst.len());
+    dst[..n].copy_from_slice(&src[..n]);
+    n
+}
+
+/// The plan for `spec`, read into `rows`: how many there are, or `None` when the package manager refused it - its
+/// answer already shown.
+#[inline(never)]
+fn read_plan(ctx: &ShellCtx, spec: &str, rows: &mut [PlanRow; PLAN_ROWS], q: &mut [u8; 512]) -> Option<usize> {
+    let t = build_godspeed_table(ctx, fmt_into(q, format_args!("plan {}", spec)), None)?;
+    let status = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"status");
+    if status.is_some_and(|s| t.cell_bytes(s, 1) == b"failed") {
+        let _ = godspeed_present(ctx, t);
+        return None;
+    }
+    let mut n = 0usize;
+    for r in 0..t.nrows() {
+        if Some(r) == status || n == rows.len() { continue; }
+        let row = &mut rows[n];
+        *row = PlanRow::EMPTY;
+        row.pl = copy_cell(&mut row.pkg, t.cell_bytes(r, 0));
+        row.vl = copy_cell(&mut row.ver, t.cell_bytes(r, 1));
+        row.kl = copy_cell(&mut row.kind, t.cell_bytes(r, 2));
+        row.al = copy_cell(&mut row.asks, t.cell_bytes(r, 3));
+        let state = t.cell_bytes(r, 4);
+        row.fetch = state.starts_with(b"fetch");
+        if let Some(at) = state.windows(10).position(|w| w == b"needed by ") { row.bl = copy_cell(&mut row.by, &state[at + 10..]); }
+        n += 1;
+    }
+    Some(n)
+}
+
+/// The newest release of `pkg` in `range` on the registry, fetched: true when it is now here.
+#[inline(never)]
+fn fetch_in_range(ctx: &ShellCtx, pkg: &str, range: &str, q: &mut [u8; 512]) -> bool {
+    let Some(t) = build_godspeed_table(ctx, fmt_into(q, format_args!("resolve {} {}", pkg, range)), None) else {
+        gs::io::println(ctx, "godspeed: the package manager did not answer");
+        return false;
+    };
+    let Some(row) = (0..t.nrows()).find(|&r| t.cell_bytes(r, 0) == b"version") else {
+        let _ = godspeed_present(ctx, t);
+        return false;
+    };
+    let mut ver = [0u8; 24];
+    let vl = copy_cell(&mut ver, t.cell_bytes(row, 1));
+    let v = core::str::from_utf8(&ver[..vl]).unwrap_or("");
+    gs::io::println_fmt(ctx, format_args!("  {} {} is needed - fetching {} {}", pkg, range, pkg, v));
+    godspeed_show(ctx, fmt_into(q, format_args!("fetch {}@{}", pkg, v))).is_ok()
+}
+
+/// What installing `spec` takes, when that is more than `spec` alone: requirements not fetched are fetched (the newest
+/// in range), the plan made again, one question asked for all of it and each installed in order, dependencies
+/// first. `None` when `spec` needs nothing besides itself, so the one-package question below asks as before.
+#[inline(never)]
+fn install_plan(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mut [u8; 512]) -> Option<bool> {
+    let mut rows = [PlanRow::EMPTY; PLAN_ROWS];
+    let mut n = 0usize;
+    // A fetched requirement can need another, so this goes round until nothing is left to fetch - a bounded number
+    // of times, the depth requirements may nest to.
+    for _ in 0..5 {
+        n = match read_plan(ctx, spec, &mut rows, q) { Some(n) => n, None => return Some(false) };
+        let mut fetched_any = false;
+        for i in 0..n {
+            if !rows[i].fetch { continue; }
+            let row = rows[i];
+            if !fetch_in_range(ctx, row.pkg(), row.ver(), q) { return Some(false); }
+            fetched_any = true;
+        }
+        if !fetched_any { break; }
+    }
+    if rows[..n].iter().any(|r| r.fetch) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} needs more than could be fetched - nothing was installed", spec));
+        return Some(false);
+    }
+    if n <= 1 { return None; }
+    let me = rows[n - 1];
+    gs::io::println_fmt(ctx, format_args!("{} {}{} needs {} more package{}:", me.pkg(), me.ver(),
+        match from { Some(h) => fmt_into(q, format_args!(" (upgrade from {})", h)), None => "" },
+        n - 1, if n == 2 { "" } else { "s" }));
+    for r in &rows[..n] {
+        gs::io::print_fmt(ctx, format_args!("  {:<28} {:<9} {:<10} asks for: {}", r.pkg(), r.ver(), r.kind(), r.asks()));
+        if r.bl > 0 { gs::io::println_fmt(ctx, format_args!("   (needed by {})", r.by())); } else { gs::io::println(ctx, ""); }
+    }
+    gs::io::print_fmt(ctx, format_args!("Install all {} and grant them? (no privilege) [y/N]: ", n));
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); }
+    else if !read_confirm(ctx) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed, nor what it needs", spec));
+        return Some(true);
+    }
+    for r in &rows[..n] {
+        let mut grant = [0u8; 192];
+        let mut gl = 0usize;
+        if r.asks() != "nothing" {
+            for p in r.asks().split(", ") {
+                if gl > 0 && gl < grant.len() { grant[gl] = b','; gl += 1; }
+                gl += copy_cell(&mut grant[gl..], p.as_bytes());
+            }
+        }
+        let g = if gl == 0 { "none" } else { core::str::from_utf8(&grant[..gl]).unwrap_or("none") };
+        let mut line = [0u8; 512];
+        let cmd = fmt_into(&mut line, format_args!("install {}@{} grant {}", r.pkg(), r.ver(), g));
+        if godspeed_show(ctx, cmd).is_err() {
+            gs::io::println_fmt(ctx, format_args!("godspeed: stopped at {} - what was installed before it stays installed, and the rest was not", r.pkg()));
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 /// `a,b,c` shown as `a, b, c`.
 struct Commas<'a>(&'a str);
 impl core::fmt::Display for Commas<'_> {
@@ -15993,11 +16178,12 @@ fn godspeed_show(ctx: &ShellCtx, line: &str) -> Result<(), ShellError> {
     }
 }
 
-/// One `godspeed` command's answer, its progress drawn in place on one line until it comes, then cleared.
+/// One `godspeed` command's answer, its progress drawn in place until it comes, then cleared.
 #[inline(never)]
 fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
-    // PROGRESS, drawn in place on one line until the answer comes, then cleared.
-    let drawn = core::cell::Cell::new(false);
+    // PROGRESS, drawn in place until the answer comes, then cleared: the words, and the bar under them.
+    // How many lines the last frame drew, 0, 1 or 2: the words, and the bar under them when it had one.
+    let drawn = core::cell::Cell::new(0u8);
     // Whether the command's own `[q] quit` was already shown when the first frame came (a slow start): then
     // the line does not offer it a second time.
     let noticed_first = core::cell::Cell::new(None::<bool>);
@@ -16013,18 +16199,39 @@ fn godspeed_answer(ctx: &ShellCtx, line: &str) -> Option<Table> {
         };
         let text = core::str::from_utf8(line).unwrap_or("");
         let text = if already { text.trim_end().trim_end_matches("[q] quit").trim_end() } else { text };
-        let mut fit = [0u8; 192];
-        let text = fit::fit_progress(text, clip, &mut fit);
-        gs::io::print(ctx, "\r\x1b[2K");
+        // THE BAR ON ITS OWN LINE, under the words and as wide as the console (`fit`): inside them it had no
+        // room on the T630's 102 columns (2026-10-19). The last frame's lines are erased first, the cursor
+        // brought up to the words; it ends on the bar.
+        let mut words = [0u8; 192];
+        let (text, bar) = fit::split_bar(text, &mut words);
+        let text = fit::cut(text, clip);
+        unwind_progress(ctx, drawn.get());
         gs::io::print(ctx, text);
-        drawn.set(true);
+        match bar {
+            Some((filled, cells)) => {
+                let mut row = [0u8; 192];
+                gs::io::print(ctx, "\r\n");
+                gs::io::print(ctx, fit::bar_line(filled, cells, clip, &mut row));
+                drawn.set(2);
+            }
+            None => drawn.set(1),
+        }
         // The line offers `q` itself, so the watch does not print a second notice under it - unless the clip
         // cut the offer off, when the watch's own notice is what tells the reader.
         if !already && text.contains("[q] quit") { ctx.quit_shown(); }
     };
     let built = build_godspeed_table(ctx, line, Some(&show));
-    if drawn.get() { gs::io::print(ctx, "\r\x1b[2K"); }
+    unwind_progress(ctx, drawn.get());
     built
+}
+
+/// Erase a progress frame of `lines` lines (0, 1 or 2), leaving the cursor at the start of the first.
+fn unwind_progress(ctx: &ShellCtx, lines: u8) {
+    match lines {
+        0 => {}
+        1 => gs::io::print(ctx, "\r\x1b[2K"),
+        _ => gs::io::print(ctx, "\r\x1b[2K\x1b[A\r\x1b[2K"),
+    }
 }
 
 /// An answer shown: the card or the list, then its status note. Err when it failed.
@@ -18975,6 +19182,11 @@ fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, 
     // line, handed to `progress`. They are read only until the answer's first byte, so nothing in an answer
     // can be taken for one.
     let mut answering = progress.is_none();
+    // A STAGE WITH PROGRESS ANSWERS A RECORD TABLE, so before the answer begins a message that is neither a
+    // frame nor the start of one is not from it: a reply that came late to the shell's endpoint for an
+    // earlier command (`ping`'s, on the T630) was taken for `godspeed fetch`'s answer and refused as bad
+    // magic (2026-10-19). Set aside and counted, never shown as the answer.
+    let mut stray = 0u32;
     for _ in 0..512 {
         let got = recv_quittable(ctx, wait_secs, &noticed, keep.unwrap_or(&|_| {}));
         match got {
@@ -18986,6 +19198,7 @@ fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, 
                         show(line);
                         continue;
                     }
+                    if !p.starts_with(gs::record::REC_WIRE_MAGIC) { stray += 1; continue; }
                     answering = true;
                 }
                 out.push(p);
@@ -18999,6 +19212,9 @@ fn drain_stage(ctx: &ShellCtx, svc: &str, peers: &[&str], input: Option<&[u8]>, 
                 break;
             }
         }
+    }
+    if stray > 0 {
+        ctx.log_fmt(format_args!("shell: set aside {} message(s) that came before '{}' answered and were not from it", stray, svc));
     }
     if grace_ms > 0 && matches!(how, Drained::Eot) {
         // Bounded by grace_ms, a second at most, and only after the program has sent its end byte.
@@ -19240,17 +19456,17 @@ fn producer_refusal(cmd: &str, arg: &str) -> Option<&'static str> {
         "wifi" => wifi_pipe_refusal(arg),
         "audio" => audio_pipe_refusal(arg),
         "godspeed" => match (arg.split_whitespace().next(), arg.split_whitespace().nth(1)) {
-            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, registry, config and check"),
-            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset" | "add" | "remove")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade', 'trust reset', 'trust add' and 'trust remove' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, inspect, list, verify, trust, registry, config and check"),
+            (Some("config"), Some("set")) => Some("pipe: 'godspeed config set' is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, plan, resolve, registry, config and check"),
+            (Some("registry"), Some("add" | "use" | "remove")) => Some("pipe: that 'godspeed registry' verb is an action, not a report, so it cannot start a pipe - the reports are: godspeed search, info, list, plan, resolve, registry, config and check"),
+            (Some("fetch" | "remove" | "install" | "uninstall" | "upgrade"), _) | (Some("trust"), Some("reset" | "add" | "remove")) => Some("pipe: 'godspeed fetch', 'remove', 'install', 'uninstall', 'upgrade', 'trust reset', 'trust add' and 'trust remove' are actions, not reports, so they cannot start a pipe - the reports are: godspeed search, info, inspect, list, plan, resolve, verify, trust, registry, config and check"),
             (Some("config"), _) | (Some("check"), None) | (Some("registry"), None) | (Some("search"), _) | (Some("info"), _) | (Some("list"), _)
-                | (Some("verify"), _) | (Some("trust"), None) => None,
+                | (Some("verify"), _) | (Some("trust"), None) | (Some("plan" | "resolve"), Some(_)) => None,
             // A report; a file named by a full path, because a pipe stage is not given the folder it was typed in.
             (Some("inspect"), Some(x)) if !x.ends_with(".gsp") || x.starts_with('/') => None,
             // Piped, `cleanup` is the listing alone: nothing is asked, so nothing is deleted.
             (Some("cleanup"), None) => None,
             (Some("inspect"), _) => Some("pipe: in a pipe, name the package file by its full path, as in godspeed inspect /users/default/hello-0.3.0.gsp"),
-            _ => Some("pipe: pipe a report: godspeed search, info, inspect, list, registry, config or check"),
+            _ => Some("pipe: pipe a report: godspeed search, info, inspect, list, plan, resolve, registry, config or check"),
         },
         "churn" if arg.split_whitespace().next() == Some("verify") => None,
         "churn" => Some("pipe: only 'churn verify' is a report - 'churn <seconds>', 'tear' and 'reset' are actions and cannot start a pipe"),
@@ -21396,6 +21612,8 @@ const HIST_SAVE_SECS: i64 = 2;
 /// prompt forever on an unbounded request - the whole shell wedges and the keyboard looks dead. Bound it:
 /// a quick try, then "no history", so the prompt + `console_read` always come up regardless of fs health.
 const HIST_LOAD_SECS: i64 = 2;
+/// How long after a history load missed its bound before one is tried again (`History::load`).
+const HIST_RETRY_SECS: i64 = 30;
 
 /// The net-stack request correlation tag.
 ///
@@ -21675,18 +21893,8 @@ fn fs_read_at(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8]) -> Optio
     r.ok()
 }
 
-/// Deadline-bounded twin of `fs_stat` for the startup history load: the reply wait is capped at
-/// `max_secs`, so an alive-but-not-serving fs (respawned, still re-mounting) cannot hang the prompt.
-/// `None` on timeout/miss/absent, treated as "no file".
-fn fs_stat_bounded(ctx: &ShellCtx, path: &[u8], max_secs: i64) -> Option<(u64, bool)> {
-    let mut g = ctx.fs().patience_secs(max_secs);
-    let r = g.stat(path);
-    ctx.fs_tag.set(g.tag());
-    r.ok().map(|st| (st.size, st.is_dir))
-}
-
-/// Deadline-bounded twin of `fs_read_at` for the startup history load - same per-chunk deadline
-/// discipline as `fs_stat_bounded`, so a stalled fs times out instead of blocking the shell.
+/// Deadline-bounded twin of `fs_read_at` for the history load (`History::load`, whose `stat` takes the same
+/// bound), so a stalled fs times out instead of blocking the shell.
 fn fs_read_at_bounded(ctx: &ShellCtx, path: &[u8], offset: u64, out: &mut [u8], max_secs: i64) -> Option<usize> {
     let mut g = ctx.fs().patience_secs(max_secs);
     let r = g.read_at(path, offset, out);
@@ -24529,7 +24737,7 @@ fn cmd_background(ctx: &ShellCtx, cwd: &Cwd, args: &[&str], argc: usize) -> Resu
     let secs: u64 = if kind == KIND_CHURN { args[2].parse().unwrap_or(30) } else { 0 };
     match start_job(ctx, kind, &slocal[..slen], &dlocal[..dlen], secs, true) {
         Ok(id) => {
-            gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", id));
+            say_backgrounded(ctx, id);
             Ok(())
         }
         Err(_) => Err(ShellError::Unknown),
@@ -24758,6 +24966,12 @@ fn drives_typed(ctx: &ShellCtx, args: &[&str], argc: usize) -> Result<(), ShellE
     }
 }
 
+/// The line a job gets when it leaves the console, saying the way back to it - all three places a job is
+/// backgrounded (`background`, `b` on a typed command, `b` while in the foreground) say the same.
+fn say_backgrounded(ctx: &ShellCtx, id: u32) {
+    gs::io::println_fmt(ctx, format_args!("[backgrounded] job {} - `foreground {}` brings it back", id, id));
+}
+
 /// A typed command's job is going on without the console: from here it is a job like any other, with a
 /// number `jobs` shows and `foreground` takes.
 fn reveal_job(ctx: &ShellCtx, id: u32) -> u32 {
@@ -24855,7 +25069,7 @@ fn attach_job(ctx: &ShellCtx, id: u32, kind: u8, mut start_owed: bool) -> Option
             if detach {
                 ctx.offer_b.set(false);
                 let shown = reveal_job(ctx, id);
-                gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", shown));
+                say_backgrounded(ctx, shown);
                 return Some(Ok(()));
             }
         }
@@ -25235,7 +25449,7 @@ fn cmd_foreground(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
         let key = if ctx.quit.get() { Some(b'q') } else { ctx.try_console_read() };
         if let Some(b) = key {
             if b == b'b' || b == b'B' {
-                gs::io::println_fmt(ctx, format_args!("[backgrounded] job {}", want));
+                say_backgrounded(ctx, want);
                 return Ok(());
             }
             if b == b'q' || b == b'Q' || b == 0x1b {

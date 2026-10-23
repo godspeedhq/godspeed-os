@@ -447,6 +447,52 @@ pub fn versions(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &R
     });
 }
 
+/// `godspeed resolve <publisher/name> <range>`: the newest release on the registry in `range`, from its verified
+/// index - what a plan fetches for a requirement nothing here satisfies (`docs/developer-services-design.md` 16.3).
+/// Columns `key value note`, the version in the `version` row; a range nothing published satisfies fails, naming
+/// the newest there is.
+#[inline(never)]
+pub fn resolve(ctx: &ServiceContext, r: &mut Rows, ready: &Ready<'_>, roots: &Roots, which: &str, range: &str) {
+    let name = match spec(which) {
+        Ok((n, None)) => n,
+        Ok((_, Some(_))) => return r.fail("usage", which, "a package and a range, not one version"),
+        Err(why) => return r.fail("usage", which, why),
+    };
+    let Ok(want) = range.parse::<godspeed_package::VersionReq>() else {
+        return r.fail("usage", range, "a version range is ^, = or >= and a whole version: ^1.2.0");
+    };
+    let mut docs = Docs::new();
+    let base = ready.url.base;
+    on_registry(ctx, r, ready, roots, |s, r| {
+        let mut iso = [0u8; 20];
+        let v = chain::verify(ctx, s, base, &ready.reg, chain::iso(ready.now, &mut iso), &mut docs)?;
+        let mut ibuf = [0u8; INDEX_MAX];
+        let Some(text) = index_text(ctx, s, base, &v, &name, &mut ibuf)? else {
+            r.fail("package", which, "never published on this registry");
+            return Ok(());
+        };
+        let mut rel = Releases::new();
+        let idx = match meta::index(text, &mut rel) {
+            Ok(i) => i,
+            Err(b) => { r.fail("index", which, cell(format_args!("line {}: {}", b.line, b.why)).as_str()); return Ok(()); }
+        };
+        let best = idx.releases.iter().map(|rel| rel.version).filter(|v| want.matches(v)).max();
+        let newest = idx.releases.iter().map(|rel| rel.version).max();
+        match best {
+            Some(b) => {
+                r.columns(&["key", "value", "note"]);
+                r.row("version", cell(format_args!("{}", b)).as_str(), cell(format_args!("the newest of {} in {}", which, want)).as_str());
+                chain_note(r, &v, "");
+            }
+            None => {
+                let n = newest.map(|n| cell(format_args!("the newest is {}", n))).unwrap_or_else(|| cell(format_args!("it has no releases")));
+                r.fail("requires", which, cell(format_args!("no release is in {} - {}", want, n.as_str())).as_str());
+            }
+        }
+        Ok(())
+    });
+}
+
 /// it was built for, what it ships, what its contract requests, who signed it, and every version published -
 /// each checked as `fetch` checks it. Columns `key value note`; the shell shows it as a card.
 #[inline(never)]
@@ -936,7 +982,7 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
         let mut shown = u64::MAX;
         // Said as the PACKAGE, not the file: `x86_64.elf` is how it is stored, not what is being fetched. And not
         // its arch: a machine fetches only its own, the card after says which, and the line has to fit a screen
-        // (the shell narrows the bar first, `fit_progress`; at 100 columns this name was what was left over).
+        // (the shell draws the bar on its own line, `split_bar`, and cuts the words at the console's width).
         let what = cell(format_args!("{} {}", name, version));
         // From a package file nothing is downloaded: it is copied out of the file, and said so.
         let verb = if s.offline() { "unpacking" } else { "downloading" };
@@ -955,8 +1001,8 @@ fn store(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, base: &str, nam
                 shown = step;
                 shown_secs = secs;
                 let ms = gs::driver::wait::counter_ms(ctx).saturating_sub(t0_ms);
-                crate::progress(ctx, format_args!("  {} {}  [{}]  {}%  {} / {}  {}  {}{}", verb, what.as_str(), bar(step as usize, 28).as_str(),
-                    got * 100 / total.max(1), size_text(got).as_str(), size_text(total).as_str(), rate_text(got, ms).as_str(),
+                crate::progress(ctx, format_args!("  {} {}  [{}]  {}%  {}  {}  {}{}", verb, what.as_str(), bar(step as usize, 28).as_str(),
+                    got * 100 / total.max(1), of_text(got, total).as_str(), rate_text(got, ms).as_str(),
                     time_text(secs, got, total).as_str(), if got == total { "" } else { "   [q] quit" }));
             }
             let mut rest = bytes;
@@ -1238,6 +1284,15 @@ pub(crate) fn size_text(bytes: u64) -> Cell {
     else { cell(format_args!("{}.{} MiB", bytes >> 20, (bytes & 0xfffff) * 10 >> 20)) }
 }
 
+/// How much of how much, the unit said once when both share it: `2.0 / 9.5 MiB`, `780 B / 9.5 MiB`.
+pub(crate) fn of_text(got: u64, total: u64) -> Cell {
+    let (g, t) = (size_text(got), size_text(total));
+    match (g.as_str().rsplit_once(' '), t.as_str().rsplit_once(' ')) {
+        (Some((gn, gu)), Some((_, tu))) if gu == tu => cell(format_args!("{} / {}", gn, t.as_str())),
+        _ => cell(format_args!("{} / {}", g.as_str(), t.as_str())),
+    }
+}
+
 /// `godspeed list fetched`: what has been fetched here. Columns `package version from size state`, `size` in
 /// bytes so a pipe can compare it; the count and total are the status note. None is no rows.
 pub fn list_fetched(ctx: &ServiceContext, r: &mut Rows) {
@@ -1362,15 +1417,18 @@ pub fn cleanup(ctx: &ServiceContext, r: &mut Rows, delete: bool) {
         if more { "; more are fetched than one listing shows - run it again after" } else { "" }));
 }
 
-/// How long a transfer has taken, and about how long is left: `3 s, about 4 s left`, then `done in 7 s`. The
-/// estimate is the rate so far, and only once a whole second has passed - a guess from the first chunk would be
-/// noise. Seconds, because that is the clock a program is given and the unit a download is felt in.
+/// How long a transfer has taken, or about how long is left: `1 s`, then `about 4 s left`, then `done in 7 s`.
+/// The estimate is the rate so far, and only once a whole second has passed - a guess from the first chunk would
+/// be noise. Seconds, because that is the clock a program is given and the unit a download is felt in. While it
+/// runs only the time LEFT is said, so the words stay short on a narrow console - with both times the bar had no
+/// room on the T630's 102 columns (2026-10-19), and the shell has drawn it on its own line since; the time taken
+/// is said once, at the end.
 pub(crate) fn time_text(secs: i64, got: u64, total: u64) -> Cell {
     let secs = secs.max(0) as u64;
     if got >= total { return cell(format_args!("done in {}", duration_text(secs).as_str())); }
     if secs == 0 || got == 0 { return duration_text(secs); }
     let left = secs * (total - got) / got;
-    cell(format_args!("{}, about {} left", duration_text(secs).as_str(), duration_text(left.max(1)).as_str()))
+    cell(format_args!("about {} left", duration_text(left.max(1)).as_str()))
 }
 
 /// A duration as a person reads one: `45 s`, `2 min 5 s`, `1 h 3 min`. `1162 s` was the operator's example of

@@ -1002,7 +1002,7 @@ fn dhcp_request(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6]
 /// network is not an acceptable price for the diagnosis - but a fallback nobody is told about is the
 /// silent kind this system does not allow.
 fn dhcp_lease(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6],
-              serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+              serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> {
     if let Some(cfg) = dhcp_discover(ctx, pending, our_mac, false, serve_status) {
         return Some(cfg);
     }
@@ -1013,10 +1013,11 @@ fn dhcp_lease(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6],
 }
 
 /// DHCP DISCOVER, then for the first OFFER the REQUEST that claims it (`dhcp_request`), up to
-/// `DANCE_TRIES` times. Returns `(address, gateway, dns server)` once an address is ACKed, or None (no
+/// `DANCE_TRIES` times. Returns `(address, gateway, dns server, subnet mask)` once an address is ACKed (the mask
+/// `[0; 4]` when the server sent none), or None (no
 /// NIC, nothing answered, or no offer acknowledged). `bcast` sets the BOOTP broadcast flag (`dhcp_lease`).
 fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6], bcast: bool,
-                 serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4])> {
+                 serve_status: Option<&[u8; 19]>) -> Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> {
     let mut send_fail = 0u32;
     // Ethernet(14) + IPv4(20) + UDP(8) + DHCP/BOOTP(244) = 286 bytes.
     let mut frame = [0u8; 286];
@@ -1055,7 +1056,7 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
         // COUNT A SEND THAT NEVER LEFT. Discarding this outcome makes "no offer" mean two different
         // things - the server was silent, or we never asked - and they need opposite fixes (§26.7).
         if nic_req(ctx, pending, &req, LINK_SECS).is_none() { send_fail += 1; }
-        let mut found: Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4])> = None;
+        let mut found: Option<([u8; 4], [u8; 4], [u8; 4], [u8; 4], [u8; 4])> = None;
         drain_scan(ctx, pending, DANCE_SECS, serve_status, |f, _| {
             // A DHCP reply: IPv4 (0x0800, IHL 5), UDP (proto 17), BOOTP op = 2 (BOOTREPLY). yiaddr (our
             // offered IP) sits at BOOTP offset 16 = frame offset 58.
@@ -1068,12 +1069,16 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
                 let mut dns = [0u8; 4];
                 let mut have_dns = false;
                 let mut srv = [0u8; 4];
+                // Option 1, the SUBNET MASK: which addresses are on this link and reached directly, and which
+                // go to the gateway (`on_link_by_mask`). None sent leaves it unknown, and ARP decides.
+                let mut mask = [0u8; 4];
                 let mut o = 282usize;
                 while o + 1 < f.len() {
                     let opt = f[o];
                     if opt == 255 { break; }          // options end
                     if opt == 0 { o += 1; continue; } // pad
                     let len = f[o + 1] as usize;
+                    if opt == 1 && len >= 4 && o + 6 <= f.len() { mask = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
                     if opt == 3 && len >= 4 && o + 6 <= f.len() { gw = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; }
                     if opt == 6 && len >= 4 && o + 6 <= f.len() { dns = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]]; have_dns = true; }
                     // Option 54, the SERVER IDENTIFIER. A REQUEST must name the server whose offer it
@@ -1104,14 +1109,15 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
                 ctx.log_fmt(format_args!(
                     "net-stack: DHCP reply - {} bytes, type {} (2=OFFER 5=ACK), server {}.{}.{}.{}",
                     f.len(), mtype, srv[0], srv[1], srv[2], srv[3]));
-                found = Some((ip, gw, dns, srv));
+                found = Some((ip, gw, dns, srv, mask));
                 true
             } else { false }
         });
-        if let Some((ip, gw, dns, srv)) = found {
+        if let Some((ip, gw, dns, srv, mask)) = found {
             ctx.log_fmt(format_args!(
-                "net-stack: DHCP - offered {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
-                ip[0], ip[1], ip[2], ip[3], gw[0], gw[1], gw[2], gw[3], dns[0], dns[1], dns[2], dns[3]));
+                "net-stack: DHCP - offered {}.{}.{}.{}, mask {}.{}.{}.{}, gw {}.{}.{}.{}, dns {}.{}.{}.{}",
+                ip[0], ip[1], ip[2], ip[3], mask[0], mask[1], mask[2], mask[3], gw[0], gw[1], gw[2], gw[3],
+                dns[0], dns[1], dns[2], dns[3]));
             // ACCEPT THE OFFER. An offer is not a lease (RFC 2131 §3.1): the client must REQUEST the
             // address and the server must ACK it, and only then is the address the client's.
             //
@@ -1122,7 +1128,7 @@ fn dhcp_discover(ctx: &ServiceContext, pending: &mut Displaced, our_mac: &[u8; 6
             // exactly what the Pi 2 shows - .66, then .67, then .70, each one used briefly and never
             // owned, with the gateway silent to every ARP.
             if dhcp_request(ctx, pending, our_mac, &ip, &srv, bcast, serve_status) {
-                return Some((ip, gw, dns));
+                return Some((ip, gw, dns, mask));
             }
             // No ACK: the address is NOT ours, and using it anyway is what produced the silent
             // gateway. Fall through and re-DISCOVER rather than pretend.
@@ -1625,10 +1631,10 @@ fn tcp_open(ctx: &ServiceContext, pending: &mut Displaced, t: &mut tcp::Tcp, net
     }
     let deadline = t.now_ms(ctx).unwrap_or(0) + budget_ms;
     let i = match t.connect(ctx, rid, dst, dport, net.peer_mac) { Some(i) => i, None => return Err(tcp::Fault::None) };
-    // OVER A RADIO, THE SMALL WINDOW (`Conn::small_window` says why), decided now, before the SYN settles it.
+    // OVER A RADIO, AT MOST `RCV_RADIO` (`Conn::small_window` says why), decided now, before the SYN settles it.
     if over_radio(ctx, pending) {
         t.conns[i].small_window();
-        ctx.log("net-stack: connect - the radio carries the link, so this connection offers the small window");
+        ctx.log("net-stack: connect - the radio carries the link, so this connection offers at most a 32 KiB window");
     }
     let n = t.syn_frame(ctx, net, i, &mut frame);
     if n > 0 {
@@ -1814,13 +1820,36 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
     // outlast its own interval and starve the client the service exists to answer.
     let t0 = gs::driver::wait::ticks(ctx);
     let budget = ticks_ms(ctx, POLL_BUDGET_MS);
-    let spent = |ctx: &ServiceContext| gs::driver::wait::ticks(ctx).wrapping_sub(t0) >= budget;
-
     let batch = nic_drain_ms(ctx, pending, POLL_TX_MS);
+    let td = gs::driver::wait::ticks(ctx);
+    // Counted from a connection's first read (`tcp::Spent`), so a connect and its handshake are not.
+    let counting = t.spent.since != 0;
+    if counting {
+        t.spent.polls += 1;
+        t.spent.drains += 1;
+        t.spent.drain_ticks += td.wrapping_sub(t0);
+    }
+    let any = poll_frames(ctx, pending, st, t, net, asks, batch.as_ref(), t0, budget);
+    if counting && t.spent.since != 0 {
+        t.spent.poll_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(t0);
+    }
+    any
+}
+
+/// The rest of [`poll_step`], on the batch the driver answered with: split out so the step's time is
+/// counted on every way out of it (`tcp::Spent`).
+#[allow(clippy::too_many_arguments)]
+fn poll_frames(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState, t: &mut tcp::Tcp, net: &tcp::Net,
+               asks: &mut UdpAsks, batch: Option<&Message>, t0: u64, budget: u64) -> bool {
+    let spent = |ctx: &ServiceContext| gs::driver::wait::ticks(ctx).wrapping_sub(t0) >= budget;
     let m = match batch { Some(m) => m, None => return false };
     let p = m.payload_bytes();
     if p.is_empty() { return false; }
     let count = p[0] as usize;
+    if t.spent.since != 0 {
+        t.spent.frames += count as u32;
+        if count == 0 { t.spent.empty += 1; }
+    }
     let mut pos = 1usize;
     let mut any = false;
     let mut out = [0u8; 1600];
@@ -1892,6 +1921,7 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
             t.forget(rid);
             let _ = gs::resource::revoke(ctx, rid);
             ctx.log("net-stack: a finished connection was reaped and its slot released");
+            report_spent(ctx, &mut t.spent);
         }
     }
 
@@ -1908,7 +1938,13 @@ fn poll_step(ctx: &ServiceContext, pending: &mut Displaced, st: &NetState,
             // `POLL_TX_MS` should be set from, and its absence is why the first value was a guess
             // that broke a working connection. A silent drop here looks exactly like a network
             // that lost the frame, which is the one thing it must not be confused with (§26.7).
-            if nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS).is_none() {
+            let ts = gs::driver::wait::ticks(ctx);
+            let taken = nic_req_ms(ctx, pending, &Message::from_bytes(&out[..n]), POLL_TX_MS);
+            if t.spent.since != 0 {
+                t.spent.sends += 1;
+                t.spent.send_ticks += gs::driver::wait::ticks(ctx).wrapping_sub(ts);
+            }
+            if taken.is_none() {
                 t.poll_tx_slow = t.poll_tx_slow.saturating_add(1);
                 if t.poll_tx_slow == 1 || t.poll_tx_slow % 64 == 0 {
                     ctx.log_fmt(format_args!(
@@ -2570,6 +2606,22 @@ struct NetState {
     leased: bool,
     dns_server: [u8; 4],
     status: [u8; 19],
+    /// The lease's subnet mask (DHCP option 1), `[0; 4]` when none is known - no lease, or none sent.
+    netmask: [u8; 4],
+}
+
+/// Is `dst` on this link, by the lease's subnet mask? `None` when no mask is known - no lease, or a server
+/// that sent none - and then ARP is the test, as it always was: a host that answers is on-link by definition.
+///
+/// **Why a mask now, when op 21's comment once refused one.** It refused to ASSUME /24, which would be a
+/// guess. This is the mask the DHCP server gave with the address (option 1), which is the network saying
+/// where its edge is. Every address off it was ARPed anyway, waited out, and sent to the gateway: about 1.8 s
+/// on every connect through op 23 (one ARP try) and 12 to 18 s on every op 21 transaction (backlog/93).
+fn on_link_by_mask(our_ip: &[u8; 4], mask: &[u8; 4], dst: &[u8; 4]) -> Option<bool> {
+    if *mask == [0; 4] {
+        return None;
+    }
+    Some((0..4).all(|i| our_ip[i] & mask[i] == dst[i] & mask[i]))
 }
 
 /// Learn our own MAC from nic-driver's `[3]` status reply (bytes 1..7). This is the one source of truth
@@ -2598,7 +2650,7 @@ fn run_dance(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option
             ctx.log("net-stack: no NIC MAC yet (driver absent/not ready) - staying unconfigured");
             return NetState { our_ip: FALLBACK_IP, our_mac: [0u8; 6], gw_mac: [0u8; 6],
                               gw_known: false, leased: false, dns_server: GATEWAY_IP,
-                              status: [0u8; 19] };
+                              status: [0u8; 19] , netmask: [0; 4] };
         }
     };
 
@@ -2607,7 +2659,7 @@ fn run_dance(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option
     // ARP + ICMP use below.
     let leased_cfg = dhcp_lease(ctx, pending, &our_mac, serve_status);
     let leased = leased_cfg.is_some();
-    let (our_ip, gateway, dns_server) = leased_cfg.unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP));
+    let (our_ip, gateway, dns_server, netmask) = leased_cfg.unwrap_or((FALLBACK_IP, GATEWAY_IP, GATEWAY_IP, [0; 4]));
 
     // ---- Phase 2 step 1: ARP - who-has GATEWAY_IP, tell our_ip (a broadcast request).
     let mut arp = [0u8; 42];
@@ -2670,7 +2722,7 @@ fn run_dance(ctx: &ServiceContext, pending: &mut Displaced, serve_status: Option
     // CONFIGURING THE NETWORK DOES NOT FETCH THE CLOCK. This dance used to end in an SNTP exchange, a
     // multi-second wait for a time server inside the loop every client is queued behind. The clock is
     // `time`'s to pursue, and it does so itself through op 12 (`UdpAsk`), which never waits in this loop.
-    NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status }
+    NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status, netmask }
 }
 
 /// Announce a cable coming or going on the CONSOLE, the way the USB drivers announce a keyboard or a
@@ -2718,6 +2770,37 @@ fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: 
             None => true,
         }
     })
+}
+
+/// Say where this service's time went while the connection just released was read (`tcp::Spent`), and start
+/// the count again. Said only for a connection that was read, so a connect that carried nothing is quiet.
+/// What is left of the time beside the parts is this loop waiting for a client to ask.
+fn report_spent(ctx: &ServiceContext, sp: &mut tcp::Spent) {
+    if sp.reads > 0 {
+        let per_ms = ticks_ms(ctx, 1).max(1);
+        let ms = |t: u64| t / per_ms;
+        let us = |t: u64, n: u32| if n == 0 { 0 } else { t * 1000 / per_ms / n as u64 };
+        let wall = gs::driver::wait::ticks(ctx).wrapping_sub(sp.since);
+        let other = wall.saturating_sub(sp.read_ticks).saturating_sub(sp.poll_ticks);
+        // Three lines, each inside `log_fmt`'s 256 bytes: one line was cut short.
+        ctx.log_fmt(format_args!(
+            "net-stack: where the connection's {} ms went (1/3) - {} reads, {} KiB, {} ms answering them, {} us each with the polls they ran left out ({} polls inside reads, {} reads from the stash)",
+            ms(wall), sp.reads, sp.read_bytes / 1024, ms(sp.read_ticks), us(sp.read_ticks, sp.reads),
+            sp.read_polls, sp.stashed));
+        ctx.log_fmt(format_args!(
+            "net-stack: where the connection's time went (2/3) - {} polls, {} ms in all; {} asks of the driver for frames, {} ms, {} us each, {} frames brought, {} asks found none",
+            sp.polls, ms(sp.poll_ticks), sp.drains, ms(sp.drain_ticks), us(sp.drain_ticks, sp.drains), sp.frames, sp.empty));
+        ctx.log_fmt(format_args!(
+            "net-stack: where the connection's time went (3/3) - {} frames sent from the polls, {} ms, {} us each; {} ms not in a read or a poll (waiting to be asked)",
+            sp.sends, ms(sp.send_ticks), us(sp.send_ticks, sp.sends), ms(other)));
+        ctx.log_fmt(format_args!(
+            "net-stack: the connection's data segments - {} next in sequence, {} ahead of a gap ({} past the window), {} already had (a retransmission)",
+            sp.seg_next, sp.seg_ahead, sp.seg_past, sp.seg_old));
+        ctx.log_fmt(format_args!(
+            "net-stack: the connection's gaps - {} opened and filled, the data waited {} ms behind them, the longest {} ms",
+            sp.gaps, sp.gap_ms, sp.gap_max_ms));
+    }
+    *sp = tcp::Spent::default();
 }
 
 /// `nic_drain`, bounded in MILLISECONDS so it can fit inside a sub-second window.
@@ -2972,6 +3055,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             leased: false,     // no cable, so certainly no lease
             dns_server: [0; 4],
             status: NO_LINK_STATUS,
+            netmask: [0; 4],
         }
     };
     let mut our_ip = d.our_ip;
@@ -3007,6 +3091,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut asks = UdpAsks::new();
     // Did DHCP grant `our_ip`, or is it the fallback guess? See `NetState::leased`.
     let mut leased = d.leased;
+    let mut netmask = d.netmask;
     // When the last automatic re-DHCP ran, so an unleased stack retries without dancing per request.
     // One RESYNC_SECS in the past, so the FIRST time a retry is wanted it happens at once and only the
     // repeats are spaced. Zero meant "sixty seconds of uptime before the first attempt", which on a
@@ -3153,7 +3238,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     if gs::driver::wait::ticks(&ctx).wrapping_sub(last_poll) >= interval {
                         last_poll = gs::driver::wait::ticks(&ctx);
                         let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased,
-                                            dns_server, status };
+                                            dns_server, status, netmask };
                         // The gateway is the FALLBACK address for anything this poll originates;
                         // every established connection carries its own peer MAC on the `Conn`,
                         // so `poll_one` addresses its frames correctly whatever is passed here.
@@ -3334,7 +3419,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("net-stack: running on the fallback address without a lease - retrying DHCP");
             let d = run_dance(&ctx, pending, Some(&status));
             asks.abandon(&ctx);
-            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
+            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; netmask = d.netmask; dns_server = d.dns_server; status = d.status;
             if leased {
                 ctx.log_fmt(format_args!("net-stack: DHCP recovered - address {}.{}.{}.{}",
                                          our_ip[0], our_ip[1], our_ip[2], our_ip[3]));
@@ -3374,7 +3459,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             ctx.log("net-stack: link up while unconfigured - auto-configuring");
             let d = run_dance(&ctx, pending, Some(&status));
             asks.abandon(&ctx);
-            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
+            our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; netmask = d.netmask; dns_server = d.dns_server; status = d.status;
         }
         // RETRY THE GATEWAY ALONE WHEN WE HOLD A LEASE BUT ARP NEVER ANSWERED.
         //
@@ -3434,7 +3519,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
                     let d = run_dance(&ctx, pending, Some(&status));
                     asks.abandon(&ctx);
-                    our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
+                    our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; netmask = d.netmask; dns_server = d.dns_server; status = d.status;
                     // The access point is asked afresh on the new link, not compared with the old one's.
                     link_peer_seen = None;
                 } else if let (Some(was), Some(now)) = (roamed_from, peer) {
@@ -3444,7 +3529,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         now[0], now[1], now[2], now[3], now[4], now[5]));
                     let d = run_dance(&ctx, pending, Some(&status));
                     asks.abandon(&ctx);
-                    our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; dns_server = d.dns_server; status = d.status;
+                    our_ip = d.our_ip; our_mac = d.our_mac; gw_mac = d.gw_mac; gw_known = d.gw_known; leased = d.leased; netmask = d.netmask; dns_server = d.dns_server; status = d.status;
                 }
             }
         }
@@ -3540,6 +3625,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         // at the next scheduled poll. One poll is one batch, two full frames at most (a
                         // message is 4 KiB), so one poll per read was a download paced by this loop.
                         let t0 = gs::driver::wait::ticks(&ctx);
+                        // The count starts here, at the first read, so the polls this read runs are in it.
+                        if tcpst.spent.since == 0 { tcpst.spent.since = t0; }
+                        let polled0 = tcpst.spent.poll_ticks;
                         let budget = ticks_ms(&ctx, RECV_DRAIN_MS);
                         // A reader whose answer is already waiting is answered at once: the stream poll keeps
                         // taking frames in between reads, so draining here as well only adds a driver round trip.
@@ -3549,14 +3637,24 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             && tcpst.conns[i].state != tcp::State::Closed
                         {
                             last_poll = gs::driver::wait::ticks(&ctx);
-                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                            let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status, netmask };
                             let net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
                             streaming = poll_step(&ctx, pending, &st, &mut tcpst, &net, &mut asks);
+                            tcpst.spent.read_polls += 1;
                             // Nothing more in the driver: answer with what there is. And a reader with enough
                             // to fill its answer is not kept waiting for more.
                             if !streaming || tcpst.conns[i].readable() >= max { break; }
                         }
-                        tcpst.read(rid, &mut resp[..max])
+                        let got = tcpst.read(rid, &mut resp[..max]);
+                        // Counted here, before the reply goes: the send is a copy into the reader's queue, the
+                        // same for every reply, and what this measures is what a read waits on inside.
+                        let sp = &mut tcpst.spent;
+                        let now = gs::driver::wait::ticks(&ctx);
+                        sp.reads += 1;
+                        sp.read_bytes += got as u64;
+                        sp.read_ticks += now.wrapping_sub(t0).wrapping_sub(sp.poll_ticks.wrapping_sub(polled0));
+                        if from_stash { sp.stashed += 1; }
+                        got
                     }
                     COP_SEND if right & RIGHT_WRITE != 0 => {
                         let took = tcpst.write(rid, body);
@@ -3721,12 +3819,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // asymmetric - it answers us direct, so the router sees only our half of the flow and
                 // drops everything after the first packet as invalid.
                 //
-                // AN ARP REPLY IS THE TEST, and it needs no netmask: a host that answers is on-link
-                // by definition, whatever the prefix happens to be. That matters because net-stack
-                // does not keep the mask from the DHCP lease, and assuming /24 would be a guess that
-                // breaks on anything else. No answer means it is not a neighbour, so the gateway is
-                // right and we fall back to it.
-                let peer_mac = match arp_resolve(&ctx, pending, &our_ip, &our_mac, &dip, None) {
+                // AN ARP REPLY IS THE TEST on the subnet, and it needs no prefix: a host that answers is
+                // on-link by definition. OFF the subnet - by the mask the DHCP server gave with the
+                // address, never an assumed /24 - nothing is asked: the gateway is the answer
+                // (`on_link_by_mask`), as op 23 does. With no mask, ARP decides: no answer means it is not a
+                // neighbour, so the gateway is right and we fall back to it.
+                let off_subnet = on_link_by_mask(&our_ip, &netmask, &dip) == Some(false);
+                let peer_mac = match if off_subnet { None }
+                                     else { arp_resolve(&ctx, pending, &our_ip, &our_mac, &dip, None) } {
                     Some(mac) => {
                         ctx.log_fmt(format_args!(
                             "net-stack: tcp {}.{}.{}.{} on-link at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} - direct",
@@ -3735,9 +3835,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                         mac
                     }
                     None => {
-                        ctx.log_fmt(format_args!(
-                            "net-stack: tcp {}.{}.{}.{} did not answer ARP - routing via the gateway",
-                            dip[0], dip[1], dip[2], dip[3]));
+                        // Said apart, as op 23 does: no ARP is asked for an address off the subnet.
+                        ctx.log_fmt(format_args!("net-stack: tcp {}.{}.{}.{} {} - routing via the gateway",
+                            dip[0], dip[1], dip[2], dip[3],
+                            if off_subnet { "is off the subnet" } else { "did not answer ARP" }));
                         gw_mac
                     }
                 };
@@ -3825,14 +3926,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if pl.len() >= 7 && gw_known {
                 let dip = [pl[1], pl[2], pl[3], pl[4]];
                 let dport = ((pl[5] as u16) << 8) | pl[6] as u16;
-                // An address that answers ARP is on-link and is reached directly, as for op 21 - but asked
-                // ONCE: a neighbour answers in milliseconds, and op 21's six tries cost 12 to 18 s on every
-                // address beyond the gateway, longer than a client will wait for the connection.
-                let on_link = arp_resolve_tries(&ctx, pending, &our_ip, &our_mac, &dip, None, 1);
+                // OFF THE SUBNET GOES TO THE GATEWAY AT ONCE (`on_link_by_mask`): the lease's mask says so, and
+                // asking ARP first cost about 1.8 s on every connect to the internet, on every board
+                // (backlog/93). On the subnet, or with no mask known, an address that answers ARP is on-link
+                // and is reached directly, as for op 21 - but asked ONCE: a neighbour answers in
+                // milliseconds, and op 21's six tries cost 12 to 18 s, longer than a client will wait.
+                let by_mask = on_link_by_mask(&our_ip, &netmask, &dip);
+                let on_link = if by_mask == Some(false) { None }
+                              else { arp_resolve_tries(&ctx, pending, &our_ip, &our_mac, &dip, None, 1) };
                 let peer_mac = on_link.unwrap_or(gw_mac);
                 ctx.log_fmt(format_args!("net-stack: connect {}.{}.{}.{}:{} - {}",
                     dip[0], dip[1], dip[2], dip[3], dport,
-                    if on_link.is_some() { "on-link, direct" } else { "via the gateway" }));
+                    if on_link.is_some() { "on-link, direct" }
+                    else if by_mask == Some(false) { "off the subnet, via the gateway" }
+                    else { "via the gateway" }));
                 let net = tcp::Net { our_mac, peer_mac, our_ip };
                 // A FULL TABLE THAT IS EMPTYING IS WAITED FOR, briefly. The connection before this one is
                 // often still closing when its client's next command asks for a new one - a client that
@@ -3843,7 +3950,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // at once, as before.
                 if !tcpst.has_free_slot() && tcpst.any_closing() {
                     let start = gs::driver::wait::ticks(&ctx);
-                    let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status };
+                    let st = NetState { our_ip, our_mac, gw_mac, gw_known, leased, dns_server, status, netmask };
                     let poll_net = tcp::Net { our_mac, peer_mac: gw_mac, our_ip };
                     while !tcpst.has_free_slot()
                         && gs::driver::wait::ticks(&ctx).wrapping_sub(start) < ticks_ms(&ctx, CONNECT_SLOT_WAIT_MS) {
@@ -4012,6 +4119,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // so a renew that lost (or won) the lease left the re-DHCP and gateway-retry decisions
             // working from the previous dance's answer (backlog/fixed/80 D3).
             leased = d.leased;
+            netmask = d.netmask;
             dns_server = d.dns_server;
             status = d.status;
             reply.send(&ctx, &status);

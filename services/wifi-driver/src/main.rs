@@ -251,7 +251,7 @@ fn verify_hard_off(ctx: &ServiceContext, h: &dyn SdioHost) -> u8 {
 /// (docs/wifi.md 48: the park did not by itself make the start cold.)
 pub(crate) fn power_on_device(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
     h.park(ctx);
-    if !ctx.device_power(true) {
+    if !godspeed::driver::power::set(&ctx, true) {
         return false;
     }
     godspeed::task::sleep_ms(ctx, POWER_ON_SETTLE_MS);
@@ -261,7 +261,7 @@ pub(crate) fn power_on_device(ctx: &ServiceContext, h: &dyn SdioHost) -> bool {
 /// `power_cycle_device` with the hold-off chosen by the caller (`wifi radio powercycle` asks for a fixed
 /// 2 s): the shell decides how long, this decides how.
 pub(crate) fn power_cycle_device_ms(ctx: &ServiceContext, h: &dyn SdioHost, off_ms: u64) -> bool {
-    if !ctx.device_power(false) {
+    if !godspeed::driver::power::set(&ctx, false) {
         return false;
     }
     // THE HOST GOES QUIET FOR THE WHOLE OFF WINDOW (docs/wifi.md 48). Every earlier cycle left the card
@@ -300,7 +300,7 @@ fn requested_off_ms(units: u8) -> u64 {
 /// first command - with the host's card clock stopped across the edge, so the card powers up into a quiet
 /// bus. The hold-offs are the device's and live here, not in the kernel (26.10).
 #[cfg(wifi_host_dw_mmc)]
-fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
+fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed::driver::Registers) -> ! {
     use godspeed_wifi::sdio as sd;
     const POWER_HOLD_MS: u64 = 10;
     let h = dwmmc::Host::new(ctx, mmio);
@@ -309,9 +309,9 @@ fn v1_dw_mmc(ctx: &ServiceContext, mmio: &godspeed_sdk::Mmio) -> ! {
         h.verid(), h.hcon()));
     let why = scan::reply::DOWN_NOT_BUILT;
     h.park(ctx);
-    let off = ctx.device_power(false);
+    let off = godspeed::driver::power::set(&ctx, false);
     godspeed::task::sleep_ms(ctx, POWER_HOLD_MS);
-    let on = ctx.device_power(true);
+    let on = godspeed::driver::power::set(&ctx, true);
     godspeed::task::sleep_ms(ctx, POWER_HOLD_MS);
     ctx.log_fmt(format_args!(
         "wifi-driver: radio power cycled for a clean power-up - off {}, on {}",
@@ -566,7 +566,7 @@ fn serve_unavailable_why(ctx: &ServiceContext, h: Option<&dyn SdioHost>, why: u8
             5
         } else if op == scan::reply::OP_RADIO && mode == scan::reply::RADIO_HARD_OFF {
             match h {
-                Some(h) if ctx.device_power(false) => {
+                Some(h) if godspeed::driver::power::set(&ctx, false) => {
                     h.park(ctx);
                     powered_off = true;
                     ctx.log("wifi-driver: `wifi radio off hard` on a radio that is down - the chip's power is cut and stays cut until `wifi radio on`");
@@ -638,7 +638,7 @@ impl godspeed_wifi::serve::Host for SdioPower<'_> {
         true
     }
     fn cut_power(&mut self, ctx: &ServiceContext) -> bool {
-        if !ctx.device_power(false) {
+        if !godspeed::driver::power::set(&ctx, false) {
             return false;
         }
         self.h.park(ctx);
@@ -666,7 +666,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // ---- Stage 1: the register window. -------------------------------------------------------------
     // Numbered because this IS a sequence and each stage can only be reached through the one before
     // it, which is what makes the last line printed the diagnosis.
-    let mmio = match ctx.mmio() {
+    let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
         None => {
             // Not a fault, and it must not read as one. The kernel grants this window only where its
@@ -699,7 +699,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // a divider from a wrong base runs the identification clock at the wrong speed so that nothing
     // answers - silently, and on hardware only. 0 means the platform declined to say, and the host
     // layer refuses rather than guessing.
-    let base = ctx.emmc_base_clock_hz();
+    let base = godspeed::driver::device::emmc_base_clock_hz(&ctx);
     let h = host::Host::new(&ctx, &mmio, base);
     // Print the version register the KERNEL identified this controller by. If the two numbers
     // disagree, the grant is pointed somewhere other than where the census looked, and this is the one
@@ -847,6 +847,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         { clock_release(&ctx, lease); serve_unavailable(&ctx, Some(&h)) }
     }
     let mut window = backplane::Window::new();
+    // THE RECEIVE REGION (`ctrl::RX_REGION`), asked for once, here, before anything is read: the boot scan
+    // reads into it and the station then owns it. A region is never given back, so one serves both. Without
+    // it a superframe over 4 KiB is lost, and with a large window the link with it, so no radio is served.
+    let Ok(mut rx) = godspeed::memory::Region::alloc(&ctx, ctrl::RX_REGION) else {
+        ctx.log_fmt(format_args!("wifi-driver: the {} KiB receive region could not be had, so the radio is not served", ctrl::RX_REGION / 1024));
+        clock_release(&ctx, lease);
+        serve_unavailable(&ctx, Some(&h))
+    };
     // The radio's session, if boot brings it up. The serving loop scans on it when the shell asks; `None`
     // means every such request is answered "radio down" - loudly, and without pretending (§26.7).
     let mut radio: Option<ctrl::Session> = None;
@@ -928,7 +936,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     Some(sdiod) => {
                         if bus::bring_up(&h, &mut window, sdiod.base, &ctx) && ctrl::report_mac(&h, &mut window, &ctx) {
                             ctx.log("wifi-driver: ADOPTED - the firmware the earlier instance loaded answers; this instance carries on with it");
-                            radio = scan::run(&h, &mut window, true, &ctx);
+                            radio = scan::run(&h, &mut window, true, &mut rx, &ctx);
                         } else if power_cycle_device(&ctx, &h) {
                             // THE FIRMWARE IS DEAD AND THE CHIP IS NOW COLD. Everything the warm path did
                             // on the SDIO side has to be done again on the fresh card - identification,
@@ -1080,7 +1088,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                     // against a channel that has never
                                                     // replied would confuse "the scan is
                                                     // wrong" with "nothing works yet".
-                                                    radio = scan::run(&h, &mut window, false, &ctx);
+                                                    radio = scan::run(&h, &mut window, false, &mut rx, &ctx);
                                                 }
                                             }
                                         }
@@ -1140,6 +1148,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     );
     let down_reason = if trapped { scan::reply::DOWN_TRAPPED } else { scan::reply::DOWN_BRINGUP };
     clock_release(&ctx, lease);
-    let mut bcm = radio.map(|s| bcm::Bcm::new(&h, &mut window, s));
+    let mut bcm = radio.map(|s| bcm::Bcm::new(&h, &mut window, s, rx));
     serve_radio(&ctx, &h, bcm.as_mut().map(|b| b as &mut dyn Station), down_reason, "CYW43455")
 }

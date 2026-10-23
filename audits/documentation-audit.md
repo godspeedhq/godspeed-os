@@ -1509,3 +1509,382 @@ spec lists and the program leaves to the shell, as every utility does.
 
 **Gates:** every documentation checker green (dash, doc refs, doc and comment symbols, line refs, facts,
 site, unsafe). `osdev test shell` 273 passed, 0 failed, 2 skipped, on `551f0c2d`.
+
+## Audit 17 - documents and code comments, `feat/gs-driver` since it left `main` (2026-10-19)
+
+Scope: the branch that put a driver's two grants into `gs::driver` (`registers`, `arena` and its layout) and
+converted AHCI and GENET, sent off-subnet traffic straight to the gateway, read the CYW43455 into a 64 KiB
+region, added package dependencies (`docs/developer-services-design.md` 16), and moved a download's bar onto
+its own line - 43 files at `1e282e7b`. Three read-only reviewers, one for the documents and two for the
+comments; every finding below was then re-read against the code by the session that made the change, which
+also wrote the code, so this is closer to a self-audit than an independent one. Dated evidence is left as written.
+
+**Result.** 47 corrections: 22 in code comments and 25 in documents, the ratchet included. Nine defects are
+in code, recorded and not changed.
+
+**Overtaken by the branch's own later commits:**
+- `godspeed-pm`'s `PROGRESS` doc said the shell draws a frame "on one line"; since `1e282e7b` the bar is on the
+  line under the words. `time_text` still gave the reason as the bar sharing the line.
+  `utilities/65_download.md` described the old line (a bar first, both times), not the words and the bar under them.
+- `docs/ahci.md` said the driver takes its grants with `ctx.mmio()` and `ctx.dma_region()`.
+- `docs/driver-library.md`, `docs/CLAUDE.md` and `backlog/71` named AHCI as the only driver on the grants; GENET
+  was converted in `4e0c733d`. Step 3 gains a GENET paragraph.
+- `backlog/93` still listed the off-link ARP wait (item 4, fixed in `3ec99a27`) and the Pi 4 superframes (item
+  2, the region read built in `1bcfb9cb`) as untouched, and its README row named the ARP wait as the next step.
+- The design doc's status line ("Nothing here is built and nothing here is approved") and its `docs/CLAUDE.md`
+  row ("not built, not approved") read as covering sections 11 to 16, which are built.
+
+**Seen on hardware, recorded:** the T630 log at `27201c83` (`build/serial_output.log`, 2026-10-19) shows AHCI's
+layout line, the disk mounted, and `connect 188.114.96.1:443 - off the subnet, via the gateway`. So
+`driver-library.md` step 3 and `backlog/93` item 4 now say the T630 has seen them, and the other boards owe a card.
+
+**Documents that disagreed with the code:**
+- 16.2's example range was `^1.2`, which the parser refuses; the section itself says never to write it.
+  It is `^1.2.0` now, and `^0.3` is now `^0.3.0`.
+- 16.3 and `utilities/61_godspeed.md` gave "at most 8 packages in one plan" and "a depth of 4". `PLAN_MAX` counts
+  the packages besides the one asked for, and `PLAN_DEPTH` counts a chain with it included. Both are stated that way now.
+- 16.3 said every refusal names "both ranges". A conflict names one range and the version already planned.
+- 16.4's sample question, marked built, was not what the shell prints. It is re-rendered from `install_plan`.
+- 16.7 left out the uninstall in the middle of `osdev test deps`.
+- 61's `plan` gave `state` as plain `install` or `fetch`; the rows say `..., needed by <pkg>`. Its section 4f
+  sat between 4b and 4c and is moved after 4e.
+- `backlog/90` quoted the verification audit's grades as four labels including "review". The audit has six check
+  grades and four reasoning results.
+
+**Comments that disagreed with the code:**
+- `gs::driver`: `arena.rs` and `registers.rs` said every driver took its grants from the SDK "until 2026-10-19",
+  which reads as none do now (only AHCI and GENET moved). `mod.rs` listed only `wait`, `delay` and `irq`.
+  `Layout::take` left out two refusals: a part of no bytes, and an alignment that is not a power of two.
+- AHCI: `issue` and `write_zeros` still named "the data buffer" / "data area" and not the `data` part, or its
+  new refusal. GENET's refusal comment said "other than 64 KiB" where only less fails.
+- `net-stack`: `on_link_by_mask` gave 1.8 s as the cost everywhere; that was op 23's, and op 21's was 12 to 18 s.
+  Op 21 had a second comment repeating the paragraph above it.
+- The wifi SDK: two doc-comment placement errors, then three wrong comments.
+  - Placement: `note_full` was inserted under `say`'s doc line, so it opened `note_full`'s doc and `say` had none.
+  - `rxq.rs` said nothing reports `handed`, which `note_full` now does.
+  - `RX_SLOTS` said everything that does not fit stays in the chip; a burst already read is turned away.
+  - `scan::step` described a 2 KiB `frame` parameter that is now the 64 KiB `rx` region.
+  - `read_frame_words` said the body goes into a `buf` it does not have.
+- `godspeed-pm`'s `install.rs` had three comments that said less than the code does.
+  - `Plan::resolve` left out the out-of-range refusal and four others.
+  - `plan` gave the wrong state strings.
+  - `asks_of` said "peers", but `console` and `device` come first.
+- The supervisor's start loop gave a cycle as the reason it ends. It ends because each pass starts one package
+  or stops.
+- The shell: `build_godspeed_table`'s doc sat above `PROGRESS_FRAME`, so the const had two docs and the function none.
+- `scripts/DOC-SYMBOLS.baseline.txt`: `left_secs` no longer needed (the ratchet tightened).
+
+**Code, recorded and not changed** (an audit changes documents only):
+- Folded into `backlog/93` item 10, which is open and covers this work:
+  - op 21 logs `did not answer ARP` where no ARP was sent;
+  - `RxQueue::push` drops an oversize frame uncounted, and the AIC8800 pull counts a full queue twice;
+  - the CYW43455's join and control waits still read 4 KiB;
+  - a log line names the region's size by hand.
+- **Not in any backlog yet, for the operator** (a new entry needs asking; the dependencies work has no open one):
+  - `meta.rs` reports a format 2 manifest with no requirements as "a format this machine does not read", where
+    the format is read and the requirements are missing.
+  - `Plan::resolve` keeps an INSTALLED requirement in range without checking its kind, so an installed app could
+    satisfy a requirement that a fetched one could not.
+  - The `PLAN_MAX` refusal says "more than 8 packages installed at once" where 9 can be.
+  - `godspeed plan` and `resolve` are reports, but refuse a pipe and are missing from `SUBCMD_FIRST`.
+  - `installed_requiring` refuses every install-over and uninstall when any one installed manifest cannot be
+    read. That may be deliberate: what cannot be read cannot be shown not to need the package.
+
+**Uncertain, not changed:**
+- `arena.rs` counts "two asserts" between the hand-kept offsets, but `dwc2` alone has eight const layout
+  asserts. The count likely covers the arena drivers only.
+- The bar is "as wide as the console" in two comments, but it stops one column short (the shell's
+  `clip = cols - 1`), deliberately.
+
+**Gates:** every documentation checker green (dash, doc refs, docs index, facts, foreign words, line refs,
+site, backlog, doc commands, doc and comment symbols).
+
+## Audit 18 - documents and code comments, the arena layouts (2026-10-20)
+
+Scope: the day's commits after `b9365a1d` that laid out by name the arenas of `pwm-audio`, `dwmac`, `ehci`,
+`dwc2` and `xhci`, moved `sdhci.rs` onto `Registers`, and updated `docs/driver-library.md` and `backlog/71` -
+23 files at `269c86f3`. One read-only reviewer read the diff and the comments around it, and swept the
+current-tense docs; every finding was re-read against the code by the session that made the change, so this is
+closer to a self-audit than an independent one.
+
+**Result.** 12 corrections, 7 in code comments and 5 in documents, the ratchet's note included. Two defects are
+in code, recorded and not changed.
+
+**Comments still describing the offsets the parts replaced:**
+- `kernel/src/task/mod.rs` gave `pwm-audio`'s 33 pages as `ARENA_NEEDED`, which is gone, and said `ehci` zeroes
+  "the whole arena" on every control transfer; it zeroes its two parts.
+- `xhci`'s module doc said its access is through `Arena`, and the comment above its grants said the arena is
+  "reached at the offsets below, as before: a layout by name is the step after this one" - above the call that
+  lays it out. Its `msc.rs` pointed at `DISK_REGION_BYTES` for an explanation that is in the note beside it.
+- `ehci`'s `arm_int` called `qh` a "DMA offset"; it is an offset within the poll part.
+- `dwc2`'s module doc said the fallback loop runs only when no window or arena was granted; it also runs when
+  the layout refuses the arena granted.
+
+**A number:** `COMMANDMENTS.baseline.toml` kept "29 are one fact stored twice" from 2026-09-14; 25 entries remain.
+
+**Overclaims and current-tense text the work made false:**
+- `docs/driver-library.md`'s status said no driver reaches its arena "at a hand-kept offset any more". Offsets
+  remain, within parts (`ehci`'s control transfer, `xhci`'s slices and `msc`'s region); it says that now.
+- `backlog/71` said 107 `phys_at` calls "carve" arenas by hand, beside "until 2026-10-20".
+- `docs/audio.md` listed five drivers that each write an arena layout; they each wrote one.
+- `docs/CLAUDE.md`'s `driver-library.md` row said step 3 converted AHCI and GENET; it covers every driver.
+
+**Left as history:** `docs/usb-hub.md`'s "two device slices" at `DEV_BASE (0x7000)` and `docs/audio.md`'s
+"the SIXTH such table" are dated design and record text, and the first was stale before this work.
+`dwmac_ring.rs`'s "Sixteen because" sits under a note saying those paragraphs were written at sixteen.
+
+**Code defects, recorded and not changed (an audit changes documents and comments only):**
+- `nic-driver`'s `dwmac_main`: when the layout refuses a granted arena it logs why, and then the `else` branch
+  logs a second, wrong line - "no dwmac register window or DMA arena granted" - though neither was missing.
+- `pwm-audio`'s `bring_up` now zeroes an arena that is too small before the layout refuses it, and checks the
+  1 GiB reach on it first; harmless, but the order differs from the size check it replaced.
+
+**Gates:** every documentation checker green (dash, doc refs, docs index, facts, line refs, doc and comment
+symbols), and the commandments selftest 78/78.
+
+## Audit 19 - documents and code comments, the download and hot-plug work (2026-10-21)
+
+Scope: the 18 commits on `feat/gs-driver` after Audit 18 (`f461feaa..14ac8dd8`): the TCP checksum and the
+damaged-segment comparison in `net-stack`, the RTL8168 restarts, sound check and ring of 256 in `nic-driver`,
+the download's `time` row, the shell's history and key logging, the console's blink, `fs`'s walk cache and
+`OP_WRITE_BLOCKS`, xhci's watch of every kept hub, and `net-stack`'s `tcp::Spent` - 22 files. Two read-only
+reviewers split the diff and swept the current-tense docs beside it; every finding was re-read against the
+code by the session that made the change, so this is closer to a self-audit than an independent one.
+
+**Result.** Corrections in the comments of 11 source files and in 7 documents. One finding was wrong and is not
+applied.
+Eight code defects: five fixed in a separate commit, three recorded.
+
+**Comments on the wrong item, after an insertion:** `rtl_rx_sound` was put between `rtl_restart_rx`'s doc and
+its `fn`, `report_spent` between `nic_drain_ms`'s doc and its `fn`, and `WalkCache` inside `Entry`'s doc, so
+each of three docs described the item beside the one it was written for. Moved back.
+
+**Overclaims and text the work made false:**
+- `rtl_restart_rx`'s doc called its pause "the fix for damaged segments"; the next card showed it was not, and
+  neither was the sound check. It says so now, and that the ring of 256 ended them.
+- The comments on logging every RTL8168 restart and TX timeout said "thinned again once that is answered" and
+  "first few"; the timing was answered (`6cda1d65`), and every one is said while item 11 is open.
+- The console's loop said its first wait blocks ("idle costs nothing"); it is bounded at `BLINK_MS` to blink.
+  `Term::blink` said output redraws the cursor "after every byte"; a bare `\r` and a request do not.
+- The shell's history said the load runs "only when the user runs out of session history"; the first command
+  entered loads it too.
+- `Timing` and `utilities/65_download.md` said what is left beside the parts is the disk, the screen and the
+  framing; the name lookup, the connect and the sends are in no figure, and the handshake is in two.
+  `IDLE_MS` is asked for as 2 ms and costs about 9 on the T630 (a sleep ends on the next tick).
+- `tcp::Spent` said it counts "from its first read to its release"; its polls were counted from the last
+  report. The counting was changed to match (a defect, below), and the doc says the polls are the service's,
+  and that the release's TIME_WAIT is in the "waiting" figure.
+- `fs`'s `BLK_XFER_MAX` doc, `block_rpc`'s buffer comments and its "one message frame" were written for the
+  1 KiB call buffer; the call buffer is `BLK_CALL_MAX`, 4 KiB, and a run is under the same 30 s as a block.
+  `WalkCache` said it is forgotten "at every commit"; it is cleared when a transaction begins or aborts.
+- xhci's hub watch said the dongle's hub has "its own watch" (there is none) and that its per-hub state
+  persists across passes (it is re-made each pass; the shared state persists). `backlog/78` said the watch
+  covers every hub no other scan covers; two hubs are covered by none (a defect, below).
+- `block-driver`'s `WRITE_RUN_MAX` doc gave "7 x 512 + 10, with the tag" as 3,595, which is 3,594 without it.
+- `docs/persistence.md` 8 listed five block ops "one block per request, not a count"; op 6 carries a count. Its
+  "global accelerator ... never RAM-resident, not built now" now says what the walk cache is and is not.
+  `services/fs/CLAUDE.md` made a block one block-IPC request; a write may be a run.
+- `stdlib`'s arena test called its 24-buffer layout "what nic-driver lays out"; the RTL8168's ring is 256.
+- `backlog/93` items 1 and 12 described the 24-ring and the walk from the root per chunk as current, and its
+  README row the ring as the next step. Each is dated now, with the card that measured where a read's time goes.
+- `docs/tcp-design.md` gave `tcp selftest` as 67 checks without a date; 77 on 2026-10-21.
+
+**One finding not applied:** that nic-driver's arena is 132 pages "on every port", so GENET's and dwmac's
+"64 KiB" comments are stale. The kernel uses a spawn's `dma_pages` only for a PCI class
+(`kernel/src/task/mod.rs`, `HwClass::dma_pages`); the fixed GENET and dwmac windows still get 64 KiB.
+
+**Code defects, fixed separately (an audit changes documents and comments only):**
+- The shell marked history loaded when its load MISSED its bound, so the next save replaced the file with
+  this boot's lines: the wipe that `aa81a796` fixed, still open on a slow `fs`. It also loaded before checking
+  for a job holding `fs`. Now only an answer marks it loaded, a save waits for one, a miss is retried no sooner
+  than 30 s, and neither runs while a job holds `fs`.
+- The shell's unrecognised-key line printed `ESC[0x` for `ESC[x` and could carry a control byte.
+- The console marked its cursor drawn on any message, so after a `\r` the next blink lifted a cursor that was
+  already lifted, and it stayed off for about a second.
+- `report_spent`'s "waiting" figure saturated to 0 when the polls before a connection's first read outweighed
+  its reads; polls now count from the first read.
+- `block_write_run` shortened a run longer than `WRITE_RUN_MAX` without a word; it refuses one now.
+
+**Code defects, recorded and not changed:** two xhci hubs watched by no scan (`backlog/78`); a run of seven
+blocks under `fs`'s one 30 s bound while a USB stick takes up to seven host calls of 10 s (`backlog/93` item 12).
+
+**Gates:** every documentation checker green (dash, doc refs, docs index, facts, line refs, doc and comment
+symbols, foreign words, doc commands, backlog).
+
+## Audit 20 - documents and code comments, the Pi 4 download work (2026-10-21)
+
+Scope: the 22 commits on `feat/gs-driver` after Audit 19 (`376e1595..02dd4fe8`), 25 files: the wake trace,
+the stick's runs as one WRITE(10), GENET's ring of 256, the SDIO host's gaps by the clock, the 32 KiB radio
+window, `power`'s governor, the busy-poll after an empty read, xhci's write gathering and its overlap, and
+the kernel giving up its per-class DMA arena sizes. Two read-only reviewers split the diff and swept the
+current-tense docs beside it; every finding was re-read against the code by the session that made the
+change, so this is closer to a self-audit than an independent one.
+
+**Result.** 35 corrections across 26 files. No finding was set aside. Five code defects, fixed in a separate
+commit; one observation recorded.
+
+**Text the work made false, in documents:**
+- `backlog/93`: item 2 still said `small_window` was not lifted and the radio offered 8 KiB; item 9 that the
+  Pis had not run `d4ed712c` (the Pi 4 has); the 2026-10-21 paragraphs spoke in the present of figures the
+  next table row replaced, and of overlap as still to do; "Where to start" named item 4, which is fixed. The
+  "Where it stands" table is dated now. The README row still said a read's time was mostly crossing cores.
+- `docs/power.md` 15.3, `services/CLAUDE.md`, `docs/CLAUDE.md`, `website/src/services.md`: the clock "at its
+  minimum when no lease is open", with no governor.
+- `utilities/65_download.md`: "found nothing yet and waited" is a count of reads, not of pauses, since the
+  busy-poll.
+- `services/block-driver/CLAUDE.md`: the USB backend "block by block"; through `xhci` a run is gathered.
+- Dated records given a dated note rather than rewritten: `docs/wifi-usb.md` (`EvMail` fresh every pass,
+  except the disk's slot now), `docs/tcp-design.md` (the rings), `docs/hardware-design.md` (an arena of
+  1168 KiB), `docs/service-ownership.md` (292 pages).
+
+**In comments:** xhci's arena (292 pages, the disk's 4) is 320 and 32; `msc.rs` said "no overlap" and
+"four pages" and that a dead driver's held writes are said; the run op's doc and its compile-time check
+named the one data page a run no longer goes through; block-driver's and dwc2's said xhci writes a run as
+one command; the kernel's `MAX_DMA_PAGES` and `SpawnImage` comments said `dma_pages` is for PCI only and
+xHCI's request is 1168 KiB; the wake trace did not say `taken` is x86's alone; GENET's counters were "eight
+lines" a download (one per 12 MB) and its short arena "a kernel change"; the supervisor's `dma_pages` named
+"the rows that name a PCI class code" and `RX_RING_COUNT` for GENET; `power`'s crate doc and its wait said
+the minimum with no lease and that an idle machine costs it nothing (the governor wakes it every 100 ms);
+`godspeed-pm`'s `IDLE_MS` and net-stack's radio-window comment and log line (a slot with no large arena
+still offers 8 KiB).
+
+**Code defects, fixed separately (an audit changes documents and comments only):**
+- **A re-scan of the USB bus dropped the disk with its gathered writes,** and the FLUSH after the rebind
+  passed: a keyboard unplug, a new device or a hub repair ends the poll loop and re-declares the disk, so
+  up to 112 sectors answered as written, a WRITE(10) in flight and a failure not yet reported were all lost
+  in silence - the journal's barrier passing over data that never reached the stick (6.1, invariant 12).
+- `msc::try_finish` took any other completion on the disk's slot as the write's failure, where
+  `await_on_slot` passes it over.
+- `power`'s lease paths recorded the clock as changed before knowing the change took.
+- The radio's pull line would say itself on every pull on a counter the kernel could not calibrate, and
+  said itself every minute on an idle radio.
+
+**Recorded, not changed:** a plain `http://` download still parks for a tick after an empty read
+(`godspeed-pm/src/download.rs`); only `https://` busy-polls (`backlog/93`).
+
+**Gates:** every documentation checker green.
+
+## Audit 21 - documents and code comments, the Pi 2 receive work (2026-10-22)
+
+Scope: the 6 commits on `feat/gs-driver` after Audit 20 (`027c4ade..742f6b00`), 6 files: the Pi 2's receive
+queue of four bursts, the smsc95xx's pause, a transmit keeping the receive it stands down and a cut frame
+carried, and the core said beside a channel that never halted. One reader, the session that made the
+change, re-read every changed comment against the code and swept the current-tense docs that describe the
+Pi 2's network; so this is a self-audit.
+
+**Result.** 13 corrections across 3 files. No code defect confirmed; two leads recorded for the open wedge.
+
+**In comments** (`services/dwc2/src/net.rs`):
+- `tx`'s stand-down said `rx` re-arms the receive "on its next pass" and that frames are not lost; the
+  re-arm is at the end of `tx` (`resume`), and until `78185667` the bytes the channel held were lost.
+- `rx`'s doc said it harvests one burst and arms; it takes a burst only when one fits, and takes held bytes
+  before it arms. Its body called itself "a non-blocking poll per pass instead of an interrupt"; the USB
+  interrupt has harvested since `0812a9f7` (`usb_irq`), and it was the interrupt that overran the old queue.
+- `rxbuf_fill` was "bytes written by the current burst" (four now); `rxq_push` was "sized to a whole burst"
+  (taken only when one fits, `rx_room`); `rx_bad` counted only a first status word (also a tail too long to
+  carry); `in_armed` named `CH_NET` (the receive is `CH_NET_RX`); `RX_BURST` "matching the kernel driver"
+  read as Linux's, which is 18,944 - it is the in-kernel driver this service replaced.
+
+**In documents:**
+- `docs/arm32-status.md`: receive harvested "when a client asks", and the 2026-08-25 paragraph that
+  interrupts harvest almost nothing - given a dated note, since under a download they now harvest enough to
+  have overrun a queue of one burst.
+- `backlog/93`: nothing recorded the Pi 2 cable work. Item 12 has its table now, from 4-13 KiB/s to 170-183,
+  and the controller wedge that followed, open; item 9 said the Pi 2 had not run `d4ed712c` (its cards ran
+  builds containing it); "Where to start" names the wedge, then Linux's receive transfer.
+
+**Recorded, not changed** (`backlog/93` item 12, leads for the wedge, not shown to matter): `chan::halt`
+returns nothing, so `tx` reads a channel whose halt expired as retired and `resume` re-arms it; and `resume`
+treats held bytes as a burst that may continue even when the IN completed on a short packet.
+
+**Gates:** every documentation checker green.
+
+## Audit 22 - documents and code comments, the Pi 2 cable and radio work (2026-10-22)
+
+Scope: the commits on `feat/gs-driver` after Audit 21 (`4a6d04cf..801a09fc`), 27 files: the AHB burst
+length, the stick's runs as one WRITE(10) and then gathered, the cable's batch receive, the shell's
+backgrounded-job line, the radio's beacon filter, receive ring and transmit-side init, the software replug
+and its routing, the refused-rejoin retry, the stand-aside change and four instruments. A self-audit: the
+session that made the changes re-read every new comment against the code and swept the docs that describe
+`dwc2`'s radio receive.
+
+**Result.** 6 corrections across 6 files. No code defect found by the audit; the two the day had (the ring's
+notice owed only on empty-to-not, and `OP_REPLUG` routed to the network) were found on hardware and fixed
+in `d7f4c6ad` and `ae4805fb`.
+
+**In comments:**
+- `msc.rs`: the gather size said a longer write holds the radio aside for longer; since `91e9448e` the radio
+  does not stand aside for the disk.
+- `chan.rs`: the stand-aside rule said "no run has had the NIC's IN armed", which has not been true since the
+  radio's first logs.
+- `rtl.rs`: `replug_allowed` was "set when it binds the radio"; it is lowered only on the bind after a replug.
+- `usbfn.rs`: `NOTE_BULK_IN`'s reason was that the host arms nothing until a transfer is collected - true of
+  `xhci`, not of `dwc2`'s ring.
+
+**In documents:**
+- `sdk/wifi/CLAUDE.md`: the `usbfn` row did not list `OP_REPLUG` or `is_request`.
+- `docs/wifi-usb.md`: the R3b design record (one held transfer, the stand-aside for every transfer) given a
+  dated note.
+
+**Recorded, not changed:** the release profile is `opt-level = "s"` for the whole workspace, and TLS
+decryption takes 5.3-5.4 s of a 20 s cable download on the Pi 2 (about 480 cycles a byte for AES-128-GCM);
+whether the crypto crates gain from a higher level is a build-wide choice, not an audit's.
+
+**Gates:** every documentation checker green.
+
+## Audit 23 - documents and code comments, the branch before it merges (2026-10-23)
+
+Scope: every file `feat/gs-driver` changed since it left `main` (`origin/main...5765f5da`, 133 files) where a
+step-4 or step-5 change could have left a statement behind - the interrupt waits of `ehci`, `dwc2` and `xhci`
+moved onto `gs::driver::irq`, and a driver's remaining SDK calls wrapped as `gs::driver::input`, `power` and
+`device` and `gs::program::mode` - plus the published site's hand-written stdlib page and the `gs::driver` doc
+comments its API reference is generated from. Comments and documents only: the operator had just run 1000
+rounds of chaos on all five boards on this code, so no code token changed, which the diff was checked for.
+
+**Result.** 18 corrections across 13 files. One code finding, recorded and not fixed: the teaching example
+`examples/driver-skeleton` still receives with `gs::ipc::recv` and tells its interrupt apart with a stub
+`is_interrupt` of its own, so "every driver that takes an interrupt waits through `irq`" was true of
+`services/` and not of the examples; the claim now says `services/`, and `docs/driver-library.md` names the
+example.
+
+**In the site (`website/src/stdlib.md`, site-owned):**
+- It told a driver author to reach for the SDK reference. Drivers are written on `gs::driver`; the page now
+  says so, with a section listing its modules (`registers`, `arena` and `Layout`, `wait`, `delay`, `irq` with
+  `Irq::take`, `input`, `power`, `device`) and a short driver, and that a driver PACKAGE is given registers
+  only.
+- It had no word on the kinds of program a developer makes. A table now gives `service`, `utility`, `app`
+  and `driver`, each with `godspeed new <kind>` and the `gs` module it is written with, and `osdev test kinds`.
+- Its first example said "There is no `exit`: every runnable thing here is a service". Untrue since the
+  `Exit` syscall (CLAUDE.md 14.5 amendment, 2026-10-17); a utility ends with `gs::program::exit`.
+
+**In the stdlib's doc comments (the API reference):**
+- `driver/irq.rs`: the header said `xhci`, `ehci` and `dwc2` "each wrote that out by hand" and stopped
+  there; it now says they wait here since 2026-10-22, and names `Irq::take`. `Irq::seen` counted "by
+  `Irq::wait`" and is counted by `take` too.
+- `driver/registers.rs` and `driver/arena.rs`: "the rest still use the SDK's" - every compiled driver has
+  taken both grants through `gs::driver` since 2026-10-19 and 2026-10-20.
+
+**In code comments:**
+- `xhci`: four comments on the main wait named `recv_within_ms` and `recv_timeout(0)`; the wait is
+  `Irq::wait`, which is what guarantees the deadline is never 0.
+- `dwc2`: `notify`'s header named `console_push` for the newline it pushes; `net.rs` named
+  `ctx.board_mac()`. Both are the `gs::driver` calls now.
+- `probe`: said the SDK exposes its mode via `ctx.probe_mode()`; it reads `gs::program::mode`.
+
+**In documents:**
+- `docs/console-service.md`: the input diagram's `ctx.console_push` is `gs::driver::input::push`.
+- `docs/stdlib-design.md`: "What is still SDK" listed `Mmio`, `Dma` and `device_power` as hardware still on
+  the SDK; a dated note says the first three come through `gs::driver` now and `cpu_clock` is the `power`
+  service's.
+- `backlog/71`: step 5 added to the step-2 record, and the Audit 18 note that four boards owed a card for
+  the layout fixes given a dated note: all five have run that code since, in the step 4 cards and a
+  1000-round run each, the refusal paths unreachable on any.
+- `docs/driver-library.md`: "Current state (2026-10-09)" retitled to the day it describes.
+- `docs/CLAUDE.md`: the index row's "every driver" said `services/`.
+
+**Recorded, not changed:** step 1l's "not yet verified on hardware" stands - its one check, `ehci` near 0%
+CPU in `observe now` with the keyboard unplugged for about 90 s, has not been run.
+
+**Gates:** every documentation checker green, the one-way and quit-wait ratchets green, and the touched
+crates built.
+

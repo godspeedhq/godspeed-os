@@ -1,6 +1,6 @@
 # 90. Adversarial verification of the kernel, and the commandments made more executable
 
-**Status: OPEN, 2026-10-16.** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
+**Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19 (the last section).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
 the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
 enforcement-layer defects are listed below, NOT fixed; four executable prototypes exist outside the tree
 and are NOT landed. Both wait on the operator. The brief, as recorded on 2026-10-15, follows; only its list of checker
@@ -221,6 +221,173 @@ C1 capability reference model (PROPERTY TEST on the real `capability/*.rs`), C2 
 consistency), C4 syscall gate check (ARCHITECTURAL CHECK). All four were rerun at `537e6861` and
 reproduce their recorded results. They live in the session scratchpad, which is temporary; landing them is
 the operator's decision, and C2 needs a `kernel/src/lib.rs` seam to live in the repo.
+
+## The programme from here: MISCIS continuous verification and engineering assurance (the operator's spec, 2026-10-19)
+
+The operator's specification for what this entry becomes once phases 1 and 2 above are acted on, recorded here
+rather than as a second entry because it is the same work: its "previous adversarial audit" is this entry's, its
+priority list is section 13's, and its enforcement repairs are E1 to E6. Adapted to the tree; the operator's words
+are kept where they are the rule.
+
+### The aim, and the rule it is judged by
+
+A lightweight, repeatable, machine-checked verification system for the MISCIS kernel that runs on every kernel
+change. **Very high engineering confidence, not a claim of complete mathematical correctness** or seL4-equivalent
+formal verification. The kernel stays small, boring, predictable and resistant to regression, and it becomes
+steadily harder for a human or an AI contributor to introduce a violation of a fundamental invariant.
+
+> **Make MISCIS harder to break with every contribution, not harder to contribute to.**
+
+Scope is the six responsibilities (CLAUDE.md 4.3), and only those: no seventh, and nothing moved from userspace
+into the kernel to make it easier to verify. **The verification lives outside the running system**: never a
+kernel service, never a runtime dependency, nothing added to an image to check it.
+
+### Five layers, each mapped to what already exists
+
+- **A. Architectural enforcement.** `scripts/commandments.py` and `commandments_redteam.py`, the boundary, seam,
+  scope and unsafe checkers, all in `osdev`'s `EXTRA_CHECKS`. What it must cover: kernel responsibilities limited
+  to MISCIS; privileged operations only in the approved modules; no prohibited dependency; no new entry point that
+  bypasses a capability check (C4, the syscall gate check, is the prototype); architecture code behind the seam;
+  no userspace service with a hidden privileged interface; and **no authority from a package's identity, a
+  filesystem path or ambient privilege** (the package work of 2026-10-15 to 2026-10-19 is the newest place this
+  could fail). **First: repair E1 to E6**, because a check that cannot fail is not evidence: a guard never observed
+  firing proves nothing.
+- **B. Property-based state-machine testing.** C1 (capabilities) and C2 (IPC routing), PROPERTY TESTS on the real
+  `capability/*.rs` and `routing.rs`, waiting to be landed (C2 needs the `kernel/src/lib.rs` seam). Then sequences
+  that cross responsibilities rather than single functions: spawn and kill, grant, attenuate, transfer and revoke,
+  send, receive, block and cancel, queue saturation and exhaustion, task-identity reuse, ownership and
+  reclamation, supervisor and service death. Deterministic seeds; a failing sequence kept and replayable.
+- **C. Bounded formal verification (Kani, or an equivalent).** New here. Start with the capability table, task
+  identity and lifecycle transitions, the IPC queue and blocked-task records, and ownership and reclamation. Every
+  harness documents the property, the PRODUCTION functions it exercises, the input and state bounds, the
+  assumptions, what it does not support, and the result. **A bounded proof is never described as unrestricted, and
+  a simplified model is never presented as the implementation.**
+- **D. Runtime chaos with invariant assertions.** The section 22 suites (property, fuzz, stress, adversarial, chaos) and
+  `chaos max-carnage`. What changes: each run checks EXPLICIT invariants, not that the machine stayed up. **A
+  surviving kernel is not necessarily a correct kernel.** Termination and recreation, IPC floods, memory
+  exhaustion, revocation mid-operation, service death and recovery, rapid scheduling, interrupt pressure, and
+  cross-core contention where the port has it.
+- **E. Architecture-specific regression.** The four ports and five boards: page tables, isolation, context
+  switches, interrupts, timer semantics (D12 is the live example), atomics and memory ordering, teardown, SMP.
+  **Emulator evidence and hardware evidence are said apart**; QEMU passing proves nothing about a board, and every
+  QEMU suite today is x86 only (E5).
+
+### The invariant registry
+
+A version-controlled registry, `verification/invariants/registry.md` (the layout is below): one row per invariant
+with a stable id, a precise definition, the responsibilities involved, the production code, the mechanisms that
+check it, the test and harness references, the assumptions and limits, and the current assurance status. The
+operator's first proposals, to be refined against the code before any is claimed:
+
+| Id | Invariant | Checked by |
+|---|---|---|
+| CAP-001 | No authority is created without a capability that permits it | model, Kani |
+| CAP-002 | Revoked authority cannot be reused through a stale reference | model, targeted tests (D25) |
+| MEM-001 | Exclusive memory is never owned by two conflicting owners at once | model, targeted checks (D7, D8, D9) |
+| IPC-001 | No send reports success unless its delivery or completion holds | model, Kani, QEMU (D2, D6) |
+| IPC-002 | Blocked sender and receiver records stay consistent | model, regression tests (D1, D3) |
+| SCH-001 | A reclaimed task cannot be scheduled | model, lifecycle tests (D10, D11) |
+| SCH-002 | Reusing a task's identity cannot expose the previous task's authority | model, Kani (D3, D5, D10) |
+| INT-001 | Interrupt state transitions stay consistent | targeted checks, QEMU (D18) |
+| SMP-001 | Shared cross-core state changes obey the synchronisation they require | concurrency tests, review (D16, D24) |
+
+The audit's own invariants (section 4 of `audits/2026-10-16-kernel-verification.md`) seed it as well.
+
+### Start with the findings, not the whole kernel
+
+Not a proof of everything: the highest-risk defects above first, in section 13's order (D8, D7, D2, D1, D12,
+D10), covering task termination and slot reuse, kernel stack and page-table lifetime, blocked-sender and receiver
+consistency, false IPC completion, timer semantics, and capabilities across the task lifecycle. For each one:
+reproduce it, or record why it is invalid (a source-level finding is never presented as a reproduced exploit);
+fix the root cause; add a regression test **shown to fail against the defect**; add a model property and a
+bounded harness where practical; verify in QEMU and on the boards it touches - one change per card.
+
+### The checks are themselves tested
+
+Mutation testing of the verification system: inject a known violation into a DISPOSABLE variant - a removed
+capability check, an invalid state transition, a task id reused too early, a stale IPC registration, a double
+release, a forbidden kernel dependency - and the matching gate must catch it; one that does not is an enforcement
+gap to record and repair. `commandments_redteam.py` is this for the commandments, and E2 lists where it is thin.
+**A green pipeline is not strong assurance unless its checks can detect representative violations.** No
+deliberate defect ever stays in production code.
+
+### Two tiers
+
+- **Tier 1, every kernel change**, in minutes where practical: the architectural checks, the fast property tests,
+  the targeted Kani harnesses, every target compiling, a short QEMU smoke and chaos run, and an assurance report.
+  A failing required check blocks the merge. A change that touches an invariant no check exercises is reported as
+  a COVERAGE GAP, never counted as verified. *Adapted:* this project's workflows are `workflow_dispatch`-only and
+  paused, and every gate runs in `osdev build` (`EXTRA_CHECKS`), so tier 1 lands there, where a build cannot skip
+  it - a check on a path nobody runs is a check on none; a hosted pipeline is added when CI runs again.
+- **Tier 2, nightly, for high-risk changes and for release candidates**: longer property runs, wider bounds, full
+  mutation testing, long QEMU chaos, architecture stress, the boards where infrastructure allows, and a review of
+  unresolved assumptions and gaps. A high-risk change gets it before merging.
+
+### How results are worded
+
+Every result is one of: **PROVED WITHIN STATED BOUNDS**, **TESTED - NO VIOLATION OBSERVED**, **COUNTEREXAMPLE
+FOUND**, **PROOF GAP**, **NOT EXAMINED**. Never conflated: passing tests with proof, a model with the
+implementation, a bounded proof with unrestricted correctness, the emulator with the hardware, simplicity with the
+absence of vulnerabilities. No percentage of correctness without a measurement model that defends it. (The audit's
+check grades - architectural check, property test, model check, implementation verification, machine-checked proof,
+unverified - and its reasoning results - counterexample found, argument supported, proof gap, not examined - map
+onto these.)
+
+### Layout
+
+```text
+verification/
+  README.md              how to run each layer, and what a failure or a gap means
+  invariants/registry.md the authoritative list (above)
+  architecture/          checks not already in scripts/ (most stay there, where the build runs them)
+  models/                reference state machines (C1, C2 land here, beside a kernel test seam)
+  properties/            property-based state-machine tests and their kept failing seeds
+  kani/                  bounded harnesses, each with its bounds and assumptions written beside it
+  mutations/             the injected violations and which gate must catch each
+  harnesses/             QEMU scenario drivers that assert invariants
+  results/               GENERATED reports, by commit, kept apart from the sources
+```
+
+Adapted to the tree: what `scripts/` and `osdev` already do is not duplicated here, and generated reports never sit
+beside the authoritative specifications.
+
+### Contributors run it themselves
+
+Documented commands for: every fast kernel check; one responsibility's checks; replaying a failing property test
+from its seed; one Kani harness; a QEMU scenario; reading the registry; reading an assurance failure or a gap. No
+private infrastructure and no proprietary AI service needed for the core suite. Correct kernel changes become
+easier to review, and incorrect ones easier to reject.
+
+### Order
+
+1. **Restore trust in architectural enforcement**: E1 to E6 fixed, the checks mutation-tested, in the build.
+2. **Capture the known high-severity defects** as permanent regression properties (D8, D7, D2, D1, D12, D10
+   first), each fix one change per card.
+3. **Bounded verification** of a few production functions, starting with capabilities and lifecycle.
+4. **Integration assurance**: cross-responsibility state machines, invariant-checking chaos, per-architecture
+   regression.
+5. **Maintained**: a kernel change preserves the invariants it touches and extends verification when it adds a
+   state transition.
+
+No TLA+ or theorem-proving programme unless a concrete gap justifies one.
+
+### Done when
+
+Every kernel change runs the fast tier; known architectural violations are reliably rejected; the confirmed
+high-severity defects have permanent regression coverage; capability, IPC and lifecycle operations have
+reproducible state-machine tests; selected production functions have machine-checked bounded properties; injected
+representative faults make the relevant checks fail; assumptions and uncovered areas are visible; contributors
+reproduce the checks locally; basic assurance needs no manual AI review; and MISCIS is still six responsibilities.
+
+### Not attempted
+
+Reproducing seL4; proving the whole kernel at once; eliminating every vulnerability; verification machinery in the
+running kernel; a seventh responsibility; models in place of hardware testing; checks in place of engineering
+review; claiming that green CI proves correctness.
+
+> The kernel should become increasingly boring because its behaviour is constrained, its invariants are explicit,
+> and its critical properties are repeatedly checked against the real implementation - a kernel contributors
+> modify confidently, because the verification challenges their assumptions before their code is merged.
 
 ## Next step
 

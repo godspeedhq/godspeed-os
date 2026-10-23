@@ -29,9 +29,10 @@ the same file deletes it first. An existing file is never replaced: delete it, o
 
 ## While it runs
 
-The same progress line as `godspeed fetch`: a bar, the percentage, the size so far and in all, the speed so
-far (`KiB/s` or `MiB/s`, the units the sizes use), the time taken and about how long is left (`45 s`, `2 min 5 s`,
-`1 h 3 min`), and `[q] quit`. Nothing ends a download that keeps arriving: the bound is
+The same progress as `godspeed fetch`: one line of words - the percentage, the size so far of the whole
+(`2.0 / 9.5 MiB`), the speed so far (`KiB/s` or `MiB/s`, the units the sizes use), about how long is left
+(`about 45 s left`, `2 min 5 s`, `1 h 3 min`; `done in ...` at the end) and `[q] quit` - and the bar on its own
+line under them, as wide as the console. Nothing ends a download that keeps arriving: the bound is
 `timeout-secs` (`godspeed config`) with NOTHING moving, never a total.
 
 ## Output
@@ -44,6 +45,7 @@ A card when it is done:
 | `from` | the link it came from | `as typed`, or how many redirects from the one typed |
 | `checked` | `https`, or `NOT checked` | what that means |
 | `speed` | KiB/s or MiB/s | the bytes and the time, the connection included |
+| `time` | where the time went: `network`, `decrypt`, `disk` and `screen`, in ms | how many reads of `net-stack` it took, and how many found nothing yet, with the time they waited (a read that finds nothing yields and asks again, and parks for a tick once 2 ms of that has found nothing, so the count is of reads, not of pauses). `https://` only; the network and decrypt figures include the handshake, and the name lookup, the connect and the sends are in none |
 
 ## What it does not do, recorded rather than hidden
 

@@ -22,11 +22,12 @@
 //! registers, which sit `DMA_REGS_OFF` past the descriptors; the PHY's internal transmit delay must be
 //! disabled for `rgmii-rxid`. What changed is only how the driver reaches the silicon:
 //!
-//! - **Registers** go through the SDK's `Mmio` wrapper instead of raw volatile pointers, so this file
+//! - **Registers** go through `gs::driver::registers` instead of raw volatile pointers, so this file
 //!   contains no `unsafe` at all (§18.2). Offsets are relative to the granted window rather than to an
 //!   absolute physical base; the numbers are otherwise identical.
-//! - **Packet buffers** live in the 64 KiB DMA arena instead of frames from the kernel's allocator,
-//!   which is what fixes the ring sizes below at something a reader can add up (§26.6.1).
+//! - **Packet buffers** live in the 528 KiB DMA arena instead of frames from the kernel's allocator,
+//!   which is what fixes the ring sizes below at something a reader can add up (§26.6.1). The arena is
+//!   laid out in two named parts, the receive and the transmit buffers (`gs::driver::arena`).
 //! - **Cache maintenance is gone**, because the arena is mapped Device-nGnRnE by the spawn path. The
 //!   kernel driver had to `dma_sync` every buffer and had one vicious bug from getting it wrong (a
 //!   `dc civac` writing a stale line back over a freshly-DMA'd frame). An uncached mapping removes the
@@ -42,7 +43,8 @@
 
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed::driver::{Part, Registers};
+use godspeed_sdk::{Message, ServiceContext};
 
 // The radio as the link's second backend (`radio.rs`), shared with the VisionFive's `dwmac`. Included by
 // path from each backend that uses it rather than declared once behind a new `cfg`: only one backend is
@@ -52,7 +54,7 @@ mod radio;
 use radio::{Carrier, Radio, CABLE_RECHECK_MS};
 
 // ---------------------------------------------------------------------------------------------
-// Register map. Byte offsets into the 64 KiB window `ctx.mmio()` hands us, which the spawn path
+// Register map. Byte offsets into the 64 KiB window `gs::driver::registers` hands us, which the spawn path
 // mapped to physical 0xFD58_0000. Block offsets are the values Linux's `bcmgenet.h` defines and are
 // the same across v1..v5 - it is the contents that move, not the blocks.
 // ---------------------------------------------------------------------------------------------
@@ -343,27 +345,31 @@ const SHD_CLK_CTL_GTXCLK_EN: u16 = 1 << 9;
 // ---------------------------------------------------------------------------------------------
 // Ring geometry, and the arena it has to fit in.
 //
-// The DMA arena is 64 KiB, fixed by the spawn path, and it holds ONLY packet buffers - GENET keeps its
-// descriptors in the controller's own register file (that is what `RDMA_OFFSET`/`TDMA_OFFSET` address),
-// so none of the arena goes on descriptor storage. 24 receive buffers plus 8 transmit buffers of 2 KiB
-// each is exactly 64 KiB, and the const assertion below is what keeps that sentence true if anyone
-// edits a number (§26.6.1: a bound you can read off the source).
+// The DMA arena is 528 KiB (the supervisor's `dma_pages` for nic-driver), and it holds ONLY packet buffers - GENET keeps
+// its descriptors in the controller's own register file (that is what `RDMA_OFFSET`/`TDMA_OFFSET` address),
+// so none of the arena goes on descriptor storage. 256 receive buffers plus 8 transmit buffers of 2 KiB
+// each is exactly 528 KiB. They are two named parts of the arena (`genet_main`), so a number edited past
+// what the arena holds is refused at start, naming the part, before any ring is enabled.
 //
-// The in-kernel driver used 32 and 32, which is 128 KiB of frames from the general allocator. Fitting
-// the arena is not a regression: transmit here is strictly one frame at a time (net-stack sends, then
-// waits for the reply), so a deep transmit ring buys nothing, and 24 receive buffers still absorb a
-// burst between drains.
+// RECEIVE IS ALL 256 DESCRIPTORS. It was 24, all a 64 KiB arena held. A download's window of 256 KiB
+// can arrive faster than net-stack drains it, and a 10 MB download over the cable spent 33 s of its 50
+// waiting for data (backlog/93); the RTL8168's ring of 24 overflowed the same way, and 256 ended it.
+// 256 also divides the 16-bit producer and consumer indices, so `cons % RX_RING_DESCS` stays the
+// hardware's own slot when they wrap; at 24 it did not, and after 65,536 frames the driver would have
+// read the wrong buffer. Transmit stays at 8: it is strictly one frame at a time (net-stack sends, then
+// waits for the reply), so a deep transmit ring buys nothing.
 // ---------------------------------------------------------------------------------------------
 
 /// Bytes per buffer. Linux's `RX_BUF_LENGTH`; one 2 KiB buffer holds any Ethernet frame this MAC will
 /// accept, so a frame never spans descriptors and the driver never has to reassemble.
 const RX_BUF_LENGTH: usize = 2048;
-const RX_RING_DESCS: usize = 24;
+const RX_RING_DESCS: usize = 256;
+// A ring that does not divide 65,536 reads the wrong slot when the 16-bit indices wrap.
+const _: () = assert!(65_536 % RX_RING_DESCS == 0 && RX_RING_DESCS <= TOTAL_DESC);
 const TX_RING_DESCS: usize = 8;
-const RX_BUF_BASE: usize = 0;
-const TX_BUF_BASE: usize = RX_BUF_BASE + RX_RING_DESCS * RX_BUF_LENGTH;
-const ARENA_NEEDED: usize = TX_BUF_BASE + TX_RING_DESCS * RX_BUF_LENGTH;
-const _: () = assert!(ARENA_NEEDED == 64 * 1024, "the ring buffers must fit the 64 KiB DMA arena");
+const RX_BUFS_LEN: usize = RX_RING_DESCS * RX_BUF_LENGTH;
+const TX_BUFS_LEN: usize = TX_RING_DESCS * RX_BUF_LENGTH;
+const ARENA_NEEDED: usize = RX_BUFS_LEN + TX_BUFS_LEN;
 
 /// One Ethernet frame (at most 1518) with headroom. The frame-interface constant, matching every other
 /// backend in this service so the reply shapes cannot drift.
@@ -384,12 +390,14 @@ const REG_SETTLE: Budget = Budget::us(10);
 // On a machine with no timer calibration a deadline cannot be computed, and the bound is
 // `godspeed::driver::wait::UNCALIBRATED_POLLS` looks - the same 200,000 this file used to name itself.
 
-/// The GENET controller, as a userspace driver sees it: a register window, a DMA arena, and the
-/// service context that provides logging and the clock the waits are bounded by.
+/// The GENET controller, as a userspace driver sees it: its registers, the two parts of its DMA arena
+/// (the receive and the transmit buffers), and the service context that provides logging and the clock
+/// the waits are bounded by.
 pub struct Genet<'a> {
     ctx: &'a ServiceContext,
-    m: Mmio,
-    a: Dma,
+    m: Registers,
+    rx: Part,
+    tx: Part,
     /// Counter ticks in 10 ms, from the kernel's own calibration, read once so bring-up can say when it
     /// is 0 and the waits are counted rather than measured. The waits themselves are `gs::driver`'s.
     per_10ms: u64,
@@ -412,8 +420,8 @@ fn dma_reg(block: usize, reg: usize) -> usize {
 }
 
 impl<'a> Genet<'a> {
-    pub fn new(ctx: &'a ServiceContext, m: Mmio, a: Dma) -> Self {
-        Genet { ctx, m, a, per_10ms: godspeed::driver::wait::ticks_per_10ms(ctx) }
+    pub fn new(ctx: &'a ServiceContext, m: Registers, rx: Part, tx: Part) -> Self {
+        Genet { ctx, m, rx, tx, per_10ms: godspeed::driver::wait::ticks_per_10ms(ctx) }
     }
 
     fn rd(&self, off: usize) -> u32 {
@@ -765,21 +773,23 @@ impl<'a> Genet<'a> {
         }
     }
 
-    /// Zero the whole DMA arena, one aligned 32-bit word at a time.
+    /// Zero both parts of the DMA arena, which are the whole of it, one aligned 32-bit word at a time.
     ///
-    /// **Not `Dma::zero()`, deliberately.** That is a `write_bytes`, and on this port the arena is
-    /// mapped Device-nGnRnE (the spawn path uses `PCD`, which AArch64 reads as the Device attribute
-    /// rather than as "uncached Normal"). Device memory does not permit the unaligned and
-    /// cache-hint-bearing accesses a `memset` is free to emit, so the portable-looking call is the
-    /// riskier one here. An explicit aligned loop cannot be anything other than what it says.
+    /// **Aligned 32-bit stores, deliberately.** On this port the arena is mapped Device-nGnRnE (the spawn
+    /// path uses `PCD`, which AArch64 reads as the Device attribute rather than as "uncached Normal"), and
+    /// Device memory does not permit the unaligned and cache-hint-bearing accesses a `memset` is free to
+    /// emit. This loop was written when the SDK's clear was one; that clear is an aligned volatile loop
+    /// too now (SEC-28), but in 64-bit stores, and this driver was proven on the board with these, so it
+    /// keeps them. An explicit aligned loop cannot be anything other than what it says.
     ///
     /// Zeroing matters beyond tidiness: `receive` trusts the controller's length for how many bytes are
     /// MEANINGFUL, so a device reporting more than it wrote would hand `net-stack` whatever previously
     /// occupied the arena (the SEC-21 information-leak class).
     fn clear_arena(&self) {
-        let words = self.a.len() / 4;
-        for i in 0..words {
-            self.a.write32(i * 4, 0);
+        for part in [&self.rx, &self.tx] {
+            for i in 0..part.len() / 4 {
+                part.write32(i * 4, 0);
+            }
         }
     }
 
@@ -787,7 +797,7 @@ impl<'a> Genet<'a> {
     /// ring position - then read the geometry back before anything is enabled.
     fn init_rx_ring(&self) -> bool {
         for i in 0..RX_RING_DESCS {
-            let phys = self.a.phys_at(RX_BUF_BASE + i * RX_BUF_LENGTH);
+            let phys = self.rx.phys_at(i * RX_BUF_LENGTH);
             // The descriptor's address words. The controller reads these to find where to put a frame,
             // so they are PHYSICAL - our own view of that memory is the arena mapping, and handing over
             // a virtual address is a device writing to an address that means nothing to it.
@@ -852,7 +862,7 @@ impl<'a> Genet<'a> {
     /// until the geometry has been read back.
     fn init_tx_ring(&self) -> bool {
         for i in 0..TX_RING_DESCS {
-            let phys = self.a.phys_at(TX_BUF_BASE + i * RX_BUF_LENGTH);
+            let phys = self.tx.phys_at(i * RX_BUF_LENGTH);
             self.wr(desc_word(TDMA_OFFSET, i, DMA_DESC_ADDRESS_LO), phys as u32);
             self.wr(desc_word(TDMA_OFFSET, i, DMA_DESC_ADDRESS_HI), (phys >> 32) as u32);
             self.wr(desc_word(TDMA_OFFSET, i, DMA_DESC_LENGTH_STATUS), 0);
@@ -942,12 +952,6 @@ impl<'a> Genet<'a> {
             self.ctx.log_fmt(format_args!(
                 "nic-driver: genet register window is only {} bytes - the DMA blocks and the filter RAM are outside it",
                 self.m.len()));
-            return None;
-        }
-        if self.a.len() < ARENA_NEEDED {
-            self.ctx.log_fmt(format_args!(
-                "nic-driver: genet needs a {} byte DMA arena and was granted {} - not enabling the rings",
-                ARENA_NEEDED, self.a.len()));
             return None;
         }
 
@@ -1119,9 +1123,9 @@ impl<'a> Genet<'a> {
         // from a descriptor the CONTROLLER wrote, so it is device-supplied and not to be trusted with a
         // copy size.
         let n = len.min(dst.len()).min(RX_BUF_LENGTH);
-        let base = RX_BUF_BASE + slot * RX_BUF_LENGTH;
+        let base = slot * RX_BUF_LENGTH;
         for (i, b) in dst.iter_mut().enumerate().take(n) {
-            *b = self.a.read8(base + i);
+            *b = self.rx.read8(base + i);
         }
 
         // Returning the descriptor to the hardware is what keeps receive alive past the first ring's
@@ -1131,6 +1135,12 @@ impl<'a> Genet<'a> {
             ring_reg(RDMA_OFFSET, RING_INDEX, RDMA_CONS_INDEX),
             cons.wrapping_add(1) & 0xFFFF,
         );
+        // Every 8,192th frame, the counters - the MAC's overflow and the ring's discard count say whether
+        // frames were lost for want of a buffer, which nothing else here can (backlog/93). About one
+        // line in 12 MB received.
+        if cons.wrapping_add(1) & 0x1FFF == 0 {
+            self.report_counters();
+        }
         n
     }
 
@@ -1141,9 +1151,9 @@ impl<'a> Genet<'a> {
             return false;
         }
         let slot = (*tx_next as usize) % TX_RING_DESCS;
-        let base = TX_BUF_BASE + slot * RX_BUF_LENGTH;
+        let base = slot * RX_BUF_LENGTH;
         for (i, b) in frame.iter().enumerate() {
-            self.a.write8(base + i, *b);
+            self.tx.write8(base + i, *b);
         }
 
         let len_stat = ((frame.len() as u32) << 16)
@@ -1211,12 +1221,27 @@ impl<'a> Genet<'a> {
 /// reports itself down instead of a request that never comes back. A bring-up that refused still
 /// serves the frame interface, with the radio as the link, and retries the MAC when a cable arrives.
 pub fn genet_main(ctx: ServiceContext) -> ! {
-    let (Some(m), Some(a)) = (ctx.mmio(), ctx.dma_region()) else {
+    let (Some(m), Some(a)) = (godspeed::driver::registers(&ctx), godspeed::driver::arena(&ctx)) else {
         ctx.log("nic-driver: no GENET register window or DMA arena granted - serving empty replies");
         crate::serve_status(&ctx, &[0u8; 8]);
     };
+    // The arena in its two parts, page-aligned: the receive buffers at 0x0, the transmit buffers after
+    // them at 0x80000. One that does not fit is said with its name and treated as no arena at all - which,
+    // unlike a MAC that will not come up, also leaves the radio unserved; it can only happen if the spawn
+    // grants less than 528 KiB, which is a change to the supervisor's `dma_pages` for nic-driver, not a board
+    // state.
+    let mut parts = a.layout();
+    let (rx, tx) = match (parts.take("rx buffers", RX_BUFS_LEN, 4096), parts.take("tx buffers", TX_BUFS_LEN, 4096)) {
+        (Ok(rx), Ok(tx)) => (rx, tx),
+        (Err(e), _) | (_, Err(e)) => {
+            ctx.log_fmt(format_args!("nic-driver: genet - {} - serving empty replies", e));
+            crate::serve_status(&ctx, &[0u8; 8]);
+        }
+    };
+    ctx.log_fmt(format_args!("nic-driver: genet arena laid out - rx buffers at {:#x}, tx buffers at {:#x} ({} of {} bytes)",
+        rx.offset(), tx.offset(), parts.used(), parts.len()));
 
-    let g = Genet::new(&ctx, m, a);
+    let g = Genet::new(&ctx, m, rx, tx);
     if g.per_10ms == 0 {
         // Say it once, here, rather than letting every bounded wait quietly change meaning. A machine
         // in this state still works; its timeouts are just counted instead of measured.

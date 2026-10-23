@@ -232,6 +232,10 @@ const OP_WRITE_BLOCK: u8 = 2;
 const OP_CAPACITY: u8 = 3;
 const OP_WRITE_ZEROS: u8 = 4; // [op, lba:u64, count:u64] - zero a run of blocks (fast format)
 const OP_FLUSH: u8 = 5;       // [op] - make prior writes durable on the medium (see `block_flush`)
+const OP_WRITE_BLOCKS: u8 = 6; // [op, lba:u64, count:u8, count x 512] - a run of consecutive blocks
+/// The most blocks one `OP_WRITE_BLOCKS` carries - a streamed chunk's seven (`IO_CHUNK`, 7 x 508) - which
+/// keeps the request, 3,595 bytes with its tag, inside one message. `block-driver` refuses more.
+const WRITE_RUN_MAX: usize = 7;
 const BLK_OK: u8 = 0;
 const BLK_ERR: u8 = 1;        // the driver's STATUS_ERR - it answered, and said the operation failed
 const BLK_UNREACHABLE: u8 = 2; // on a flush: the driver answered, but reached no device (its USB host was
@@ -517,6 +521,10 @@ struct Fs {
     /// stamping happens on `&self` paths, and owned by `Fs` rather than a static (invariant 9).
     /// See `now_epoch` and `CLOCK_MAX_AGE_S`.
     clock: core::cell::Cell<(u32, i64)>,
+    /// The last path `walk` resolved and what it found (`WalkCache`): a download writes one file in about
+    /// 2,800 chunks, and each walked the path from the root, about three directory reads before seven
+    /// data writes (`backlog/93` item 12).
+    walk_cache: core::cell::Cell<WalkCache>,
     /// Set when a block operation got no usable ANSWER (desync, truncated reply, driver gone) as
     /// opposed to a refusal from the device. Kept apart from `io_error_seen` because they demand
     /// opposite responses: a device error re-mounts and degrades, a desync must be reported as itself
@@ -570,6 +578,26 @@ const _: () = assert!(
     core::mem::size_of::<Fs>() <= 40 * 1024,
     "Fs exceeds its stack budget - see the note above this assertion before raising it"
 );
+
+/// The one path `Fs::walk` last resolved, and its entry.
+///
+/// **A derived view, and subordinate (26.4, Commandment III):** the directory tree on the disk is the truth,
+/// and this is a copy of one lookup in it. It is forgotten at every metadata write (`tb_write`, through which
+/// every directory, bitmap and superblock block goes), when a transaction begins or aborts, and with the `Fs`
+/// itself at every mount; and it is neither read nor filled while a transaction is open, so a commit finds it
+/// empty and it never holds a lookup of staged, uncommitted blocks. A file's data writes (`write_at`) change no directory block, which is
+/// why a streamed file keeps its entry from one chunk to the next. A miss is a walk, so the worst a stale entry
+/// could do is what these rules exist to rule out; a path longer than `WALK_CACHE_PATH` is never cached.
+#[derive(Clone, Copy)]
+struct WalkCache {
+    len: usize,
+    path: [u8; WALK_CACHE_PATH],
+    entry: Option<Entry>,
+}
+const WALK_CACHE_PATH: usize = 256;
+impl WalkCache {
+    const EMPTY: WalkCache = WalkCache { len: 0, path: [0; WALK_CACHE_PATH], entry: None };
+}
 
 /// A decoded `file_record` plus where it lives, so it can be written back. `loc == None`
 /// means the root directory (its extent lives in the superblock, it has no parent entry).
@@ -2238,6 +2266,7 @@ impl Fs {
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
             clock: core::cell::Cell::new((0, 0)),
+            walk_cache: core::cell::Cell::new(WalkCache::EMPTY),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -2290,6 +2319,8 @@ impl Fs {
     /// Write a block: stage it in the active transaction (de-duplicating by `lba`), else write
     /// through to disk. Staging overflow is recorded and surfaces as a loud commit failure.
     fn tb_write(&mut self, ctx: &ServiceContext, lba: u64, data: &[u8; BLOCK]) -> bool {
+        // Any metadata block changing ends the lookup `walk` kept (`WalkCache`).
+        self.walk_cache.set(WalkCache::EMPTY);
         if self.txn_active {
             for i in 0..self.txn_n {
                 if self.txn_lba[i] == lba { self.txn_blk[i] = *data; return true; }
@@ -2449,12 +2480,14 @@ impl Fs {
     }
 
     fn begin_txn(&mut self) {
+        self.walk_cache.set(WalkCache::EMPTY);
         self.txn_active = true;
         self.txn_n = 0;
         self.txn_overflow = false;
     }
 
     fn abort_txn(&mut self) {
+        self.walk_cache.set(WalkCache::EMPTY);
         self.txn_active = false;
         self.txn_n = 0;
         self.txn_overflow = false;
@@ -2898,6 +2931,7 @@ fn replay_window(_ctx: &ServiceContext) {}
             blk_ops: core::cell::Cell::new(0),
             blk_cycles: core::cell::Cell::new(0),
             clock: core::cell::Cell::new((0, 0)),
+            walk_cache: core::cell::Cell::new(WalkCache::EMPTY),
             transport_fail_seen: core::cell::Cell::new(false),
             // `None` = unknown, so the first persist of this mount always writes. One write per
             // mount is the price of never assuming what is on a disk we have not written to yet.
@@ -3244,10 +3278,22 @@ fn replay_window(_ctx: &ServiceContext) {}
     }
 
     fn walk(&self, ctx: &ServiceContext, path: &[u8]) -> Option<Entry> {
+        let cacheable = !self.txn_active && path.len() <= WALK_CACHE_PATH;
+        if cacheable {
+            let c = self.walk_cache.get();
+            if let Some(e) = c.entry {
+                if c.len == path.len() && &c.path[..c.len] == path { return Some(e); }
+            }
+        }
         let mut cur = self.root_entry();
         for comp in components(path) {
             if cur.itype != ITYPE_DIR { return None; }
             cur = self.dir_find(ctx, &cur, comp)?;
+        }
+        if cacheable {
+            let mut c = WalkCache { len: path.len(), path: [0; WALK_CACHE_PATH], entry: Some(cur) };
+            c.path[..path.len()].copy_from_slice(path);
+            self.walk_cache.set(c);
         }
         Some(cur)
     }
@@ -3631,6 +3677,11 @@ fn replay_window(_ctx: &ServiceContext) {}
         let frag = if e.itype == ITYPE_FILE_FRAG { Some(self.ext_of(ctx, &e).ok_or("extent block read failed")?) } else { None };
         let base_idx = offset / DATA_PAYLOAD as u64;
         let nblk = (chunk.len() + DATA_PAYLOAD - 1) / DATA_PAYLOAD;
+        // A direct write sends consecutive blocks as ONE request (`block_write_run`): a chunk of a
+        // contiguous file is seven blocks in a row, which were seven round trips to `block-driver`
+        // (`backlog/93` item 12). A fragmented file's run breaks where its extent does.
+        let mut run = [[0u8; BLOCK]; WRITE_RUN_MAX];
+        let (mut run_lba, mut run_n) = (0u64, 0usize);
         for i in 0..nblk {
             let s = i * DATA_PAYLOAD;
             let end = (s + DATA_PAYLOAD).min(chunk.len());
@@ -3639,9 +3690,19 @@ fn replay_window(_ctx: &ServiceContext) {}
                 None => e.first_block + idx,
                 Some((exts, ne)) => nth_data_block(exts, *ne, idx).ok_or("extent out of range")?,
             };
-            let ok = if journal { self.data_stage(ctx, lba, &chunk[s..end]) } else { data_write(ctx, lba, &chunk[s..end]) };
-            if !ok { return Err("block write failed"); }
+            if journal {
+                if !self.data_stage(ctx, lba, &chunk[s..end]) { return Err("block write failed"); }
+                continue;
+            }
+            if run_n > 0 && (lba != run_lba + run_n as u64 || run_n == WRITE_RUN_MAX) {
+                if !block_write_run(ctx, run_lba, &run[..run_n]) { return Err("block write failed"); }
+                run_n = 0;
+            }
+            if run_n == 0 { run_lba = lba; }
+            data_block(&mut run[run_n], &chunk[s..end]);
+            run_n += 1;
         }
+        if run_n > 0 && !block_write_run(ctx, run_lba, &run[..run_n]) { return Err("block write failed"); }
         Ok(())
     }
 
@@ -4762,9 +4823,9 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(a)
 }
 
-/// One block-protocol transfer buffer: big enough for the largest REQUEST (write: op + lba + block)
-/// as well as the largest reply (status + block), because the bounded call stages the request and
-/// receives the reply in the SAME buffer.
+/// One single-block transfer: big enough for a one-block write REQUEST (tag + op + lba + block) as well as
+/// the largest reply (tag + status + block). A run (`OP_WRITE_BLOCKS`) is larger, and the bounded call
+/// carries it in `BLK_CALL_MAX`.
 ///
 /// One constant, used by both the buffer and this struct. They were two separate expressions - 514
 /// here and 514 at the call site, against a 522-byte write request - and sizing them independently is
@@ -4784,6 +4845,14 @@ pub const BLK_XFER_MAX: usize = 1 + 9 + BLOCK;
 // which is the exact smash the capacity was added to prevent. So the buffer moves to the class
 // boundary instead. Costs ~500 bytes of a 256 KiB stack whose deepest measured use is 78 KiB.
 const BLK_REPLY_MAX: usize = 1024;
+/// The buffer the bounded call carries a REQUEST out in, as well as the reply back: it must hold the largest
+/// request, a run of `WRITE_RUN_MAX` blocks (`block_write_run`, 1 + 10 + 7 x 512 = 3,595 bytes), and is a power
+/// of two for the reason above. Lives only in `block_rpc`'s frame; the reply is copied out into a
+/// `BlockReply` of `BLK_REPLY_MAX`, so the larger buffer is not carried back through every caller. Without it
+/// the SDK refused every run as too large before it left (`MessageTooLarge`), seen first as "NO usable reply".
+const BLK_CALL_MAX: usize = 4096;
+const _: () = assert!(BLK_CALL_MAX >= 1 + 10 + WRITE_RUN_MAX * BLOCK && BLK_CALL_MAX.is_power_of_two(),
+    "the call buffer must hold a run of blocks AND be a power of two");
 const _: () = assert!(BLK_REPLY_MAX >= BLK_XFER_MAX && BLK_REPLY_MAX.is_power_of_two(),
     "the block buffer must hold a full transfer AND be a power of two - see the note above");
 
@@ -4880,19 +4949,21 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // over `..._outcome`, whose enum CARRIES a `Message` - a second 4 KiB temporary on a service
     // already near its 256 KiB stack. On hardware it was an instant data abort at startup and an
     // 826-deep restart loop: a change meant to prevent a hang produced an unusable machine. The
-    // wrapper now writes the wait out itself and costs one message frame, not two.
+    // wrapper now writes the wait out itself, so no second `Message` temporary is made; its frame holds the
+    // call buffer and the request (`BLK_CALL_MAX`, `block_write_run`), about two messages' worth.
     //
     // 30 s is chosen against the WORK: `block-driver` retries a busy device for up to 30 s per block,
-    // so anything shorter abandons a request still being legitimately serviced.
+    // so anything shorter abandons a request still being legitimately serviced. A run of seven blocks is one
+    // request under the same 30 s, which a slow USB stick can outlast (`backlog/93` item 12, not changed).
     const BLOCK_RPC_SECS: i64 = 30;
-    // The reply lands in a buffer THIS function owns, sized to the protocol (status + one block), and
-    // the caller reads it as a slice. No `Message` is returned, forwarded or mutated anywhere on this
+    // The reply lands in a buffer THIS function owns, `BLK_CALL_MAX` (the call carries the request out in
+    // it and the reply back), and is copied into a `BlockReply` of `BLK_REPLY_MAX` for the caller. No `Message` is returned, forwarded or mutated anywhere on this
     // path - which is what makes room for the correlation tag that would not previously fit.
     // TAG + STATUS + BLOCK. Sized 1 + BLOCK first, which truncated every read by one byte: `fs` then
     // saw a 512-byte body where 513 belongs and rejected it as a desync - "block read at lba 0 got a
     // MALFORMED reply (512 bytes)". The shape check did its job; the buffer was simply a byte short.
-    // The shared transfer size - see `BLK_XFER_MAX`.
-    let mut rbuf = [0u8; BLK_REPLY_MAX];
+    // A reply is at most `BLK_XFER_MAX`; the buffer is larger because it carries a run out too.
+    let mut rbuf = [0u8; BLK_CALL_MAX];
 
     // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.
     //
@@ -4912,7 +4983,8 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
         }
         if t == 0 { 1 } else { t }
     };
-    let mut treq = [0u8; 1 + 9 + BLOCK];
+    // Sized for the largest request, a run of `WRITE_RUN_MAX` blocks (`block_write_run`).
+    let mut treq = [0u8; 1 + 10 + WRITE_RUN_MAX * BLOCK];
     let rn = req.len().min(treq.len() - 1);
     treq[0] = tag;
     treq[1..1 + rn].copy_from_slice(&req[..rn]);
@@ -5005,7 +5077,11 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
                     // permanent.
                     return None;
                 }
-                return Some(BlockReply { buf: rbuf, len: n - 1 });
+                // A reply is at most a tag, a status and one block; more is the peer out of step.
+                if n > BLK_REPLY_MAX { return None; }
+                let mut buf = [0u8; BLK_REPLY_MAX];
+                buf[..n].copy_from_slice(&rbuf[..n]);
+                return Some(BlockReply { buf, len: n - 1 });
             }
             // Delivered, unanswered. The peer is alive and holding the request; re-sending would ask
             // for the work twice and desync the tags.
@@ -5240,11 +5316,57 @@ fn block_write_kind(
 /// leaves harmless garbage in free space (Phase C). `payload.len()` must be ≤ DATA_PAYLOAD.
 fn data_write(ctx: &ServiceContext, lba: u64, payload: &[u8]) -> bool {
     let mut blk = [0u8; BLOCK];
+    data_block(&mut blk, payload);
+    block_write(ctx, lba, &blk)
+}
+
+/// A file-data block in `blk`: up to 508 payload bytes, zero-padded, its CRC32 at @508.
+fn data_block(blk: &mut [u8; BLOCK], payload: &[u8]) {
+    *blk = [0u8; BLOCK];
     let n = payload.len().min(DATA_PAYLOAD);
     blk[..n].copy_from_slice(&payload[..n]);
     let c = crc32(&blk[..DATA_PAYLOAD]);
     blk[DATA_CRC_OFF..DATA_CRC_OFF + 4].copy_from_slice(&c.to_le_bytes());
-    block_write(ctx, lba, &blk)
+}
+
+/// Write `blocks` to consecutive LBAs from `lba` in ONE request (`OP_WRITE_BLOCKS`), at most
+/// `WRITE_RUN_MAX`. Direct, as `data_write` is. The answers are `block_write_kind`'s, said for the run.
+fn block_write_run(ctx: &ServiceContext, lba: u64, blocks: &[[u8; BLOCK]]) -> bool {
+    // A run the protocol cannot carry is refused and said, never shortened: shortened, the blocks past
+    // `WRITE_RUN_MAX` would be reported written and never reach the disk (Audit 19). The one caller sends
+    // a chunk, which is at most `WRITE_RUN_MAX`.
+    if blocks.is_empty() || blocks.len() > WRITE_RUN_MAX {
+        ctx.log_fmt(format_args!("fs: a block run of {} at lba {} refused - a run is 1 to {} blocks",
+                                 blocks.len(), lba, WRITE_RUN_MAX));
+        return false;
+    }
+    let n = blocks.len();
+    let mut req = [0u8; 10 + WRITE_RUN_MAX * BLOCK];
+    req[0] = OP_WRITE_BLOCKS;
+    req[1..9].copy_from_slice(&lba.to_le_bytes());
+    req[9] = n as u8;
+    for (i, b) in blocks[..n].iter().enumerate() {
+        req[10 + i * BLOCK..10 + (i + 1) * BLOCK].copy_from_slice(b);
+    }
+    match block_rpc(ctx, &req[..10 + n * BLOCK]) {
+        Some(reply) if reply.body().first() == Some(&BLK_OK) => true,
+        Some(reply) if reply.body().first() == Some(&BLK_ERR) && reply.body().len() == 1 => {
+            ctx.log_fmt(format_args!("fs: block write of {} block(s) failed at lba {} (device I/O error)", n, lba));
+            false
+        }
+        Some(reply) => {
+            ctx.log_fmt(format_args!(
+                "fs: block write of {} block(s) at lba {} got a MALFORMED reply ({} bytes) - protocol desync, not a device error",
+                n, lba, reply.body().len()));
+            false
+        }
+        None => {
+            ctx.log_fmt(format_args!(
+                "fs: block write of {} block(s) at lba {} got NO usable reply - protocol desync or the driver is gone, not a device error",
+                n, lba));
+            false
+        }
+    }
 }
 
 /// Read a **file-data block** at `lba` and verify its CRC trailer. Returns the full 512-byte

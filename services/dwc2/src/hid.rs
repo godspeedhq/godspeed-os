@@ -12,7 +12,9 @@
 //! was known good.
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
+use godspeed_sdk::ServiceContext;
 
 use crate::chan::{self, Target};
 
@@ -29,22 +31,9 @@ const PROTOCOL_KEYBOARD: u8 = 0x01;
 /// Endpoint attribute bits: transfer type is the low two, 3 = interrupt.
 const EP_TYPE_INTERRUPT: u8 = 0x03;
 
-/// Where the keyboard's 8-byte boot report is DMA'd.
-///
-/// **Clear of the control-transfer scratch, which the first version was not.** `DATA_OFF` is 0x0040
-/// and `DATA_LEN` is 256, so that scratch spans 0x0040..0x0140 - and this was 0x0100, inside it. The
-/// 256-byte config-descriptor read landed directly on the report buffer, so the poll then read back
-/// leftover descriptor bytes: non-zero, so they passed the "is there a keypress" filter, and garbage,
-/// so they decoded to nothing. 88 reports in 15 seconds with nothing typed and nothing printed.
-///
-/// The previous comment on this line asserted it was clear of the scratch. It was not, and asserting
-/// it is what stopped me checking - a comment that states a layout invariant without deriving it is
-/// worth less than the arithmetic it replaced.
-///
-/// 0x0200 is past `DATA_OFF + DATA_LEN` (0x0140) with room to spare, and the assertion below now
-/// derives the property instead of claiming it.
-pub const REPORT_OFF: usize = 0x0200;
-const _: () = assert!(REPORT_OFF >= chan::DATA_OFF + chan::DATA_LEN);
+// The keyboard's 8-byte boot report is DMA'd into its own part of the arena (`Parts::report`); the
+// overlap that once laid it inside the control scratch is told in `parts.rs`, where the layout now
+// refuses it.
 
 /// A bound boot keyboard.
 pub struct Keyboard {
@@ -104,7 +93,7 @@ fn find_boot_keyboard(buf: &[u8], total: usize) -> Option<(u8, Keyboard)> {
 /// `splt` is the split descriptor for this device (0 if it is directly attached), so the same code
 /// serves a keyboard on a hub port and one plugged straight into the root port.
 pub fn bind(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, splt: u32,
 ) -> Option<Keyboard> {
     // TWO ATTEMPTS, because one dropped control transfer used to cost the keyboard entirely.
     //
@@ -168,7 +157,7 @@ fn has_hid_interface(buf: &[u8], total: usize) -> bool {
 }
 
 fn try_bind(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, splt: u32,
 ) -> BindOutcome {
     // The 9-byte header first, for wTotalLength - the full descriptor's length is not knowable in
     // advance and asking for a fixed guess either truncates it or overruns the device's answer.
@@ -232,15 +221,15 @@ fn try_bind(
 /// Returns true if a report arrived. An idle keyboard NAKs, which is a positive answer of "nothing
 /// happened" rather than a failure - so a false here is the normal case and must not be logged.
 pub fn poll(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32, kbd: &Keyboard,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, splt: u32, kbd: &Keyboard,
     state: &mut KeyState, multi_tt: bool,
 ) -> bool {
     let len = (kbd.mps as u32).min(8);
-    let phys = dma.phys_at(REPORT_OFF) as u32;
+    let phys = dma.report.phys() as u32;
     // Zero first, for the same reason every IN transfer here does: a short report would otherwise
     // leave the PREVIOUS keystroke in the buffer and it would be delivered a second time.
     for i in 0..8 {
-        dma.write8(REPORT_OFF + i, 0);
+        dma.report.write8(i, 0);
     }
 
     // TRACE THE FAILING POLLS, not the first ones.
@@ -450,7 +439,7 @@ pub fn poll(
                 && now.wrapping_sub(state.last_data) < state.repeat_window;
             if proven {
                 let n = &mut state.emitted_repeat;
-                state.repeat.poll(now, |ch| { *n = n.wrapping_add(1); ctx.console_push(ch) });
+                state.repeat.poll(now, |ch| { *n = n.wrapping_add(1); godspeed::driver::input::push(&ctx, ch) });
             } else if state.repeat.armed() {
                 state.repeat.cancel();
             }
@@ -464,14 +453,14 @@ pub fn poll(
     // A report of any kind - keypress or release - is proof the path works: the remedies are working
     // or were never needed, so the escalation streak starts over.
     state.clears_since_data = 0;
-    let any = (0..8).any(|i| dma.read8(REPORT_OFF + i) != 0);
+    let any = (0..8).any(|i| dma.report.read8(i) != 0);
     if !any {
         state.pid = chan::pid_from_hctsiz(mmio, chan::CH_KBD);
         state.last_data = wait::ticks(ctx); // a release report is proof the path works
         let rel = [0u8; 8];
         godspeed_sdk::hid::decode_keyboard(
             &rel, &mut state.last, &mut state.repeat, &mut state.caps,
-            wait::ticks(ctx), |ch| ctx.console_push(ch), |_| {});
+            wait::ticks(ctx), |ch| godspeed::driver::input::push(&ctx, ch), |_| {});
         // (a release report emits nothing; counted for symmetry only if it ever does)
         return false;
     }
@@ -488,7 +477,7 @@ pub fn poll(
 
     let mut rep = [0u8; 8];
     for i in 0..8 {
-        rep[i] = dma.read8(REPORT_OFF + i);
+        rep[i] = dma.report.read8(i);
     }
     let mut state_emitted = 0u32;
     state.last_data = wait::ticks(ctx); // a data report is proof the path works
@@ -498,7 +487,7 @@ pub fn poll(
         &mut state.repeat,
         &mut state.caps,
         wait::ticks(ctx),
-        |ch| { state_emitted += 1; ctx.console_push(ch) },
+        |ch| { state_emitted += 1; godspeed::driver::input::push(&ctx, ch) },
         |code| ctx.log_fmt(format_args!("dwc2-svc: unmapped HID key usage {:#04x}", code)),
     );
     state.emitted_report = state.emitted_report.wrapping_add(state_emitted);

@@ -14,7 +14,9 @@
 //! tree already known to be reachable, rather than tangled with "does addressing even work".
 
 use godspeed as gs;
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
+use godspeed_sdk::ServiceContext;
 
 use crate::chan::{self, Target};
 
@@ -92,7 +94,7 @@ fn find_interrupt_in(buf: &[u8], total: usize) -> Option<(u8, u16)> {
 /// The device accepts this at address 0 and answers everything afterwards at the new one, so the
 /// caller's `Target` must be updated in step. A mismatch here does not report an error - the device
 /// simply stops answering, which reads as broken hardware.
-fn set_address(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, addr: u8) -> bool {
+fn set_address(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, addr: u8) -> bool {
     let setup = [0x00, 0x05, addr, 0, 0, 0, 0, 0];
     let mut none: [u8; 0] = [];
     if !chan::control(ctx, mmio, dma, t, &setup, &mut none, false, 0) {
@@ -106,7 +108,7 @@ fn set_address(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, addr: u
 }
 
 /// Read the hub descriptor (class-specific, type 0x29) and return its downstream port count.
-fn hub_port_count(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<u8> {
+fn hub_port_count(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> Option<u8> {
     // bmRequestType 0xA0: device-to-host, CLASS, device recipient. Not the 0x80 a standard
     // descriptor uses - a hub descriptor is class-specific and the wrong request type STALLs.
     let setup = [0xA0, 0x06, 0, DESC_HUB, 0, 0, 9, 0];
@@ -128,7 +130,7 @@ fn hub_port_count(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> O
 /// Address and identify whatever is on the root port.
 ///
 /// Returns `None` if any step failed - each one has already reported which.
-pub fn root_device(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma) -> Option<RootDevice> {
+pub fn root_device(ctx: &ServiceContext, mmio: &Registers, dma: &Parts) -> Option<RootDevice> {
     // A just-reset device answers at address 0 with an EP0 max-packet-size of 8. Eight bytes is the
     // minimum every device must accept, which is why the first read asks for exactly that: the real
     // MPS0 is byte 7 of the reply, and asking for more before knowing it is how enumeration fails on

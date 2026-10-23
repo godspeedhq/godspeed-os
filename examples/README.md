@@ -80,7 +80,7 @@ kernel panics. The flag is opt-in and changes nothing without it: the default `k
 degrade paths. Granting `e1000` the NIC would put two drivers on one controller (`nic-driver` takes
 it by PCI class, unconditionally), which is the footgun the 2026-08-09 amendment in CLAUDE.md 6.4
 records. The register-read path is covered instead by `nic-driver`, which uses the same
-`Mmio::read32` wrapper on every boot and is hardware-verified on the T630 and the Wyse. Likewise
+`Registers::read32` on every boot and is hardware-verified on the T630 and the Wyse. Likewise
 `cap-grant`'s actual TRANSFER has no `receiver` to land on; that path is covered by
 `resource-server` granting to `holder`.
 

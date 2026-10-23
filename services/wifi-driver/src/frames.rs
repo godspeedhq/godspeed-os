@@ -57,17 +57,28 @@ pub fn pull(
     w: &mut Window,
     s: &mut Session,
     q: &mut RxQueue,
-    frame: &mut [u8; ctrl::FRAME],
+    rx: &mut godspeed::memory::Region,
     mut keys: Option<&mut Keys>,
     ctx: &ServiceContext,
 ) -> Pulled {
     let mut got = Pulled { data: 0, rekeyed: 0, rekey_failed: 0, pairwise_rekeyed: 0, pairwise_failed: 0, dropped_link: None };
     let mut reads = 0u32;
+    let pull_t0 = godspeed::driver::wait::Since::now(ctx);
     while reads < PULL_MAX_READS && q.has_room() {
-        let f = match ctrl::read_frame(h, w, frame, ctx) {
-            Some(f) => f,
-            None => break,
+        let read_t0 = godspeed::driver::wait::Since::now(ctx);
+        let f = match ctrl::read_frame_region(h, w, rx, ctx) {
+            Some(f) => {
+                s.stats.reads_frame += 1;
+                s.stats.read_frame_us += read_t0.elapsed_us(ctx);
+                f
+            }
+            None => {
+                s.stats.reads_empty += 1;
+                s.stats.read_empty_us += read_t0.elapsed_us(ctx);
+                break;
+            }
         };
+        let frame = rx.bytes();
         reads += 1;
         s.note_frame(ctx, &f, &frame[..], false);
         let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
@@ -125,7 +136,7 @@ pub fn pull(
                     // The access point restarted the four-way handshake. It is run here to completion,
                     // reading the frames that follow; data frames that arrive meanwhile are queued as
                     // they would be by any pull.
-                    if pairwise_rekey(h, w, s, q, frame, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
+                    if pairwise_rekey(h, w, s, q, rx, &eapol_frame[..eapol_len], keys.as_deref_mut(), ctx) {
                         got.pairwise_rekeyed += 1;
                     } else {
                         got.pairwise_failed += 1;
@@ -135,7 +146,45 @@ pub fn pull(
             }
         }
     }
+    s.stats.pulls += 1;
+    s.stats.pull_us += pull_t0.elapsed_us(ctx);
+    report_pulls(s, ctx);
     got
+}
+
+/// Once a minute in which frames came, say where the pulls' time went, then start again: how many pulls
+/// and their time, and the reads inside them that brought a frame and that found none, each with its
+/// time. Instrumentation for backlog/93 (an ask of the radio cost 9.8 ms on the Pi 4); it changes nothing
+/// it measures. A minute with no frame - an idle radio, pulled every 250 ms - is not said, and nothing is
+/// said on a counter the kernel could not calibrate, where there is no minute to measure.
+fn report_pulls(s: &mut Session, ctx: &ServiceContext) {
+    let now = s.now_ms(ctx);
+    if now == 0 {
+        return;
+    }
+    if s.stats.pull_report_ms == 0 {
+        s.stats.pull_report_ms = now.max(1);
+        return;
+    }
+    if now.wrapping_sub(s.stats.pull_report_ms) < 60_000 {
+        return;
+    }
+    let st = &s.stats;
+    let per = |us: u64, n: u32| if n == 0 { 0 } else { us / n as u64 };
+    if st.reads_frame > 0 {
+        ctx.log_fmt(format_args!(
+            "wifi-driver: pulls this minute - {} in {} ms ({} us each); reads that brought a frame {} ({} us each), that found none {} ({} us each)",
+            st.pulls, st.pull_us / 1000, per(st.pull_us, st.pulls),
+            st.reads_frame, per(st.read_frame_us, st.reads_frame),
+            st.reads_empty, per(st.read_empty_us, st.reads_empty)));
+    }
+    s.stats.pulls = 0;
+    s.stats.pull_us = 0;
+    s.stats.reads_frame = 0;
+    s.stats.read_frame_us = 0;
+    s.stats.reads_empty = 0;
+    s.stats.read_empty_us = 0;
+    s.stats.pull_report_ms = now.max(1);
 }
 
 // The rekey itself is every radio's (`godspeed_wifi::supplicant::group_rekey`); the Broadcom supplies its
@@ -155,7 +204,7 @@ fn pairwise_rekey(
     w: &mut Window,
     s: &mut Session,
     q: &mut RxQueue,
-    frame: &mut [u8; ctrl::FRAME],
+    rx: &mut godspeed::memory::Region,
     first: &[u8],
     keys: Option<&mut Keys>,
     ctx: &ServiceContext,
@@ -176,7 +225,7 @@ fn pairwise_rekey(
     }
     let mut empty = 0u32;
     while empty < REKEY_EMPTY_POLLS {
-        let f = match ctrl::read_frame(h, w, frame, ctx) {
+        let f = match ctrl::read_frame_region(h, w, rx, ctx) {
             Some(f) => f,
             None => {
                 empty += 1;
@@ -184,9 +233,10 @@ fn pairwise_rekey(
                 continue;
             }
         };
-        s.note_frame(ctx, &f, &frame[..], false);
+        let frame = rx.bytes();
+        s.note_frame(ctx, &f, frame, false);
         let mut subs = [ctrl::Sub::default(); ctrl::MAX_SUBS];
-        let nsubs = ctrl::subframes(&f, &frame[..], s.glom_descriptor(), &mut subs, ctx);
+        let nsubs = ctrl::subframes(&f, frame, s.glom_descriptor(), &mut subs, ctx);
         for sub in subs.iter().take(nsubs) {
             let channel = sub.chanflag & CHANNEL_MASK;
             let body = &frame[sub.off..sub.off + sub.len];
@@ -201,6 +251,8 @@ fn pairwise_rekey(
                 }
                 let ethertype = u16::from_be_bytes([eth_frame[ev::ETHERTYPE], eth_frame[ev::ETHERTYPE + 1]]);
                 if ethertype != eapol::ETHERTYPE_EAPOL {
+                    // A frame the queue has no room for is counted there (`RxQueue::full`), and the serve
+                    // loop says so; nothing here can keep it.
                     let _ = q.push(eth_frame);
                     continue;
                 }

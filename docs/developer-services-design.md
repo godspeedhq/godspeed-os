@@ -1,7 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
 # Developer services: building a service from outside the tree into an image
 
-**Status: PROPOSAL, 2026-10-15. Nothing here is built and nothing here is approved.** Written for the
+**Status: PROPOSAL, 2026-10-15, for sections 1-8: nothing in them is built and nothing in them is approved. The
+later sections are dated, and 11, 12, 14, 15 and 16 have since been built (each says so).** Written for the
 `godspeed` developer CLI (the separate `godspeed-cli` repository), whose contract says its first half -
 create, build, test, run in QEMU - "can be built now". Measured against this tree it cannot, without
 the CLI editing supervisor source, and that is the boundary the CLI's own contract forbids. This
@@ -1435,3 +1436,137 @@ record (12); the residual there is unchanged.
 `godspeed inspect` reads an unpublished file too, on the machine and in the CLI, and says that no registry vouches
 for it.
 
+## 16. Dependencies: a package that needs another (approved 2026-10-19; built on `feat/gs-driver` except 16.7, QEMU-verified: `osdev test deps` 19/0)
+
+The operator asked for this: a service that needs a driver, an app that needs a service, and the package manager
+and the CLI both knowing it. Until now a contract named the PEERS a package talks to, and the operator approved
+each one, but nothing said a peer had to be INSTALLED. An app naming `alice/notes-store` installed whether or not
+that package existed, and started with no capability to it. The operator approved this design the same day.
+
+### 16.1 What a dependency is, and is not
+
+- **A package that another package needs installed and running.** `alice/notes` requires `alice/notes-store`.
+- **Not a built-in service.** `fs`, `net-stack`, `block-driver`, `nic-driver` and the rest come with the OS
+  release, which a package already names (`[os] release`, "built for 0.29.0"). A package does not depend on them;
+  it talks to them, as now.
+- **Never hardware.** A package that needs the network depends on nothing, because `net-stack` is built in. A
+  package never names a NIC driver: which driver serves a device is the machine's business, decided by the
+  device's class.
+- **In the manifest, not the contract.** The contract says what a package may DO (its peers, its device class),
+  and the operator approves it. The manifest says what it NEEDS, and approves nothing. Kept apart, a requirement
+  can never become a grant: installing a dependency still asks about that dependency's own peers.
+
+### 16.2 The format
+
+```toml
+format = 2
+
+[[requires]]
+name = "alice/notes-store"
+version = "^1.2.0"
+```
+
+- **`format = 2` exactly when there is a requirement.** A manifest with none stays format 1. So every package
+  published so far, and every new one without dependencies, installs on a 0.29.0 machine unchanged. A reader that
+  predates this refuses a format 2 manifest as "a manifest format this machine does not read", which is the true
+  reason, rather than as a table it does not know.
+- **At most 8 requirements**, with no duplicates and never the package itself.
+- **A range is one of three forms**, read by one function in the shared `godspeed-package` crate, each written
+  with the whole version - `^1.2.0`, never `^1.2` - because before 1.0 a shortened caret is ambiguous (`^0` and
+  `^0.0.0` accept different versions):
+  - `^1.2.0`: the same major version, and at least this one. For a `0.x`
+    version, the same minor (`^0.3.0` is `>= 0.3.0, < 0.4.0`); for `0.0.z`, exactly that version. That is the usual
+    reading, because before 1.0 a minor change is allowed to break.
+  - `=1.2.3`: exactly this version.
+  - `>=1.2.0`: this version or any later one, later majors included.
+- **What may be required: a service or a driver**, something that runs and is talked to. A utility ends and an
+  app belongs to the operator, so needing one installed means nothing. A requirement naming one is refused when it
+  is resolved, with that reason.
+- **A peer that is a package must be required.** Every peer in the contract whose name is `publisher/name` (a
+  built-in has no `/`) must be in `[[requires]]`. The CLI's `check` refuses the package otherwise, and the machine
+  refuses to install it. A requirement need not be a peer: a service may need a driver running that it never
+  sends to. **Found while building it:** the contract schema allowed only plain names in `ipc_send`, so a package
+  could not name another package as a peer at all; it accepts `publisher/name` now (an additive change, the
+  schema's `v1` unchanged).
+
+### 16.3 Resolution, on the machine
+
+Before it asks anything, `godspeed install <pkg>` works out every package the install needs, from the verified
+snapshot:
+
+- for each requirement, the newest release that satisfies its range;
+- an INSTALLED version that satisfies it is kept, and not fetched again;
+- an installed version that does not satisfy it is refused, naming both. A plan never upgrades something the
+  operator did not ask to upgrade;
+- the requirements of each package in turn, in a chain of at most 4 packages (the one asked for included) and at
+  most 8 packages besides the one asked for. A cycle is refused, naming it;
+- one version of each package on a machine, so two requirements that no single version satisfies are refused,
+  naming the range and the version the plan already takes.
+
+Every refusal is a sentence that names the package, and the range where a range is what failed. Nothing is fetched or installed when the plan
+cannot be made.
+
+### 16.4 One question
+
+The operator is asked once, for the whole plan, dependencies first:
+
+```text
+gsh> godspeed install alice/notes
+alice/notes 1.0.0 needs 1 more package:
+  alice/notes-store            1.2.4     a service  asks for: fs   (needed by alice/notes)
+  alice/notes                  1.0.0     an app     asks for: console, alice/notes-store
+Install all 2 and grant them? (no privilege) [y/N]:
+```
+
+`yes` on the command line answers it, as it does for one package. No installs nothing.
+
+### 16.5 Start order
+
+- **At install**, each dependency is installed and started before the package that needs it, in the plan's order.
+  A dependency that does not start stops the plan there: what was installed before it stays installed, the rest is
+  not started, and the line says which.
+- **At boot**, the supervisor starts installed packages in dependency order, read from their manifests, which it
+  checks at every start anyway. A package whose dependency is not running is not started, and says which one.
+
+### 16.6 Uninstall, upgrade, cleanup
+
+- **`uninstall`** refuses a package that another installed package requires, naming that package. Uninstalling
+  the dependent first is the way through.
+- **`upgrade`** refuses a version that would break an installed dependent's range, naming the dependent and the
+  range. Upgrading the dependent itself may bring in a dependency, through the same one question.
+- **`cleanup` and `uninstall ... purge`** never delete the fetched copy of a package an installed one requires.
+
+### 16.7 Offline
+
+`fetch <pkg> --offline` (the CLI) writes the dependencies' releases into the same `.gsp`, so one file installs a
+package and everything it needs. Installing from a file resolves within the file and what is already installed; a
+requirement that neither satisfies is refused, naming it. Nothing in section 15 changes: every release in the file
+is checked as a fetched one is.
+
+**Not built yet (2026-10-19), and why.** Both halves change: the CLI's `fetch --offline` writing several releases,
+and the OS's `unpack`, which reads "one index and one release" today. A file can only carry a requirement the
+registry has, and the registry has no package with requirements until it is redeployed with this format (16.9), so
+the closure cannot be tested end to end yet. Until then a package's requirements install from their own files
+first, which works: `osdev test deps` installs `dep-store`'s file, uninstalls it (its fetched copy stays), then
+installs `dep-user`'s file, whose plan takes that fetched copy.
+
+### 16.8 The CLI
+
+- `godspeed.toml` gains `[requires]`, written the way a developer would: `"alice/notes-store" = "^1.2.0"`.
+  `package` turns it into `[[requires]]` and format 2.
+- `check` applies 16.2: the forms, the bound, and that peers which are packages are required.
+- `publish` refuses a requirement the registry has no release of that satisfies its range (built: seen against the
+  live registry with `--dry-run`, nothing uploaded).
+- `inspect` and `fetch` say what a release requires.
+
+### 16.9 The order it lands in
+
+The manifest reader is strict, so a format 2 manifest is refused by every reader that predates it: the
+registry's Worker, CLI 0.3.0 and GodspeedOS 0.29.0. So, in order: the crate, then the registry (redeployed, which
+needs the operator's approval), then the CLI release and the OS release. No package is published with
+requirements before all of them read it.
+
+### 16.10 What does not change
+
+No kernel change and no new authority. A requirement grants nothing; peers are still approved one by one, and a
+package still gets no privilege (14.1). The supervisor already starts what is installed; it learns an order.

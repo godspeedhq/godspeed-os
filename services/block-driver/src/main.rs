@@ -220,7 +220,7 @@ mod usbdisk;
 mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
-//   Request : [tag:u8, op:u8, lba:u64 LE, (WriteBlock only: 512 data bytes)]
+//   Request : [tag:u8, op:u8, lba:u64 LE, (WriteBlock: 512 data bytes; WriteBlocks: count:u8, count x 512)]
 //   Reply   : [tag:u8, status:u8, (ReadBlock only: 512 data bytes)]
 // `tag` is the caller's correlation byte, echoed unread (`Reply`); the op lines below omit it.
 // The LBA is u64 (persistence §6.3): GSFS capacity fields are u64, so the block
@@ -240,6 +240,15 @@ const OP_WRITE_ZEROS: u8 = 4;
 // the points where it promises it (format, journal commit). Backends that cannot flush say so
 // once at startup rather than quietly implying the data is safe (§26.7).
 const OP_FLUSH: u8 = 5;
+// Write a run: [OP_WRITE_BLOCKS, lba:u64, count:u8, count x 512 data] -> [status]. `count` consecutive
+// blocks from `lba`, 1 to `WRITE_RUN_MAX`, in one request: what a file's chunk is (seven blocks), which
+// was seven requests (`backlog/93` item 12). AHCI issues it as one multi-sector command; through `dwc2`
+// its blocks are written in turn, and through `xhci` it is held and written with the runs that follow it,
+// so there a `STATUS_OK` means held and a failed write is reported at the next FLUSH.
+const OP_WRITE_BLOCKS: u8 = 6;
+/// The most blocks one `OP_WRITE_BLOCKS` carries: 1 (the tag) + 10 + 7 x 512 is 3,595 bytes, inside one
+/// 4 KiB message. `fs` sends no more (its own `WRITE_RUN_MAX`).
+const WRITE_RUN_MAX: usize = 7;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 // A flush that reached NO device: the USB host service did not answer, or had no disk bound. `fs`
@@ -251,7 +260,7 @@ const STATUS_UNREACHABLE: u8 = 2;
 
 /// Drive the AHCI controller directly, through the BAR the kernel granted this service.
 #[cfg(not(storage_is_usb))]
-fn backend_run(ctx: &ServiceContext, m: &godspeed_sdk::Mmio) -> ! { ahci::run(ctx, m) }
+fn backend_run(ctx: &ServiceContext, m: &godspeed::driver::Registers) -> ! { ahci::run(ctx, m) }
 /// On a board whose only card slot is its boot medium, storage is the USB stick and ONLY the USB
 /// stick. Never the SD/EMMC card.
 ///
@@ -326,7 +335,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "block-driver");
     // A USB board's backend needs NO MMIO: the disk is reached by IPC to the service that owns the
     // host controller (`STORAGE_HOST`), so this service is granted no window and asks for none. Going
-    // through the `ctx.mmio()` gate would refuse a perfectly good USB stick on any board that does not
+    // through the register gate (`gs::driver::registers`) would refuse a perfectly good USB stick on any board that does not
     // also hand this service a peripheral window it never reads - which is the Pi 4 exactly.
     //
     // (This used to say the USB stack was in the kernel and the disk reached through syscalls. That
@@ -336,7 +345,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     #[cfg(storage_is_usb)]
     backend_run(&ctx);
     #[cfg(not(storage_is_usb))]
-    match ctx.mmio() {
+    match godspeed::driver::registers(&ctx) {
         Some(m) => backend_run(&ctx, &m),
         None => {
             ctx.log("block-driver: no AHCI controller found (no SATA disk?)");

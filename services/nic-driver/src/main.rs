@@ -15,7 +15,7 @@
 //! board has a radio, the same frame ops carry the frames to it when the cable is out (`radio.rs`).
 //! An ordinary restartable userspace service (Commandment I): the kernel grants it a register window
 //! and a DMA arena from the spawn request - by PCI class 0x020000 on x86, by device kind elsewhere -
-//! and all device logic lives here, `unsafe`-free behind the SDK `Mmio`/`Dma` wrappers (§18.1).
+//! and all device logic lives here, `unsafe`-free behind `gs::driver`'s `Registers` and arena parts (§18.1).
 //!
 //! The progress list below is the e1000's Phase 1 history (2026-10-09: step 5's "the reply payload IS
 //! the frame that came back" no longer holds - a transmit is answered with one status byte, and frames
@@ -37,7 +37,8 @@
 
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{ServiceContext, Message, Mmio, Dma};
+use godspeed_sdk::{ServiceContext, Message};
+use godspeed::driver::{Arena, Part, Registers};
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
@@ -95,12 +96,10 @@ const TXD_STA_DD:   u8 = 1 << 0; // (TX) descriptor done
 // RX descriptor (16 B): addr@0, length(u16)@8, status(u8)@12, errors(u8)@13.
 const RXD_STA_DD:   u8 = 1 << 0; // (RX) descriptor done - a frame landed in this buffer
 
-// DMA-arena layout (64 KiB): TX ring + one TX frame buffer, then an RX ring + 24 x 2 KiB RX buffers, then the tally.
-const TX_RING_OFF:   usize = 0x0000;
+// DMA-arena layout (132 pages, `Parts` below): the TX ring at 0x0, one TX frame buffer at 0x1000, the RX ring at
+// 0x2000, 256 x 2 KiB RX buffers from 0x3000, then the tally at 0x83000.
 const TX_RING_COUNT: usize = 8;
 const TX_RING_BYTES: u32   = (TX_RING_COUNT * 16) as u32;
-const TX_BUF_OFF:    usize = 0x1000;
-const RX_RING_OFF:   usize = 0x2000;
 // EIGHT, BECAUSE THE DEVICE REQUIRES IT - not because eight buffers felt better than four.
 //
 // The e1000 wants a descriptor ring whose LENGTH IN BYTES is a multiple of 128. At four descriptors
@@ -120,18 +119,63 @@ const RX_RING_OFF:   usize = 0x2000;
 // (2026-10-18). A sender puts a window's worth on the wire at once, and the ring is all that holds a
 // burst until net-stack takes it: past eight frames the rest were dropped, the sender saw loss, and a
 // download in QEMU never had more than 12.7 KiB in flight against a 64 KiB window, with three to five
-// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too. It is what the
-// 64 KiB arena holds: 24 x 2 KiB from 0x3000 ends at 0xF000, and the tally goes after it.
-const RX_RING_COUNT: usize = 24;
+// retransmissions a second (read off the capture). The GENET and dwmac rings are 24 too, and still are.
+//
+// TWO HUNDRED AND FIFTY-SIX (2026-10-20), because twenty-four was the CABLE's limit as eight had been QEMU's.
+// The receive window is 256 KiB, and a sender puts that on the wire at line rate - about 180 full frames in
+// under 2 ms on a gigabit link - while the ring was all that held them until net-stack drained it. The RTL8168
+// on the T630 stopped and was restarted 412 times in six 10 MB downloads, each stop a burst lost, and the
+// downloads spent most of their time with nothing yet to read (`backlog/93` items 1 and 12). 256 holds a whole
+// window with room over; 4096 bytes of ring is a multiple of 128 for the e1000, and under the RTL8168's 1024.
+// The arena is sized for it in the supervisor (`dma_pages`, 132 pages: 0x3000 + 256 x 2 KiB, then the tally).
+const RX_RING_COUNT: usize = 256;
 const RX_RING_BYTES: u32   = (RX_RING_COUNT * 16) as u32;
-const RX_BUF_OFF:    usize = 0x3000;
 const RX_BUF_SIZE:   usize = 2048;
-// After RX_BUF (24 x 2 KiB, so it ends at 0xF000): a 64-byte, 64-byte-aligned buffer the NIC DMAs
-// its hardware tally counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error
+// After the RX buffers (256 x 2 KiB, so they end at 0x83000), the tally: a 64-byte, 64-byte-aligned buffer the
+// NIC DMAs its hardware tally counters into (DTCCR dump). Layer-1 ground truth - the chip's OWN RX/TX/error
 // counts, read straight off silicon and INDEPENDENT of net-stack.
-const TALLY_OFF:     usize = 0xF000;
-const _: () = assert!(RX_BUF_OFF + RX_RING_COUNT * RX_BUF_SIZE <= TALLY_OFF && TALLY_OFF + 64 <= 0x10000,
-    "the RX buffers and the tally must fit the 64 KiB arena, apart");
+
+/// The e1000's and the RTL8168's arena, in the five parts both drivers use, taken by name through
+/// `gs::driver::arena` (`docs/driver-library.md` step 3). Page-aligned, so they land at the offsets above
+/// as they always have - the tally on its 64-byte boundary after the receive buffers - and the layout's
+/// refusal replaces the assert that checked they fit. An access past a part ends the driver naming it.
+struct Parts {
+    tx_ring: Part,
+    tx_buf: Part,
+    rx_ring: Part,
+    rx_bufs: Part,
+    tally: Part,
+}
+
+impl Parts {
+    fn zero(&self) {
+        for p in [&self.tx_ring, &self.tx_buf, &self.rx_ring, &self.rx_bufs, &self.tally] { p.zero(); }
+    }
+}
+
+/// Lay the arena out, said once; `None`, said with the part that did not fit, serves as no arena at all.
+fn lay_out(ctx: &ServiceContext, a: Arena) -> Option<Parts> {
+    let mut l = a.layout();
+    let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>(Parts {
+        tx_ring: l.take("tx ring", TX_RING_COUNT * 16, 4096)?,
+        tx_buf: l.take("tx buffer", RX_BUF_SIZE, 4096)?,
+        rx_ring: l.take("rx ring", RX_RING_COUNT * 16, 4096)?,
+        rx_bufs: l.take("rx buffers", RX_RING_COUNT * RX_BUF_SIZE, 4096)?,
+        tally: l.take("tally", 64, 64)?,
+    }))();
+    match laid {
+        Ok(p) => {
+            ctx.log_fmt(format_args!(
+                "nic-driver: arena laid out - tx ring at {:#x}, tx buffer at {:#x}, rx ring at {:#x}, rx buffers at {:#x}, tally at {:#x} ({} of {} bytes)",
+                p.tx_ring.offset(), p.tx_buf.offset(), p.rx_ring.offset(), p.rx_bufs.offset(), p.tally.offset(), l.used(), l.len()));
+            Some(p)
+        }
+        Err(e) => {
+            ctx.log_fmt(format_args!("nic-driver: {} - serving as with no arena", e));
+            None
+        }
+    }
+}
 
 // Bounded hardware/protocol-timing polls (the exempt category, like AHCI/USB spins - NOT the
 // correctness-by-time Commandment VIII forbids): wait on the TRUTH of a bit, give up LOUDLY.
@@ -239,7 +283,9 @@ const RX_SILENCE_STALLED: u32 = 20_000;
 const RTL_DESC_OWN: u32 = 1 << 31; // owned by the NIC (set = NIC's; it clears the bit when done)
 const RTL_DESC_EOR: u32 = 1 << 30; // end of ring (the last descriptor - the NIC wraps here)
 const RTL_DESC_FS:  u32 = 1 << 29; // first segment (TX)
-const RTL_DESC_LS:  u32 = 1 << 28; // last segment (TX)
+const RTL_DESC_LS:  u32 = 1 << 28; // last segment (TX); on RX, with FS, a frame whole in one buffer
+/// RX: the chip's error summary - a CRC error, a runt, a frame too long - beside the length (r8169 `RxRES`).
+const RTL_RX_RES:   u32 = 1 << 21;
 
 // RCR: AB (broadcast) | AM (multicast) | APM (physical match) | AAP (all = promiscuous), MXDMA=7
 // (unlimited burst), RXFTH=7 (no FIFO threshold - DMA on whole-frame). Promiscuous so a reply lands
@@ -255,6 +301,9 @@ const RTL_MTPS_VALUE: u8 = 0x3B;
 /// How long to let the chip settle after Rx/Tx are switched off, before asking it to reset. Gives an
 /// in-flight DMA burst time to retire instead of being reset underneath itself.
 const RTL_QUIESCE_MS: u64 = 10;
+/// The same pause for a receiver restart (`rtl_restart_rx`), which runs during a download, so it is short:
+/// a full frame lands in about 12 us at 1 Gbit/s, so a millisecond retires any write in flight many times over.
+const RTL_RX_QUIESCE_MS: u64 = 1;
 /// How long nobody has collected a frame before the receiver is restarted with its ring emptied, whether
 /// or not the chip said it stopped. Frames that waited this long were waited for by nobody: the ring
 /// filled with broadcasts while `net-stack` was idle. A ring that filled DURING a download is collected
@@ -284,7 +333,7 @@ fn realtek_main(ctx: ServiceContext) -> ! {
     const R_PHYSTATUS: usize = 0x6C; // PHY status: LinkSts = 0x02
     const CR_RST:      u8    = 0x10;
 
-    let mmio = match ctx.mmio() {
+    let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
         None => { ctx.log("nic-driver: RTL8168 found but no MMIO mapped - serving empty replies"); serve_status(&ctx, &[0u8; 8]); }
     };
@@ -323,7 +372,7 @@ fn realtek_main(ctx: ServiceContext) -> ! {
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]));
     // Stage B: set up the C+ TX/RX rings and serve REAL frames. Without a DMA arena, degrade to the
     // status-only server (net-stack still degrades cleanly rather than hanging, §26.7).
-    match ctx.dma_region() {
+    match godspeed::driver::arena(&ctx).and_then(|a| lay_out(&ctx, a)) {
         Some(arena) => realtek_serve(&ctx, &mmio, &arena, reset_ok, &mac),
         None => {
             ctx.log("nic-driver: RTL8168 has no DMA arena - serving empty replies");
@@ -363,27 +412,57 @@ fn note_reply<E>(r: Result<(), E>, ctx: &ServiceContext, fails: &mut u32) {
 
 /// Arm RX descriptor `i`: point it at its 2 KiB buffer and hand ownership to the NIC (OWN set), with
 /// EOR on the last descriptor so the NIC wraps the ring. Written OWN-last (the addr is valid first).
-fn rtl_arm_rx(arena: &Dma, i: usize) {
-    let d = RX_RING_OFF + i * 16;
-    let buf = arena.phys_at(RX_BUF_OFF + i * RX_BUF_SIZE);
-    arena.write32(d + 8, (buf & 0xffff_ffff) as u32);
-    arena.write32(d + 12, (buf >> 32) as u32);
-    arena.write32(d + 4, 0);
+fn rtl_arm_rx(arena: &Parts, i: usize) {
+    let d = i * 16;
+    let buf = arena.rx_bufs.phys_at(i * RX_BUF_SIZE);
+    arena.rx_ring.write32(d + 8, (buf & 0xffff_ffff) as u32);
+    arena.rx_ring.write32(d + 12, (buf >> 32) as u32);
+    arena.rx_ring.write32(d + 4, 0);
     let mut o1 = RTL_DESC_OWN | (RX_BUF_SIZE as u32 & 0x3FFF);
     if i == RX_RING_COUNT - 1 { o1 |= RTL_DESC_EOR; }
-    arena.write32(d, o1);
+    arena.rx_ring.write32(d, o1);
 }
 
-/// Restart the RTL8168's receiver on an empty ring: RX off, every descriptor armed, the ring base
-/// re-pointed (which puts the chip back at descriptor 0), RX on. Whatever the ring held is gone, so this
-/// runs only for a receiver the chip stopped, and only once its frames are taken or stale (`RTL_STALE_RX_MS`).
-fn rtl_restart_rx(mmio: &Mmio, arena: &Dma) {
+/// Whether a received descriptor the chip handed back holds a whole, sound frame: no error summary
+/// (`RTL_RX_RES`), and first AND last segment, so the frame is all in this one buffer. What r8169 checks before
+/// it takes a frame, and this driver did not until 2026-10-20: `net-stack` was dropping segments whose bytes past
+/// the first 128 were another frame's, each within 25 ms of a receiver restart or a TX recovery (`backlog/93`
+/// item 11). A descriptor that fails is given back and counted, never handed up.
+fn rtl_rx_sound(o1: u32) -> bool {
+    o1 & RTL_RX_RES == 0 && o1 & (RTL_DESC_FS | RTL_DESC_LS) == (RTL_DESC_FS | RTL_DESC_LS)
+}
+
+/// Restart the RTL8168's receiver on an empty ring: RX off, a pause for a frame the chip is still
+/// writing, every descriptor armed, the ring base re-pointed (which puts the chip back at descriptor 0),
+/// RX on. Whatever the ring held is gone, so this runs only for a receiver the chip stopped, and only once
+/// its frames are taken or stale (`RTL_STALE_RX_MS`).
+///
+/// **The pause was the first suspect for damaged segments** (`backlog/93` item 11): a frame in flight when RX
+/// went off could finish landing after its descriptor had been armed again, and be taken as a frame whose first
+/// 128 bytes (one DMA write) were right and the rest another's. Every one of seven such segments on the T630
+/// came within 0 to 76 ms of a restart. The pause did not end them, and neither did `rtl_rx_sound`; a ring of
+/// 256 (`RX_RING_COUNT`) did: with it no restart has come during a download, only while the link is idle. The
+/// pause stays, as the bring-up's does (`RTL_QUIESCE_MS`).
+fn rtl_restart_rx(ctx: &ServiceContext, mmio: &Registers, arena: &Parts) {
     mmio.write8(RTL_CR, RTL_CR_TE);
+    delay::hold(ctx, Budget::ms(RTL_RX_QUIESCE_MS));
     for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
-    let rx_ring = arena.phys_at(RX_RING_OFF);
+    let rx_ring = arena.rx_ring.phys();
     mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
     mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
     mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);
+}
+
+/// Say an unsound descriptor: its status word, where it was, and how many restarts there had been, at the
+/// first eight and every 64th.
+fn note_unsound(ctx: &ServiceContext, n: u32, o1: u32, idx: usize, restarts: u32) {
+    if n <= 8 || n % 64 == 0 {
+        ctx.log_fmt(format_args!(
+            "nic-driver: RTL8168 receive descriptor {} handed back unsound (#{}) - status {:#010x}: {}{}, length {}; given back unread ({} restarts so far)",
+            idx, n, o1, if o1 & RTL_RX_RES != 0 { "error summary set" } else { "no error" },
+            if o1 & (RTL_DESC_FS | RTL_DESC_LS) != (RTL_DESC_FS | RTL_DESC_LS) { ", not whole in one buffer" } else { "" },
+            o1 & 0x3FFF, restarts));
+    }
 }
 
 /// Answer a request on `reply_cap` and give the capability back - both halves, every time, so a reply
@@ -408,18 +487,18 @@ pub(crate) fn cycles(ctx: &ServiceContext, ms: u64) -> u64 {
 /// the cable in, and the nine-byte `radio::status` answer with it out. The receiver stays on; each
 /// transmit re-arms the receive ring first (see "RESET THE RECEIVER per frame request" below).
 /// Never returns.
-fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool, mac: &[u8; 6]) -> ! {
+fn realtek_serve(ctx: &ServiceContext, mmio: &Registers, arena: &Parts, reset_ok: bool, mac: &[u8; 6]) -> ! {
     arena.zero();
     mmio.write8(RTL_9346CR, 0xC0);              // unlock the config registers
     mmio.write16(RTL_RMS, RTL_RMS_VALUE);       // max RX packet size
 
     // TX ring base (descriptors are written per frame).
-    let tx_ring = arena.phys_at(TX_RING_OFF);
+    let tx_ring = arena.tx_ring.phys();
     mmio.write32(RTL_TNPDS, (tx_ring & 0xffff_ffff) as u32);
     mmio.write32(RTL_TNPDS + 4, (tx_ring >> 32) as u32);
     // RX ring: arm every descriptor to the NIC, then program its base.
     for i in 0..RX_RING_COUNT { rtl_arm_rx(arena, i); }
-    let rx_ring = arena.phys_at(RX_RING_OFF);
+    let rx_ring = arena.rx_ring.phys();
     mmio.write32(RTL_RDSAR, (rx_ring & 0xffff_ffff) as u32);
     mmio.write32(RTL_RDSAR + 4, (rx_ring >> 32) as u32);
 
@@ -464,7 +543,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     // = report the forced state. Cleared ([8]) after a flap so a REAL later unplug is never masked.
     let mut force_link: Option<bool> = None;
     let mut tally_wedged_logged = false;   // one-shot loud note if the DMA counter dump ever times out
-    let mut tx_fail_logged = 0u32;         // diagnose the first few TX timeouts to guide the root-cause fix
+    let mut tx_fail_logged = 0u32;         // TX timeouts recovered, each said (see the recovery below)
     // Counts replies that could not be delivered; see `note_reply`.
     let mut reply_fails = 0u32;
     // RX GROUND TRUTH. Added after a T630 chaos run left this NIC with link UP and TX working
@@ -480,6 +559,9 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
     let mut collected_at = wait::Since::now(ctx);
     // For the restart's line: how many there have been, and the ISR bits latched since the last.
     let mut rx_restarts = 0u32;
+    // Descriptors handed back with an error summary or not whole in one buffer (`rtl_rx_sound`), given back
+    // unread. Said at the first eight and every 64th (`note_unsound`).
+    let mut rx_unsound = 0u32;
     let mut isr_seen = 0u16;
 
     // THE RADIO AS THE LINK'S SECOND BACKEND (`docs/wifi-usb.md` 39): the USB WiFi dongle's service,
@@ -534,7 +616,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         if isr & (RTL_ISR_RDU | RTL_ISR_FOVW) != 0 {
             rx_stopped = true;
         }
-        let taken = arena.read32(RX_RING_OFF + rx_idx * 16) & RTL_DESC_OWN != 0;
+        let taken = arena.rx_ring.read32(rx_idx * 16) & RTL_DESC_OWN != 0;
         let why = if rx_stopped && taken {
             Some("the chip stopped it and every frame was taken")
         } else if collected_at.passed(ctx, Budget::ms(RTL_STALE_RX_MS)) {
@@ -544,13 +626,14 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             None
         };
         if let Some(why) = why {
-            rtl_restart_rx(mmio, arena);
+            rtl_restart_rx(ctx, mmio, arena);
             rx_restarts = rx_restarts.saturating_add(1);
-            if rx_restarts <= 8 || rx_restarts % 64 == 0 {
-                ctx.log_fmt(format_args!(
-                    "nic-driver: RTL8168 receiver restarted (#{}) - {}; ISR since the last 0x{:04x}, rx_idx was {}, {} frames taken",
-                    rx_restarts, why, isr_seen, rx_idx, rx_count));
-            }
+            // EVERY restart is said, not the first eight and every 64th, while `backlog/93` item 11 is
+            // open: `net-stack` dropped segments whose bytes past the first 128 belonged to another frame,
+            // and these lines are what showed each followed a restart (`6cda1d65`, 2026-10-20).
+            ctx.log_fmt(format_args!(
+                "nic-driver: RTL8168 receiver restarted (#{}) - {}; ISR since the last 0x{:04x}, rx_idx was {}, {} frames taken",
+                rx_restarts, why, isr_seen, rx_idx, rx_count));
             rx_idx = 0;
             rx_stopped = false;
             isr_seen = 0;
@@ -580,8 +663,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             let speed = if phy & 0x10 != 0 { 3u8 } else if phy & 0x08 != 0 { 2 }
                         else if phy & 0x04 != 0 { 1 } else { 0 };
             // DTCCR dump: point the NIC at our 64-byte buffer and set bit 3; it DMAs its counters there.
-            let tbuf = arena.phys_at(TALLY_OFF);
-            for i in 0..64 { arena.write8(TALLY_OFF + i, 0); }
+            let tbuf = arena.tally.phys();
+            for i in 0..64 { arena.tally.write8(i, 0); }
             mmio.write32(RTL_DTCCR + 4, (tbuf >> 32) as u32);
             mmio.write32(RTL_DTCCR, ((tbuf as u32) & !0x3F) | 0x08);   // 64B-aligned addr | Dump
             let mut td = 0u32;
@@ -593,11 +676,11 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                 ctx.log("nic-driver: RTL8168 counter dump timed out (DMA slow/wedged) - stats degraded, link still served");
                 tally_wedged_logged = true;
             }
-            let rx_ok  = arena.read32(TALLY_OFF + 0x08);
-            let tx_ok  = arena.read32(TALLY_OFF + 0x00);
-            let rx_brd = arena.read32(TALLY_OFF + 0x30);
-            let rx_er  = (arena.read32(TALLY_OFF + 0x18) & 0xFFFF) as u16;
-            let miss   = (arena.read32(TALLY_OFF + 0x1C) & 0xFFFF) as u16;
+            let rx_ok  = arena.tally.read32(0x08);
+            let tx_ok  = arena.tally.read32(0x00);
+            let rx_brd = arena.tally.read32(0x30);
+            let rx_er  = (arena.tally.read32(0x18) & 0xFFFF) as u16;
+            let miss   = (arena.tally.read32(0x1C) & 0xFFFF) as u16;
 
             let mut s = [0u8; 32];
             s[0] = reset_ok as u8;
@@ -637,11 +720,16 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             }
             // One frame if the NIC has finished one, else an empty reply at once (RECEIVING RETURNS WHAT IS THERE, above).
             let mut n = 0usize;
-            let rd = RX_RING_OFF + rx_idx * 16;
-            let o1 = arena.read32(rd);
-            if o1 & RTL_DESC_OWN == 0 {
+            let rd = rx_idx * 16;
+            let o1 = arena.rx_ring.read32(rd);
+            if o1 & RTL_DESC_OWN == 0 && !rtl_rx_sound(o1) {
+                rx_unsound = rx_unsound.saturating_add(1);
+                note_unsound(ctx, rx_unsound, o1, rx_idx, rx_restarts);
+                rtl_arm_rx(arena, rx_idx);
+                rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+            } else if o1 & RTL_DESC_OWN == 0 {
                 n = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
-                for i in 0..n { rxbuf[i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                for i in 0..n { rxbuf[i] = arena.rx_bufs.read8(rx_idx * RX_BUF_SIZE + i); }
                 rtl_arm_rx(arena, rx_idx);
                 rx_idx = (rx_idx + 1) % RX_RING_COUNT;
             }
@@ -679,14 +767,19 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             let mut opos = 1usize;   // out[0] = frame count, filled at the end
             let mut nfr = 0u8;
             while (nfr as usize) < BATCH_MAX {
-                let rd = RX_RING_OFF + rx_idx * 16;
-                let o1 = arena.read32(rd);
-                if o1 & RTL_DESC_OWN == 0 {
+                let rd = rx_idx * 16;
+                let o1 = arena.rx_ring.read32(rd);
+                if o1 & RTL_DESC_OWN == 0 && !rtl_rx_sound(o1) {
+                    rx_unsound = rx_unsound.saturating_add(1);
+                    note_unsound(ctx, rx_unsound, o1, rx_idx, rx_restarts);
+                    rtl_arm_rx(arena, rx_idx);
+                    rx_idx = (rx_idx + 1) % RX_RING_COUNT;
+                } else if o1 & RTL_DESC_OWN == 0 {
                     let flen = ((o1 & 0x3FFF) as usize).min(FRAME_MAX);
                     if opos + 2 + flen > out.len() { break; }   // reply full - stop cleanly
                     out[opos..opos + 2].copy_from_slice(&(flen as u16).to_le_bytes());
                     opos += 2;
-                    for i in 0..flen { out[opos + i] = arena.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                    for i in 0..flen { out[opos + i] = arena.rx_bufs.read8(rx_idx * RX_BUF_SIZE + i); }
                     opos += flen;
                     nfr += 1;
                     last_rx_len = flen as u16;
@@ -722,8 +815,8 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                     //   reaped > 0, reply_fails>0 -> reaped fine; DELIVERY to net-stack is broken
                     //
                     // Four outcomes, one line, four different bugs.
-                    let tb = arena.phys_at(TALLY_OFF);
-                    for i in 0..64 { arena.write8(TALLY_OFF + i, 0); }
+                    let tb = arena.tally.phys();
+                    for i in 0..64 { arena.tally.write8(i, 0); }
                     mmio.write32(RTL_DTCCR + 4, (tb >> 32) as u32);
                     mmio.write32(RTL_DTCCR, ((tb as u32) & !0x3F) | 0x08);
                     let mut td = 0u32;
@@ -734,10 +827,10 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
                     ctx.log_fmt(format_args!(
                         "nic-driver: RX SILENT {} drains - chip RxOk={} RxErr={} Missed={} TxOk={} (dump {}), reaped={} reply_fails={} link={} rx_idx={}",
                         empty_drains,
-                        arena.read32(TALLY_OFF + 0x08),
-                        arena.read32(TALLY_OFF + 0x18) & 0xFFFF,
-                        arena.read32(TALLY_OFF + 0x1C) & 0xFFFF,
-                        arena.read32(TALLY_OFF + 0x00),
+                        arena.tally.read32(0x08),
+                        arena.tally.read32(0x18) & 0xFFFF,
+                        arena.tally.read32(0x1C) & 0xFFFF,
+                        arena.tally.read32(0x00),
                         if td < TALLY_POLL_MAX { "ok" } else { "TIMED OUT" },
                         rx_count, reply_fails,
                         if phy & 0x02 != 0 { "up" } else { "DOWN" }, rx_idx));
@@ -775,7 +868,7 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
             s[19..23].copy_from_slice(&mmio.read32(RTL_TNPDS).to_le_bytes());
             s[23..27].copy_from_slice(&mmio.read32(RTL_RDSAR).to_le_bytes());
             for i in 0..RX_RING_COUNT {
-                let opts1 = arena.read32(RX_RING_OFF + i * 16);
+                let opts1 = arena.rx_ring.read32(i * 16);
                 let o = STAT_FIXED + i * 4;
                 s[o..o + 4].copy_from_slice(&opts1.to_le_bytes());
             }
@@ -834,36 +927,36 @@ fn realtek_serve(ctx: &ServiceContext, mmio: &Mmio, arena: &Dma, reset_ok: bool,
         // "no work" and skipped ours. With exactly one descriptor the head cannot drift from it.
         let frame = req.payload_bytes();
         let flen = frame.len().min(RX_BUF_SIZE);
-        for i in 0..flen { arena.write8(TX_BUF_OFF + i, frame[i]); }
-        let td = TX_RING_OFF;                       // the single TX descriptor (slot 0)
-        let tx_buf = arena.phys_at(TX_BUF_OFF);
-        arena.write32(td + 8, (tx_buf & 0xffff_ffff) as u32);
-        arena.write32(td + 12, (tx_buf >> 32) as u32);
-        arena.write32(td + 4, 0);
+        for i in 0..flen { arena.tx_buf.write8(i, frame[i]); }
+        let td = 0;                                 // the single TX descriptor (slot 0)
+        let tx_buf = arena.tx_buf.phys();
+        arena.tx_ring.write32(td + 8, (tx_buf & 0xffff_ffff) as u32);
+        arena.tx_ring.write32(td + 12, (tx_buf >> 32) as u32);
+        arena.tx_ring.write32(td + 4, 0);
         // OWN + EOR (single-entry ring) + FS + LS + length. OWN set LAST (the NIC may read at once).
         let o1 = RTL_DESC_OWN | RTL_DESC_EOR | RTL_DESC_FS | RTL_DESC_LS | (flen as u32 & 0x3FFF);
-        arena.write32(td, o1);
+        arena.tx_ring.write32(td, o1);
         mmio.write8(RTL_TPPOLL, RTL_TPPOLL_NPQ);
         // Same clock bound as the e1000 path - see TX_CONFIRM_MS for why a yield COUNT was wrong.
-        await_tx(&ctx, || arena.read32(td) & RTL_DESC_OWN == 0);
-        let tx_done = arena.read32(td) & RTL_DESC_OWN == 0;
+        await_tx(&ctx, || arena.tx_ring.read32(td) & RTL_DESC_OWN == 0);
+        let tx_done = arena.tx_ring.read32(td) & RTL_DESC_OWN == 0;
         if !tx_done {
             // With a single descriptor a ring desync is impossible, so a timeout here is a genuine NIC
-            // hiccup, not a cascade. Fail FAST (the tight bound above), DIAGNOSE (first few, to confirm
-            // the desync is gone), and RECOVER the engine: TE off/on to reset it, clear latched status,
+            // hiccup, not a cascade. Fail FAST (the tight bound above), DIAGNOSE (every one, below), and
+            // RECOVER the engine: TE off/on to reset it, clear latched status,
             // drop the stuck OWN. RE stays on, so RX is undisturbed (VIII bounded+loud, IX recover).
             let isr = mmio.read16(RTL_ISR);
             let cr  = mmio.read8(RTL_CR);
-            if tx_fail_logged < 6 {
-                ctx.log_fmt(format_args!(
-                    "nic-driver: RTL8168 TX timeout - desc={:#010x} isr={:#06x} cr={:#04x} len={} - recovering",
-                    arena.read32(td), isr, cr, flen));
-                tx_fail_logged += 1;
-            }
+            // Every one, numbered, for the same timing question as the receiver restarts above (its
+            // recovery clears the receive status bits too); it was the first six only.
+            tx_fail_logged = tx_fail_logged.saturating_add(1);
+            ctx.log_fmt(format_args!(
+                "nic-driver: RTL8168 TX timeout (#{}) - desc={:#010x} isr={:#06x} cr={:#04x} len={} - recovering",
+                tx_fail_logged, arena.tx_ring.read32(td), isr, cr, flen));
             mmio.write8(RTL_CR, RTL_CR_RE);             // TE off: reset the TX engine (RX stays up)
             mmio.write16(RTL_ISR, 0xFFFF);             // clear any latched TX error/status
-            arena.write32(td, 0);                       // drop the stuck descriptor's OWN
-            let tx_ring = arena.phys_at(TX_RING_OFF);
+            arena.tx_ring.write32(td, 0);                       // drop the stuck descriptor's OWN
+            let tx_ring = arena.tx_ring.phys();
             mmio.write32(RTL_TNPDS, (tx_ring & 0xffff_ffff) as u32);
             mmio.write32(RTL_TNPDS + 4, (tx_ring >> 32) as u32);
             mmio.write8(RTL_CR, RTL_CR_RE | RTL_CR_TE);  // TE back on - re-reads TNPDS
@@ -899,8 +992,8 @@ const E1000_82540EM: u32 = 0x100E_8086;
 /// The granted register window, if the controller behind it is the e1000 this driver knows - and,
 /// when it is not, a line naming what it is instead (backlog/fixed/80 D2). It asks the DEVICE, so it needs
 /// no ISA test: only x86 reaches the e1000 path, every other port's backend having diverged first.
-fn known_e1000(ctx: &ServiceContext, mmio: Option<godspeed_sdk::Mmio>) -> Option<godspeed_sdk::Mmio> {
-    let vd = ctx.nic_vendor_device();
+fn known_e1000(ctx: &ServiceContext, mmio: Option<Registers>) -> Option<Registers> {
+    let vd = godspeed::driver::device::nic_vendor_device(&ctx);
     if mmio.is_some() && vd != E1000_82540EM {
         ctx.log_fmt(format_args!(
             "nic-driver: the network controller is {:04x}:{:04x}, which this driver does not know (it drives the Intel 82540EM, 8086:100e, and the Realtek RTL8168, 10ec:8168) - not driving it",
@@ -1166,6 +1259,25 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             None => 0,
         }
     };
+    // `dwc2`'s batch (`OP_NET_RX_BATCH`, 0x13): its answer is `[0x13, count, (len, frame) x count]`, this
+    // driver's own batch format after the tag, so it is checked frame by frame and copied whole into `out`
+    // (`out[0]` the count). Returns the bytes of `out` used; a malformed frame ends the batch there.
+    let dev_rx_batch = |ctx: &ServiceContext, out: &mut [u8]| -> usize {
+        let Some(r) = dwc2_rpc(ctx, &Message::from_bytes(&[0x13])) else { out[0] = 0; return 1 };
+        let p = r.payload_bytes();
+        let want = p.get(1).copied().unwrap_or(0) as usize;
+        let (mut at, mut count) = (2usize, 0usize);
+        while count < want && count < BATCH_MAX as usize {
+            if at + 2 > p.len() { break; }
+            let n = (p[at] as usize) | ((p[at + 1] as usize) << 8);
+            if n == 0 || n > FRAME_MAX || at + 2 + n > p.len() || at - 1 + 2 + n > out.len() { break; }
+            out[at - 1..at - 1 + 2 + n].copy_from_slice(&p[at..at + 2 + n]);
+            at += 2 + n;
+            count += 1;
+        }
+        out[0] = count as u8;
+        at - 1
+    };
     let mut info = [0u8; 7];
     if dev_info(&ctx, &mut info) {
         ctx.log_fmt(format_args!(
@@ -1252,13 +1364,19 @@ fn kernel_net_main(ctx: ServiceContext) -> ! {
             let mut out = [0u8; BATCH_MSG_MAX];
             let mut opos = 1usize;
             let mut count = 0u8;
-            while count < BATCH_MAX {
+            // The cable's batch is `dwc2`'s, in one exchange (`dev_rx_batch`); the radio's is built here,
+            // a frame at a time.
+            if cable {
+                opos = dev_rx_batch(&ctx, &mut out);
+                count = out[0];
+            }
+            while !cable && count < BATCH_MAX as u8 {
                 // Check a MAX-size frame would fit BEFORE dequeuing, so a frame is never pulled off the
                 // device only to be dropped for lack of room (userspace-audit Audit 5, A5-U2). net-stack
                 // re-polls (op 4/9) for whatever we stop short of.
                 if opos + 2 + FRAME_MAX > out.len() { break; }
                 let mut rx = [0u8; FRAME_MAX];
-                let n = if cable { dev_rx(&ctx, &mut rx) } else { radio.rx(&ctx, &mut rx) };
+                let n = radio.rx(&ctx, &mut rx);
                 if n == 0 { break; }
                 out[opos] = (n & 0xff) as u8;
                 out[opos + 1] = ((n >> 8) & 0xff) as u8;
@@ -1404,7 +1522,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // excluded because each has already taken the call above; left in, this arm would compile as
     // unreachable code, which is a warning today and a misleading read of the dispatch forever.
     #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
-    if ctx.nic_vendor_device() == 0x8168_10EC {
+    if godspeed::driver::device::nic_vendor_device(&ctx) == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
     }
 
@@ -1416,8 +1534,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // is now NOT driven, and said so with its identity. With no window, no arena or an unknown part we
     // still SERVE the frame interface - with empty replies, link down - so net-stack degrades instead of
     // hanging on a reply (§26.7).
-    let mmio = known_e1000(&ctx, ctx.mmio());
-    let arena = ctx.dma_region();
+    let mmio = known_e1000(&ctx, godspeed::driver::registers(&ctx));
+    let arena = godspeed::driver::arena(&ctx).and_then(|a| lay_out(&ctx, a));
 
     // NOTE: there is deliberately no `active` boolean here any more. It was a second copy of a fact
     // the two Options already hold (Commandment III), and every site that consulted it then re-asserted
@@ -1453,7 +1571,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
         a.zero();
         // TX ring registers (set up once; descriptors are written per request).
-        let tx_ring_phys = a.phys_at(TX_RING_OFF);
+        let tx_ring_phys = a.tx_ring.phys();
         m.write32(REG_TDBAL, (tx_ring_phys & 0xffff_ffff) as u32);
         m.write32(REG_TDBAH, (tx_ring_phys >> 32) as u32);
         m.write32(REG_TDLEN, TX_RING_BYTES);
@@ -1464,7 +1582,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // RX ring: descriptors point at the buffers; receiver stays OFF (RCTL=0) until a request
         // needs it, so an idle nic-driver is not burning QEMU-TCG cycles on background traffic.
         for i in 0..RX_RING_COUNT {
-            a.write64(RX_RING_OFF + i * 16, a.phys_at(RX_BUF_OFF + i * RX_BUF_SIZE));
+            a.rx_ring.write64(i * 16, a.rx_bufs.phys_at(i * RX_BUF_SIZE));
         }
         // HAND THE NIC DESCRIPTORS IT OWNS: buffer address set, and status CLEAR.
         //
@@ -1479,11 +1597,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // that had never done its own job. Doing it here is where it always belonged: arming a ring is
         // an init concern, not something to redo on every request.
         for i in 0..RX_RING_COUNT {
-            a.write8(RX_RING_OFF + i * 16 + 12, 0);   // status: not done
-            a.write8(RX_RING_OFF + i * 16 + 13, 0);   // errors
+            a.rx_ring.write8(i * 16 + 12, 0);   // status: not done
+            a.rx_ring.write8(i * 16 + 13, 0);   // errors
         }
         for i in 0..128usize { m.write32(REG_MTA + i * 4, 0); }
-        let rx_ring_phys = a.phys_at(RX_RING_OFF);
+        let rx_ring_phys = a.rx_ring.phys();
         m.write32(REG_RDBAL, (rx_ring_phys & 0xffff_ffff) as u32);
         m.write32(REG_RDBAH, (rx_ring_phys >> 32) as u32);
         m.write32(REG_RDLEN, RX_RING_BYTES);
@@ -1563,12 +1681,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             if let (Some(m), Some(a)) = (mmio.as_ref(), arena.as_ref()) {
                 // Same ring discipline as the batch drain: take the next descriptor the NIC has
                 // finished with, hand it straight back, and leave the receiver alone.
-                let d = RX_RING_OFF + rx_idx * 16;
-                if a.read8(d + 12) & RXD_STA_DD != 0 {
-                    n = (a.read16(d + 8) as usize).min(FRAME_MAX);
-                    for i in 0..n { rxbuf[i] = a.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
-                    a.write8(d + 12, 0);
-                    a.write64(d, a.phys_at(RX_BUF_OFF + rx_idx * RX_BUF_SIZE));
+                let d = rx_idx * 16;
+                if a.rx_ring.read8(d + 12) & RXD_STA_DD != 0 {
+                    n = (a.rx_ring.read16(d + 8) as usize).min(FRAME_MAX);
+                    for i in 0..n { rxbuf[i] = a.rx_bufs.read8(rx_idx * RX_BUF_SIZE + i); }
+                    a.rx_ring.write8(d + 12, 0);
+                    a.rx_ring.write64(d, a.rx_bufs.phys_at(rx_idx * RX_BUF_SIZE));
                     m.write32(REG_RDT, rx_idx as u32);
                     rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 }
@@ -1593,20 +1711,20 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 // blocks until a frame arrives holds a core on someone else's schedule; the caller
                 // paces its own polling and carries its own budget.
                 while (nfr as usize) < BATCH_MAX {
-                    let d = RX_RING_OFF + rx_idx * 16;
-                    if a.read8(d + 12) & RXD_STA_DD == 0 { break; }   // NIC still owns it
-                    let len = (a.read16(d + 8) as usize).min(FRAME_MAX);
+                    let d = rx_idx * 16;
+                    if a.rx_ring.read8(d + 12) & RXD_STA_DD == 0 { break; }   // NIC still owns it
+                    let len = (a.rx_ring.read16(d + 8) as usize).min(FRAME_MAX);
                     if opos + 2 + len > out.len() { break; }          // reply full - stop cleanly
                     out[opos..opos + 2].copy_from_slice(&(len as u16).to_le_bytes());
                     opos += 2;
-                    for i in 0..len { out[opos + i] = a.read8(RX_BUF_OFF + rx_idx * RX_BUF_SIZE + i); }
+                    for i in 0..len { out[opos + i] = a.rx_bufs.read8(rx_idx * RX_BUF_SIZE + i); }
                     opos += len;
                     nfr += 1;
                     // Return the descriptor: clear status, restore its buffer address, then move the
                     // tail onto it. RDT is the last descriptor the NIC may write, so advancing it to
                     // the one just freed is what re-arms the ring.
-                    a.write8(d + 12, 0);
-                    a.write64(d, a.phys_at(RX_BUF_OFF + rx_idx * RX_BUF_SIZE));
+                    a.rx_ring.write8(d + 12, 0);
+                    a.rx_ring.write64(d, a.rx_bufs.phys_at(rx_idx * RX_BUF_SIZE));
                     m.write32(REG_RDT, rx_idx as u32);
                     rx_idx = (rx_idx + 1) % RX_RING_COUNT;
                 }
@@ -1653,15 +1771,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
             // --- Transmit: copy the frame into the TX buffer, point descriptor tx_idx at it, hand it
             // to the NIC (advance TDT), wait on the DD bit (Commandment VIII, bounded + loud).
-            for i in 0..flen { a.write8(TX_BUF_OFF + i, frame[i]); }
-            let td = TX_RING_OFF + tx_idx * 16;
-            a.write64(td, a.phys_at(TX_BUF_OFF));
-            a.write16(td + 8, flen as u16);
-            a.write8(td + 11, TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
-            a.write8(td + 12, 0); // clear DD
+            for i in 0..flen { a.tx_buf.write8(i, frame[i]); }
+            let td = tx_idx * 16;
+            a.tx_ring.write64(td, a.tx_buf.phys());
+            a.tx_ring.write16(td + 8, flen as u16);
+            a.tx_ring.write8(td + 11, TXD_CMD_EOP | TXD_CMD_IFCS | TXD_CMD_RS);
+            a.tx_ring.write8(td + 12, 0); // clear DD
             m.write32(REG_TDT, ((tx_idx + 1) % TX_RING_COUNT) as u32);
-            await_tx(&ctx, || a.read8(td + 12) & TXD_STA_DD != 0);
-            tx_confirmed = a.read8(td + 12) & TXD_STA_DD != 0;
+            await_tx(&ctx, || a.tx_ring.read8(td + 12) & TXD_STA_DD != 0);
+            tx_confirmed = a.tx_ring.read8(td + 12) & TXD_STA_DD != 0;
             tx_idx = (tx_idx + 1) % TX_RING_COUNT;
 
             // TRANSMIT ONLY - no coupled receive. There used to be a bounded wait here for a frame to

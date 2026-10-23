@@ -5836,7 +5836,10 @@ pub fn run_fs_check(image_path: &Path, persist_path: &str, expect_free: u64, smp
     // What the test is FOR is preserved exactly - that fsck rebuilds the count from the tree instead
     // of believing the superblock. The value must no longer be the bogus one, and must land within a
     // few blocks of the truth: a window boot-time writes fit in and a 123,456-block lie does not.
-    let bogus_free = format!("{} free", expect_free.wrapping_add(123_456));
+    // THE REBUILT COUNT, on the summary line, is what must not be the lie. The report now NAMES the lie
+    // ("the superblock claimed N free, the tree says M"), which is right and which an any-mention check
+    // read as fsck still believing it: 8 of 9, with nothing wrong in `fs` (2026-10-20, `backlog/32`).
+    let bogus_free = format!("{} free (bitmap", expect_free.wrapping_add(123_456));
     match run!(b"drives check\r", 15) {
         Some(r) => {
             check!(!r.contains(&bogus_free), "fsck stopped believing the drifted superblock count");
@@ -8474,8 +8477,12 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fetched.contains("log_write"), "it says what the contract requests");
         check!(fetched.contains("installed") && fetched.contains("not installed") && fetched.contains("`godspeed install` starts it"),
                "and that it is fetched, not installed, and how to install it");
-        check!(fetched.contains("downloading godspeed/hello 0.3.0  [") && !fetched.contains("downloading x86_64.elf") && fetched.contains("####"),
-               "`godspeed fetch` draws a progress bar naming the package, not the file, while it downloads");
+        check!(fetched.contains("downloading godspeed/hello 0.3.0  ") && !fetched.contains("downloading godspeed/hello 0.3.0  [")
+               && !fetched.contains("downloading x86_64.elf"),
+               "`godspeed fetch` names the package, not the file, while it downloads");
+        check!(fetched.contains("
+  [####") && fetched.contains("[A"),
+               "and draws its bar on the line under the words, going back up to redraw both");
         check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
         let kept = run!(b"dir /system/packages/godspeed/hello/0.3.0\r", 60);
         check!(kept.contains("x86_64.elf") && kept.contains("manifest.toml") && kept.contains("manifest.sig")
@@ -12036,6 +12043,278 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
     }
     let _ = std::fs::write("build/tests/gsp_serial.log", &transcript);
     println!("\ngsp: {pass} passed, {fail} failed (serial: build/tests/gsp_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// `osdev test deps`: a package that requires another (`docs/developer-services-design.md` 16). Two unpublished
+/// package files are on the disk, signed by the fixtures' throwaway test key (`osdev/fixtures/README.md`):
+/// `godspeed/dep-store` and `godspeed/dep-user`, which requires `godspeed/dep-store ^0.1.0` and sends it a line.
+///
+/// Boot 1: refused while the requirement cannot be had; one question for both once it is fetched; both installed,
+/// the dependency first, and the dependent wired to it; the dependency's uninstall refused while the dependent is
+/// installed; the dependency reinstalled so the installed list names it LAST. Boot 2: it starts first anyway, and
+/// the two uninstall in the right order.
+pub fn run_deps(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("deps: PASS - {}", $label); pass += 1; }
+        else { println!("deps: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    let mut transcript: Vec<u8> = Vec::new();
+    const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+
+    for boot in 1..=2 {
+        let port = pick_free_port();
+        let mut cmd = std::process::Command::new(&qemu);
+        cmd.args([
+            "-drive",   &format!("format=raw,file={image_str},if=ide"),
+            "-device",  "ich9-ahci,id=ahci",
+            "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+            "-device",  "ide-hd,drive=data,bus=ahci.0",
+            "-cpu",     "qemu64,+rdrand",
+            "-smp",     &smp.to_string(), "-m", "512M",
+            "-serial",  &format!("tcp::{port},server"),
+            "-serial",  "null",
+            "-display", "none", "-no-reboot", "-no-shutdown",
+            "-device", "e1000,netdev=n0", "-netdev", "user,id=n0",
+        ]);
+        cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("deps: QEMU launch failed: {e}"); std::process::exit(1); } };
+        let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+            Some(s) => s,
+            None => { child.kill().ok(); eprintln!("deps: no shell serial"); std::process::exit(1); }
+        };
+        let mut read_half = stream.try_clone().expect("clone");
+        let mut write_half = stream;
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let buf2 = Arc::clone(&buf);
+            thread::spawn(move || {
+                let mut tmp = [0u8; 4096];
+                loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+            });
+        }
+        let mut cursor = 0usize;
+        if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+            child.kill().ok(); eprintln!("deps: never reached a prompt"); std::process::exit(1);
+        }
+        macro_rules! run { ($c:expr, $secs:expr) => {{
+            send(&mut write_half, $c);
+            collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+        }}; }
+
+        if boot == 1 {
+            let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+            let _ = run!(b"godspeed config\r", 60);
+            send(&mut write_half, format!("godspeed trust add godspeed {KEY}\r").as_bytes());
+            let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20));
+            let added = run!(b"y\r", 60);
+            check!(added.contains("trusted by this machine's operator"), "the fixtures' test key is trusted");
+
+            // REFUSED: what it needs is neither installed nor here, and no registry has it.
+            let refused = run!(b"godspeed install /dep-user-0.1.0.gsp yes\r", 240);
+            check!(refused.contains("godspeed/dep-store") && refused.contains("never published")
+                       && !refused.contains("installed godspeed/dep-user"),
+                   "a package whose requirement cannot be had is refused, naming it, and nothing is installed");
+            let none = run!(b"godspeed list installed\r", 60);
+            check!(!none.contains("godspeed/dep-user"), "and it is not on the installed list");
+
+            // THE DEPENDENCY HERE, NOT INSTALLED: installed from its file, then uninstalled (its copy stays).
+            let store = run!(b"godspeed install /dep-store-0.1.0.gsp yes\r", 240);
+            check!(store.contains("installed") && store.contains("godspeed/dep-store"), "the dependency installs on its own");
+            let _ = run!(b"godspeed uninstall godspeed/dep-store yes\r", 60);
+
+            // ONE QUESTION FOR BOTH, the dependency first.
+            send(&mut write_half, b"godspeed install /dep-user-0.1.0.gsp\r");
+            let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(240)).unwrap_or_default();
+            check!(asked.contains("needs 1 more package") && asked.contains("Install all 2 and grant them"),
+                   "one question, for the package and what it needs");
+            let a = asked.find("godspeed/dep-store").unwrap_or(usize::MAX);
+            let b = asked.rfind("godspeed/dep-user").unwrap_or(0);
+            check!(a < b && asked.contains("(needed by godspeed/dep-user)") && asked.contains("asks for: godspeed/dep-store"),
+                   "the dependency listed first, with what needs it, and the dependent asking for it as a peer");
+            let both = run!(b"y\r", 300);
+            check!(both.contains("godspeed/dep-store 0.1.0") && both.contains("godspeed/dep-user 0.1.0"), "answered yes, both are installed");
+            // Read from the whole transcript after the question: a log line can land either side of a prompt.
+            let _ = collect_until(&buf, &mut cursor, b"a dependent says: hello from dep-user", Duration::from_secs(30));
+            let since = {
+                let all = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+                let at = all.rfind("Install all 2 and grant them").unwrap_or(0);
+                all[at..].to_string()
+            };
+            let (s, u) = (since.find("dep-store 0.1.0: started"), since.find("dep-user 0.1.0: started"));
+            check!(matches!((s, u), (Some(s), Some(u)) if s < u), "the dependency is started before the package that needs it");
+            check!(since.contains("dep-store 0.1.0: a dependent says: hello from dep-user"),
+                   "and the dependent reaches it: dep-store logs the line dep-user sent");
+            let listed = run!(b"godspeed list installed\r", 60);
+            check!(listed.contains("godspeed/dep-store") && listed.contains("godspeed/dep-user"), "both are on the installed list");
+            // `plan` is a REPORT, so it pipes; with its requirement installed in range it is kept, and the one
+            // row left to install is the package asked for.
+            let planned = run!(b"godspeed plan godspeed/dep-user | where state=install\r", 120);
+            check!(planned.contains("godspeed/dep-user") && !planned.contains("pipe:"),
+                   "`godspeed plan` pipes as records, its installed requirement kept");
+
+            // NOT WHILE SOMETHING NEEDS IT.
+            let kept = run!(b"godspeed uninstall godspeed/dep-store yes\r", 60);
+            check!(kept.contains("godspeed/dep-user 0.1.0 requires it") && kept.contains("uninstall godspeed/dep-user first"),
+                   "the dependency's uninstall is refused while the dependent is installed, naming it");
+
+            // REINSTALLED, SO THE LIST NAMES IT LAST: boot 2 must start it first anyway.
+            let re = run!(b"godspeed install godspeed/dep-store yes\r", 240);
+            check!(re.contains("godspeed/dep-store 0.1.0"), "the dependency reinstalled in place, now last on the list");
+            let order = run!(b"read /system/packages/installed\r", 60);
+            let (s, u) = (order.rfind("godspeed/dep-store").unwrap_or(0), order.find("godspeed/dep-user").unwrap_or(usize::MAX));
+            check!(u < s, "the installed list names the dependent before the dependency");
+        } else {
+            // THE BOOT STARTS THE DEPENDENCY FIRST, whatever the list's order.
+            let _ = collect_until(&buf, &mut cursor, b"dep-user 0.1.0: sent dep-store a line", Duration::from_secs(120));
+            let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+            let s = log.find("dep-store 0.1.0: started").unwrap_or(usize::MAX);
+            let u = log.find("dep-user 0.1.0: started").unwrap_or(0);
+            check!(s < u, "at boot the dependency starts before the package that needs it, though the list names it last");
+            check!(log.contains("dep-user 0.1.0: sent dep-store a line"), "and the dependent is wired to it at boot too");
+
+            let first = run!(b"godspeed uninstall godspeed/dep-user yes\r", 60);
+            check!(first.contains("uninstalled"), "the dependent uninstalls");
+            let then = run!(b"godspeed uninstall godspeed/dep-store yes\r", 60);
+            check!(then.contains("uninstalled"), "and then the dependency");
+            let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
+            check!(removed.contains("no longer trusted"), "the test key is withdrawn");
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        transcript.extend_from_slice(format!("\n===== boot {boot} =====\n").as_bytes());
+        transcript.extend_from_slice(&buf.lock().unwrap());
+    }
+    let _ = std::fs::write("build/tests/deps_serial.log", &transcript);
+    println!("\ndeps: {pass} passed, {fail} failed (serial: build/tests/deps_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// The kinds a developer makes with `godspeed new`, each a fixture `kind-<kind>-0.1.0.gsp` (`osdev test kinds`).
+pub const KINDS: [&str; 4] = ["service", "utility", "app", "driver"];
+
+/// `osdev test kinds`: every kind of program the CLI scaffolds, as it scaffolds it, installed and seen working. The
+/// four files were made by `godspeed new <kind> kind-<kind> --publisher godspeed` and `godspeed package --local` with
+/// the fixtures' throwaway key, untouched, so this is the templates themselves on a machine. The driver's template
+/// drives QEMU's `edu`, so the machine has one.
+pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("kinds: PASS - {}", $label); pass += 1; }
+        else { println!("kinds: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+
+    let port = pick_free_port();
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+        "-device", "e1000,netdev=n0", "-netdev", "user,id=n0",
+        // The driver template's device: QEMU's teaching device, which no GodspeedOS driver claims.
+        "-device", "edu",
+    ]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("kinds: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("kinds: no shell serial"); std::process::exit(1); }
+    };
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("kinds: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+    let _ = run!(b"godspeed config\r", 60);
+    send(&mut write_half, format!("godspeed trust add godspeed {KEY}\r").as_bytes());
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20));
+    let added = run!(b"y\r", 60);
+    check!(added.contains("trusted by this machine's operator"), "the fixtures' test key is trusted");
+
+    // A SERVICE: installed, it starts, and the supervisor keeps it running.
+    let svc = run!(b"godspeed install /kind-service-0.1.0.gsp yes\r", 240);
+    check!(svc.contains("godspeed/kind-service 0.1.0   (unpacked from an UNPUBLISHED package file)")
+               && svc.contains("installed godspeed/kind-service 0.1.0 started"),
+           "the service installs from its file, and the supervisor starts it");
+    let _ = collect_until(&buf, &mut cursor, b"kind-service: started", Duration::from_secs(30));
+    check!(String::from_utf8_lossy(&buf.lock().unwrap()).contains("kind-service: started"), "and it starts, saying so");
+    let listed = run!(b"godspeed list installed\r", 60);
+    check!(listed.contains("godspeed/kind-service") && listed.contains("running"), "and it is listed as running");
+
+    // A UTILITY: typed by name, given its arguments, its output shown, and it ends.
+    let utl = run!(b"godspeed install /kind-utility-0.1.0.gsp yes\r", 240);
+    check!(utl.contains("a utility: type `kind-utility"), "the utility installs, and the install says how to run it");
+    let ran = run!(b"kind-utility Ada\r", 60);
+    check!(ran.contains("hello, Ada"), "typed with an argument, it prints `hello, Ada` and ends");
+    let piped = run!(b"kind-utility Bo | count\r", 60);
+    check!(piped.contains("1 line, 2 words, 10 bytes"), "and its output pipes: `count` sees the one line `hello, Bo`");
+
+    // AN APP: it has the screen and the keyboard until a key, then gives them back.
+    let app = run!(b"godspeed install /kind-app-0.1.0.gsp yes\r", 240);
+    check!(app.contains("asks for: console") && app.contains("an app: type `kind-app"),
+           "the app installs, asking for the console, and the install says how to run it");
+    send(&mut write_half, b"kind-app Cy\r");
+    let shown = collect_until(&buf, &mut cursor, b"Press any key", Duration::from_secs(60)).unwrap_or_default();
+    check!(shown.contains("hello, Cy"), "the app has the screen: it shows `hello, Cy`");
+    let back = run!(b"x", 60);
+    let again = run!(b"version\r", 60);
+    check!(!back.is_empty() && again.contains("GodspeedOS"), "a key gives the console back, and the shell answers");
+
+    // A DRIVER: the operator approves the device, the OS finds which it is, and the driver drives it.
+    let drv = run!(b"godspeed install /kind-driver-0.1.0.gsp yes\r", 240);
+    check!(drv.contains("asks for: device") && drv.contains("started (") && drv.contains("its device, checked from disk"),
+           "the driver installs, asking for its device, and the supervisor starts it with that device");
+    let _ = collect_until(&buf, &mut cursor, b"5! = 120", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("kind-driver: device id 0x010000ed, alive true, 5! = 120"),
+           "the driver reads `edu`'s identity, its liveness register and a factorial, through gs::driver");
+    let listed = run!(b"godspeed list installed\r", 60);
+    check!(listed.contains("godspeed/kind-driver") && listed.contains("running"), "and it is listed as running");
+
+    // CLEANUP: all four uninstalled, and the key withdrawn.
+    for k in KINDS {
+        let out = run!(format!("godspeed uninstall godspeed/kind-{k} yes\r").as_bytes(), 120);
+        check!(out.contains("uninstalled"), format!("kind-{k} uninstalls"));
+    }
+    let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
+    check!(removed.contains("no longer trusted"), "the test key is withdrawn");
+    check!(!String::from_utf8_lossy(&buf.lock().unwrap()).contains("KERNEL PANIC"), "and the kernel did not panic");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::write("build/tests/kinds_serial.log", &*buf.lock().unwrap());
+    println!("\nkinds: {pass} passed, {fail} failed (serial: build/tests/kinds_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }
 

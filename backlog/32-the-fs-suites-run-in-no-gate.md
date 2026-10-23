@@ -165,3 +165,11 @@ One correction to the framing above, in fairness to the tests: all four failures
 not filesystem faults**. That is not reassuring, it is the point. A suite that fails for its own
 reasons is the one nobody investigates, and it trains exactly the reflex the entry names - discount
 red, re-run, move on.
+
+**A fifth, found and fixed 2026-10-20 (`fs-check`, 8 of 9).** `drives check` now reports a repaired count by
+naming the lie - "the superblock claimed N free, the tree says M" - and the check `fsck stopped believing the
+drifted superblock count` failed on ANY mention of "N free", so the report that is right tripped it. It now looks
+at the rebuilt count on the summary line. (Its setup line also printed the drifted value twice, `156147 ->
+156147`, which first read as a drift that changed nothing; that was the print, also fixed.) The same 8 of 9 with
+and without the change being tested that day (the `fs` walk cache): the fixture's, not the filesystem's - the
+shape this entry names.

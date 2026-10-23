@@ -85,6 +85,11 @@ struct Writer<'c> {
     t0_ms: u64,
     shown_step: u64,
     shown_secs: i64,
+    /// Ticks spent writing to `fs` and drawing the progress line, and the session's own (`https::Timing`),
+    /// for the `time` row.
+    disk: u64,
+    screen: u64,
+    net: https::Timing,
 }
 
 impl<'c> Writer<'c> {
@@ -104,15 +109,17 @@ impl<'c> Writer<'c> {
         let step = self.got * 28 / self.total.max(1);
         let secs = gs::task::uptime_secs(self.ctx) - self.t0;
         if step != self.shown_step || secs != self.shown_secs || self.got == self.total {
+            let t = gs::driver::wait::ticks(self.ctx);
             self.shown_step = step;
             self.shown_secs = secs;
             let ms = gs::driver::wait::counter_ms(self.ctx).saturating_sub(self.t0_ms);
-            crate::progress(self.ctx, format_args!("  downloading {}  [{}]  {}%  {} / {}  {}  {}{}", self.name,
+            crate::progress(self.ctx, format_args!("  downloading {}  [{}]  {}%  {}  {}  {}{}", self.name,
                 crate::packages::bar(step as usize, 28).as_str(), self.got * 100 / self.total.max(1),
-                crate::packages::size_text(self.got).as_str(), crate::packages::size_text(self.total).as_str(),
+                crate::packages::of_text(self.got, self.total).as_str(),
                 crate::packages::rate_text(self.got, ms).as_str(),
                 crate::packages::time_text(secs, self.got, self.total).as_str(),
                 if self.got == self.total { "" } else { "   [q] quit" }));
+            self.screen += gs::driver::wait::ticks(self.ctx).wrapping_sub(t);
         }
         let mut rest = bytes;
         while !rest.is_empty() {
@@ -121,7 +128,10 @@ impl<'c> Writer<'c> {
             self.held += take;
             rest = &rest[take..];
             if self.held == self.chunk.len() {
-                if let Err(e) = self.fs.write_at(self.partial, self.written, &self.chunk) { self.err = Some(e); return false; }
+                let t = gs::driver::wait::ticks(self.ctx);
+                let wrote = self.fs.write_at(self.partial, self.written, &self.chunk);
+                self.disk += gs::driver::wait::ticks(self.ctx).wrapping_sub(t);
+                if let Err(e) = wrote { self.err = Some(e); return false; }
                 self.written += self.held as u64;
                 self.held = 0;
             }
@@ -177,6 +187,7 @@ pub fn run(ctx: &ServiceContext, r: &mut Rows, typed: &str, dest: &str, setup: &
     let w = RefCell::new(Writer {
         ctx, fs: gs::fs::Fs::new(ctx), partial, name, total: 0, got: 0, written: 0, held: 0,
         chunk: [0u8; gs::fs::IO_CHUNK], created: false, no_length: false, err: None, t0: 0, t0_ms: 0, shown_step: u64::MAX, shown_secs: -1,
+        disk: 0, screen: 0, net: https::Timing::default(),
     });
     let (head, tls) = loop {
         let (u, tls) = match config::link(link.as_str()) {
@@ -193,7 +204,9 @@ pub fn run(ctx: &ServiceContext, r: &mut Rows, typed: &str, dest: &str, setup: &
                 return r.fail("clock", "not set", "a certificate's dates cannot be checked - `date sync` first");
             };
             https::session(ctx, u.host, u.port, setup.roots, now, setup.timeout, |s| {
-                s.get_sized(u.base, &mut |h| w.borrow_mut().on_head(h), &mut |b| w.borrow_mut().put(b))
+                let r = s.get_sized(u.base, &mut |h| w.borrow_mut().on_head(h), &mut |b| w.borrow_mut().put(b));
+                w.borrow_mut().net = s.timing;
+                r
             }).and_then(|x| x)
         } else {
             plain_get(ctx, &u, setup.timeout, &mut |h| w.borrow_mut().on_head(h), &mut |b| w.borrow_mut().put(b))
@@ -262,6 +275,7 @@ pub fn run(ctx: &ServiceContext, r: &mut Rows, typed: &str, dest: &str, setup: &
         return r.fail("http", dest, cell(format_args!("{} of {} bytes arrived - nothing was saved", got, total)).as_str());
     }
     let (total, got) = (wr.total, wr.got);
+    let (disk, screen, net) = (wr.disk, wr.screen, wr.net);
     drop(wr);
     if let Err(e) = fs.rename(partial, name) {
         let _ = fs.delete(partial);
@@ -281,6 +295,16 @@ pub fn run(ctx: &ServiceContext, r: &mut Rows, typed: &str, dest: &str, setup: &
     if began != 0 {
         r.row("speed", crate::packages::rate_text(got, ms).as_str(),
               cell(format_args!("{} bytes in {}, the connection included", got, crate::packages::duration_text(ms / 1000).as_str())).as_str());
+    }
+    if tls {
+        // Where the time went (`backlog/93`): the session's reads and records, the disk and the screen. Over
+        // plain http the session parts are not measured.
+        let per = gs::driver::wait::ticks_per_10ms(ctx);
+        let to_ms = |t: u64| if per == 0 { 0 } else { t.saturating_mul(10) / per };
+        r.row("time", cell(format_args!("network {} ms, decrypt {} ms, disk {} ms, screen {} ms",
+                to_ms(net.recv + net.idle), to_ms(net.decrypt), to_ms(disk), to_ms(screen))).as_str(),
+              cell(format_args!("{} reads of net-stack in {} ms; {} found nothing and waited, {} ms", net.recvs,
+                to_ms(net.recv), net.empty, to_ms(net.idle))).as_str());
     }
     r.note(format_args!("{}", if tls { "downloaded and checked" } else { "downloaded over plain http - not checked" }));
 }

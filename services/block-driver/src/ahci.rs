@@ -15,7 +15,8 @@ use core::cell::Cell;
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed as gs;
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::{Part, Registers};
+use godspeed_sdk::ServiceContext;
 
 // HBA Generic Host Control registers (offsets from ABAR).
 const HBA_CAP: usize = 0x00;
@@ -49,13 +50,17 @@ const TFD_DRQ: u32 = 1 << 3;
 
 const SIG_SATA: u32 = 0x0000_0101;
 
-// DMA arena layout (the arena is page-aligned, so all these meet AHCI alignment:
-// command list 1 KiB, FIS 256 B, command table 128 B).
-const CMD_LIST_OFF: usize = 0x000; // 32 command headers × 32 B
-const RX_FIS_OFF: usize = 0x400;   // received FIS (256 B)
-const CMD_TBL_OFF: usize = 0x500;  // command table: CFIS @ +0, PRDT @ +0x80
-const PRDT_OFF: usize = CMD_TBL_OFF + 0x80;
-const DATA_OFF: usize = 0x1000;    // data buffer (one page)
+// THE DMA ARENA, IN NAMED PARTS (`gs::driver::arena`), each at the alignment AHCI requires of its
+// PHYSICAL address (AHCI 1.3.1, 4.2): the command list 1 KiB, the received FIS 256 bytes, a command table
+// 128 bytes. Taken in this order they land where the hand-placed offsets put them - 0x000, 0x400, 0x500
+// and 0x1000 - so the device sees exactly what it saw before (`run` logs the layout once).
+const CMD_LIST_LEN: usize = 32 * 32; // 32 command headers x 32 bytes
+const RX_FIS_LEN: usize = 256;
+const PRDT_AT: usize = 0x80;         // in the command table: the CFIS at 0, the one PRDT entry here
+const CMD_TBL_LEN: usize = PRDT_AT + 16;
+/// The most sectors one command moves, and so the data part's size: 64 sectors, 32 KiB.
+const MAX_PER: u64 = 64;
+const DATA_LEN: usize = MAX_PER as usize * 512;
 
 const ATA_IDENTIFY: u8 = 0xEC;
 const ATA_READ_DMA_EXT: u8 = 0x25;
@@ -154,8 +159,11 @@ impl WriteCache {
 }
 
 struct Ahci<'a> {
-    hba: &'a Mmio,
-    arena: Dma,
+    hba: &'a Registers,
+    cmd_list: Part,
+    rx_fis: Part,
+    cmd_tbl: Part,
+    data: Part,
     port: u32,
     /// Total addressable 512-byte sectors, from IDENTIFY. Served on OP_CAPACITY.
     sectors: Cell<u64>,
@@ -240,10 +248,10 @@ impl<'a> Ahci<'a> {
         // Program the command-list + received-FIS base (physical addresses) BEFORE the reset, so
         // the device's post-COMRESET initial D2H FIS lands in a valid receive area and PxTFD clears
         // BSY (AHCI 10.1.2 port-init order: arm FB/CLB before bringing the engine up).
-        let cl = self.arena.phys_at(CMD_LIST_OFF);
+        let cl = self.cmd_list.phys();
         self.pwrite(PX_CLB, cl as u32);
         self.pwrite(PX_CLBU, (cl >> 32) as u32);
-        let fb = self.arena.phys_at(RX_FIS_OFF);
+        let fb = self.rx_fis.phys();
         self.pwrite(PX_FB, fb as u32);
         self.pwrite(PX_FBU, (fb >> 32) as u32);
         // Hard-reset the port (COMRESET) so EVERY (re)start clears a wedged port the way a cold boot
@@ -253,7 +261,8 @@ impl<'a> Ahci<'a> {
     }
 
     /// Issue a single-PRDT command (slot 0) transferring `data_bytes` to/from the
-    /// arena's data buffer. Builds the command header, command table FIS, and PRDT.
+    /// arena's `data` part (refused when larger than it). Builds the command header, command table FIS,
+    /// and PRDT.
     fn issue(
         &self,
         ctx: &ServiceContext,
@@ -268,48 +277,54 @@ impl<'a> Ahci<'a> {
             return Err("port busy before issue");
         }
 
+        // THE DEVICE IS TOLD HOW MANY BYTES TO MOVE (the PRDT below), and nothing on the CPU side can stop
+        // it going past the data part once it is told. So the count is checked here, against the part.
+        if data_bytes as usize > self.data.len() {
+            return Err("transfer larger than the data part");
+        }
+
         // Command header[0]: CFL=5 dwords (H2D register FIS); PRDTL=1 if there's
         // data, 0 for no-data commands (e.g. FLUSH).
         let prdtl = if data_bytes > 0 { 1u32 } else { 0 };
         let dw0 = 5u32 | (if write { 1 << 6 } else { 0 }) | (prdtl << 16);
-        self.arena.write32(CMD_LIST_OFF, dw0);
-        self.arena.write32(CMD_LIST_OFF + 4, 0); // PRDBC
-        let ctba = self.arena.phys_at(CMD_TBL_OFF);
-        self.arena.write32(CMD_LIST_OFF + 8, ctba as u32);
-        self.arena.write32(CMD_LIST_OFF + 12, (ctba >> 32) as u32);
+        self.cmd_list.write32(0, dw0);
+        self.cmd_list.write32(4, 0); // PRDBC
+        let ctba = self.cmd_tbl.phys();
+        self.cmd_list.write32(8, ctba as u32);
+        self.cmd_list.write32(12, (ctba >> 32) as u32);
 
         // Command table - H2D Register FIS (clear the 64-byte CFIS area first).
         for i in 0..16 {
-            self.arena.write32(CMD_TBL_OFF + i * 4, 0);
+            self.cmd_tbl.write32(i * 4, 0);
         }
         let dev: u32 = if ata_cmd == ATA_IDENTIFY { 0 } else { 0x40 }; // 0x40 = LBA
         // DW0: type 0x27 | C(byte1 bit7)=0x80 | command | featurel(0)
-        self.arena.write32(CMD_TBL_OFF, 0x27 | (0x80 << 8) | ((ata_cmd as u32) << 16));
+        self.cmd_tbl.write32(0, 0x27 | (0x80 << 8) | ((ata_cmd as u32) << 16));
         // DW1: lba[7:0] | lba[15:8] | lba[23:16] | device
-        self.arena.write32(
-            CMD_TBL_OFF + 4,
+        self.cmd_tbl.write32(
+            4,
             (lba as u32 & 0xFF)
                 | (((lba >> 8) as u32 & 0xFF) << 8)
                 | (((lba >> 16) as u32 & 0xFF) << 16)
                 | (dev << 24),
         );
         // DW2: lba[31:24] | lba[39:32] | lba[47:40] | featureh(0)
-        self.arena.write32(
-            CMD_TBL_OFF + 8,
+        self.cmd_tbl.write32(
+            8,
             ((lba >> 24) as u32 & 0xFF)
                 | (((lba >> 32) as u32 & 0xFF) << 8)
                 | (((lba >> 40) as u32 & 0xFF) << 16),
         );
         // DW3: count[7:0] | count[15:8]
-        self.arena.write32(CMD_TBL_OFF + 12, (count as u32 & 0xFF) | (((count >> 8) as u32 & 0xFF) << 8));
+        self.cmd_tbl.write32(12, (count as u32 & 0xFF) | (((count >> 8) as u32 & 0xFF) << 8));
 
         // PRDT[0]: data base + (byte count - 1). Only for data commands.
         if data_bytes > 0 {
-            let dba = self.arena.phys_at(DATA_OFF);
-            self.arena.write32(PRDT_OFF, dba as u32);
-            self.arena.write32(PRDT_OFF + 4, (dba >> 32) as u32);
-            self.arena.write32(PRDT_OFF + 8, 0);
-            self.arena.write32(PRDT_OFF + 12, data_bytes - 1);
+            let dba = self.data.phys();
+            self.cmd_tbl.write32(PRDT_AT, dba as u32);
+            self.cmd_tbl.write32(PRDT_AT + 4, (dba >> 32) as u32);
+            self.cmd_tbl.write32(PRDT_AT + 8, 0);
+            self.cmd_tbl.write32(PRDT_AT + 12, data_bytes - 1);
         }
 
         // Issue command slot 0 and wait for it to clear.
@@ -404,20 +419,20 @@ impl<'a> Ahci<'a> {
         // Model: words 27..47, each word's two bytes ATA-swapped.
         let mut model = [b' '; 40];
         for w in 0..20 {
-            let word = self.arena.read16(DATA_OFF + (27 + w) * 2);
+            let word = self.data.read16((27 + w) * 2);
             model[w * 2] = (word >> 8) as u8;
             model[w * 2 + 1] = (word & 0xFF) as u8;
         }
         // LBA48 sector count: words 100..104. Fall back to LBA28 (words 60..62).
-        let lba48 = (self.arena.read16(DATA_OFF + 100 * 2) as u64)
-            | ((self.arena.read16(DATA_OFF + 101 * 2) as u64) << 16)
-            | ((self.arena.read16(DATA_OFF + 102 * 2) as u64) << 32)
-            | ((self.arena.read16(DATA_OFF + 103 * 2) as u64) << 48);
+        let lba48 = (self.data.read16(100 * 2) as u64)
+            | ((self.data.read16(101 * 2) as u64) << 16)
+            | ((self.data.read16(102 * 2) as u64) << 32)
+            | ((self.data.read16(103 * 2) as u64) << 48);
         let sectors = if lba48 != 0 {
             lba48
         } else {
-            (self.arena.read16(DATA_OFF + 60 * 2) as u64)
-                | ((self.arena.read16(DATA_OFF + 61 * 2) as u64) << 16)
+            (self.data.read16(60 * 2) as u64)
+                | ((self.data.read16(61 * 2) as u64) << 16)
         };
         Ok((model, sectors))
     }
@@ -426,7 +441,7 @@ impl<'a> Ahci<'a> {
     fn read_block(&self, ctx: &ServiceContext, lba: u64, out: &mut [u8; 512]) -> Result<(), &'static str> {
         self.issue_io(ctx, "read", ATA_READ_DMA_EXT, lba, 1, false, 512)?;
         for i in 0..128 {
-            let w = self.arena.read32(DATA_OFF + i * 4);
+            let w = self.data.read32(i * 4);
             out[i * 4] = w as u8;
             out[i * 4 + 1] = (w >> 8) as u8;
             out[i * 4 + 2] = (w >> 16) as u8;
@@ -480,7 +495,7 @@ impl<'a> Ahci<'a> {
                 | ((data[i * 4 + 1] as u32) << 8)
                 | ((data[i * 4 + 2] as u32) << 16)
                 | ((data[i * 4 + 3] as u32) << 24);
-            self.arena.write32(DATA_OFF + i * 4, w);
+            self.data.write32(i * 4, w);
         }
         self.issue_io(ctx, "write", ATA_WRITE_DMA_EXT, lba, 1, true, 512)?;
         // Only on the success path: a write that failed did not reach the medium, so recording it
@@ -509,17 +524,34 @@ impl<'a> Ahci<'a> {
         Ok(())
     }
 
+    /// Write `count` consecutive sectors from `lba` (`data`, `count` x 512 bytes) in ONE WRITE DMA EXT, with
+    /// `write_block`'s bounded retry and, for its reason, no flush (`OP_WRITE_BLOCKS`). `count` is at most
+    /// `WRITE_RUN_MAX`, well inside the `data` part (`MAX_PER` sectors).
+    #[cfg_attr(feature = "volatile-cache-test", allow(dead_code))]
+    fn write_blocks(&self, ctx: &ServiceContext, lba: u64, data: &[u8], count: usize) -> Result<(), &'static str> {
+        for i in 0..count * 128 {
+            let w = u32::from_le_bytes([data[i * 4], data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]]);
+            self.data.write32(i * 4, w);
+        }
+        self.issue_io(ctx, "write", ATA_WRITE_DMA_EXT, lba, count as u16, true, (count * 512) as u32)?;
+        for s in 0..count {
+            let mut sec = [0u8; 512];
+            sec.copy_from_slice(&data[s * 512..(s + 1) * 512]);
+            self.write_tap(ctx, lba + s as u64, &sec);
+        }
+        Ok(())
+    }
+
     /// Write `count` zeroed sectors from `lba`, batched into multi-sector WRITE DMA EXT
-    /// commands (up to MAX_PER sectors each - bounded by the DMA arena's data area). One
+    /// commands (up to MAX_PER sectors each - bounded by the arena's `data` part, `DATA_LEN`). One
     /// IPC call zeros a whole run, so `fs` can clear a big bitmap without per-block traffic.
     fn write_zeros(&self, ctx: &ServiceContext, lba: u64, count: u64) -> Result<(), &'static str> {
         if count == 0 {
             return Ok(());
         }
-        const MAX_PER: u64 = 64; // 32 KiB - fits the arena's data area (DATA_OFF..64 KiB)
         // Zero the data buffer once; it stays zero across the batched commands.
         for i in 0..(MAX_PER as usize * 512 / 4) {
-            self.arena.write32(DATA_OFF + i * 4, 0);
+            self.data.write32(i * 4, 0);
         }
         let mut lba = lba;
         let mut left = count;
@@ -628,7 +660,8 @@ impl<'a> Ahci<'a> {
     }
 
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
-        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, OP_WRITE_ZEROS,
+                    STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
         let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
         if p.is_empty() {
             err(ctx);
@@ -720,6 +753,38 @@ impl<'a> Ahci<'a> {
                 };
                 reply.send(ctx, &[status]);
             }
+            OP_WRITE_BLOCKS => {
+                // [op, lba:u64, count:u8, count x 512] - a run of consecutive blocks, one command.
+                let count = p.get(9).copied().unwrap_or(0) as usize;
+                if count == 0 || count > WRITE_RUN_MAX || p.len() < 10 + count * 512 {
+                    err(ctx);
+                    return;
+                }
+                let data = &p[10..10 + count * 512];
+                // The cache model takes blocks one at a time, as `OP_WRITE_BLOCK` gives them to it.
+                #[cfg(feature = "volatile-cache-test")]
+                {
+                    let mut ok = true;
+                    for s in 0..count {
+                        let at = lba + s as u64;
+                        let mut sec = [0u8; 512];
+                        sec.copy_from_slice(&data[s * 512..(s + 1) * 512]);
+                        if !self.cache_write(ctx, at, &sec) && self.write_block(ctx, at, &sec).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
+                }
+                #[cfg(not(feature = "volatile-cache-test"))]
+                {
+                    let status = match self.write_blocks(ctx, lba, data, count) {
+                        Ok(()) => STATUS_OK,
+                        Err(_) => STATUS_ERR,
+                    };
+                    reply.send(ctx, &[status]);
+                }
+            }
             OP_WRITE_ZEROS => {
                 // [op, lba:u64, count:u64] - zero `count` blocks from `lba`.
                 if p.len() < 17 {
@@ -754,7 +819,7 @@ impl<'a> Ahci<'a> {
 /// after its bound, so a genuinely empty port still returns `false` **loudly** rather than wedging
 /// boot. It touches only `PxSCTL`/`PxSSTS`/`PxSERR` (detection state) - the command engine and CLB/FB
 /// are left to `init_port`, which runs a full `port_comreset` on the chosen port afterwards.
-fn wait_port_ready(ctx: &ServiceContext, hba: &Mmio, base: usize) -> bool {
+fn wait_port_ready(ctx: &ServiceContext, hba: &Registers, base: usize) -> bool {
     // 1. Fast path + slow-establish: a healthy, already-up link returns on the first read (zero added
     //    latency); a slow one gets `LINK_WAIT` (a clock, `gs::driver::wait`).
     if wait::until(ctx, LINK_WAIT, || hba.read32(base + PX_SSTS) & 0xF == 3).is_ok() {
@@ -813,7 +878,7 @@ fn serve_no_disk(ctx: &ServiceContext) -> ! {
 
 /// Detect the HBA + disk, init the port, IDENTIFY, read-self-test sector 0, then serve block I/O to
 /// `fs` forever. With no disk or no DMA arena it serves the no-disk answers instead (`serve_no_disk`).
-pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
+pub fn run(ctx: &ServiceContext, hba: &Registers) -> ! {
     let cap = hba.read32(HBA_CAP);
     let vs = hba.read32(HBA_VS);
     let mut ghc = hba.read32(HBA_GHC);
@@ -874,7 +939,7 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         }
     };
 
-    let arena = match ctx.dma_region() {
+    let arena = match godspeed::driver::arena(ctx) {
         Some(d) => d,
         None => {
             ctx.log("block-driver: AHCI - no DMA arena granted; serving I/O errors so fs degrades loudly (not a hang)");
@@ -882,10 +947,29 @@ pub fn run(ctx: &ServiceContext, hba: &Mmio) -> ! {
         }
     };
     arena.zero();
+    // The parts, in order (the alignments are AHCI's, of the physical address). One that does not fit
+    // is said with its name, and the driver serves the no-disk answers rather than a half-laid arena.
+    let mut parts = arena.layout();
+    let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>((
+        parts.take("command list", CMD_LIST_LEN, 1024)?,
+        parts.take("received FIS", RX_FIS_LEN, 256)?,
+        parts.take("command table", CMD_TBL_LEN, 128)?,
+        parts.take("data", DATA_LEN, 4096)?,
+    )))();
+    let (cmd_list, rx_fis, cmd_tbl, data) = match laid {
+        Ok(p) => p,
+        Err(e) => {
+            ctx.log_fmt(format_args!("block-driver: AHCI - {}; serving I/O errors so fs degrades loudly (not a hang)", e));
+            serve_no_disk(ctx);
+        }
+    };
+    ctx.log_fmt(format_args!(
+        "block-driver: AHCI arena laid out - command list at {:#x}, received FIS at {:#x}, command table at {:#x}, data at {:#x} ({} of {} bytes)",
+        cmd_list.offset(), rx_fis.offset(), cmd_tbl.offset(), data.offset(), parts.used(), parts.len()));
     // `io-error-test` build: arm a few forced read/write failures so the boot self-test +
     // mount exercise the retry/recovery path. Always 0 (no injection) in production.
     let forced = if cfg!(feature = "io-error-test") { 2 } else { 0 };
-    let ahci = Ahci { hba, arena, port, sectors: Cell::new(0), forced_fails: Cell::new(forced),
+    let ahci = Ahci { hba, cmd_list, rx_fis, cmd_tbl, data, port, sectors: Cell::new(0), forced_fails: Cell::new(forced),
                       #[cfg(feature = "volatile-cache-test")] cache: WriteCache::new(),
                       #[cfg(feature = "lying-flush-test")] lied: Cell::new(false),
                       tap_seq: Cell::new(0) };

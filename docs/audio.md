@@ -70,7 +70,8 @@ rather than be their next copy:
 - **Interrupt waiting** - wait on a timed receive, tell an interrupt from a request, serve the request
   rather than drop it. `xhci`, `ehci` and `dwc2` each write it.
 - **DMA arena layout** - named regions with alignment and a fit check against the arena. `xhci`,
-  `ehci`, `nic-driver`, `dwmac` and `genet` each write it.
+  `ehci`, `nic-driver`, `dwmac` and `genet` each wrote it by hand; since 2026-10-20 every driver takes it
+  from `gs::driver::arena` (`docs/driver-library.md` step 3).
 
 Extracting them touches those drivers and needs their hardware, so it is its own work, ahead of the
 step that first needs each (A3 for the arena, the interrupt step for the other).

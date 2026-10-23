@@ -11,7 +11,9 @@
 
 use godspeed as gs;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{Dma, Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
+use godspeed_sdk::ServiceContext;
 
 use crate::chan::{self, Target};
 
@@ -72,6 +74,21 @@ pub struct Disk {
     pub busy_csw: u32,
     /// Commands that completed, so the counts above can be read as a rate rather than a total.
     pub commands: u32,
+    /// What the disk buffer holds of WRITE GATHERING (`GATHER_SECTORS`): `gather_n` sectors from
+    /// `gather_lba`, the last appended at `gather_at`. 0 sectors = nothing held.
+    pub gather_lba: u32,
+    pub gather_n: u32,
+    pub gather_at: Option<wait::Since>,
+    /// A gathered write failed since the last FLUSH, after its runs were answered as written: the next
+    /// FLUSH answers an error, so `fs` learns it at its barrier (6.1).
+    pub gather_lost: bool,
+    /// WRITE(10)s that completed, and the time in each of their three stages in all, in us: the command,
+    /// the data and the status. Where a write's time goes decides what overlapping writes could save - the
+    /// status wait can be left in flight, the data cannot.
+    pub w_cmds: u32,
+    pub w_cbw_us: u64,
+    pub w_data_us: u64,
+    pub w_csw_us: u64,
 }
 
 /// Walk a configuration descriptor for a Bulk-Only mass-storage interface and its endpoints.
@@ -127,7 +144,7 @@ fn find_bulk_only(buf: &[u8], total: usize) -> Option<(u8, u8, u16, u8)> {
 ///
 /// Returns `None` for anything else, which is an ordinary outcome and not reported.
 pub fn bind(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, splt: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, splt: u32,
 ) -> Option<Disk> {
     let mut head = [0u8; 9];
     let get9 = [0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0];
@@ -164,19 +181,23 @@ pub fn bind(
         "dwc2-svc: MASS STORAGE bound - bulk IN {} OUT {} mps {} (ep0 mps {})",
         ep_in, ep_out, mps, t.mps));
     Some(Disk { ep_in, ep_out, mps, ep0_mps: t.mps, pid_in: chan::PID_DATA0, pid_out: chan::PID_DATA0, iface, fail_streak: 0,
-        busy_cbw: 0, busy_data: 0, busy_csw: 0, commands: 0 })
+        busy_cbw: 0, busy_data: 0, busy_csw: 0, commands: 0,
+        gather_lba: 0, gather_n: 0, gather_at: None, gather_lost: false,
+        w_cmds: 0, w_cbw_us: 0, w_data_us: 0, w_csw_us: 0 })
 }
 
-/// Where a BOT command's buffers live in the DMA arena. Past the keyboard report, which is past the
-/// control scratch - the assertions below derive that rather than asserting it in prose, after a
-/// buffer overlap cost a boot in slice 2.
-pub const CBW_OFF: usize = 0x0300;
-pub const CSW_OFF: usize = 0x0340;
-pub const DATA_OFF: usize = 0x0400;
-pub const DATA_MAX: usize = 4096;
-const _: () = assert!(CBW_OFF >= crate::hid::REPORT_OFF + 8);
-const _: () = assert!(CSW_OFF >= CBW_OFF + 31);
-const _: () = assert!(DATA_OFF >= CSW_OFF + 13);
+/// The most one BOT command moves, the size of its data part of the arena. Its wrappers have parts of
+/// their own (`parts.rs`), so none of the three can land on another buffer.
+pub const DATA_MAX: usize = GATHER_BYTES;
+/// The disk buffer's size, and the most one WRITE(10) gathers: 32 KiB, nine of `fs`'s seven-block runs.
+/// 96 KiB was tried (`fa806f3d`) and the stick took the same 10.6 s of a 10 MB download as at 32 (Pi 2,
+/// 2026-10-22): its own writing speed is the limit, not a command's turnaround. A longer write also holds
+/// the radio's receive aside for longer (it stands aside for every bulk transfer, `chan::program_ping`), so
+/// it went back, and the arena's room is the radio's ring.
+pub const GATHER_BYTES: usize = 0x8000;
+pub const GATHER_SECTORS: u32 = (GATHER_BYTES / 512) as u32;
+/// How long a held run waits for the next before it is written.
+pub const GATHER_IDLE_MS: u64 = 10;
 
 /// Why a bulk transfer did not complete.
 ///
@@ -200,7 +221,7 @@ pub(crate) enum XferErr {
 /// goes BUSY for tens of seconds under load, and a 45-second stall was observed on this branch.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bulk_xfer(
-    ctx: &ServiceContext, mmio: &Mmio, t: &Target, mps: u16,
+    ctx: &ServiceContext, mmio: &Registers, t: &Target, mps: u16,
     dir_in: bool, ep: u8, buf_phys: u32, len: u32, budget_ms: u64, pid: &mut u32,
 ) -> Result<u32, XferErr> {
     let bt = Target { addr: t.addr, mps, low_speed: false };
@@ -209,7 +230,9 @@ pub(crate) fn bulk_xfer(
     let mut xact_errs = 0u32;
     loop {
         chan::program(ctx, mmio, &bt, chan::CH_BULK, dir_in, *pid, len, buf_phys, ep as u32, 2, 0);
-        match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100) {
+        // 100 ms, and 1 ms more for each 256 bytes: a gathered 32 KiB write is waited 228 ms, an estimate
+        // of how long a stick may take to take that much, not a measurement of it.
+        match chan::wait_halt(ctx, mmio, chan::CH_BULK, 100 + len as u64 / 256) {
             Some(hcint) if hcint & crate::regs::HCINT_XFERCOMPL != 0 => {
                 // HCTSIZ counts DOWN the bytes still outstanding, so what moved is the difference.
                 // Reading it is what makes a SHORT transfer detectable at all.
@@ -248,6 +271,7 @@ pub(crate) fn bulk_xfer(
             }
             None => {
                 ctx.log_fmt(format_args!("dwc2-svc: bulk ep {} channel never halted", ep));
+                crate::chan::say_core(ctx, mmio);
                 return Err(XferErr::Failed);
             }
         }
@@ -266,7 +290,7 @@ pub(crate) fn bulk_xfer(
 ///
 /// Returns the bytes moved by the data stage, or `None`.
 pub fn bot(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
     cdb: &[u8], data_in: bool, dlen: usize,
 ) -> Option<usize> {
     const TAG: u32 = 0x1234_5678;
@@ -274,22 +298,22 @@ pub fn bot(
     let (ep_in, ep_out, mps) = (disk.ep_in, disk.ep_out, disk.mps);
     // CBW: 31 bytes, "USBC".
     for i in 0..31 {
-        dma.write8(CBW_OFF + i, 0);
+        dma.cbw.write8(i, 0);
     }
     for (i, b) in 0x4342_5355u32.to_le_bytes().iter().enumerate() {
-        dma.write8(CBW_OFF + i, *b);
+        dma.cbw.write8(i, *b);
     }
     for (i, b) in TAG.to_le_bytes().iter().enumerate() {
-        dma.write8(CBW_OFF + 4 + i, *b);
+        dma.cbw.write8(4 + i, *b);
     }
     for (i, b) in (dlen as u32).to_le_bytes().iter().enumerate() {
-        dma.write8(CBW_OFF + 8 + i, *b);
+        dma.cbw.write8(8 + i, *b);
     }
-    dma.write8(CBW_OFF + 12, if data_in { 0x80 } else { 0x00 });
-    dma.write8(CBW_OFF + 13, 0); // LUN
-    dma.write8(CBW_OFF + 14, cdb.len().min(16) as u8);
+    dma.cbw.write8(12, if data_in { 0x80 } else { 0x00 });
+    dma.cbw.write8(13, 0); // LUN
+    dma.cbw.write8(14, cdb.len().min(16) as u8);
     for (i, b) in cdb.iter().take(16).enumerate() {
-        dma.write8(CBW_OFF + 15 + i, *b);
+        dma.cbw.write8(15 + i, *b);
     }
 
     // NAME THE STAGE THAT FAILED. `?` here discarded which of the three transfers died, and "READ
@@ -297,22 +321,24 @@ pub fn bot(
     // port a boot every time it has appeared. CBW-out failing means the device is not accepting
     // commands at all; a data-stage failure means it accepted the command and would not answer; a
     // CSW failure means it did the work and would not report. Three different faults.
-    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.phys_at(CBW_OFF) as u32, 31, 2_000, &mut disk.pid_out) {
+    let t0 = wait::Since::now(ctx);
+    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, false, ep_out, dma.cbw.phys() as u32, 31, 2_000, &mut disk.pid_out) {
         return stage_failed(ctx, mmio, dma, t, disk, e, "CBW-out", cdb[0]);
     }
+    let t_cbw = t0.elapsed_us(ctx);
 
     let mut moved = 0usize;
     if dlen > 0 {
         let want = dlen.min(DATA_MAX);
         if data_in {
             for i in 0..want {
-                dma.write8(DATA_OFF + i, 0);
+                dma.disk.write8(i, 0);
             }
         }
         moved = match bulk_xfer(
             ctx, mmio, t, mps, data_in,
             if data_in { ep_in } else { ep_out },
-            dma.phys_at(DATA_OFF) as u32, want as u32, 5_000,
+            dma.disk.phys() as u32, want as u32, 5_000,
             if data_in { &mut disk.pid_in } else { &mut disk.pid_out })
         {
             Ok(n) => n as usize,
@@ -320,17 +346,25 @@ pub fn bot(
         };
     }
 
+    let t_data = t0.elapsed_us(ctx);
     // CSW: 13 bytes, "USBS".
     for i in 0..13 {
-        dma.write8(CSW_OFF + i, 0);
+        dma.csw.write8(i, 0);
     }
-    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.phys_at(CSW_OFF) as u32, 13, 2_000, &mut disk.pid_in) {
+    if let Err(e) = bulk_xfer(ctx, mmio, t, mps, true, ep_in, dma.csw.phys() as u32, 13, 2_000, &mut disk.pid_in) {
         return stage_failed(ctx, mmio, dma, t, disk, e, "CSW-in", cdb[0]);
+    }
+    if cdb[0] == 0x2A {
+        let t_all = t0.elapsed_us(ctx);
+        disk.w_cmds = disk.w_cmds.saturating_add(1);
+        disk.w_cbw_us = disk.w_cbw_us.saturating_add(t_cbw);
+        disk.w_data_us = disk.w_data_us.saturating_add(t_data.saturating_sub(t_cbw));
+        disk.w_csw_us = disk.w_csw_us.saturating_add(t_all.saturating_sub(t_data));
     }
 
     let mut csw = [0u8; 13];
     for i in 0..13 {
-        csw[i] = dma.read8(CSW_OFF + i);
+        csw[i] = dma.csw.read8(i);
     }
     let sig = u32::from_le_bytes([csw[0], csw[1], csw[2], csw[3]]);
     let tag = u32::from_le_bytes([csw[4], csw[5], csw[6], csw[7]]);
@@ -385,7 +419,7 @@ pub fn bot(
 /// split is the entire difference between a driver that survives this stick and one that resets it
 /// 564 times in a selfcheck.
 fn stage_failed(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
     e: XferErr, what: &str, cdb0: u8,
 ) -> Option<usize> {
     match e {
@@ -415,7 +449,7 @@ fn stage_failed(
 /// machine; clear-halt only unsticks the pipes. Without it a device that lost framing stays lost -
 /// both halts clear, it is still waiting for the rest of a transfer we abandoned, and every following
 /// command fails.
-pub fn recover(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk) {
+pub fn recover(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk) {
     // FRAME THESE WITH EP0'S PACKET SIZE, not the bulk endpoint's.
     //
     // A control transfer framed with 512 instead of EP0's 64 is malformed, so the clear-halt fails
@@ -452,13 +486,13 @@ pub fn recover(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &
 
 /// READ CAPACITY(10): the device's last LBA and block size.
 pub fn read_capacity(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
 ) -> Option<(u64, u32)> {
     let cdb = [0x25u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     bot(ctx, mmio, dma, t, disk, &cdb, true, 8)?;
     let mut b = [0u8; 8];
     for i in 0..8 {
-        b[i] = dma.read8(DATA_OFF + i);
+        b[i] = dma.disk.read8(i);
     }
     // Both fields are BIG endian - SCSI, not USB. Reading them little-endian gives a plausible but
     // wildly wrong capacity, which is the sort of error that surfaces as corruption much later.
@@ -469,7 +503,7 @@ pub fn read_capacity(
 
 /// READ(10): one block into the arena's data buffer.
 pub fn read_block(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, block: u32,
 ) -> bool {
     let cdb = [
         0x28u8, 0,
@@ -489,22 +523,77 @@ pub const OP_WRITE_BLOCK: u8 = 2;
 pub const OP_CAPACITY: u8 = 3;
 pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
+/// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]` (`block-driver`'s
+/// `OP_WRITE_BLOCKS`). GATHERED with the runs it follows on from and written with them as ONE WRITE(10)
+/// (`GATHER_SECTORS`, `write_held`), as `xhci` does on the Pi 4.
+pub const OP_WRITE_BLOCKS: u8 = 6;
+/// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
+pub const WRITE_RUN_MAX: usize = 7;
+// A run must fit the gather buffer, with room for the next before it is written.
+const _: () = assert!(WRITE_RUN_MAX * 512 <= GATHER_BYTES);
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device - the same value and meaning as
 /// `xhci`'s (`backlog/57`): a refusal by a device and the absence of one are different facts.
 pub const STATUS_NO_DISK: u8 = 2;
 
-/// WRITE(10): one block from the arena's data buffer.
-pub fn write_block(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk, lba: u32, block: u32,
+/// WRITE(10): `count` consecutive blocks from the start of the arena's data buffer, as one command.
+///
+/// **One command per run, not per block.** A 512-byte block per WRITE(10) cost the stick a command's
+/// whole turnaround for every block: on the Pi 2 a 10 MB download spent 43-50 s of its 60-71 s writing
+/// (2026-10-22), as the Pi 4 did before its runs went as one command (`b2f91e9a`, 40 s to 9.8 s).
+pub fn write_blocks(
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, count: u16,
 ) -> bool {
     let cdb = [
         0x2Au8, 0,
         (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
-        0, 0, 1, 0,
+        0, (count >> 8) as u8, count as u8, 0,
     ];
-    bot(ctx, mmio, dma, t, disk, &cdb, false, block as usize).is_some()
+    bot(ctx, mmio, dma, t, disk, &cdb, false, count as usize * 512).is_some()
+}
+
+/// WRITE GATHERING. A stick answers each Bulk-Only command after its own turnaround, so a file written a
+/// seven-block run at a time paid it per run: on the Pi 2 a 10 MB download spent 16-19 s of its 28-35 s on
+/// the stick with each run one command (2026-10-22). Consecutive runs are kept in the disk buffer and
+/// written as ONE command when it is full, when a run that does not follow on arrives, before any other
+/// request (a read, a single write, a flush), and after `GATHER_IDLE_MS` with nothing new - the rules
+/// xhci's gather keeps on the Pi 4, without its overlap: this driver waits for each transfer.
+///
+/// **What a run's reply means, said plainly.** "Held, to be written", not "on the stick": the promise a
+/// device's own write cache already makes. Only file data comes as runs (`fs`'s direct path); the journal
+/// and metadata are single writes and pass straight through, after what is held. A gathered write that
+/// fails is said, and the next FLUSH answers an error (`gather_lost`). What is held when the stick is
+/// pulled is lost and said (`note_drop`).
+pub fn write_held(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk) {
+    let (lba, n) = (disk.gather_lba, disk.gather_n);
+    if n == 0 {
+        return;
+    }
+    disk.gather_n = 0;
+    disk.gather_at = None;
+    if !with_busy_retry(ctx, 30_000, || write_blocks(ctx, mmio, dma, t, disk, lba, n as u16)) {
+        disk.gather_lost = true;
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: a gathered WRITE(10) of {} sectors at lba {} FAILED - they were answered as written and are not on the stick; the next FLUSH fails",
+            n, lba));
+    }
+}
+
+/// Write what is held if nothing has joined it for `GATHER_IDLE_MS`. The main loop's, each pass.
+pub fn write_held_if_idle(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk) {
+    if disk.gather_n > 0 && disk.gather_at.map_or(true, |at| at.passed(ctx, Budget::ms(GATHER_IDLE_MS))) {
+        write_held(ctx, mmio, dma, t, disk);
+    }
+}
+
+/// Say what is lost when a disk is dropped holding gathered sectors. For every place that drops one.
+pub fn note_drop(ctx: &ServiceContext, disk: &Disk) {
+    if disk.gather_n > 0 {
+        ctx.log_fmt(format_args!(
+            "dwc2-svc: the disk was dropped holding {} gathered sectors at lba {} - they were answered as written and are LOST",
+            disk.gather_n, disk.gather_lba));
+    }
 }
 
 /// Retry a BOT command that handed back BUSY, bounded by the CLOCK.
@@ -542,7 +631,7 @@ fn with_busy_retry(
 /// The reply cap is the ONLY authority to answer (§8.5). A reply that cannot be delivered is said
 /// once (`capless_logged` doubles as that latch) rather than dropped silently.
 pub fn serve(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, disk: &mut Disk,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk,
     msg: &godspeed_sdk::Message, sectors: u64, reply: gs::cap::Cap,
     capless_logged: &mut bool,
 ) -> bool {
@@ -552,6 +641,11 @@ pub fn serve(
     }
 
     let mut out = [0u8; 520];
+    // Anything but a run, or a capacity (no I/O), writes what is held first: a read then sees it, and a
+    // single write or a flush is ordered after it - `fs`'s barriers order everything before them.
+    if p[0] != OP_WRITE_BLOCKS && p[0] != OP_CAPACITY {
+        write_held(ctx, mmio, dma, t, disk);
+    }
     let n = match p[0] {
         OP_CAPACITY => {
             out[0] = STATUS_OK;
@@ -566,7 +660,7 @@ pub fn serve(
             if with_busy_retry(ctx, 30_000, || read_block(ctx, mmio, dma, t, disk, lba, 512)) {
                 out[0] = STATUS_OK;
                 for i in 0..512 {
-                    out[1 + i] = dma.read8(DATA_OFF + i);
+                    out[1 + i] = dma.disk.read8(i);
                 }
                 513
             } else {
@@ -580,14 +674,44 @@ pub fn serve(
         }
         OP_WRITE_BLOCK if p.len() >= 521 => {
             for i in 0..512 {
-                dma.write8(DATA_OFF + i, p[9 + i]);
+                dma.disk.write8(i, p[9 + i]);
             }
             let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
-            out[0] = if with_busy_retry(ctx, 30_000, || write_block(ctx, mmio, dma, t, disk, lba, 512)) {
+            out[0] = if with_busy_retry(ctx, 30_000, || write_blocks(ctx, mmio, dma, t, disk, lba, 1)) {
                 STATUS_OK
             } else {
                 STATUS_ERR
             };
+            1
+        }
+        OP_WRITE_BLOCKS if p.len() >= 10 => {
+            let count = p[9] as usize;
+            let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
+            let ok = (1..=WRITE_RUN_MAX).contains(&count) && p.len() >= 10 + count * 512
+                && (lba as u64).saturating_add(count as u64) <= sectors;
+            if ok {
+                // A run that does not follow on, or does not fit, writes what is held first.
+                if disk.gather_n > 0
+                    && (lba != disk.gather_lba.wrapping_add(disk.gather_n)
+                        || disk.gather_n + count as u32 > GATHER_SECTORS)
+                {
+                    write_held(ctx, mmio, dma, t, disk);
+                }
+                if disk.gather_n == 0 {
+                    disk.gather_lba = lba;
+                }
+                let at = disk.gather_n as usize * 512;
+                for i in 0..count * 512 {
+                    dma.disk.write8(at + i, p[10 + i]);
+                }
+                disk.gather_n += count as u32;
+                disk.gather_at = Some(wait::Since::now(ctx));
+                // Full enough that the next run would not fit: written now rather than on the next request.
+                if disk.gather_n + WRITE_RUN_MAX as u32 > GATHER_SECTORS {
+                    write_held(ctx, mmio, dma, t, disk);
+                }
+            }
+            out[0] = if ok { STATUS_OK } else { STATUS_ERR };
             1
         }
         OP_FLUSH => {
@@ -602,7 +726,16 @@ pub fn serve(
             // whichever way the device goes - a refusal is a fact about the device rather than an
             // error, and `fs` decides what a refusal means. Nothing here changes; the belief does.
             let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            out[0] = if bot(ctx, mmio, dma, t, disk, &cdb, false, 0).is_some() { STATUS_OK } else { STATUS_ERR };
+            // A held write that failed since the last barrier fails this one: `fs` was told the run was
+            // written, and the barrier is where it must learn otherwise (6.1).
+            out[0] = if core::mem::replace(&mut disk.gather_lost, false) {
+                ctx.log("dwc2-svc: FLUSH answered with an error - a gathered write failed since the last one");
+                STATUS_ERR
+            } else if bot(ctx, mmio, dma, t, disk, &cdb, false, 0).is_some() {
+                STATUS_OK
+            } else {
+                STATUS_ERR
+            };
             1
         }
         _ => {

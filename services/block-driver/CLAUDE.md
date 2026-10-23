@@ -23,8 +23,10 @@ reacquires it by name and retries (§14.3).
 The driver talks to a SATA disk through an AHCI HBA: the kernel maps the HBA's ABAR
 (MMIO) and grants a physically-contiguous DMA arena at spawn - the same path the USB
 drivers use. It brings up port 0, IDENTIFYs the disk, runs a boot read self-test, then
-serves block read/write to `fs` over IPC. It uses the SDK's safe `Mmio`/`Dma` wrappers,
-so the driver itself is `unsafe`-free (§18.1).
+serves block read/write to `fs` over IPC. It takes both grants through the standard library,
+`gs::driver::registers` and `gs::driver::arena`, and lays the arena out in named parts (the command
+list, the received FIS, the command table and the data), so the driver itself is `unsafe`-free (§18.1)
+and an offset past a part ends it naming the part (`docs/driver-library.md` step 3).
 
 Command shape: a command list (32 headers) + received-FIS area + a command table per
 slot (H2D Register FIS type 0x27 + PRDT). ATA commands: IDENTIFY `0xEC`, READ DMA EXT
@@ -65,6 +67,7 @@ OP_WRITE_BLOCK  = 2  [lba:u64 LE, 512 data bytes]    -> [status]
 OP_CAPACITY     = 3  []                              -> [STATUS_OK, sectors:u64 LE]
 OP_WRITE_ZEROS  = 4  [lba:u64 LE, count:u64 LE]      -> [status]
 OP_FLUSH        = 5  []                              -> [status]
+OP_WRITE_BLOCKS = 6  [lba:u64 LE, count:u8, count x 512 data] -> [status]   (count 1..=7)
 STATUS_OK = 0, STATUS_ERR = 1, STATUS_UNREACHABLE = 2 (USB backend, OP_FLUSH only)
 ```
 
@@ -78,7 +81,9 @@ The **tag** is a correlation byte `fs` puts at byte 0 of every request and block
 believed. The op constants live in `main.rs`, and `services/fs` must match them.
 
 The LBA is **u64** (persistence §6.3) so GSFS's u64 capacity fields reach the device at
-full width. One request moves one 512-byte block (= one sector). `fs` owns file layout;
+full width. A read moves one 512-byte block (= one sector); a write moves one, or a run of up to seven
+consecutive ones (`OP_WRITE_BLOCKS`, 2026-10-20: a file's chunk is seven blocks, which was seven requests),
+which AHCI issues as one multi-sector command; through `xhci` it is gathered into WRITE(10)s of up to 56 KiB, and through `dwc2` it is one WRITE(10). `fs` owns file layout;
 `block-driver` only moves sectors - policy above, mechanism below.
 
 ## Failure semantics (§6.2)

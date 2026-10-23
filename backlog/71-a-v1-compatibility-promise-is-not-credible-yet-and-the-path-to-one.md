@@ -65,12 +65,36 @@ That moves the driver gap into step 2: before the freeze, `gs::driver` gains the
 reach the SDK for, found repeated in real drivers as `docs/driver-library.md` requires. Two were found in
 the 2026-10-11 survey:
 
-- **An arena layout.** 107 `phys_at` calls across 17 files carve DMA arenas by hand-kept offset constants
-  (`block-driver`'s `CMD_LIST_OFF`..`DATA_OFF`, `audio-driver`'s `CORB_OFF`, `dwmac`'s `TX_RING_OFF`), with
+- **An arena layout.** 107 `phys_at` calls across 17 files carved DMA arenas by hand-kept offset constants
+  (every compiled driver's, until 2026-10-19 and 2026-10-20), with
   nothing checking that the pieces do not overlap or fit the granted arena. A layout of named, aligned,
-  bounds-checked regions, fixed at start, fails loudly at spawn instead.
+  bounds-checked regions, fixed at start, fails loudly at spawn instead. **Built 2026-10-19** as
+  `gs::driver::arena` (`Layout::take`, `Part`), with `gs::driver::registers`; AHCI, GENET, `nic-driver` and `audio-driver` converted first
+  (`docs/driver-library.md` step 3).
 - **Taking the grants.** Nine drivers each handle "no window or arena granted" in their own words. The
   shared part is taking both and saying plainly what is missing; what to do then stays the driver's.
+  **Built 2026-10-19:** every compiled driver takes them through `gs::driver::registers` and `arena`, and
+  the one-way ratchet counts the SDK's four grant calls, so a new driver starts at zero
+  (`docs/driver-library.md` step 3). Since 2026-10-20 every compiled driver's arena is laid out by name too:
+  `pwm-audio`, `dwmac`, `ehci`, `dwc2` and `xhci` followed the first four.
+  **Two defects in that work, found by Audit 18 (`audits/documentation-audit.md`), fixed 2026-10-21 (built for
+  the three ports, neither path reachable in QEMU, so each owes its board's card):**
+  `nic-driver`'s `dwmac_main`, when the layout refuses a granted arena, logs the reason and then a second,
+  wrong line, "no dwmac register window or DMA arena granted", though neither was missing; and
+  `pwm-audio`'s `bring_up` zeroes and reach-checks an arena that is too small before the layout refuses
+  it, where the size check it replaced came first. Neither changes what reaches the device. Now `dwmac_main`
+  says which was missing, and `bring_up` lays the arena out, then checks the reach, then zeroes the two parts. **Hardware:**
+  the Wyse card passed on 2026-10-20 (`269c86f3`: the AHCI, xhci, audio and RTL8168 layout lines, the
+  keyboard, the disk, audio ready); the T630, the Pi 2, the Pi 4 and the VisionFive were owed theirs. (Note
+  2026-10-23: all five have since run this code, in the step 4 cards of 2026-10-22 and a 1000-round chaos
+  run each on 2026-10-23, every driver up and its device working; the two refusal paths themselves are
+  reachable on none of them.)
+- **The rest of what a driver asked the SDK for (2026-10-22, step 5).** By the operator's decision on closing
+  the branch, as thin wrappers rather than mechanisms found repeated: `gs::driver::input` (`push`, `ready`),
+  `power::set` and `device` (`board_mac`, `nic_vendor_device`, `emmc_base_clock_hz`, `pci_cfg_read`), and
+  `gs::program::mode`. Counted by the one-way ratchet, every crate at zero. What a driver still takes from
+  the SDK is `godspeed_sdk::hid` (a device class, so a domain library) and the `ServiceContext` and
+  `Message` imports every service shares (`docs/driver-library.md` step 5).
 
 **The principle that decides what goes in `gs` (settled 2026-10-11).** The SDK answers *what can this
 kernel do, and how is it reached safely*: the syscall ABI and the audited `unsafe` (CLAUDE.md 18.1),

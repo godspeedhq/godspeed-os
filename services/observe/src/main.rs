@@ -57,7 +57,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // whole busy ratio), so a service sharing a core with a busy-poller (xhci/ehci) is not tarred 100%.
     let mut prev_task_ticks  = [0u64; MAX_SLOTS as usize];
 
-    if ctx.probe_mode() == MODE_NOW {
+    if gs::program::mode(&ctx) == MODE_NOW {
         // `observe now`: print exactly one frame, then park. The first frame has
         // no previous baseline, so CPU% is the cumulative share since boot - the
         // correct meaning for a point-in-time snapshot. There is no graceful
@@ -68,7 +68,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         gs::ipc::park(&ctx);
     }
 
-    if ctx.probe_mode() == MODE_LIVE_FG {
+    if gs::program::mode(&ctx) == MODE_LIVE_FG {
         // `observe` (live): the shell-brokered foreground view. We own the screen:
         // hide the cursor, suppress keystroke echo and repaint in place about once a
         // second. The SHELL owns `q`: it kills this task and restores the console
@@ -234,7 +234,7 @@ fn print_state(
     // `observe: ` so they stay identifiable amid other services' output. The interactive views -
     // `observe now` (snapshot) and the full-screen live view - own the display and drop the tag,
     // which otherwise just reads busy. (font8x8 is ASCII-only, so bars use '-'/'=' not box-drawing.)
-    let p = if ctx.probe_mode() == MODE_LIVE { "observe: " } else { "" };
+    let p = if gs::program::mode(&ctx) == MODE_LIVE { "observe: " } else { "" };
 
     // --- Title bar (live only) - the quit hint up top where the eye starts ---
     if live {
@@ -253,7 +253,7 @@ fn print_state(
     // its baselines across frames, so there it genuinely is the last interval. Printing one fixed
     // label for both made the snapshot claim a window it does not measure (§26.7 - the reader must
     // never have to guess), which is what makes a long-idle service read as ~99% on the way out.
-    let window = if ctx.probe_mode() == MODE_NOW { "since boot" } else { "since last snapshot" };
+    let window = if gs::program::mode(&ctx) == MODE_NOW { "since boot" } else { "since last snapshot" };
     ctx.console_line_fmt(live, format_args!("{}CPU% core share {} | UPTIME since the service last (re)started", p, window));
 
     // --- System summary ---

@@ -253,7 +253,9 @@ stops it when the dongle leaves (`docs/wifi-usb.md`).
 ```
 
 Holds `CPU_CLOCK` alone. Leases of up to 30 s keep the Arm clock at its maximum while any is open; a
-lease nobody returns expires on its own, so a holder that dies cannot pin the machine fast. It also gives a
+lease nobody returns expires on its own, so a holder that dies cannot pin the machine fast. Without a lease
+a governor sets the clock by load, as Raspberry Pi OS's `ondemand` does: every 100 ms, a core over 50% busy
+holds it at its maximum for 5 s. It reads each core's counters with `INTROSPECT`, and nothing more. It also gives a
 shutdown's or a reboot's warnings and its tidy-up three seconds before the deadline, reading the deadline the kernel holds; it cannot shut the
 machine down itself - only the shell can.
 

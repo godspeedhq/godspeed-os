@@ -47,6 +47,8 @@ godspeed trust remove <publisher> <key>            stop trusting it: what it sig
 godspeed install <publisher/name>[,...] [yes]      start fetched packages, now and at every boot; asks [y/N] for each
 godspeed install <publisher/name> grant <p>,...    the same with the peers named, and no question
 godspeed install <file>.gsp [yes] [accept-old]     a package file, with no network (4d)
+godspeed plan <publisher/name>[@version]           what installing it takes: what it requires, in the order to install (4f)
+godspeed resolve <publisher/name> <range>          the newest release on the registry in a range, such as ^1.2.0 (4f)
 godspeed upgrade <publisher/name>[,...] | all [yes] fetch the newest release of what is installed and install it; asks
 godspeed uninstall <publisher/name>[,...] [yes]    stop them, and no longer start them at boot; asks [y/N] for each
 godspeed uninstall <publisher/name>[,...] purge [yes]  and delete every fetched version too; asks [y/N], naming both
@@ -332,9 +334,45 @@ deletes (`yes` answers it; piped, it only lists). It cleans only the package man
 `/system/packages/`, and its scratch folder: never the installed version of anything, never a package file
 (`.gsp`) wherever it is, since those are the operator's, and never the registries' trust or the settings.
 
+## 4f. Dependencies: a package that needs another
+
+A package may REQUIRE others - a service it talks to, a driver it needs running - in its signed manifest
+(`docs/developer-services-design.md` 16). A requirement grants nothing: the peers are still asked about, one
+question for all of them. A built-in service (`fs`, `net-stack`) is never required; it comes with the OS.
+
+`godspeed install` of such a package works out what it needs first. A requirement already installed in range is
+kept; one fetched in range is planned; one neither is fetched - the newest release in range, found by `godspeed
+resolve` - and then planned too. Then it asks once:
+
+```
+gsh> godspeed install godspeed/dep-user
+godspeed/dep-user 0.1.0 needs 1 more package:
+  godspeed/dep-store           0.1.0     a service  asks for: nothing   (needed by godspeed/dep-user)
+  godspeed/dep-user            0.1.0     a service  asks for: godspeed/dep-store
+Install all 2 and grant them? (no privilege) [y/N]:
+```
+
+On yes they install in that order, the dependency first; one that does not start stops the rest, and what was
+installed before it stays installed. `yes` on the command line answers it, as for one package.
+
+**Refused, with nothing installed:** a requirement no release satisfies, or that no registry has; one installed
+outside its range (`godspeed upgrade` it first); two that no one version of a package satisfies; packages that
+require each other; a chain of more than 4 packages, the one asked for included, or more than 8 besides it; a requirement that is a
+utility or an app, which runs to end rather than to be needed.
+
+**Kept whole afterwards.** `uninstall` refuses a package another installed one requires, naming it. An install
+or upgrade that would take a package outside an installed dependent's range is refused, naming both. At every
+boot the supervisor starts installed packages in dependency order, whatever order the list is in, and one whose
+requirement is not running is not started, with a line saying which.
+
+`godspeed plan <pkg>` shows what an install would take without doing it: one row per package, in the order to
+install them, columns `package version kind asks state` - `state` is `install, needed by <pkg>` (fetched and
+checked) or `fetch, needed by <pkg>` (not here yet; its version column is the range, and kind and asks are `-`),
+and the package asked for is last, `install`.
+
 ## 5. Pipes
 
-`godspeed search`, `info`, `list available | fetched | installed | updates`, `verify`, `trust`, `registry`, `config` and `check` are reports, so they pipe as records
+`godspeed search`, `info`, `list available | fetched | installed | updates`, `plan`, `resolve`, `verify`, `trust`, `registry`, `config` and `check` are reports, so they pipe as records
 (`item`, `value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```

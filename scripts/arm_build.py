@@ -72,11 +72,19 @@ def run(cmd):
         sys.exit(r.returncode)
 
 
-# `orr rX, rX, #0xC0000000` - the VideoCore bus alias `services/dwc2` applies to every DMA address on
-# real silicon, and must NOT be present in a `--qemu` build (QEMU addresses RAM directly). The encoded
-# word is 0x_3822103 with the condition nibble varying, so match the low three bytes as stored
-# little-endian: 03 21 82 <cond|8>.
-_ALIAS_SIG = bytes([0x03, 0x21, 0x82])
+# `orr Rd, Rn, #0xC0000000` - the VideoCore bus alias `services/dwc2` applies to every DMA address on
+# real silicon, and must NOT be present in a `--qemu` build (QEMU addresses RAM directly). Matched by the
+# instruction's FIELDS - ORR immediate, S clear, the rotated immediate 0x103 - with any condition and any
+# registers. It matched three fixed bytes, `orr r2, r2, ...`, until 2026-10-19, when moving dwc2's grants
+# onto `gs::driver` left the compiler choosing `orr r3, r0, ...`: the alias was there and the check said
+# it was not.
+def _has_alias(elf):
+    import struct
+    for i in range(0, len(elf) - 3, 4):
+        w, = struct.unpack_from("<I", elf, i)
+        if w & 0x0FF00FFF == 0x03800103:
+            return True
+    return False
 
 
 def trim_elf(b):
@@ -137,7 +145,7 @@ def verify_image(img_path, dwc2_elf_path, want_qemu):
             "BUILD VERIFY FAILED: the image does not embed the dwc2 ELF this build just produced "
             "(%s) - the embedded service ELF is stale." % dwc2_elf_path
         )
-    found = _ALIAS_SIG in elf
+    found = _has_alias(elf)
     if want_qemu and found:
         raise SystemExit(
             "BUILD VERIFY FAILED: --qemu was requested but the image embeds the HARDWARE DWC2 "

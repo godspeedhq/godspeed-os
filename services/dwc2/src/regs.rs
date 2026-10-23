@@ -73,6 +73,12 @@ pub(crate) const GRSTCTL_AHBIDLE: u32 = 1 << 31; // AHB master idle
 pub(crate) const GOTGCTL_HSTSETHNPEN: u32 = 1 << 10;
 pub(crate) const GAHBCFG_GLBLINTRMSK: u32 = 1 << 0; // global interrupt enable
 pub(crate) const GAHBCFG_DMAEN:       u32 = 1 << 5; // DMA mode enable
+/// Bits 4:1, the burst length the core's DMA uses on the AHB.
+pub(crate) const GAHBCFG_HBSTLEN_MASK: u32 = 0xF << 1;
+/// What Linux's dwc2 writes on this silicon: `ahbcfg = 0x10` for "brcm,bcm2835-usb" (params.c, v4.4
+/// to v6.6), the field at 8, applied over the reset value with only the control bits kept. The reset
+/// value is 0, single transfers, which is what this driver ran with until 2026-10-22.
+pub(crate) const GAHBCFG_HBSTLEN_BCM: u32 = 0x10;
 /// GINTMSK bit 25 - Host Channel interrupt. The ONLY core interrupt this driver enables: which
 /// channels may raise it is gated by HAINTMSK, and that is set for the net RX channel alone.
 pub(crate) const GINTMSK_HCHINT:      u32 = 1 << 25;

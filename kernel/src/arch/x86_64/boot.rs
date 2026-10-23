@@ -1609,6 +1609,10 @@ unsafe extern "C" fn ipi_wake_stub() {
         "push rax", "push rcx", "push rdx",
         "push rdi", "push rsi", "push r8",
         "push r9",  "push r10", "push r11",
+        // Count the wake for `wake-trace` (empty unless built with it). Only this stub knows the
+        // vector was the wake and not the timer, and `timer_tick_from_irq` ignores its arguments, so
+        // the registers this call clobbers do not matter.
+        "call {wake_taken}",
         "call timer_tick_from_irq",
         "pop r11", "pop r10", "pop r9",
         "pop r8",  "pop rsi", "pop rdi",
@@ -1620,6 +1624,7 @@ unsafe extern "C" fn ipi_wake_stub() {
         "swapgs",
         "2:",
         "iretq",
+        wake_taken = sym crate::task::scheduler::wake_ipi_taken,
     )
 }
 

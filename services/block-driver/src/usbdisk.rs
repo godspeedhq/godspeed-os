@@ -70,12 +70,17 @@ fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 {
     if super::xhciblk::write(ctx, lba, buf) { 0 } else { -1 }
 }
 
+fn dev_write_run(ctx: &ServiceContext, lba: u64, data: &[u8]) -> i64 {
+    if super::xhciblk::write_run(ctx, lba, data) { 0 } else { -1 }
+}
+
 fn dev_flush(ctx: &ServiceContext) -> super::xhciblk::Flush { super::xhciblk::flush(ctx) }
 
 /// Serve one block-IPC request. Same wire protocol as the AHCI backend - `fs` is unaware of which one
 /// it is talking to.
 fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
-    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
+    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, OP_WRITE_ZEROS,
+                STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
     let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
     if p.is_empty() { return err(ctx); }
     if p[0] == OP_FLUSH {
@@ -138,6 +143,17 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
             buf.copy_from_slice(&p[9..521]);
             let status = if request(ctx, "write", lba, || dev_write(ctx, lba, &buf)) { STATUS_OK } else { STATUS_ERR };
             reply.send(ctx, &[status]);
+        }
+        OP_WRITE_BLOCKS => {
+            // A run, passed to the USB host as one request: `xhci` gathers it with the runs it follows on
+            // from and answers once it is held, writing them as one WRITE(10); `dwc2` writes it block by
+            // block. Split here, the host paid a whole Bulk-Only command per
+            // block - on the Pi 4, 40 s of a 10 MB download's 78 went to the stick (2026-10-21).
+            let count = p.get(9).copied().unwrap_or(0) as usize;
+            if count == 0 || count > WRITE_RUN_MAX || p.len() < 10 + count * 512 { return err(ctx); }
+            let data = &p[10..10 + count * 512];
+            let ok = request(ctx, "write-run", lba, || dev_write_run(ctx, lba, data));
+            reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
         }
         OP_WRITE_ZEROS => {
             if p.len() < 17 { return err(ctx); }

@@ -48,6 +48,12 @@ pub const RCV_SMALL: usize = 8192;
 /// whatever the link can do. 256 KiB over the same path is 10 MiB/s, which is past what this stack can take
 /// in through 4 KiB messages today, so the window stops being the limit.
 pub const RCV_BIG: usize = 256 * 1024;
+/// The most a connection over a RADIO offers ([`Conn::small_window`]): 32 KiB, half of the 64 KiB region
+/// each radio driver reads the chip into, so a burst the window allows always fits one read. Under 64 KiB,
+/// so the window field holds it unscaled and the SYN asks no scale. It was [`RCV_SMALL`], 8 KiB, which over
+/// a WiFi round trip is about 200 KiB/s: a 10 MB download over the Pi 4's radio came down at 208 KiB/s,
+/// 25 s of its 46 waiting for data (backlog/93, 2026-10-21).
+pub const RCV_RADIO: usize = 32 * 1024;
 /// Out-of-order RANGES tracked while waiting for a gap to fill. A segment that arrives ahead of a gap is put
 /// straight into its place in the receive arena - the window is the arena's free space, so anything in the
 /// window has a place - and only its sequence range is kept here; neighbouring ranges merge. A segment that
@@ -259,6 +265,8 @@ pub struct Conn {
     /// Out-of-order ranges already in the arena, `[start, end)` in sequence numbers, beyond `rcv_nxt`.
     ooo: [(u32, u32); MAX_OOO],
     ooo_n: usize,
+    /// When a gap opened in what has arrived (`ooo_n` going from none), for `Spent::gap_ms`; 0 with none.
+    gap_since_ms: u64,
 
     // Timers, all in milliseconds of monotonic service time.
     /// When the oldest unacknowledged segment must be resent. 0 = no timer armed.
@@ -351,7 +359,7 @@ impl Conn {
             snd_buf: [0u8; SND_BUF], snd_len: 0,
             rcv_small: [0u8; RCV_SMALL], rcv_big: None, rcv_head: 0, rcv_len: 0,
             rcv_shift: 0, snd_shift: 0, peer_ws: None, rcv_limit: RCV_BIG,
-            ooo: [(0, 0); MAX_OOO], ooo_n: 0,
+            ooo: [(0, 0); MAX_OOO], ooo_n: 0, gap_since_ms: 0,
             snd_mss: MSS_DEFAULT,
             cwnd: 0, ssthresh: u32::MAX / 2,
             dup_acks: 0, recover: 0, in_recovery: false, fast_retx: false,
@@ -380,17 +388,18 @@ impl Conn {
         have.min(self.rcv_limit)
     }
 
-    /// Offer the peer no more than the small window ([`RCV_SMALL`]), for a connection whose link cannot take a
-    /// large one's bursts. Before the SYN: the window and its scale are settled by the handshake.
+    /// Offer the peer no more than [`RCV_RADIO`], for a connection whose link cannot take a large window's
+    /// bursts. Before the SYN: the window and its scale are settled by the handshake.
     ///
     /// **Why a link would not.** Over a radio both drivers here read the chip into fixed buffers, and a large
     /// window lets the access point send bursts the chip hands over as one transfer: 26 KiB through the
     /// VisionFive's AIC8800 (which now reads its whole queue) and superframes of 4.7 to 14 KB through the Pi 4's
     /// CYW43455, whose driver reads at most 4 KiB - so the rest stayed unread, the radio stopped, and after a
-    /// `godspeed fetch` even `ping` failed (2026-10-19). Until the radio drivers can take a large window's
-    /// bursts, a connection over a radio keeps the window it had before, which worked.
+    /// `godspeed fetch` even `ping` failed (2026-10-19). Both drivers now read into a 64 KiB region (the
+    /// CYW43455's `ctrl::RX_REGION`, the AIC8800's `aic::RX_REGION`), and a 7,232-byte superframe came through
+    /// whole on the Pi 4, so the limit is half of that region rather than the 8 KiB that came before it.
     pub fn small_window(&mut self) {
-        self.rcv_limit = RCV_SMALL;
+        self.rcv_limit = RCV_RADIO;
     }
 
     fn rcv_ring(&mut self) -> &mut [u8] {
@@ -564,6 +573,46 @@ pub fn parse(f: &[u8]) -> Option<Seg<'_>> {
         mss, ws,
         payload: &f[t + doff..ip_end],
     })
+}
+
+/// Whether a frame `parse` accepted carries a correct IPv4 header checksum AND a correct TCP checksum.
+///
+/// Until 2026-10-20 neither was checked on the way in, so a segment damaged between the wire and this
+/// task was taken as data: TCP acknowledged it, the peer never resent it, and the damage surfaced only
+/// above, as a TLS record that would not decrypt (seen on the Wyse, `backlog/93`). Dropping it instead leaves the
+/// sender's retransmission to repair it, which is what the checksum is for. The lengths are the ones
+/// `parse` already checked; a header claiming more bytes than arrived fails here, as it should.
+/// `None` is a sound segment; `Some` names which check it failed, for the log line.
+fn checksum_fault(f: &[u8]) -> Option<&'static str> {
+    let ihl = ((f[ETH_LEN] & 0x0f) as usize) * 4;
+    if super::checksum(&f[ETH_LEN..ETH_LEN + ihl]) != 0 { return Some("the IP header checksum is wrong"); }
+    let ip_total = be16(&f[ETH_LEN + 2..ETH_LEN + 4]) as usize;
+    if ip_total < ihl || ETH_LEN + ip_total > f.len() { return Some("the IP length is more than arrived"); }
+    let mut src = [0u8; 4]; src.copy_from_slice(&f[ETH_LEN + 12..ETH_LEN + 16]);
+    let mut dst = [0u8; 4]; dst.copy_from_slice(&f[ETH_LEN + 16..ETH_LEN + 20]);
+    if tcp_checksum(&src, &dst, &f[ETH_LEN + ihl..ETH_LEN + ip_total]) != 0 { return Some("the TCP checksum is wrong"); }
+    None
+}
+
+/// The IPv4 flags-and-offset word when the datagram is a FRAGMENT (more to follow, or an offset), else
+/// `None`. This stack does not reassemble: `parse` reads the first fragment's leading bytes as a whole
+/// segment, which before the checksum check was taken as truncated data. Told apart from damage so the
+/// log says which it is (`backlog/93` item 11).
+fn fragment_word(f: &[u8]) -> Option<u16> {
+    let w = be16(&f[ETH_LEN + 6..ETH_LEN + 8]);
+    if w & 0x3fff != 0 { Some(w) } else { None }
+}
+
+/// Up to six differing bytes, as `offset:damaged/intact` in hex, for `Tcp::compare_resend`.
+struct DiffList<'a>(&'a [(usize, u8, u8)]);
+impl core::fmt::Display for DiffList<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for (i, (o, b, g)) in self.0.iter().enumerate() {
+            if i > 0 { f.write_str(" ")?; }
+            write!(f, "{:#x}:{:02x}/{:02x}", o, b, g)?;
+        }
+        Ok(())
+    }
 }
 
 /// The TCP checksum: one's-complement sum over the pseudo-header, the TCP header and the payload
@@ -778,6 +827,24 @@ pub struct Tcp {
     /// still only the SYN count, the acknowledgement was never built - which is a different fault
     /// from one that was built and lost.
     pub stat_sent: u16,
+    /// Segments for this machine dropped because a checksum was wrong (`checksum_fault`), since the table
+    /// was made. Each is one the peer resends; logged at the first eight and every 64th.
+    pub bad_checksum: u32,
+    /// IPv4 fragments of a TCP segment for this machine, dropped because this stack does not reassemble
+    /// (`fragment_word`), since the table was made; logged at the first eight and every 64th.
+    pub fragments: u32,
+    /// The payload of the last segment dropped for a wrong TCP checksum, kept so that when the sender's
+    /// resend of it arrives intact the two are compared byte by byte (`compare_resend`): where the
+    /// damage sits says where it was made (`backlog/93` item 11). One page, asked for at the first such
+    /// drop; `damaged_len` 0 means nothing is held.
+    damaged: Option<godspeed::memory::Region>,
+    damaged_len: usize,
+    damaged_seq: u32,
+    damaged_from: ([u8; 4], u16),
+    /// Where the kept payload began in its frame, which is where it began in the driver's receive buffer.
+    damaged_at: usize,
+    /// The drop's number (`bad_checksum` then), so the comparison names the line it answers.
+    damaged_n: u32,
     /// One character per frame this transaction handed to the driver, in order, so the log can show
     /// WHICH frames were built rather than only how many.
     ///
@@ -788,6 +855,53 @@ pub struct Tcp {
     /// acknowledgement never leaves look identical in a count, and they are different bugs.
     pub tx_log: [u8; 24],
     pub tx_n: usize,
+    /// Where this service's time went while a connection was read (`Spent`), said when it is released.
+    pub spent: Spent,
+}
+
+/// Where `net-stack`'s time goes while a connection is being read, in counter ticks, from its first read
+/// to its release (`backlog/93` item 12). The polls are the service's, not one connection's: with two
+/// connections open, a poll for either is counted, and the report is said when either is released. The
+/// release comes about 2 s after the last read (the close and TIME_WAIT), and that time is in the report's
+/// "waiting to be asked". A read of 4 KiB costs a download 250 to 550 us on the T630, where
+/// a round trip and a 4 KiB copy should cost about 62 (BP1, BP9); this says which part of this service
+/// holds the rest. The parts do not overlap: a read's own time leaves out the polls it ran, which are
+/// counted with the polls.
+#[derive(Clone, Copy, Default)]
+pub struct Spent {
+    /// When the first read began, or 0 before it: nothing is counted until then.
+    pub since: u64,
+    /// Reads answered, the bytes they carried, and the time answering them, the polls they ran left out.
+    pub reads: u32,
+    pub read_bytes: u64,
+    pub read_ticks: u64,
+    /// Polls run inside reads (`RECV_DRAIN_MS`), and reads that were served from the stash.
+    pub read_polls: u32,
+    pub stashed: u32,
+    /// Poll steps, and all the time in them.
+    pub polls: u32,
+    pub poll_ticks: u64,
+    /// Of the polls: asks of the driver for frames, the round trips, the frames they brought, and asks that
+    /// brought none.
+    pub drains: u32,
+    pub drain_ticks: u64,
+    pub frames: u32,
+    pub empty: u32,
+    /// Of the polls: frames handed to the driver to send, and the round trips.
+    pub sends: u32,
+    pub send_ticks: u64,
+    /// The data segments that came, by where they fell: the next in sequence, ahead of a gap (something
+    /// before them was lost or is late) inside the window and past it, and already had (a retransmission
+    /// of what arrived). Counted, never acted on: they tell a slow sender from a lossy path.
+    pub seg_next: u32,
+    pub seg_ahead: u32,
+    pub seg_past: u32,
+    pub seg_old: u32,
+    /// Gaps that opened and closed, the time the data waited behind them in all, and the longest: the
+    /// time a lost segment cost before its retransmission came.
+    pub gaps: u32,
+    pub gap_ms: u64,
+    pub gap_max_ms: u64,
 }
 
 impl Tcp {
@@ -802,8 +916,12 @@ impl Tcp {
             last_state: State::Closed,
             last_retx: 0,
             poll_tx_slow: 0,
-            stat_seen: 0, stat_matched: 0, stat_sent: 0,
+            stat_seen: 0, stat_matched: 0, stat_sent: 0, bad_checksum: 0, fragments: 0,
+            damaged: None, damaged_len: 0, damaged_seq: 0, damaged_from: ([0; 4], 0), damaged_at: 0, damaged_n: 0,
             tx_log: [0u8; 24], tx_n: 0,
+            spent: Spent { since: 0, reads: 0, read_bytes: 0, read_ticks: 0, read_polls: 0, stashed: 0, polls: 0,
+                           poll_ticks: 0, drains: 0, drain_ticks: 0, frames: 0, empty: 0, sends: 0, send_ticks: 0,
+                           seg_next: 0, seg_ahead: 0, seg_past: 0, seg_old: 0, gaps: 0, gap_ms: 0, gap_max_ms: 0 },
         }
     }
 
@@ -817,6 +935,55 @@ impl Tcp {
     }
 
     pub fn have_clock(&self) -> bool { self.cyc_per_ms != 0 }
+
+    /// Keep a damaged segment's payload until its resend arrives (`damaged`). A page is asked for once;
+    /// if none is given, nothing is kept and the comparison is simply never made.
+    fn keep_damaged(&mut self, ctx: &ServiceContext, f: &[u8], seg: &Seg<'_>, n: u32) {
+        if self.damaged.is_none() {
+            self.damaged = godspeed::memory::Region::alloc(ctx, 4096).ok();
+        }
+        let Some(r) = self.damaged.as_mut() else { return };
+        let len = seg.payload.len().min(r.len());
+        r.bytes_mut()[..len].copy_from_slice(&seg.payload[..len]);
+        self.damaged_len = len;
+        self.damaged_seq = seg.seq;
+        self.damaged_from = (seg.src_ip, seg.src_port);
+        self.damaged_at = (seg.payload.as_ptr() as usize).wrapping_sub(f.as_ptr() as usize);
+        self.damaged_n = n;
+    }
+
+    /// The resend of the kept segment arrived intact: say which bytes differ, at which offsets, and how
+    /// many bits, then let the copy go. Offsets are in the payload; add `frame at` for the driver's
+    /// buffer. Up to six differing bytes are listed as `offset:damaged/intact`.
+    fn compare_resend(&mut self, ctx: &ServiceContext, good: &[u8]) {
+        let Some(r) = self.damaged.as_ref() else { self.damaged_len = 0; return };
+        let bad = &r.bytes()[..self.damaged_len];
+        let len = bad.len().min(good.len());
+        let (mut diffs, mut bits, mut first, mut last) = (0usize, 0u32, usize::MAX, 0usize);
+        let mut shown = [(0usize, 0u8, 0u8); 6];
+        for i in 0..len {
+            if bad[i] != good[i] {
+                if diffs < shown.len() { shown[diffs] = (i, bad[i], good[i]); }
+                diffs += 1;
+                bits += (bad[i] ^ good[i]).count_ones();
+                if first == usize::MAX { first = i; }
+                last = i;
+            }
+        }
+        if diffs == 0 {
+            ctx.log_fmt(format_args!(
+                "net-stack: the resend of damaged segment #{} arrived intact and its first {} payload bytes match the damaged copy - the damage was outside them (lengths {} and {}), frame at {}",
+                self.damaged_n, len, bad.len(), good.len(), self.damaged_at));
+        } else {
+            let k = diffs.min(shown.len());
+            let mut list = [(0usize, 0u8, 0u8); 6];
+            list[..k].copy_from_slice(&shown[..k]);
+            ctx.log_fmt(format_args!(
+                "net-stack: the resend of damaged segment #{} arrived intact - {} of {} payload bytes differ, {} bits, offsets {}..{} (frame at {}); {}",
+                self.damaged_n, diffs, len, bits, first, last, self.damaged_at, DiffList(&list[..k])));
+        }
+        self.damaged_len = 0;
+    }
 
     /// Give every slot its large receive arena ([`RCV_BIG`]), asked of the kernel once. How many slots got
     /// one: a slot that did not keeps the small arena and works, slower, and the caller says so (26.7).
@@ -1205,6 +1372,36 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
             check(t2.conns[j].state == State::Established, "a SYN-ACK with no options still establishes", &mut pass, &mut fail);
             check(t2.conns[j].snd_mss == MSS_DEFAULT,
                   "a peer that offers no MSS is assumed to accept 536, not our own 1460", &mut pass, &mut fail);
+
+            // A data segment damaged after its checksum was made is dropped and counted, never taken
+            // as data; the same segment intact is taken. Either half failing is the 2026-10-20 bug.
+            let (rn, bad0) = (t2.conns[j].rcv_nxt, t2.bad_checksum);
+            let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                         80, lp2, rn, ack2, ACK, 8000, b"damaged");
+            buf[n - 1] ^= 0x01;
+            t2.on_frame(ctx, &net, &buf[..n], &mut sink);
+            check(t2.bad_checksum == bad0 + 1 && t2.conns[j].rcv_nxt == rn,
+                  "a segment with a bad checksum is dropped and counted, not taken as data", &mut pass, &mut fail);
+            check(t2.damaged_len == 7 && t2.damaged_seq == rn,
+                  "the damaged segment's payload is kept for its resend", &mut pass, &mut fail);
+            buf[n - 1] ^= 0x01;
+            t2.on_frame(ctx, &net, &buf[..n], &mut sink);
+            check(t2.bad_checksum == bad0 + 1 && t2.conns[j].rcv_nxt == rn.wrapping_add(7),
+                  "the same segment with its checksum intact is taken", &mut pass, &mut fail);
+            check(t2.damaged_len == 0, "its intact resend is compared and the kept copy let go", &mut pass, &mut fail);
+            // The same bytes marked as the first IP fragment of a larger datagram (more to follow, its
+            // header checksum made good) are counted as a fragment and not taken: this stack does not
+            // reassemble, and a first fragment read as a whole segment is truncated data.
+            let (rn2, frag0) = (t2.conns[j].rcv_nxt, t2.fragments);
+            let n = emit(&mut buf, &net.our_mac, &net.peer_mac, &peer, &net.our_ip,
+                         80, lp2, rn2, ack2, ACK, 8000, b"fragment");
+            buf[ETH_LEN + 6] |= 0x20;
+            buf[ETH_LEN + 10] = 0; buf[ETH_LEN + 11] = 0;
+            let ck = super::checksum(&buf[ETH_LEN..ETH_LEN + IP_LEN]);
+            buf[ETH_LEN + 10] = (ck >> 8) as u8; buf[ETH_LEN + 11] = ck as u8;
+            t2.on_frame(ctx, &net, &buf[..n], &mut sink);
+            check(t2.fragments == frag0 + 1 && t2.conns[j].rcv_nxt == rn2,
+                  "an IP fragment is counted as one and not taken as data", &mut pass, &mut fail);
         }
     }
 
@@ -1425,11 +1622,11 @@ pub fn selftest(ctx: &ServiceContext, spare: &mut Option<godspeed::memory::Regio
         check(c.last_adv as usize == RCV_BIG, "a scaled peer is told the whole arena", &mut pass, &mut fail);
     }
     if c.rcv_big.is_some() {
-        // Over a radio the large arena offers only the small window, and its SYN asks no scale.
+        // Over a radio the large arena offers only the radio's window, and its SYN asks no scale.
         c.reset();
         c.small_window();
-        check(c.window() as usize == RCV_SMALL && c.our_ws() == 0,
-              "a connection over a radio offers the small window, unscaled, from the large arena", &mut pass, &mut fail);
+        check(c.window() as usize == RCV_RADIO && c.our_ws() == 0,
+              "a connection over a radio offers 32 KiB, unscaled, from the large arena", &mut pass, &mut fail);
     }
     *spare = c.rcv_big.take();
 
@@ -1575,6 +1772,41 @@ impl Tcp {
         self.stat_seen = self.stat_seen.saturating_add(1);
         let seg = match parse(f) { Some(s) => s, None => return 0 };
         if seg.dst_ip != net.our_ip { return 0; }
+        // What a dropped segment's line says beside its reason: the IP length against the bytes that
+        // arrived, the flags-and-offset word, and the sequence number and payload length as parsed.
+        let ip_total = be16(&f[ETH_LEN + 2..ETH_LEN + 4]);
+        let frag_word = be16(&f[ETH_LEN + 6..ETH_LEN + 8]);
+        if let Some(w) = fragment_word(f) {
+            self.fragments = self.fragments.saturating_add(1);
+            let n = self.fragments;
+            if n <= 8 || n % 64 == 0 {
+                let ip = seg.src_ip;
+                ctx.log_fmt(format_args!(
+                    "net-stack: dropped an IP fragment of a TCP segment from {}.{}.{}.{} (#{}) - offset {} bytes, {}, IP length {} of {} arrived; fragments are not reassembled",
+                    ip[0], ip[1], ip[2], ip[3], n, (w & 0x1fff) as usize * 8,
+                    if w & 0x2000 != 0 { "more to follow" } else { "the last" }, ip_total, f.len() - ETH_LEN));
+            }
+            return 0;
+        }
+        if let Some(why) = checksum_fault(f) {
+            self.bad_checksum = self.bad_checksum.saturating_add(1);
+            let n = self.bad_checksum;
+            if n <= 8 || n % 64 == 0 {
+                let ip = seg.src_ip;
+                ctx.log_fmt(format_args!(
+                    "net-stack: dropped a TCP segment from {}.{}.{}.{}:{} (#{}) - {}; IP length {} of {} arrived, flags {:#06x}, seq {}, {} payload bytes; the peer resends it",
+                    ip[0], ip[1], ip[2], ip[3], seg.src_port, n, why, ip_total, f.len() - ETH_LEN,
+                    frag_word, seg.seq, seg.payload.len()));
+            }
+            if why == "the TCP checksum is wrong" && !seg.payload.is_empty() {
+                self.keep_damaged(ctx, f, &seg, n);
+            }
+            return 0;
+        }
+        if self.damaged_len != 0 && seg.seq == self.damaged_seq
+            && self.damaged_from == (seg.src_ip, seg.src_port) && !seg.payload.is_empty() {
+            self.compare_resend(ctx, seg.payload);
+        }
         let now = self.now_ms(ctx).unwrap_or(0);
 
         let (lp, rip, rp) = (seg.dst_port, seg.src_ip, seg.src_port);
@@ -1658,7 +1890,12 @@ impl Tcp {
             return 0;
         }
 
-        let c = match self.find(lp, &rip, rp) { Some(c) => c, None => return 0 };
+        // By index into `conns` rather than through `find`, so `spent` - a field beside it - can be counted
+        // into while `c` is held (the data segments, below).
+        let Some(ci) = self.conns.iter().position(|c| {
+            c.state != State::Closed && c.local_port == lp && c.remote_port == rp && c.remote_ip == rip
+        }) else { return 0 };
+        let c = &mut self.conns[ci];
 
         // A RST ends the connection, and the reason is kept. Anything else about this segment is
         // moot once the peer has refused.
@@ -1847,6 +2084,20 @@ impl Tcp {
 
             // ---- data ----
             if !seg.payload.is_empty() && c.state != State::TimeWait {
+                if self.spent.since != 0 {
+                    let s = &mut self.spent;
+                    if seg.seq == c.rcv_nxt {
+                        s.seg_next = s.seg_next.saturating_add(1);
+                    } else if seq_gt(seg.seq, c.rcv_nxt) {
+                        if seq_lt(seg.seq, c.rcv_nxt.wrapping_add(c.window())) {
+                            s.seg_ahead = s.seg_ahead.saturating_add(1);
+                        } else {
+                            s.seg_past = s.seg_past.saturating_add(1);
+                        }
+                    } else {
+                        s.seg_old = s.seg_old.saturating_add(1);
+                    }
+                }
                 if seg.seq == c.rcv_nxt {
                     let had_hole = c.ooo_n > 0;
                     let before = c.rcv_nxt;
@@ -1867,6 +2118,21 @@ impl Tcp {
                     // retransmitting because it did not hear us, and staying silent repeats that). Both at once:
                     // the duplicate acknowledgements are how the sender learns of a loss.
                     need_ack = true;
+                }
+            }
+
+            // How long the data waits behind a gap (`Spent::gap_ms`): opened when out-of-order data is first
+            // held, closed when the gap is filled.
+            if c.ooo_n > 0 && c.gap_since_ms == 0 {
+                c.gap_since_ms = now.max(1);
+            } else if c.ooo_n == 0 && c.gap_since_ms != 0 {
+                let waited = now.saturating_sub(c.gap_since_ms);
+                c.gap_since_ms = 0;
+                if self.spent.since != 0 {
+                    let s = &mut self.spent;
+                    s.gaps = s.gaps.saturating_add(1);
+                    s.gap_ms = s.gap_ms.saturating_add(waited);
+                    s.gap_max_ms = s.gap_max_ms.max(waited);
                 }
             }
 

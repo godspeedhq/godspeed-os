@@ -49,7 +49,9 @@
 //! of that interface (rtlwifi's `_usbctrl_vendorreq` and rtl8xxxu's equivalent are the reference for
 //! WHAT the silicon wants, per 26.14); no code copied, and the model here is ours.
 
-use godspeed_sdk::{Dma, Message, Mmio, ServiceContext};
+use godspeed::driver::Registers;
+use crate::parts::Parts;
+use godspeed_sdk::{Message, ServiceContext};
 use godspeed_sdk::service_context::usbdev;
 use godspeed as gs;
 use gs::cap::Cap;
@@ -86,6 +88,19 @@ pub struct Radio {
     sync_radio: bool,
     /// When the driver last asked anything, for that quiet.
     last_req: Option<wait::Since>,
+    /// The ring (`RX_SLOTS`): each slot's length and when it landed (for `RxStats::held_ms`), the oldest slot,
+    /// and how many hold a transfer.
+    ring_len: [usize; RX_SLOTS],
+    ring_at: [Option<wait::Since>; RX_SLOTS],
+    ring_head: usize,
+    ring_n: usize,
+    /// When the ring last filled, for `RxStats::full_ms`.
+    full_at: Option<wait::Since>,
+    /// The driver asked for a replug (`usbfn::OP_REPLUG`); the main loop does it once the answer is sent.
+    pub replug_asked: bool,
+    /// Whether one may be done now: true at a bind, and false on the bind after a replug once the main
+    /// loop's bound (`REPLUG_MAX`) is spent.
+    pub replug_allowed: bool,
     /// Consecutive transaction errors on the IN, for `RX_ERROR_TRIES`.
     errs_run: u32,
     pub stats: RxStats,
@@ -110,10 +125,6 @@ pub struct TxStats {
 /// The most bulk OUT endpoints kept: Linux's `RTL8XXXU_OUT_ENDPOINTS` is 6 for its whole family; the
 /// RTL8188CUS has two or three, so three is the bound here, and a fourth is not addressable.
 const MAX_OUT: usize = 3;
-/// Where a frame to send is staged: after the radio's receive area, inside the 64 KiB arena.
-const RADIO_TX_OFF: usize = 0x5000;
-const _: () = assert!(RADIO_TX_OFF >= RADIO_RX_OFF + usbfn::BULK_IN_MAX);
-const _: () = assert!(RADIO_TX_OFF + usbfn::BULK_OUT_MAX <= 64 * 1024);
 /// How long one frame may take to go out: a bulk OUT the chip NAKs is it pacing us (its transmit FIFO full),
 /// and a frame is milliseconds; past this the frame is reported not sent.
 const RADIO_TX_BUDGET_MS: u64 = 200;
@@ -127,15 +138,25 @@ struct Eps {
     out_mps: u16,
 }
 
-/// Where the radio's receive is. `Armed { at }`: the IN is programmed to land at `RADIO_RX_OFF + at`, `at` being
-/// what a transfer that was stood aside had already received. `Held(n)`: a transfer of `n` bytes is waiting
-/// for `wifi-usb` to collect it, and the IN is NOT armed.
+/// Where the radio's receive is. `Armed { at }`: the IN is programmed to land in the ring's next free slot at
+/// `at`, `at` being what a transfer that was stood aside had already received. `Full`: every slot holds a
+/// transfer `wifi-usb` has not collected, and the IN is NOT armed - the chip holds what arrives, until it is full.
 #[derive(Clone, Copy, PartialEq)]
 enum Rx {
     Off,
     Armed { at: usize },
-    Held(usize),
+    Full,
 }
+
+/// THE RECEIVE RING: `RX_SLOTS` transfers, each in its own `RX_SLOT` of `Parts::radio_rx`, collected oldest
+/// first. It was ONE transfer, and the IN was not armed again until `wifi-usb` collected it, so the chip was
+/// drained only as fast as the slowest link of `net-stack` -> `nic-driver` -> `wifi-usb` -> here asked: on the
+/// Pi 2 a transfer sat uncollected for up to 708 ms during a download, and the data waited 33.7 s of 119 s
+/// behind 62 gaps, about 23 segments lost in each (2026-10-22). Now the IN is armed into the next slot the
+/// moment a transfer lands, and a slow collection fills this ring, not the chip.
+pub const RX_SLOTS: usize = 8;
+pub const RX_SLOT: usize = 0x1000;
+const _: () = assert!(usbfn::BULK_IN_MAX <= RX_SLOT);
 
 /// What the radio's receive has done, for the heartbeat report. Counts, never reset: a rate is two reports.
 #[derive(Default, Clone, Copy)]
@@ -149,13 +170,17 @@ pub struct RxStats {
     pub notes_late: u32,
     /// `OP_SYNC`s: notices the driver received in place of an answer (it has no reply mailbox).
     pub syncs: u32,
+    /// The time transfers sat HELD - received, the IN not armed again - before the driver collected them, in
+    /// all and the longest, in ms: the chip holds what arrives meanwhile, and a full chip drops it.
+    pub held_ms: u64,
+    pub held_max_ms: u64,
+    /// The time the ring was full - the IN not armed, the chip holding what arrived - in all, in ms.
+    pub full_ms: u64,
 }
 
-/// Where the radio's transfers land: after the NIC's receive burst, inside the 64 KiB arena. Derived and
-/// asserted, as `net.rs` does its own, because an overlap here is a device writing into another's buffer.
-const RADIO_RX_OFF: usize = 0x4000;
-const _: () = assert!(RADIO_RX_OFF >= crate::net::RX_OFF + crate::net::RX_BURST);
-const _: () = assert!(RADIO_RX_OFF + usbfn::BULK_IN_MAX <= 64 * 1024);
+// The radio's transfers land in `Parts::radio_rx`, and a frame to send is staged in `Parts::radio_tx`,
+// both after the network's receive burst (`parts.rs`): an overlap there would be a device writing into
+// another's buffer, and the layout refuses one.
 
 /// Transaction errors in a row on the IN before what it had received is dropped and it starts again: the
 /// figure `chan::stage` takes from Linux's `dwc2_release_channel` (the third error fails the transfer).
@@ -174,14 +199,15 @@ const HS_BULK_MPS: u16 = 512;
 /// it - this host never did, and control transfers worked without it, but a bulk endpoint exists only in a
 /// configured device - with its bulk endpoints found, then milestone 1's two reads. Bound whatever happens, so
 /// `wifi-usb` reaches its registers and says itself what failed.
-pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
+pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
     stop(ctx, mmio);
     let e = configure(ctx, mmio, dma, t)
         .unwrap_or(Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 });
     let _ = probe(ctx, mmio, dma, t);
     Radio {
         t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
-        sync_bulk: false, sync_radio: false, last_req: None,
+        sync_bulk: false, sync_radio: false, last_req: None, ring_len: [0; RX_SLOTS], ring_at: [None; RX_SLOTS], ring_head: 0, ring_n: 0, full_at: None,
+        replug_asked: false, replug_allowed: true,
         errs_run: 0, stats: RxStats::default(),
         outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
         tx: TxStats::default(),
@@ -190,7 +216,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, vid: u16, 
 
 /// Read the configuration descriptor, find the bulk IN endpoint and the bulk OUTs, and SET_CONFIGURATION.
 /// `None`, said, on any failure; an `ep_in` of 0 when it configured but has no high-speed bulk IN.
-fn configure(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> Option<Eps> {
+fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> Option<Eps> {
     const TRIES: u32 = 4;
     let ctl = |setup: &[u8; 8], buf: &mut [u8], data_in: bool, len: usize| -> bool {
         (0..TRIES).any(|i| {
@@ -283,17 +309,18 @@ fn bulk_in(buf: &[u8], total: usize) -> Option<(u8, u16)> {
 
 /// Take the radio's channel down: halted, its interrupt masked, its status cleared. Before a binding and
 /// after a removal, so no IN is left armed at a device that has gone - or at the next one at its address.
-pub fn stop(ctx: &ServiceContext, mmio: &Mmio) {
+pub fn stop(ctx: &ServiceContext, mmio: &Registers) {
     chan::halt(ctx, mmio, CH_RADIO_RX);
     chan::release(mmio, CH_RADIO_RX);
     mmio.write32(HAINTMSK, mmio.read32(HAINTMSK) & !(1 << CH_RADIO_RX));
 }
 
-/// Arm the IN to land at `RADIO_RX_OFF + at`, for the rest of `BULK_IN_MAX`, and let it raise the interrupt.
-fn arm(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, at: usize) {
+/// Arm the IN to land at `Parts::radio_rx` at `at`, for the rest of `BULK_IN_MAX`, and let it raise the interrupt.
+fn arm(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radio, at: usize) {
     let t = Target { addr: r.t.addr, mps: r.in_mps, low_speed: false };
+    let slot = (r.ring_head + r.ring_n) % RX_SLOTS;
     chan::program(ctx, mmio, &t, CH_RADIO_RX, true, r.pid_in, (usbfn::BULK_IN_MAX - at) as u32,
-                  dma.phys_at(RADIO_RX_OFF + at) as u32, r.ep_in as u32, 2, 0);
+                  dma.radio_rx.phys_at(slot * RX_SLOT + at) as u32, r.ep_in as u32, 2, 0);
     // The halt alone: a completion halts the channel too, so it is the one event that covers all of them.
     // HAINTMSK picks which channels may raise the core's HCHINT; the NIC's receive sets its own bit.
     mmio.write32(chan::hcintmsk_at(CH_RADIO_RX), HCINT_CHHLTD);
@@ -315,7 +342,7 @@ fn arm(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, at: usize) {
 /// error is re-run from there too, up to `RX_ERROR_TRIES` in a row; a STALL stops receive, said. Called on
 /// the USB interrupt and once a pass. `true` when it found a halt to retire - what lets the interrupt
 /// handler know the line was this channel's.
-pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> bool {
+pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radio) -> bool {
     // Notices named in an `OP_SYNC`, again, once the driver is between requests.
     if (r.sync_bulk || r.sync_radio)
         && r.last_req.as_ref().map_or(true, |t| t.passed(ctx, Budget::ms(DRIVER_QUIET_MS)))
@@ -328,7 +355,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> b
             r.note_owed = true;
         }
     }
-    if r.note_owed && matches!(r.rx, Rx::Held(_)) {
+    if r.note_owed && r.ring_n > 0 {
         r.note_owed = !tell_bulk(ctx);
     }
     let at = match r.rx {
@@ -351,8 +378,20 @@ pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> b
         }
         r.stats.transfers = r.stats.transfers.wrapping_add(1);
         r.stats.bytes = r.stats.bytes.wrapping_add(got as u32);
-        r.rx = Rx::Held(got);
-        if !tell_bulk(ctx) {
+        let slot = (r.ring_head + r.ring_n) % RX_SLOTS;
+        r.ring_len[slot] = got;
+        r.ring_at[slot] = Some(wait::Since::now(ctx));
+        r.ring_n += 1;
+        if r.ring_n < RX_SLOTS {
+            arm(ctx, mmio, dma, r, 0);
+        } else {
+            r.rx = Rx::Full;
+            r.full_at = Some(wait::Since::now(ctx));
+        }
+        // Told when the ring stops being empty; once a transfer is collected and more wait, a notice is owed
+        // again (`bulk_in_request`), so the driver - which, with the cable carrying the link, collects only
+        // when told - empties the ring one notice at a time.
+        if r.ring_n == 1 && !tell_bulk(ctx) {
             r.note_owed = true;
             r.stats.notes_late = r.stats.notes_late.wrapping_add(1);
         }
@@ -377,7 +416,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio) -> b
 
 /// `OP_BULK_IN`: the held transfer, if any, and the IN armed again. Answers on `reply` itself, with a
 /// buffer of its own, so `serve`'s frame stays the size of a control transfer.
-fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, reply: Cap) {
+fn bulk_in_request(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radio, reply: Cap) {
     let mut out = [0u8; 2 + usbfn::BULK_IN_MAX];
     out[0] = usbfn::OP_BULK_IN;
     let mut n = 0usize;
@@ -386,14 +425,33 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, 
     } else {
         // A completion the interrupt has not been handled for yet is taken now rather than a pass later.
         let _ = service(ctx, mmio, dma, r);
-        if let Rx::Held(len) = r.rx {
+        if r.ring_n > 0 {
+            let slot = r.ring_head;
+            let len = r.ring_len[slot];
+            if let Some(at) = r.ring_at[slot].take() {
+                let ms = at.elapsed_us(ctx) / 1000;
+                r.stats.held_ms = r.stats.held_ms.saturating_add(ms);
+                r.stats.held_max_ms = r.stats.held_max_ms.max(ms);
+            }
             for (i, b) in out[2..2 + len].iter_mut().enumerate() {
-                *b = dma.read8(RADIO_RX_OFF + i);
+                *b = dma.radio_rx.read8(slot * RX_SLOT + i);
             }
             n = len;
-            r.note_owed = false;
+            r.ring_head = (slot + 1) % RX_SLOTS;
+            r.ring_n -= 1;
+            // MORE WAITING IS NEWS: said by `service`. Told only on empty-to-not, the ring stayed full for good
+            // with the cable in - the driver collected one, was never told of the other seven, and the radio
+            // heard nothing until it was no longer joined (Pi 2, 2026-10-22).
+            r.note_owed = r.ring_n > 0;
+            if r.rx == Rx::Full {
+                if let Some(at) = r.full_at.take() {
+                    r.stats.full_ms = r.stats.full_ms.saturating_add(at.elapsed_us(ctx) / 1000);
+                }
+                r.rx = Rx::Off;
+            }
         }
-        if !matches!(r.rx, Rx::Armed { .. }) {
+        // Not armed - not started yet, or the ring was full until now: armed into the slot just freed.
+        if r.rx == Rx::Off && r.ring_n < RX_SLOTS {
             arm(ctx, mmio, dma, r, 0);
         }
         out[1] = usbfn::ST_OK;
@@ -405,17 +463,17 @@ fn bulk_in_request(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, 
 /// disk's, by the same transfer the disk uses - one at a time, which is all one service can make - with the
 /// endpoint's toggle carried forward. The radio's IN stands aside for it as for any bulk transfer
 /// (`chan::program_ping`). A status byte.
-fn bulk_out(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, r: &mut Radio, p: &[u8]) -> u8 {
+fn bulk_out(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radio, p: &[u8]) -> u8 {
     let idx = p.get(1).copied().unwrap_or(u8::MAX) as usize;
     let data = p.get(2..).unwrap_or(&[]);
     if idx >= r.n_out || data.is_empty() || data.len() > usbfn::BULK_OUT_MAX {
         return usbfn::ST_BAD_REQUEST;
     }
     for (i, &b) in data.iter().enumerate() {
-        dma.write8(RADIO_TX_OFF + i, b);
+        dma.radio_tx.write8(i, b);
     }
     let sent = crate::msc::bulk_xfer(ctx, mmio, &r.t, r.out_mps, false, r.outs[idx],
-                                     dma.phys_at(RADIO_TX_OFF) as u32, data.len() as u32, RADIO_TX_BUDGET_MS,
+                                     dma.radio_tx.phys() as u32, data.len() as u32, RADIO_TX_BUDGET_MS,
                                      &mut r.pid_out[idx]);
     match sent {
         Ok(n) if n as usize == data.len() => {
@@ -436,12 +494,16 @@ pub fn report(ctx: &ServiceContext, r: &Radio) {
     let state = match r.rx {
         Rx::Off if r.ep_in == 0 => "no bulk IN",
         Rx::Off => "not started",
-        Rx::Armed { .. } => "armed",
-        Rx::Held(_) => "held for wifi-usb",
+        Rx::Armed { .. } if r.ring_n == 0 => "armed",
+        Rx::Armed { .. } => "armed, some held for wifi-usb",
+        Rx::Full => "the ring full, held for wifi-usb",
     };
     ctx.log_fmt(format_args!(
         "dwc2-svc: radio rx - {} transfers {} bytes, {} asides, {} errors (last HCINT={:#010x}), {} notices late, {} taken as answers (OP_SYNC); {}; tx - {} frames {} bytes, {} failed",
         s.transfers, s.bytes, s.asides, s.errors, s.last_err, s.notes_late, s.syncs, state, r.tx.frames, r.tx.bytes, r.tx.failed));
+    ctx.log_fmt(format_args!(
+        "dwc2-svc: radio rx held - {} ms in all before the driver collected a transfer, the longest {} ms; the ring of {} full {} ms",
+        s.held_ms, s.held_max_ms, RX_SLOTS, s.full_ms));
 }
 
 fn tell_bulk(ctx: &ServiceContext) -> bool {
@@ -471,7 +533,7 @@ const REG_SYS_ISO_CTRL: u16 = 0x0000;
 /// RETRIED, for the reason recorded at the enumeration retry in `hub.rs`: this controller sequences
 /// transfers in software, so a single XACTERR is a transient on a contended bus rather than a verdict,
 /// and the SAME dongle needed a retry to enumerate on 2026-09-27. Bounded and reported (26.6).
-fn read32(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, reg: u16) -> Option<u32> {
+fn read32(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, reg: u16) -> Option<u32> {
     const TRIES: u32 = 4;
     let setup = [
         DIR_IN,
@@ -548,7 +610,7 @@ const CONTROL_TRIES: u32 = 4;
 /// that is not here included, so a client is
 /// never left to time out against a clean log.
 pub fn serve(
-    ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, radio: Option<&mut Radio>, msg: &Message, reply: Cap,
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, radio: Option<&mut Radio>, msg: &Message, reply: Cap,
 ) {
     let p = msg.payload_bytes();
     let op = p.first().copied().unwrap_or(0);
@@ -602,6 +664,15 @@ pub fn serve(
         }
         (usbfn::OP_CONTROL, Some(r)) => control(ctx, mmio, dma, &r.t, p, CONTROL_TRIES, &mut out),
         (usbfn::OP_CONTROL_ONCE, Some(r)) => control(ctx, mmio, dma, &r.t, p, 1, &mut out),
+        (usbfn::OP_REPLUG, Some(r)) => {
+            out[1] = if r.replug_allowed {
+                r.replug_asked = true;
+                usbfn::ST_OK
+            } else {
+                usbfn::ST_FAILED
+            };
+            2
+        }
         _ => {
             out[1] = usbfn::ST_BAD_REQUEST;
             2
@@ -611,7 +682,7 @@ pub fn serve(
 }
 
 /// One control transfer: `p` is `[op, setup(8), data out...]`. Fills `out[1..]` and returns its length.
-fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], tries: u32, out: &mut [u8]) -> usize {
+fn control(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, p: &[u8], tries: u32, out: &mut [u8]) -> usize {
     if p.len() < 9 {
         out[1] = usbfn::ST_BAD_REQUEST;
         return 2;
@@ -660,7 +731,7 @@ fn control(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target, p: &[u8], t
 /// `0x00000000` and `0xFFFFFFFF` are both treated as failures: a floating bus and a dead chip read as
 /// those, and accepting either would let this report success on a device that never replied. That is
 /// the instrument-that-agrees-with-you failure this project keeps finding, so it is refused up front.
-pub fn probe(ctx: &ServiceContext, mmio: &Mmio, dma: &Dma, t: &Target) -> bool {
+pub fn probe(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> bool {
     let cfg = read32(ctx, mmio, dma, t, REG_SYS_CFG);
     let iso = read32(ctx, mmio, dma, t, REG_SYS_ISO_CTRL);
 

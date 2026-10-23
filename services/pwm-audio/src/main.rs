@@ -37,8 +37,9 @@ use godspeed_audio::settings::{self, Settings};
 use godspeed_audio::sine::Sine;
 use godspeed_audio::sounds::{self, Chime};
 use godspeed_audio::wire;
-use godspeed_sdk::mmio::Mmio;
-use godspeed_sdk::{Dma, Message, ServiceContext};
+use godspeed::driver::Registers;
+use godspeed::driver::{Arena, Part};
+use godspeed_sdk::{Message, ServiceContext};
 
 // ---- The window: the PWM page at +0, the DMA engine's page at +0x1000 ------------------------------
 const WINDOW: usize = 0x2000;
@@ -75,15 +76,17 @@ const DMA_BUS_RAM: u32 = 0xC000_0000;
 const DMA_REACH: u64 = 0x4000_0000;
 
 // ---- The arena: control blocks, then the ring ----------------------------------------------------------
+// Laid out by name (`lay_out`): one 32-byte control block per period at 0x0, then the ring on the next page,
+// at 0x1000, where it always was.
 const PERIODS: usize = 16;
+/// One control block per period, 32 bytes each (BCM2835 ARM Peripherals 4.2.1.1).
+const CB_BYTES: usize = 32;
 /// One period: 2048 words, 1024 stereo frames, about 23 ms at 44.1 kHz - Circle's chunk.
 const PERIOD_BYTES: usize = 8192;
-const RING_OFF: usize = 0x1000;
 const RING_BYTES: usize = PERIODS * PERIOD_BYTES;
 /// A frame is two 32-bit words: RIGHT then LEFT (both Pis wire channel 1 to the right).
 const FRAME: usize = 8;
 const RING_FRAMES: usize = RING_BYTES / FRAME;
-const ARENA_NEEDED: usize = RING_OFF + RING_BYTES;
 /// How far ahead of the engine's position the driver keeps written: it reads ahead in bursts.
 const GUARD: usize = 256;
 
@@ -169,8 +172,10 @@ struct Feed {
 
 struct Pwm<'a> {
     ctx: &'a ServiceContext,
-    m: &'a Mmio,
-    d: &'a Dma,
+    m: &'a Registers,
+    /// The arena's two parts: the control blocks the engine follows, and the ring of sound they point into.
+    cbs: Part,
+    ring: Part,
     b: Board,
     rate: u32,
     range: u32,
@@ -207,12 +212,8 @@ impl<'a> Pwm<'a> {
         DMA_PAGE + self.b.channel * DMA_CH_STRIDE
     }
 
-    fn bus(&self, off: usize) -> u32 {
-        DMA_BUS_RAM | (self.d.phys_at(off) as u32 & 0x3FFF_FFFF)
-    }
-
     fn cb(&self, i: usize) -> usize {
-        i * 32
+        i * CB_BYTES
     }
 
     /// The PWM word for a sample: the volume applied (a square law, so equal steps sound like equal
@@ -229,24 +230,24 @@ impl<'a> Pwm<'a> {
 
     /// Write one frame at ring position `at` (frames, any count - wrapped here).
     fn put(&self, at: usize, left: i16, right: i16) {
-        let off = RING_OFF + (at % RING_FRAMES) * FRAME;
-        self.d.write32(off, self.word(right));
-        self.d.write32(off + 4, self.word(left));
+        let off = (at % RING_FRAMES) * FRAME;
+        self.ring.write32(off, self.word(right));
+        self.ring.write32(off + 4, self.word(left));
     }
 
     fn put_silence(&self, from: usize, frames: usize) {
         let w = self.silence_word();
         for i in 0..frames {
-            let off = RING_OFF + ((from + i) % RING_FRAMES) * FRAME;
-            self.d.write32(off, w);
-            self.d.write32(off + 4, w);
+            let off = ((from + i) % RING_FRAMES) * FRAME;
+            self.ring.write32(off, w);
+            self.ring.write32(off + 4, w);
         }
     }
 
     /// Where the engine is reading in the ring, in frames, from the channel's source address.
     fn position(&self) -> usize {
         let src = self.m.read32(self.ch() + DMA_SOURCE_AD);
-        let base = self.bus(RING_OFF);
+        let base = bus(self.ring.phys());
         (src.wrapping_sub(base) as usize % RING_BYTES) / FRAME
     }
 
@@ -264,7 +265,7 @@ impl<'a> Pwm<'a> {
     /// silent, the control blocks chained into a loop, and the engine started. Returns whether the PWM and
     /// the channel say they are running.
     fn start(&mut self, rate: u32) -> bool {
-        let (ctx, m, d, pwm, ch) = (self.ctx, self.m, self.d, self.b.pwm, self.ch());
+        let (ctx, m, d, pwm, ch) = (self.ctx, self.m, self.cbs, self.b.pwm, self.ch());
         m.write32(pwm + PWM_DMAC, 0);
         m.write32(pwm + PWM_CTL, 0);
         m.write32(DMA_PAGE + DMA_ENABLE, m.read32(DMA_PAGE + DMA_ENABLE) | 1 << self.b.channel);
@@ -297,13 +298,13 @@ impl<'a> Pwm<'a> {
         // clock, the pins' PWM, the DMA request line and the engine together, and measures the rate.
         let cb0 = self.cb(0);
         d.write32(cb0, ti);
-        d.write32(cb0 + 4, self.bus(RING_OFF));
+        d.write32(cb0 + 4, bus(self.ring.phys()));
         d.write32(cb0 + 8, self.b.fifo_bus);
         d.write32(cb0 + 12, PERIOD_BYTES as u32);
         d.write32(cb0 + 16, 0);
         d.write32(cb0 + 20, 0); // NEXTCONBK 0: this chain ENDS
         m.write32(pwm + PWM_DMAC, PWM_DMAC_RUN);
-        m.write32(ch + DMA_CONBLK_AD, self.bus(cb0));
+        m.write32(ch + DMA_CONBLK_AD, bus(d.phys_at(cb0)));
         m.write32(ch + DMA_CS, DMA_CS_START);
         let took = wait::until(ctx, PACED_WAIT, || m.read32(ch + DMA_CS) & DMA_CS_ACTIVE == 0);
         m.write32(ch + DMA_CS, DMA_CS_END); // write-1-to-clear
@@ -337,16 +338,16 @@ impl<'a> Pwm<'a> {
         for i in 0..PERIODS {
             let cb = self.cb(i);
             d.write32(cb, ti);
-            d.write32(cb + 4, self.bus(RING_OFF + i * PERIOD_BYTES));
+            d.write32(cb + 4, bus(self.ring.phys_at(i * PERIOD_BYTES)));
             d.write32(cb + 8, self.b.fifo_bus);
             d.write32(cb + 12, PERIOD_BYTES as u32);
             d.write32(cb + 16, 0);
-            d.write32(cb + 20, self.bus(self.cb((i + 1) % PERIODS)));
+            d.write32(cb + 20, bus(d.phys_at(self.cb((i + 1) % PERIODS))));
             d.write32(cb + 24, 0);
             d.write32(cb + 28, 0);
         }
         m.write32(pwm + PWM_DMAC, PWM_DMAC_RUN);
-        m.write32(ch + DMA_CONBLK_AD, self.bus(self.cb(0)));
+        m.write32(ch + DMA_CONBLK_AD, bus(d.phys_at(self.cb(0))));
         m.write32(ch + DMA_CS, DMA_CS_START);
         let cs = m.read32(ch + DMA_CS);
         if cs & DMA_CS_ERROR != 0 || cs & DMA_CS_ACTIVE == 0 {
@@ -540,9 +541,9 @@ impl<'a> Pwm<'a> {
                     }
                 } else {
                     let w = self.silence_word();
-                    let off = RING_OFF + ((p.filled + i) % RING_FRAMES) * FRAME;
-                    self.d.write32(off, w);
-                    self.d.write32(off + 4, w);
+                    let off = ((p.filled + i) % RING_FRAMES) * FRAME;
+                    self.ring.write32(off, w);
+                    self.ring.write32(off + 4, w);
                 }
             }
             p.filled += room;
@@ -847,15 +848,15 @@ fn bad(out: &mut [u8]) -> usize {
 #[no_mangle]
 pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     gs::trace::as_name(&ctx, "pwm-audio");
-    let mmio = ctx.mmio();
-    let dma = ctx.dma_region();
+    let mmio = godspeed::driver::registers(&ctx);
+    let dma = godspeed::driver::arena(&ctx);
     let irq = Irq::granted(&ctx);
-    let dev = bring_up(&ctx, mmio.as_ref(), dma.as_ref());
+    let dev = bring_up(&ctx, mmio.as_ref(), dma);
     serve(&ctx, &irq, dev)
 }
 
-fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Mmio>, d: Option<&'a Dma>) -> Device<'a> {
-    let b = match ctx.probe_mode() {
+fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Registers>, d: Option<Arena>) -> Device<'a> {
+    let b = match gs::program::mode(&ctx) {
         2 => PI2,
         4 => PI4,
         other => {
@@ -867,21 +868,27 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Mmio>, d: Option<&'a Dma>
         ctx.log("pwm-audio: no PWM and DMA window was granted - this board has no jack the kernel knows");
         return Device::Absent(wire::no_device::NO_CONTROLLER);
     };
-    let Some(d) = d.filter(|d| d.len() >= ARENA_NEEDED) else {
-        ctx.log_fmt(format_args!("pwm-audio: no DMA arena of {} bytes was granted - nothing to play from", ARENA_NEEDED));
+    let Some(d) = d else {
+        ctx.log("pwm-audio: no DMA arena was granted - nothing to play from");
         return Device::Absent(wire::no_device::NO_ARENA);
     };
-    // The engine reaches the first 1 GiB of RAM through its uncached alias, and no more.
+    // The engine reaches the first 1 GiB of RAM through its uncached alias, and no more. Read before the
+    // layout takes the arena, and acted on after it: an arena too small is refused first, as the size check
+    // the layout replaced was, and nothing is written to an arena that is refused.
     let top = d.phys_at(0) + d.len() as u64;
+    let Some((cbs, ring)) = lay_out(ctx, d) else {
+        return Device::Absent(wire::no_device::NO_ARENA);
+    };
     if top > DMA_REACH {
         ctx.log_fmt(format_args!(
             "pwm-audio: the DMA arena ends at {:#x}, past the 1 GiB the DMA engine can reach - refusing rather than playing someone else's memory",
             top));
         return Device::Absent(wire::no_device::NO_ARENA);
     }
-    d.zero();
+    cbs.zero();
+    ring.zero();
     let mut p = Pwm {
-        ctx, m, d, b, rate: RATE_DEFAULT, range: 0, power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false,
+        ctx, m, cbs, ring, b, rate: RATE_DEFAULT, range: 0, power: wire::POWER_ON, volume: DEFAULT_VOLUME, muted: false,
         play: None, underruns_total: 0, last_silence_ms: 0, settings_dirty: false, settings_failing: false,
         paced: None, system_sounds: true, last_sound: None,
     };
@@ -900,6 +907,33 @@ fn bring_up<'a>(ctx: &'a ServiceContext, m: Option<&'a Mmio>, d: Option<&'a Dma>
         b.name, p.rate, p.range, 31 - p.range.leading_zeros(), b.channel,
         RING_FRAMES as u64 * 1000 / p.rate as u64, p.volume, if p.muted { ", muted" } else { "" }));
     Device::Ready(p)
+}
+
+/// RAM as the DMA engine addresses it: the physical address through the uncached alias.
+fn bus(phys: u64) -> u32 {
+    DMA_BUS_RAM | (phys as u32 & 0x3FFF_FFFF)
+}
+
+/// Lay the arena out by name (`docs/driver-library.md` step 3): the control blocks, then the ring on its
+/// own page. `None`, said with the part that did not fit, is no arena to play from.
+fn lay_out(ctx: &ServiceContext, a: Arena) -> Option<(Part, Part)> {
+    let mut l = a.layout();
+    let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>((
+        l.take("control blocks", PERIODS * CB_BYTES, CB_BYTES)?,
+        l.take("ring", RING_BYTES, 4096)?,
+    )))();
+    match laid {
+        Ok((cbs, ring)) => {
+            ctx.log_fmt(format_args!(
+                "pwm-audio: arena laid out - control blocks at {:#x}, ring at {:#x} ({} of {} bytes)",
+                cbs.offset(), ring.offset(), l.used(), l.len()));
+            Some((cbs, ring))
+        }
+        Err(e) => {
+            ctx.log_fmt(format_args!("pwm-audio: {} - nothing to play from", e));
+            None
+        }
+    }
 }
 
 fn serve(ctx: &ServiceContext, irq: &Irq, mut dev: Device) -> ! {

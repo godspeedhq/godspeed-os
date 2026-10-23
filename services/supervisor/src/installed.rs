@@ -36,6 +36,8 @@ use crate::check::{self, Text, MAX_PEERS, PEER_MAX};
 
 /// The installed packages, one per line: `publisher/name version`.
 pub const LIST: &str = "/system/packages/installed";
+/// The most installed packages one boot starts in order (the list is 1 KiB, a line at least 8 bytes).
+const BOOT_MAX: usize = 128;
 /// The largest image an installed package may have. One region of this size is asked for, once, at the first install.
 pub const IMAGE_MAX: usize = 1024 * 1024;
 /// The most memory an installed package is given, whatever its contract says.
@@ -514,13 +516,51 @@ impl Installed {
         if self.boot_said {
             ctx.log_fmt(format_args!("supervisor: {} read after {} s - starting the installed packages", LIST, waited));
         }
-        for line in core::str::from_utf8(&list[..n]).unwrap_or("").lines() {
-            let mut it = line.split_whitespace();
-            let (Some(pkg), Some(version)) = (it.next(), it.next()) else { continue };
-            if let Err(why) = self.start(ctx, pkg, version) {
-                ctx.log_fmt(format_args!("supervisor: installed {} {} NOT started: {}", pkg, version, why.as_str()));
+        // IN DEPENDENCY ORDER (`docs/developer-services-design.md` 16.5): the list's order is the order things were
+        // installed, and an upgrade moves a package to the end - after what needs it. So each pass starts every
+        // package whose requirements are running, until a pass starts nothing; what is left waits on something
+        // that is not running, and says which. Each pass starts at least one or ends the loop, so there are at most
+        // as many passes as lines; and a cycle cannot be installed, so nothing is left waiting on one.
+        let text = core::str::from_utf8(&list[..n]).unwrap_or("");
+        let mut done = [false; BOOT_MAX];
+        let entries = || text.lines().filter_map(|l| { let mut it = l.split_whitespace(); Some((it.next()?, it.next()?)) }).take(BOOT_MAX);
+        loop {
+            let mut progressed = false;
+            for (i, (pkg, version)) in entries().enumerate() {
+                if done[i] { continue; }
+                if self.waiting_on(ctx, pkg, version).is_some() { continue; }
+                done[i] = true;
+                progressed = true;
+                if let Err(why) = self.start(ctx, pkg, version) {
+                    ctx.log_fmt(format_args!("supervisor: installed {} {} NOT started: {}", pkg, version, why.as_str()));
+                }
+            }
+            if !progressed { break; }
+        }
+        for (i, (pkg, version)) in entries().enumerate() {
+            if done[i] { continue; }
+            if let Some(waiting) = self.waiting_on(ctx, pkg, version) {
+                ctx.log_fmt(format_args!("supervisor: installed {} {} NOT started: it requires {}, which is not running", pkg, version, waiting.as_str()));
             }
         }
+    }
+
+    /// The first requirement of `pkg` `version` that is not running, read from its manifest, or `None` when all are -
+    /// or when the manifest cannot be read, which `start` then refuses on its own, saying why.
+    fn waiting_on(&self, ctx: &ServiceContext, pkg: &str, version: &str) -> Option<Text> {
+        let mut path = Text::new();
+        let _ = core::fmt::Write::write_fmt(&mut path, format_args!("{}{}/{}/manifest.toml", check::DIR, pkg, version));
+        let mut buf = [0u8; check::MANIFEST_MAX];
+        let n = gs::fs::Fs::new(ctx).read_into(path.as_str(), &mut buf).ok()?;
+        let text_ = core::str::from_utf8(&buf[..n]).ok()?;
+        let mut arts = crate::meta::Artifacts::new();
+        let m = crate::meta::manifest(text_, &mut arts).ok()?.manifest;
+        for r in m.requires {
+            let mut name = Text::new();
+            let _ = core::fmt::Write::write_fmt(&mut name, format_args!("{}", r.name()));
+            if !alive(ctx, name.as_str()) { return Some(name); }
+        }
+        None
     }
 }
 

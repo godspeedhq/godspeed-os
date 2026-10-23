@@ -21,12 +21,23 @@
 //! may ask, for how long, and when to go back. The rule is a LEASE - see `docs/power.md`:
 //!
 //! - `OP_HOLD [1, secs]` opens a lease of `secs` seconds (0 means `DEFAULT_SECS`, capped at `MAX_SECS`)
-//!   and answers `[status, lease, hz:u32]` - `hz` is the rate this lease set, and 0 when another lease
-//!   already held the clock at its maximum. While any lease is open the clock is at its maximum.
-//! - `OP_RELEASE [2, lease]` closes it early and answers `[status]`. When none is open, the minimum.
+//!   and answers `[status, lease, hz:u32]` - `hz` is the rate this lease set, and 0 when the clock was
+//!   already at its maximum (another lease, or the governor). While any lease is open the clock is at its
+//!   maximum.
+//! - `OP_RELEASE [2, lease]` closes it early and answers `[status]`. When none is open, the clock is the
+//!   governor's (below).
 //! - A lease nobody releases EXPIRES. A holder that dies or hangs mid-way therefore cannot pin the
 //!   machine at full power: it lasts `MAX_SECS` at most, and the expiry is said (26.7). No death
 //!   notification is needed for that, which is why there is none.
+//!
+//! **The governor (2026-10-21).** Leases are for what knows it needs speed; the governor is for load,
+//! and it is Raspberry Pi OS's: the kernel's `ondemand` governor (`drivers/cpufreq/cpufreq_ondemand.c`,
+//! `od_update`) with the tunables `raspi-config`'s start-up script writes (`debian/raspi-config.init`).
+//! Every `SAMPLE_MS` the busiest core's share of busy ticks is read; over `UP_THRESHOLD` the clock goes
+//! to its maximum and is not looked at again for `SAMPLING_DOWN_FACTOR` samples. At or under it,
+//! `ondemand` picks the step nearest `min + load * (max - min) / 100`; the kernel offers only the two
+//! ends, and for a load at or under half the nearer one is the minimum, so the rule is the same. The
+//! clock is at its maximum while a lease is open OR the governor says so.
 //!
 //! **Shutdown (`docs/shutdown.md`).** This service holds no `POWER_OFF`; the shell does. It READS the one pending
 //! power-off or reboot the kernel holds (InspectKernel query 28, `power_pending`), warns at 1 h, 30 m, 15 m, 5 m, 1 m and
@@ -78,6 +89,58 @@ const DEFAULT_SECS: u64 = 15;
 const MAX_SECS: u64 = 30;
 /// Open leases at once. A handful of drivers loading firmware at the same moment is the realistic most.
 const SLOTS: usize = 8;
+
+/// The governor's tunables, `raspi-config`'s (`debian/raspi-config.init`): `CPU_ONDEMAND_SAMPLING_RATE`
+/// 100000 us, `CPU_ONDEMAND_UP_THRESHOLD` 50, `CPU_ONDEMAND_DOWN_SAMPLING_FACTOR` 50. So a busy machine is
+/// fast within 100 ms and stays so for at least 5 s before it is looked at again.
+const SAMPLE_MS: u64 = 100;
+const UP_THRESHOLD: u64 = 50;
+const SAMPLING_DOWN_FACTOR: u64 = 50;
+/// Cores the governor reads. A core past this is not looked at, which on every board here is none.
+const GOV_CORES: usize = 8;
+
+/// The governor's state: whether load has the clock at its maximum, when it looks next, and each core's
+/// busy and total ticks at the last look (InspectKernel queries 6 and 7, the counters `observe` shows).
+struct Governor {
+    fast: bool,
+    next: u64,
+    primed: bool,
+    off: bool,
+    active: [u64; GOV_CORES],
+    total: [u64; GOV_CORES],
+}
+
+impl Governor {
+    /// Look at the load: whether the busiest core is over `UP_THRESHOLD`, its percentage and which core it
+    /// is. `None` when the counters cannot be read, which turns the governor off for good, said once.
+    fn sample(&mut self, ctx: &ServiceContext) -> Option<(bool, u64, usize)> {
+        let n = (ctx.inspect_core_count() as usize).min(GOV_CORES);
+        let (mut busiest, mut which) = (0u64, 0usize);
+        for c in 0..n {
+            let (Some(a), Some(t)) = (ctx.inspect_core_active_ticks(c as u32), ctx.inspect_core_total_ticks(c as u32)) else {
+                self.off = true;
+                ctx.log("power: the per-core load cannot be read (no INTROSPECT) - the governor is off, leases still work");
+                return None;
+            };
+            let (da, dt) = (a.saturating_sub(self.active[c]), t.saturating_sub(self.total[c]));
+            self.active[c] = a;
+            self.total[c] = t;
+            if dt > 0 {
+                let load = (da.min(dt) * 100) / dt;
+                if load > busiest {
+                    busiest = load;
+                    which = c;
+                }
+            }
+        }
+        // The first look has nothing to compare with: it only records where the counters stand.
+        if !self.primed {
+            self.primed = true;
+            return Some((false, 0, 0));
+        }
+        Some((busiest > UP_THRESHOLD, busiest, which))
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Lease {
@@ -315,27 +378,60 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut sd = Shutdown::new();
     sd.changed(&ctx);
 
+    let mut gov = Governor { fast: false, next: 0, primed: false, off: !control, active: [0; GOV_CORES], total: [0; GOV_CORES] };
+    // What the clock was last set to, so it is changed - and said - only when the answer changes.
+    let mut clock_fast = false;
+    if control {
+        ctx.log_fmt(format_args!(
+            "power: governor on - every {} ms, a core over {}% busy holds the clock at its maximum for {} s (Raspberry Pi OS's ondemand)",
+            SAMPLE_MS, UP_THRESHOLD, SAMPLE_MS * SAMPLING_DOWN_FACTOR / 1000));
+    }
+
     let mut no_cap: u32 = 0;
     loop {
-        // WAIT FOR THE EARLIEST EVENT - a lease expiry, or the shutdown's next warning or tidy-up - or block outright
-        // when there is none: an idle machine costs this service nothing at all.
+        // WAIT FOR THE EARLIEST EVENT - a lease expiry, the shutdown's next warning or tidy-up, or the governor's
+        // next look - or block outright when there is none, which is only on a board with no clock control:
+        // where the governor runs, it wakes every `SAMPLE_MS` to look at the load.
         let now = gs::driver::wait::ticks(&ctx);
-        // Whole seconds, rounded UP, because `gs::ipc::recv_within` counts in seconds: waking a fraction
-        // late is a lease running a fraction long, and waking early would only loop back here.
-        let per_sec = cycles(&ctx, 1000).max(1);
+        // Milliseconds, rounded UP: waking a fraction late is a lease running a fraction long, and waking
+        // early would only loop back here. The governor's next look is one more deadline.
+        let per_ms = cycles(&ctx, 1).max(1);
         let lease_wait = leases.slots.iter().flatten().map(|l| l.until).min()
-            .map(|until| { let left = until.saturating_sub(now); (left + per_sec - 1) / per_sec });
+            .map(|until| until.saturating_sub(now).div_ceil(per_ms));
+        let gov_wait = if gov.off { None } else { Some(gov.next.saturating_sub(now).div_ceil(per_ms)) };
         // The shutdown's next event is in the KERNEL's seconds, never this service's clock: on QEMU RISC-V the
         // two did not keep time together, and the deadline fired before the last-second tidy-up.
-        let wait = match (lease_wait, sd.secs_to_next()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let wait = [lease_wait, sd.secs_to_next().map(|s| s * 1000), gov_wait].into_iter().flatten().min();
         let msg = match wait {
             None => Some(gs::ipc::recv(&ctx)),
             Some(0) => None,
-            Some(secs) => gs::ipc::recv_within(&ctx, secs as i64),
+            Some(ms) => gs::ipc::recv_within_ms(&ctx, ms),
         };
+
+        // THE GOVERNOR'S LOOK, when it is due.
+        let now = gs::driver::wait::ticks(&ctx);
+        if !gov.off && now >= gov.next {
+            if let Some((fast, load, core)) = gov.sample(&ctx) {
+                let samples = if fast { SAMPLING_DOWN_FACTOR } else { 1 };
+                gov.next = now.wrapping_add(cycles(&ctx, SAMPLE_MS * samples));
+                if fast != gov.fast {
+                    gov.fast = fast;
+                    let want = fast || leases.open() > 0;
+                    if want != clock_fast {
+                        // One line, with the load that decided it; `apply`'s says only why.
+                        match ctx.cpu_clock(want) {
+                            Some(hz) => {
+                                clock_fast = want;
+                                ctx.log_fmt(format_args!(
+                                    "power: Arm clock -> {} ({} MHz) - the governor: the busiest core, {}, was {}% busy",
+                                    if want { "maximum" } else { "minimum" }, hz / 1_000_000, core, load));
+                            }
+                            None => ctx.log("power: the governor's clock change was refused - the clock is where it was"),
+                        }
+                    }
+                }
+            }
+        }
 
         // EXPIRE whatever is due, whether or not a message arrived - a busy endpoint must not keep a
         // lease alive past its bound.
@@ -351,8 +447,11 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 }
             }
         }
-        if before > 0 && leases.open() == 0 {
-            let _ = apply(&ctx, false, "the last lease expired", &mut no_control_said);
+        // The clock's state is recorded only when the kernel made the change (the governor's rule too).
+        if before > 0 && leases.open() == 0 && !gov.fast && clock_fast
+            && apply(&ctx, false, "the last lease expired", &mut no_control_said).is_some()
+        {
+            clock_fast = false;
         }
 
         // The pending shutdown: re-read the kernel's deadline (a cancel, or one brought earlier), warn at the
@@ -395,11 +494,17 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 };
                 let id = leases.take_id();
                 let until = gs::driver::wait::ticks(&ctx).wrapping_add(cycles(&ctx, secs * 1000));
-                let first = leases.open() == 0;
                 leases.slots[free] = Some(Lease { id, until, secs });
                 ctx.log_fmt(format_args!("power: lease {} opened for {} s ({} open)", id, secs, leases.open()));
-                let hz = if first {
-                    apply(&ctx, true, "a lease is open", &mut no_control_said).unwrap_or(0)
+                // 0 when the clock was already at its maximum - another lease, or the governor.
+                let hz = if !clock_fast {
+                    match apply(&ctx, true, "a lease is open", &mut no_control_said) {
+                        Some(hz) => {
+                            clock_fast = true;
+                            hz
+                        }
+                        None => 0,
+                    }
                 } else {
                     0
                 };
@@ -423,8 +528,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 match found {
                     Some(_) => {
                         ctx.log_fmt(format_args!("power: lease {} released ({} open)", id, leases.open()));
-                        if leases.open() == 0 {
-                            let _ = apply(&ctx, false, "no lease is open", &mut no_control_said);
+                        if leases.open() == 0 && !gov.fast && clock_fast
+                            && apply(&ctx, false, "no lease is open", &mut no_control_said).is_some()
+                        {
+                            clock_fast = false;
                         }
                         reply(&ctx, cap, &[ST_OK]);
                     }

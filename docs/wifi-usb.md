@@ -292,7 +292,7 @@ host its board has.
 from its mass-storage path rather than assumed: a bulk IN there is an endpoint added by Configure Endpoint
 with the DIRECTIONAL type (bulk IN is 6, xHCI 6.2.3 - `bind_msc` records that the wrong type configures a
 pipe that never completes), with a transfer ring and data page in a region of its own (`msc.rs`'s
-`DISK_BASE`, separate because one shared page let an armed interrupt endpoint overwrite a disk command on
+disk region, a part of the arena of its own since 2026-10-20, separate because one shared page let an armed interrupt endpoint overwrite a disk command on
 the Pi 4). The radio needs the same: its own ring and a `BULK_IN_MAX` buffer, one Normal TRB queued as the
 "armed" IN, and its Transfer Event taken where the interrupt already drains the event ring - matched to the
 radio's slot and endpoint, which is point 3 above again. `dwc2`'s stand-aside is a fact about `dwc2`'s
@@ -328,6 +328,13 @@ BSSID checks, so any network's beacons pass), aggregation off, CCK and OFDM on, 
 and beacon timings (transmit, which R5 needs and R3 does not), the IQ calibration (it improves image
 rejection and EVM; the baseband table loads default matrices, and a 1 Mb/s beacon does not need it), and the
 thermal meter.
+
+*(Note 2026-10-22: R5 sent frames and R11 set the transmit power, but the rest of that transmit side was never
+added - the response rate set, the SIFS the chip answers after, the retry limits, the EDCA parameters, the
+rate fallback and the ACK timeout. They decide how the chip ACKNOWLEDGES what it receives, and on the Pi 2 an
+access point ended an association for frames left unacknowledged (reason 34) while a download ran at 41 frames
+a second. `rtl8188::transmit_side` now does them as `rtl8xxxu_init_device` does. The beacon timings, the IQ
+calibration and the thermal meter are still out.)*
 
 **Its check is the RF chip itself.** After the channel is set, `RF_MODE_AG` is read back through the HSSI
 path - the one register that only a working RF serial interface can answer - and its channel field must read
@@ -395,7 +402,11 @@ zero entries free). Whether it starves a control transfer has never been measure
 show the NIC's IN never armed (`nohalt 0`), so they cannot answer it, though they first looked as if they
 did - and a SETUP takes the same queue. So `chan::program_ping` halts the radio's IN before programming any
 control or bulk transfer on another channel, and `rtl::service` puts it back from the packet it reached, with
-the data toggle read out of the channel. Periodic transfers (the keyboard, the hub's status) ride the other
+the data toggle read out of the channel. *(Note 2026-10-22: two of these paragraphs' facts have changed. `dwc2`
+now takes the radio's transfers into a ring of eight and arms again at once (`rtl::RX_SLOTS`), notifying while
+the ring holds any. Keeping the IN armed through the disk's bulk transfers was tried (`91e9448e`): the disk
+was unharmed and the radio's burst losses did not change, so the stand-aside is as described. `backlog/93`
+has the cards.)* Periodic transfers (the keyboard, the hub's status) ride the other
 queue and do not stand it aside.
 
 **The interrupt could be dropped, and now cannot.** The USB interrupt reaches `dwc2` as the message `[0x29]`
@@ -1875,10 +1886,11 @@ still tests one change.
 - **Where the rings live.** Up to three OUT rings of 28 TRBs, in the slice's report page between EP0's
   data stage and the IN ring, each followed by a 64-byte gap. The VL805 reads the 64 bytes after any TRB
   it fetches, and past a ring's Link that lands in the gap rather than in the next ring.
-- **Where the frame lives.** In `DATA_BUF_OFF`, the arena page enumeration uses for its control data,
+- **Where the frame lives.** In the data buffer (`Parts::data_buf`), the arena page enumeration uses for its control data,
   borrowed for one synchronous send at a time. Nothing else touches it inside the poll loop, and a send
-  never overlaps an enumeration, since both run on one task. That needs no kernel change. A dedicated page
-  would (`XHCI_DMA_PAGES`), which is the cleaner answer if this one is ever contended.
+  never overlaps an enumeration, since both run on one task. A dedicated page is the cleaner answer if this
+  one is ever contended, and it is xhci's and the supervisor's change alone: the arena's size is the spawn
+  request's (`dma_pages`), and the kernel holds none (2026-10-21).
 - **`OP_BULK_OUT`, as `dwc2` sends.** One Normal TRB, the Link written eagerly, the completion waited for
   up to 200 ms (`dwc2`'s budget), matched by slot AND endpoint. A completion for the IN or for another
   consumer met while waiting is handed on, not taken.
@@ -2258,7 +2270,8 @@ waits for the transfer event whose TRB pointer is the one it posted (`Ring::push
 for the disk's slot that retires any other TRB is logged as `passed over` and not taken, from the ring and
 from `EvMail`, which now files the pointer too (`take_trb`). The mailbox half of the plan above was not
 needed: `EvMail` is built fresh on every pass and the whole arena is zeroed on a controller reset, so
-nothing filed survives one. The slot-only match predates this branch (it is unchanged since before the
+nothing filed survives one. (2026-10-21: no longer for the disk's slot - its entry is kept across passes for
+a gathered write in flight, `EvMail::keep_only`; a controller reset still clears it.) The slot-only match predates this branch (it is unchanged since before the
 dongle work began); what is new is a second device on the same controller whose faults make the disk's
 waits run out. `scripts/cross_isa.py`, whose riscv64 leg runs every disk read and write through `xhci`'s
 mass storage in QEMU, passes 12 of 12 with no completion passed over.

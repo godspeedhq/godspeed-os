@@ -38,7 +38,7 @@ did not watch.
 
 ## 2. The actual mechanism
 
-`msc::await_on_slot` (`services/xhci/src/msc.rs:263`) waits for the disk's completion and, on a
+`msc::await_on_slot` (in `services/xhci/src/msc.rs`) waits for the disk's completion and, on a
 transfer event belonging to any other slot, **consumes and discards** it:
 
 ```rust
@@ -65,7 +65,7 @@ almost always a serve segment to swallow the previous probe's answer, so probes 
 **And the 151 "ok" are not necessarily correct.** A timed-out probe leaves an **unretired TD** on the
 hub's EP0 ring. The next probe posts a second TD behind it, then accepts the first completion whose
 `sid` matches the hub - which is the **previous** TD, answering about a **possibly different port**,
-with `DATA_BUF_OFF` holding whatever that transfer wrote. This is a one-behind lockstep desync: the
+with the data buffer holding whatever that transfer wrote. This is a one-behind lockstep desync: the
 identical failure `fs` had ("run `ls` twice and it is out of step" - fixed by the reply tag at byte 0),
 fixed there the same way this must be.
 
@@ -107,7 +107,7 @@ pub(crate) struct EvMail {
 
 ### 4.2 Handle the stale TD, do not just collect it
 
-A mailed completion may be **stale**: it answers the previous probe, and `DATA_BUF_OFF` may since
+A mailed completion may be **stale**: it answers the previous probe, and the data buffer may since
 have been overwritten. Collecting it blindly swaps one wrong answer for another.
 
 Track, per hub, whether a posted TD is still unretired. Before posting a new probe:
@@ -121,7 +121,7 @@ stale reply (`drain_stale_fs_replies` in the shell is the same idea from the cli
 
 ### 4.3 Give the probe its own data buffer
 
-`hub_port_status` reuses `DATA_BUF_OFF` with the comment "unused by the poll loop, so safe to reuse
+`hub_port_status` reused the data buffer with the comment "unused by the poll loop, so safe to reuse
 here". That stopped being true the moment a completion could be collected a pass later. Give the
 probe a dedicated 4-byte slot in the DMA arena so an in-flight probe's data cannot be clobbered by
 anything else.

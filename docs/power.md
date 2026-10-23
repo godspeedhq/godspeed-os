@@ -279,7 +279,7 @@ a completion raises `USBINT` regardless of driver activity - which is what lets 
    (complete-split microframes) - a periodic split-interrupt transfer.
 4. Link the QH into the periodic tree at the polling interval, instead of the async reclamation ring.
 5. Keep IOC on the qTD (already done) so periodic completions raise `USBINT` autonomously; then the
-   driver can genuinely block on `EHCI_INT_VECTOR` (0x29).
+   driver can genuinely block on its interrupt (vector 0x29).
 
 This is a **medium-to-large** change - a second schedule engine, new DMA regions, split-interrupt S/C
 mask computation, periodic-tree linking - and every existing helper (`control`, `arm_int`,
@@ -454,9 +454,9 @@ A service that needs the cores fast asks for a lease of N seconds:
 Status: 0 OK, 1 every slot is open (8), 2 this machine has no clock control, 3 no such lease (already
 expired, already released, or from before this service restarted), 4 a malformed request.
 
-While any lease is open the clock is at its maximum. When none is, it is at its minimum. The `hz` in a
-HOLD reply is the rate the clock read back when that lease raised it, or 0 when it joined one already
-open.
+While any lease is open the clock is at its maximum; when none is, it is wherever the governor (15.7)
+has it. The `hz` in a HOLD reply is the rate the clock read back when that lease raised it, or 0 when the
+clock was already at its maximum, held by another lease or by the governor.
 
 **A lease that nobody releases expires.** That is the whole answer to "what if the holder dies or
 hangs while holding it": the clock comes back down within 30 seconds at most, and the expiry is said in
@@ -473,18 +473,66 @@ needs to be, and not otherwise.
 
 ### 15.5 Who holds leases today
 
+(The governor, 15.7, holds no lease: it is the other half of the same rule.)
+
+
 `wifi-driver`, across its bring-up: from the moment it holds the SDIO window, through the firmware
 upload and the first scan, to the moment it starts serving (about ten seconds measured on the card, `docs/wifi.md` 57). Optional on its side: a `power`
 that is absent or refuses costs one log line and the load goes ahead at whatever the clock is.
 
 ### 15.6 What is not here yet, and is not promised
 
-- **Load-based scaling.** A governor that reads per-core load and sets the clock is the obvious next
-  rule, and it belongs here. It is not built, because nothing needs it yet (26.2) - and because the WiFi
-  chip's dependence on host speed is not understood, a governor that slowed the cores mid-load would
-  bring the trap back unless the load held a lease. It does.
+- **Load-based scaling** is built now (15.7). This line said it was not, because nothing needed it yet
+  (26.2); a download needed it.
 - **Rates between the two ends.** The kernel offers the firmware's minimum and maximum and nothing in
   between. Widening that is a kernel change and needs a reason.
 - **Other power: device power-down, thermal.** This is where they would live. Neither exists.
 - **Shutdown** (2026-10-14, `docs/shutdown.md`): this service gives the warnings and the tidy-up three seconds before the deadline,
   reading the one deadline the kernel holds. It holds no authority to turn the machine off; the shell does.
+
+### 15.7 The governor: the clock by load, as Raspberry Pi OS sets it (2026-10-21)
+
+**Why.** Every download on the Pi 4 ran with the cores at 600 MHz, 40% of their maximum: the only lease
+was the radio's firmware load, over by eight seconds after boot. A download is work for the cores -
+decrypting, copying each frame from service to service, reading the radio's FIFO a word at a time - and
+nothing in it knew to ask for speed, nor should it have to.
+
+**What Linux does, read from the source rather than remembered** (`raspberrypi/linux` `rpi-6.6.y`, and
+`RPi-Distro/raspi-config` `master`):
+
+- `drivers/cpufreq/raspberrypi-cpufreq.c` asks the firmware for its minimum and maximum and registers
+  every 100 MHz step between them (`RASPBERRYPI_FREQ_INTERVAL`), 600 to 1,500 MHz on a Pi 4.
+- `arch/arm64/configs/bcm2711_defconfig` makes `ondemand` the default governor
+  (`CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND=y`).
+- `drivers/cpufreq/cpufreq_ondemand.c`, `od_update`: each sample, the load is the busiest core's share
+  of non-idle time over the interval (`cpufreq_governor.c`, `dbs_update`). Over `up_threshold` the
+  clock goes to its maximum and, if it was below it, the next sample waits `sampling_down_factor`
+  intervals. At or under it, the clock goes to the step nearest `min + load * (max - min) / 100`, and
+  the next sample is one interval away.
+- The kernel's defaults are an `up_threshold` of 95 (80 without microsecond idle accounting), a
+  `sampling_down_factor` of 1, and an interval of 10 ms on this board (the driver's steps carry no
+  transition latency, so `cpufreq_policy_transition_delay_us` caps it).
+- Raspberry Pi OS overrides them at boot, in `debian/raspi-config.init`: `up_threshold` 50, a
+  `sampling_rate` of 100,000 us, `sampling_down_factor` 50, and `io_is_busy` 0 (time waiting on I/O
+  counts as idle).
+- `drivers/cpufreq/cpufreq-dt.c` puts every core in one policy when no device-tree table says
+  otherwise (`cpumask_setall`). Whether the Pi 4's device tree carries one was not checked; the driver
+  adds its steps at run time.
+
+**What this does, and where it differs.** Every 100 ms the busiest core's share of busy timer ticks
+(InspectKernel queries 6 and 7, the counters `observe` shows) is read. Over 50% puts the clock at its
+maximum, and the next look is 50 samples, 5 s, away; at or under 50%, the minimum, and the next look
+is 100 ms away. The kernel offers only the two ends (15.6), and for a load at or under half the step
+`ondemand` would pick is nearer the minimum, so on this board the rule is the same. Busy ticks count
+only time a task ran, so time spent blocked waiting on a device is idle, as `io_is_busy` 0 makes it.
+Not copied: `ondemand`'s case for a core that was idle for two intervals and has just woken, which
+reuses its previous load so a burst starts fast. A burst here waits for the next 100 ms look.
+
+**With the leases.** The clock is at its maximum while any lease is open OR the governor says so, and
+at its minimum only when neither does. A lease opened while the governor holds the clock fast is
+answered with `hz` 0, as one that joins an open lease is.
+
+**What it needs.** `INTROSPECT`, to read the counters, granted in the supervisor's spawn row and pinned
+in `COMMANDMENTS.baseline.toml` (operator approved, 2026-10-21). It reads; it cannot act on anything it
+reads. On a board with no clock control the governor never starts.
+

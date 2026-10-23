@@ -162,6 +162,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             _ => r.fail("usage", "godspeed install <file>.gsp [yes] [accept-old]", "a package file, as the CLI writes one"),
         },
         (Some("install"), None) => r.fail("usage", "godspeed install <publisher/name>[@version]", "a fetched package to install"),
+        // What installing a package takes: its requirements, resolved, in the order to install them (`install.rs`).
+        (Some("plan"), Some(name)) if words.clone().next().is_none() => install::plan(&ctx, &mut r, name),
+        (Some("resolve"), Some(name)) => match (words.next(), words.next()) {
+            (Some(range), None) => with_ready(&ctx, &mut r, None, |ready, roots, r| packages::resolve(&ctx, r, ready, roots, name, range)),
+            _ => r.fail("usage", "godspeed resolve <publisher/name> <range>", "a package and the versions that will do"),
+        },
         // What the package manager keeps that nothing uses: listed, and deleted only once the shell has asked.
         (Some("cleanup"), None) => packages::cleanup(&ctx, &mut r, false),
         (Some("cleanup"), Some("delete")) if words.clone().next().is_none() => packages::cleanup(&ctx, &mut r, true),
@@ -300,8 +306,9 @@ impl Rows {
 }
 
 /// A progress frame for the shell, sent BEFORE the answer: `PROGRESS` and one line of text, which the shell
-/// draws in place on one line until the answer arrives. The shell reads frames only until the first byte of
-/// the answer, so nothing in an answer can be taken for one.
+/// draws in place until the answer arrives - the words on one line and, when the frame has a bar, the bar on
+/// the line under them. The shell reads frames only until the first byte of the answer, and sets aside anything
+/// else that comes before it, so nothing in an answer can be taken for one.
 pub(crate) const PROGRESS: &[u8; 8] = b"\x01GSPROG1";
 
 /// Send one progress line to the shell. A frame that cannot be sent changes nothing: progress is a courtesy,
@@ -327,6 +334,7 @@ impl RecordSink for BufSink {
 }
 
 /// A short formatted string, for a table cell.
+#[derive(Clone, Copy)]
 pub(crate) struct Cell { b: [u8; 160], pub(crate) n: usize }
 impl Cell {
     pub(crate) fn new() -> Cell { Cell { b: [0; 160], n: 0 } }
