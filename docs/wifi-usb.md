@@ -34,7 +34,7 @@ the register file this needs a host-side MLME - scan, authenticate, associate - 
 serve loop the Broadcom and AIC8800 run moves into `sdk/wifi` so both WiFi services share it. That move
 is due when a scan exists, not before.
 
-## 2. The protocol (`sdk/rust/src/usbfn.rs`; `sdk/wifi/src/usbfn.rs` until 2026-10-23, re-exported as `godspeed_wifi::usbfn`)
+## 2. The protocol (`sdk/wifi/src/usbfn.rs`; its numbers are `sdk/rust/src/usbfn.rs` since 2026-10-23, re-exported)
 
 | Op | Request | Reply |
 |---|---|---|

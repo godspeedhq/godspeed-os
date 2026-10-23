@@ -1750,6 +1750,7 @@ fn cmd_test(suite: &str) {
         "gsp"            => run_gsp_test(),
         "deps"           => run_deps_test(),
         "kinds"          => run_kinds_test(),
+        "driver-packages" => run_driver_packages_test(),
         "download"       => run_download_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
@@ -4015,11 +4016,32 @@ fn run_kinds_test() {
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         gsfs_add_file(persist, &f, &bytes);
     }
-    // And a driver that takes a device over from a GodspeedOS driver: the e1000, from `nic-driver`.
-    let nic = std::fs::read("osdev/fixtures/kind-nic-0.1.0.gsp").unwrap_or_else(|e| panic!("kind-nic-0.1.0.gsp: {e}"));
-    gsfs_add_file(persist, "kind-nic-0.1.0.gsp", &nic);
     gsfs_layout(persist);
     crate::shell_test::run_kinds(&image_path, persist, 2);
+}
+
+/// `osdev test driver-packages`: a driver package that takes a device over from a GodspeedOS driver, and one that
+/// drives a USB device through its host (`shell_test::run_driver_packages`). Two fixtures, on a disk of their own.
+fn run_driver_packages_test() {
+    println!("
+=== driver-packages: a device taken over, and a USB device through its host ===");
+    build_blockdev_fs("selftest", "");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_driver_packages.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    for f in ["kind-nic-0.1.0.gsp", "kind-usb-0.1.0.gsp"] {
+        let path = format!("osdev/fixtures/{f}");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        gsfs_add_file(persist, f, &bytes);
+    }
+    gsfs_layout(persist);
+    crate::shell_test::run_driver_packages(&image_path, persist, 2);
 }
 
 /// `osdev test gsp`: a package carried as one `.gsp` file, made on the machine and installed with no network.

@@ -2022,13 +2022,22 @@ fn read_config_and_bind(
         // THE WIFI DONGLE (U2a), by its VID:PID - a vendor-class device has no class to match on. It is
         // configured and KEPT, its slot and slice with it, and served to `wifi-usb` (`radio.rs`): EP0 for
         // its registers, and the bulk endpoints configured below for its frames (U2b, U2c).
-        if radio::is_radio(ids) {
+        // AND ANY VENDOR-SPECIFIC DEVICE, for an installed driver package that names it (`radio::binds`). It is bound
+        // exactly as the dongle is - the same slot, slice, rings and `usbfn` - and the supervisor decides from the
+        // host's report which driver it gets, if any. The rest of this host's log still calls it the dongle.
+        if radio::binds(ids, first_iclass) {
             if control(
                 dma, mmio, dboff, ir0, slot, dev_idx, 96, ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
             ) {
-                ctx.log_fmt(format_args!(
-                    "xhci: the WiFi dongle {:04x}:{:04x} on port {} (slot {}) - configured, bound as the radio for wifi-usb (U2a)",
-                    ids & 0xFFFF, ids >> 16, port, slot));
+                if radio::is_radio(ids) {
+                    ctx.log_fmt(format_args!(
+                        "xhci: the WiFi dongle {:04x}:{:04x} on port {} (slot {}) - configured, bound as the radio for wifi-usb (U2a)",
+                        ids & 0xFFFF, ids >> 16, port, slot));
+                } else {
+                    ctx.log_fmt(format_args!(
+                        "xhci: USB device {:04x}:{:04x} on port {} (slot {}), vendor-specific - configured, bound for a driver of its own",
+                        ids & 0xFFFF, ids >> 16, port, slot));
+                }
                 // THE PAGE AFTER ITS EP0 RING IS ZEROED, because the dongle's EP0 ring wraps (every other
                 // device's runs a few transfers and never reaches its end) and the VL805 reads past a
                 // ring's end: up to four TRBs from the next page, even past a Link TRB on a page boundary,

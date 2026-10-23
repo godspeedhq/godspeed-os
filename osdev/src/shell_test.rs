@@ -12305,6 +12305,108 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
     let listed = run!(b"godspeed list installed\r", 60);
     check!(listed.contains("godspeed/kind-driver") && listed.contains("running"), "and it is listed as running");
 
+    // CLEANUP: all four uninstalled, and the key withdrawn.
+    for k in KINDS {
+        let out = run!(format!("godspeed uninstall godspeed/kind-{k} yes\r").as_bytes(), 120);
+        check!(out.contains("uninstalled"), format!("kind-{k} uninstalls"));
+    }
+    let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
+    check!(removed.contains("no longer trusted"), "the test key is withdrawn");
+    check!(!String::from_utf8_lossy(&buf.lock().unwrap()).contains("KERNEL PANIC"), "and the kernel did not panic");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::write("build/tests/kinds_serial.log", &*buf.lock().unwrap());
+    println!("\nkinds: {pass} passed, {fail} failed (serial: build/tests/kinds_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
+/// `osdev test driver-packages`: what a driver package can be given beyond `osdev test kinds`' registers, interrupt
+/// and DMA arena - a device TAKEN OVER from a GodspeedOS driver (`kind-nic`, the e1000 from `nic-driver`), and a USB
+/// device reached through its host (`kind-usb`, QEMU's FTDI serial adapter behind `xhci`). Both made with the CLI's
+/// driver template (`osdev/fixtures/README.md`). Its own disk, because a test disk's root holds only so many files.
+pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("driver-packages: PASS - {}", $label); pass += 1; }
+        else { println!("driver-packages: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+
+    let port = pick_free_port();
+    // The FTDI adapter's serial port is a TCP socket this suite connects to: what the USB driver package writes to the
+    // adapter's bulk OUT arrives on it, and a line written to it is what the package reads back through the bulk IN.
+    // (A file chardev would do for output, but QEMU on Windows takes no input from one.)
+    let usb_port = pick_free_port();
+    let usb_chardev = format!("socket,id=fser,host=127.0.0.1,port={usb_port},server=on,wait=off");
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+        "-device", "e1000,netdev=n0", "-netdev", "user,id=n0",
+        // The driver template's device: QEMU's teaching device, which no GodspeedOS driver claims.
+        "-device", "edu",
+        // The USB driver package's device: an FTDI serial adapter (0403:6001) behind an xHCI, which no GodspeedOS
+        // driver claims - `xhci` binds it as vendor-specific and reports it.
+        "-device", "qemu-xhci,id=xhci",
+        "-chardev", &usb_chardev,
+        "-device", "usb-serial,bus=xhci.0,chardev=fser",
+    ]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("driver-packages: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("driver-packages: no shell serial"); std::process::exit(1); }
+    };
+    // The adapter's serial port: the line it will receive, and what it sends, collected as it comes.
+    let usb_wire: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut usb_line = None;
+    if let Some(port) = retry_tcp_connect(usb_port, Duration::from_secs(15)) {
+        usb_line = port.try_clone().ok();
+        let mut port = port;
+        let wire = Arc::clone(&usb_wire);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 512];
+            loop { match port.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => wire.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("driver-packages: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+    let _ = run!(b"godspeed config\r", 60);
+    send(&mut write_half, format!("godspeed trust add godspeed {KEY}\r").as_bytes());
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20));
+    let added = run!(b"y\r", 60);
+    check!(added.contains("trusted by this machine's operator"), "the fixtures' test key is trusted");
+
     // A DRIVER THAT TAKES A DEVICE OVER: its class is ethernet, which `nic-driver` drives. Installing it stops
     // `nic-driver` and keeps it stopped; uninstalling it gives the device back and `nic-driver` starts again.
     let nic = run!(b"godspeed install /kind-nic-0.1.0.gsp yes\r", 240);
@@ -12312,7 +12414,7 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
            "a driver of a device GodspeedOS drives installs, and with no arena it is not asked about DMA memory");
     let _ = collect_until(&buf, &mut cursor, b"took the ethernet device over", Duration::from_secs(30));
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
-    check!(log.contains("supervisor: nic-driver stood down - the installed godspeed/kind-nic drives its device (class 020000)"),
+    check!(log.contains("supervisor: nic-driver stood down - the installed godspeed/kind-nic drives its device until it is uninstalled"),
            "the supervisor stops nic-driver for it, and says so");
     check!(log.contains("kind-nic: took the ethernet device over - status ") && log.contains("MAC 52:54:00:12:34:56"),
            "and the package drives the e1000 nic-driver had: it reads its status and its MAC");
@@ -12331,19 +12433,36 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
                && log.contains("supervisor: nic-driver started again - an installed package gave its device back"),
            "uninstalled, it gives the device back, and the supervisor starts nic-driver again");
 
-    // CLEANUP: all four uninstalled, and the key withdrawn.
-    for k in KINDS {
-        let out = run!(format!("godspeed uninstall godspeed/kind-{k} yes\r").as_bytes(), 120);
-        check!(out.contains("uninstalled"), format!("kind-{k} uninstalls"));
-    }
+    // A DRIVER OF A USB DEVICE: no registers of its own. `xhci` bound the adapter at boot and reported it, so the
+    // package starts when it is installed, with `xhci` as its peer, and drives the device through it.
+    let usb = run!(b"godspeed install /kind-usb-0.1.0.gsp yes\r", 240);
+    check!(usb.contains("asks for: device") && usb.contains("its USB device through its host, checked from disk"),
+           "a driver of a USB device installs, and the supervisor starts it with its host as its peer");
+    // The line goes to the adapter's serial port once the package listens, so the adapter has it when it is asked.
+    let _ = collect_until(&buf, &mut cursor, b"kind-usb: listening", Duration::from_secs(30));
+    if let Some(p) = usb_line.as_mut() { let _ = p.write_all(b"hello from the serial port
+"); }
+    let _ = collect_until(&buf, &mut cursor, b"kind-usb: drove", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("xhci: USB device 0403:6001 on port") && log.contains("bound for a driver of its own"),
+           "xhci bound QEMU's FTDI adapter for a driver of its own, as vendor-specific");
+    check!(log.contains("kind-usb: drove 0403:6001 through xhci - device release ")
+               && log.contains("bytes sent by bulk OUT ok, bulk IN ") && log.contains("bytes: \"hello from the serial port\""),
+           "the package reads the device's identity and its descriptor, and moves data both ways, through gs::driver::bus");
+    let wrote = usb_wire.lock().unwrap().clone();
+    check!(String::from_utf8_lossy(&wrote).contains("hello from a Godspeed driver package"),
+           "and what it sent came out of the adapter's serial port");
+    let out = run!(b"godspeed uninstall godspeed/kind-usb yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-usb uninstalls");
+
     let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
     check!(removed.contains("no longer trusted"), "the test key is withdrawn");
     check!(!String::from_utf8_lossy(&buf.lock().unwrap()).contains("KERNEL PANIC"), "and the kernel did not panic");
 
     let _ = child.kill();
     let _ = child.wait();
-    let _ = std::fs::write("build/tests/kinds_serial.log", &*buf.lock().unwrap());
-    println!("\nkinds: {pass} passed, {fail} failed (serial: build/tests/kinds_serial.log)");
+    let _ = std::fs::write("build/tests/driver_packages_serial.log", &*buf.lock().unwrap());
+    println!("\ndriver-packages: {pass} passed, {fail} failed (serial: build/tests/driver_packages_serial.log)");
     if fail > 0 { std::process::exit(1); }
 }
 

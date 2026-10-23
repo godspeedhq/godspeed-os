@@ -124,6 +124,15 @@ pub fn is_radio(ids: u32) -> bool {
     ids & 0xFFFF == VID as u32 && ids >> 16 == PID as u32
 }
 
+/// Whether this host binds the device for a driver of its OWN rather than driving it itself: the dongle, or any
+/// device whose first interface is vendor-specific (class 0xFF) - a class this host has no driver for, which an
+/// installed driver package may (`hw_usb`, `docs/developer-services-design.md` 13.1). A hub, a keyboard, a mouse
+/// and a disk are this host's; a device of a standard class it does not drive (audio, video, Bluetooth, CDC) is
+/// left as before, released. One such device per host, as the dongle always was: the first bound keeps the slot.
+pub fn binds(ids: u32, first_iclass: Option<u8>) -> bool {
+    is_radio(ids) || first_iclass == Some(0xFF)
+}
+
 /// Where the runtime control transfers begin on the dongle's EP0 ring: past the enumeration's own - the
 /// device descriptor at 0, the configuration descriptor at 48, Set Configuration at 96, ending at 128.
 pub const EP0_RUNTIME_START: usize = 128;

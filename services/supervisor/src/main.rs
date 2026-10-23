@@ -1051,6 +1051,16 @@ mod installed;
 
 /// The in-tree driver whose spawn row names PCI class `class`, if one does: a driver package is not given a device
 /// the OS already drives (`installed.rs`).
+/// The built-in driver of a USB device, by its vendor and product (`USB_MATCH`), if this image has one.
+fn in_tree_usb_driver_of(vid: u16, pid: u16) -> Option<&'static str> {
+    USB_MATCH.iter().find(|m| m.vid == vid && m.pid == pid).map(|m| m.driver)
+}
+
+/// This board's USB host that binds a device for a driver of its own, and reports it (`USB_HOSTS`).
+fn usb_host() -> Option<&'static str> {
+    USB_HOSTS.first().copied()
+}
+
 fn in_tree_driver_of(class: u32) -> Option<&'static str> {
     use godspeed_sdk::service_context::hwclass;
     IMAGES.iter().chain(USB_IMAGES.iter())
@@ -1819,8 +1829,16 @@ fn devices_answer(usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
 
 /// A host's report (`usbdev::Report`): start the device's driver if it is attached and not running, stop
 /// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
-fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents, r: usbdev::Report) {
+fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents,
+              inst: &mut installed::Installed, r: usbdev::Report) {
     usb.heard = true;
+    // An installed driver package of this device comes first: it is started, and no built-in driver is (`holds`).
+    if inst.usb_report(ctx, r.present, r.vid, r.pid) {
+        if let Some(i) = USB_MATCH.iter().position(|m| m.vid == r.vid && m.pid == r.pid) { usb.present[i] = true; }
+        ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - an installed package drives it",
+            r.vid, r.pid, r.gen));
+        return;
+    }
     if !r.present {
         // Said once per report, which is rare: a host reports at its boot, on a plug or unplug, and when a
         // new supervisor asks.
@@ -2608,7 +2626,7 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
     // A USB host's device report, before the commands it shares `supcmd::MARKER` with: it carries no reply
     // capability and is never answered.
     if let Some(r) = usbdev::decode(msg.payload_bytes()) {
-        usb_report(ctx, name_map, usb, events, r);
+        usb_report(ctx, name_map, usb, events, inst, r);
         return;
     }
     // A command, or a death notification? The first byte decides (see supcmd::MARKER).

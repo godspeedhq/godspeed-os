@@ -46,8 +46,10 @@ BASELINE = 7
 # Hand-kept, so it drifts: `audio-driver`, `pwm-audio` and `wifi-driver` arrived after it was written and
 # were counted as ordinary programs for using `Mmio` and `Dma`, which failed this check by 2 on `main`
 # and on every branch since, unnoticed because nothing ran it (2026-10-09).
+# `wifi-usb` is the USB dongle's driver and was missing for the same reason; it surfaced on 2026-10-23, when the
+# USB function protocol it speaks with its host moved from `sdk/wifi`, which this check does not scan, into the SDK.
 DRIVERS = {'block-driver', 'dwc2', 'ehci', 'nic-driver', 'xhci', 'driver-skeleton', 'console',
-           'audio-driver', 'pwm-audio', 'wifi-driver'}
+           'audio-driver', 'pwm-audio', 'wifi-driver', 'wifi-usb'}
 # Harness, adversarial and control surface - also 18.1, also not ordinary programs.
 HARNESS = {'probe', 'mem-pressure', 'control', 'chaos'}
 # Services that IMPLEMENT a wire protocol `gs` is the client for. `events` is the trace sink, so it

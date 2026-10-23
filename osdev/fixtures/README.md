@@ -70,13 +70,26 @@ Remake them when a template changes, or when the OS's program layout does.
 
 ## `kind-nic-0.1.0.gsp`
 
-An UNPUBLISHED driver package for `osdev test kinds`, signed by the same throwaway test key: a driver that TAKES A
+An UNPUBLISHED driver package for `osdev test driver-packages`, signed by the same throwaway test key: a driver that TAKES A
 DEVICE OVER from GodspeedOS. Made 2026-10-23 with `godspeed new driver kind-nic --publisher godspeed`
 (`godspeed-cli` `feat/driver-packages`) and changed in two places: its contract names the ethernet class
 (`hw_pci_class = "020000"`, `hw_pci_bar = "auto"`, no interrupt and no arena), which `nic-driver` drives, and its
 `src/main.rs` reads the e1000's status and its MAC (`RAL0`/`RAH0`) instead of `edu`'s registers, logging
 `kind-nic: took the ethernet device over - status ..., MAC 52:54:00:12:34:56`. The suite sees the supervisor stand
 `nic-driver` down, keep it down, and start it again once the package is uninstalled. Packaged as the files above.
+
+## `kind-usb-0.1.0.gsp`
+
+An UNPUBLISHED driver package for `osdev test driver-packages`, signed by the same throwaway test key: a driver of a
+USB DEVICE, which has no registers of its own and is reached through its host. Made 2026-10-23 with `godspeed new
+driver kind-usb --publisher godspeed` (`godspeed-cli` `feat/driver-packages`) and changed in two places: its contract
+names QEMU's FTDI serial adapter by `hw_usb = "0403:6001"` (no PCI class, interrupt or arena), and its `src/main.rs`
+uses `gs::driver::bus` - the device's identity from its host, `GET_DESCRIPTOR(DEVICE)` by a control transfer, a line
+sent by bulk OUT, and the bulk IN asked (bounded at 10 s, after logging `kind-usb: listening ...`) until the adapter
+has received something - logging `kind-usb: drove 0403:6001 through xhci - device release 0x0400, 38 bytes sent by
+bulk OUT ok, bulk IN <n> bytes: "<what arrived>"`. The suite puts the adapter's serial port on a TCP socket, writes
+`hello from the serial port` to it once the package listens, and reads back what the package sent. Packaged as the
+files above.
 
 ## `gts-root-r4.der`
 

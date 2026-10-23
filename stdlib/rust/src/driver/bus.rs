@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 //! `bus` - a device a driver reaches through the host of the bus it is on, not through registers of its own.
 //!
 //! A USB device has no register window and no DMA arena a driver could be granted: its host controller owns both,

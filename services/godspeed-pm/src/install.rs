@@ -313,8 +313,11 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     }
     if checked.kind == godspeed_package::Kind::Driver {
         let class = checked.contract.pci_class.map_or(cell(format_args!("none named")), |c| cell(format_args!("{:06x}", c)));
-        let gives = cell(format_args!("the PCI device of class {}: its registers{}", class.as_str(),
-            if checked.contract.pci_irq { " and its interrupt" } else { "" }));
+        let gives = match checked.contract.usb {
+            Some((v, p)) => cell(format_args!("the USB device {:04x}:{:04x}, through its USB host: started while it is attached", v, p)),
+            None => cell(format_args!("the PCI device of class {}: its registers{}", class.as_str(),
+                if checked.contract.pci_irq { " and its interrupt" } else { "" })),
+        };
         r.entry(&[C::S("device"), C::S(gives.as_str()),
                   C::S("a built-in driver of that device is stopped while this one is installed, and started again when it is uninstalled")]);
         // DMA memory is its own row, and the shell asks about it by a question of its own (13.1): whether an IOMMU
