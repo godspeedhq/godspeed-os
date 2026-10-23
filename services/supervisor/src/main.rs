@@ -157,7 +157,7 @@ fn handle_command(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, ev
         body_len = inst.answer(ctx, &mut body);
         supcmd::OK
     } else if payload.len() == 2 && payload[1] == supcmd::MANAGED {
-        body_len = managed_answer(map, usb, &mut body);
+        body_len = managed_answer(map, usb, inst, &mut body);
         supcmd::OK
     } else if payload.len() > 2 && payload[1] == supcmd::WHY {
         let name = core::str::from_utf8(&payload[2..]).unwrap_or("");
@@ -1702,12 +1702,12 @@ impl DevEvents {
 /// (`supcmd::MANAGED`). Exactly the set the reconcile sweep restarts - a name it has an image and a cap
 /// for, and wants (a USB device's driver only while its device is attached) - so `ask` calls a service
 /// down by the same rule the supervisor would bring it back by.
-fn managed_answer(map: &NameCapMap, usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
+fn managed_answer(map: &NameCapMap, usb: &UsbState, inst: &installed::Installed, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
     out[0] = supcmd::OK;
     let mut n = 2usize;
     let mut count = 0u8;
     for name in MANAGED.iter() {
-        if map.get(name).is_none() || !usb.wanted(name) { continue; }
+        if map.get(name).is_none() || !usb.wanted(name) || inst.holds(name) { continue; }
         let b = name.as_bytes();
         if n + 1 + b.len() > out.len() { break; }
         out[n] = b.len() as u8;
@@ -2008,7 +2008,7 @@ fn respawn_retry(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool
 /// and a dropped name is silently never restarted (the "fs gone from observe after a storm" bug).
 /// `acquire_*_cap` cannot detect this (the kernel directory keeps a dead name), so we scan REAL liveness
 /// via `task_stat`. Returns how many it respawned. (One pass; the death-loop backstop.)
-fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events: &mut DevEvents) -> u32 {
+fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, inst: &installed::Installed, events: &mut DevEvents) -> u32 {
     let alive = managed_alive(ctx);
     let mut n = 0;
     for i in 0..MANAGED_N {
@@ -2016,7 +2016,8 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, events:
         // the PCI scan did not find (ehci/nic-driver/net-stack, below). Without this, reconcile would
         // "resurrect" a deliberately-skipped driver on the first death notification, undoing the skip.
         // Mirrors converge's `map.get(...).is_none()` guard.
-        if alive[i] || map.get(MANAGED[i]).is_none() || !usb.wanted(MANAGED[i]) { continue; }
+        // A built-in driver an installed package took the device from stays down until the package gives it back.
+        if alive[i] || map.get(MANAGED[i]).is_none() || !usb.wanted(MANAGED[i]) || inst.holds(MANAGED[i]) { continue; }
         // respawn_RETRY, not a single respawn_managed: the reconcile backstop recovers a service whose
         // death NOTIFICATION was dropped (endpoint overflow under a storm), so a transient respawn
         // failure here has no later death to ride - it must retry to satisfaction like the death arms
@@ -2567,7 +2568,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // 16-deep endpoint overflowed under a storm, or we were ourselves dead and respawning when it was
         // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
         // gone from observe after a storm" bug). Cheap when nothing is dead.
-        reconcile(&ctx, &mut name_map, &usb, &mut events);
+        reconcile(&ctx, &mut name_map, &usb, &inst, &mut events);
         tell_radio_of_dongle(&ctx, &name_map, &usb, &mut told_radio);
         name_map.release_handoff(&ctx);
     }
@@ -2653,6 +2654,11 @@ fn handle_message(ctx: &ServiceContext, name_map: &mut NameCapMap, usb: &mut Usb
     // comes back when its host reports the device attached again.
     if !name.is_empty() && !usb.wanted(name) {
         ctx.log_fmt(format_args!("supervisor: {} ended - not restarted, its USB device is not attached", name));
+        return;
+    }
+    // A built-in driver stood down for an installed package (`installed::Installed::holds`): not restarted beside it.
+    if !name.is_empty() && inst.holds(name) {
+        ctx.log_fmt(format_args!("supervisor: {} ended - not restarted, an installed package drives its device", name));
         return;
     }
     if !name.is_empty() && is_watched(name) {

@@ -1118,7 +1118,7 @@ message at a time) and `finish(status)` (the end byte, then `Exit`). The package
 - `godspeed/hello-utility` is the first, published 2026-10-17. The registry was redeployed with the crate that
   knows the kind, with the operator's approval.
 
-## 13. Drivers and apps from packages: a design for approval (2026-10-17, not built)
+## 13. Drivers and apps from packages (designed 2026-10-17; built since, 13.1 says how far)
 
 The operator's fourth decision was **design only** for these two kinds: no template, no package, no OS change
 until this is approved. What follows is a proposal. 9.4 and 9.5 named what each needs; this answers them using
@@ -1162,6 +1162,28 @@ A register-only class (no arena) carries no such warning.
 - The CLI: `godspeed new driver` on `gs::driver`, refused until this ships, as `utility` was.
 - Open: what a USB-class driver's host does (it must hand the device to the package, as `dwc2`/`xhci` hand the
   dongle to `wifi-usb` today - that protocol, `usbfn`, is the precedent).
+
+**What was built, and in what order.** The register grant came first (v0.30.0): a package named its PCI class and
+was given that device's registers and nothing else, and a class an in-tree driver handled was refused. That was
+one of the five things this section asks for, and the operator's goal for `gs::driver` was all of them, so the
+rest is `feat/driver-packages` (2026-10-23):
+
+- **An interrupt**: `hw_pci_irq = true` in the contract, and the supervisor sets `PCI_IRQ` in the spawn request, as
+  for an in-tree driver. The kernel allocates the vector and programs the device's MSI; the package waits for it
+  with `gs::driver::irq`. No question of its own: the interrupt is the device's, and `device` already grants it.
+- **A DMA arena**: `hw_dma = "64KiB"` (at most 2 MiB, `installed::DMA_MAX`), a size and never an address, laid out
+  with `gs::driver::arena`. The operator grants it as `memory`, by a SECOND question at install. That question is
+  asked on every machine, which is wider than "only where no IOMMU confines it" above: nothing a service can ask
+  says whether the kernel will confine this device (the Pis and the VisionFive have no IOMMU at all; on x86 the
+  kernel confines where it can and says so only on the log), so the warning is always given rather than guessed.
+  A kernel fact that says it would let a confined machine skip the question; it is not built.
+- **Taking a device over**: a class an in-tree driver handles is no longer refused. The supervisor records the
+  device as the package's, stops the in-tree driver, and keeps it stopped - its death notice, the reconcile sweep
+  and the `MANAGED` answer all ask `Installed::holds` - until the package is uninstalled, ends itself, or is left
+  down after its restarts; then the in-tree driver is wanted again and the sweep brings it back. A respawned
+  supervisor reads a running driver package's contract from the disk again and stands the in-tree driver down
+  once more. What the in-tree driver's CLIENTS do is unchanged: they reach it by name, and the package has its
+  own name, so `net-stack` does not talk to a package that took the NIC.
 
 ### 13.2 `app`: a program with a screen of its own, while it has focus
 

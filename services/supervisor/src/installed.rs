@@ -15,7 +15,9 @@
 //!
 //! **What it is given:** no privilege at all, a send capability to each peer that the grant names AND the contract
 //! requests (never `supervisor`), an endpoint if its contract declares `ipc_receive`, and its contract's memory limit
-//! up to [`MEMORY_MAX`]. It runs under its package name, `publisher/name`, which no built-in service can hold.
+//! up to [`MEMORY_MAX`]; a driver, its one device by class - the registers, the interrupt its contract asks for and a DMA
+//! arena the operator granted (`memory`) - taken over from a built-in driver if one holds it. It runs under its package
+//! name, `publisher/name`, which no built-in service can hold.
 //!
 //! **What it is not, recorded rather than hidden (26.7):** the grant file and the trust record are as protected as
 //! `/system` is. Anything that can write there can widen a grant up to what the signed contract requests, or swap the
@@ -31,6 +33,9 @@ use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_HANDOVER, SPAWN_FLA
 pub const CONSOLE_GRANT: &str = "console";
 /// ...and the word a driver's uses for its device.
 pub const DEVICE_GRANT: &str = "device";
+/// ...and for its DMA arena, which the operator answers by a question of its own (`docs/developer-services-design.md`
+/// 13.1): where no IOMMU confines the device, a driver with an arena can reach all of memory.
+pub const MEMORY_GRANT: &str = "memory";
 
 use crate::check::{self, Text, MAX_PEERS, PEER_MAX};
 
@@ -51,6 +56,10 @@ pub const MAX_INSTALLED: usize = 8;
 pub const RESTARTS_MAX: u32 = 5;
 /// The longest package name, `publisher/name`.
 const NAME_MAX: usize = 80;
+/// The largest DMA arena an installed driver is given, whatever its contract asks (`hw_dma`).
+pub const DMA_MAX: u64 = 2 * 1024 * 1024;
+/// How long a built-in driver is given to end when a package takes its device over, before the package is refused.
+const STAND_DOWN_MS: u64 = 2000;
 
 /// This machine's architecture, in the package format's spelling.
 fn this_arch() -> Option<&'static str> {
@@ -191,6 +200,24 @@ impl Installed {
         Ok(true)
     }
 
+    /// Is `driver`, a built-in driver, stood down because an installed package holds its device? The death notice,
+    /// the reconcile sweep and the startup convergence all ask, so none of them starts it beside the package.
+    pub fn holds(&self, driver: &str) -> bool {
+        self.e.iter().flatten().any(|x| x.pci_class.is_some_and(|c| crate::in_tree_driver_of(c) == Some(driver)))
+    }
+
+    /// `pkg` no longer drives its device: its class is forgotten, so a built-in driver it took the device from is
+    /// wanted again, and said.
+    fn give_back(&mut self, ctx: &ServiceContext, pkg: &str) {
+        let Some(i) = self.find(pkg) else { return };
+        let Some(mut e) = self.e[i] else { return };
+        let Some(class) = e.pci_class.take() else { return };
+        self.e[i] = Some(e);
+        if let Some(holder) = crate::in_tree_driver_of(class) {
+            ctx.log_fmt(format_args!("supervisor: {}'s device (class {:06x}) goes back to {}", pkg, class, holder));
+        }
+    }
+
     /// Record the device class `pkg` was started with.
     fn class_of(&mut self, pkg: &str, class: Option<u32>) {
         if let Some(i) = self.find(pkg) {
@@ -258,12 +285,35 @@ impl Installed {
             // A respawned supervisor finds what the last one started still running: adopt it, do not start a second.
             let kind = self.e[slot].map_or((false, false), |x| (x.utility, x.app));
             self.remember(slot, pkg, version, restarts, kind);
+            self.adopt_device(ctx, publisher, name, pkg, version);
             return Ok(());
         }
-        let ((kind, _), handover) = self.run_as(ctx, publisher, name, pkg, version, None, false).map(|(k, c, h)| ((k, c), h))?;
+        // Listed before it starts, so a device it takes over is recorded against it from the first moment.
+        let new = self.e[slot].is_none();
+        if new { self.remember(slot, pkg, version, restarts, (false, false)); }
+        let started = self.run_as(ctx, publisher, name, pkg, version, None, false).map(|(k, c, h)| ((k, c), h));
+        let ((kind, _), handover) = match started {
+            Ok(x) => x,
+            Err(why) => { if new { self.e[slot] = None; } return Err(why); }
+        };
         self.remember(slot, pkg, version, restarts, kind);
         self.note_handover(pkg, handover);
         Ok(())
+    }
+
+    /// A driver package found running by a respawned supervisor: its contract read from the disk again, so the device
+    /// it holds is recorded and the built-in driver this supervisor's startup brought back is stood down once more.
+    fn adopt_device(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str) {
+        let Ok(c) = check::package(ctx, publisher, name, version, this_arch(), &mut |_, _| true) else { return };
+        if c.kind != Kind::Driver { return; }
+        let Some(class) = c.contract.pci_class else { return };
+        self.class_of(pkg, Some(class));
+        if let Some(holder) = crate::in_tree_driver_of(class) {
+            if alive(ctx, holder) {
+                let _ = ctx.kill(holder);
+                ctx.log_fmt(format_args!("supervisor: {} stood down again - the installed {} still drives its device", holder, pkg));
+            }
+        }
     }
 
     /// Run the installed utility `task`, for the shell: `peers` are the shell's own (it reads the output), and
@@ -349,6 +399,7 @@ impl Installed {
         // The console: for an app, and only when the operator's answer gave it. The device, likewise, for a driver.
         let mut console = false;
         let mut device = false;
+        let mut memory = false;
         let mut peers: [&str; MAX_PEERS + 1] = [""; MAX_PEERS + 1];
         let mut np = 0usize;
         // The shell first: a utility's output goes to its first peer (`gs::program::Output`).
@@ -362,6 +413,11 @@ impl Installed {
             if p == DEVICE_GRANT {
                 if !driver { return Err(text(format_args!("its grant names a device, which only a driver is given"))); }
                 device = true;
+                continue;
+            }
+            if p == MEMORY_GRANT {
+                if !driver { return Err(text(format_args!("its grant names DMA memory, which only a driver is given"))); }
+                memory = true;
                 continue;
             }
             if p == "supervisor" { return Err(text(format_args!("its grant names `supervisor`, which no package is given"))); }
@@ -381,28 +437,37 @@ impl Installed {
             if !console { return Err(text(format_args!("it is an app, and its grant does not give it the console"))); }
             req.flags |= SPAWN_FLAG_REQ_CONSOLE;
         }
+        // A built-in driver this package takes a device over from: stood down below, just before the spawn.
+        let mut stood_down: Option<&'static str> = None;
         if driver {
-            // ONE DEVICE, BY CLASS, REGISTERS ONLY. The class is the contract's, signed; the operator approved it
-            // ("device"); the kernel finds which device of that class this is from its own bus scan (a BDF of 0),
-            // exactly as for an in-tree driver named by class. No DMA arena and no interrupt, yet: a package
-            // reaches its device's registers and nothing more (docs/developer-services-design.md 13.1).
+            // ONE DEVICE, BY CLASS. The class is the contract's, signed; the operator approved it ("device"); the
+            // kernel finds which device of that class this is from its own bus scan (a BDF of 0), exactly as for an
+            // in-tree driver named by class (docs/developer-services-design.md 13.1). An interrupt and a DMA arena
+            // are given when the contract asks, the arena only when the operator answered its own question.
             let Some(class) = checked.contract.pci_class else {
                 return Err(text(format_args!("it is a driver, and its contract names no device (hw_pci_class)")));
             };
             if !device { return Err(text(format_args!("it is a driver, and its grant does not give it its device"))); }
-            if checked.contract.pci_irq {
-                return Err(text(format_args!("its contract asks for an interrupt, which a package is not given yet - it would wait for one forever")));
-            }
-            if let Some(holder) = crate::in_tree_driver_of(class) {
-                return Err(text(format_args!("its device class {:06x} is driven by `{}`, which a package does not replace", class, holder)));
-            }
             if let Some(other) = self.e.iter().flatten().find(|x| x.name() != pkg && x.pci_class == Some(class)) {
                 return Err(text(format_args!("its device class {:06x} is driven already by the installed {}", class, other.name())));
             }
-            // Confined where an IOMMU can confine it, with no arena: the device itself cannot reach memory there.
-            req.hw_flags = godspeed_sdk::service_context::hwclass::pci(class, checked.contract.pci_bar, true);
+            let dma = checked.contract.dma_bytes;
+            if dma > DMA_MAX {
+                return Err(text(format_args!("its contract asks for {} KiB of DMA memory, and a package is given at most {} KiB",
+                    dma / 1024, DMA_MAX / 1024)));
+            }
+            if dma > 0 && !memory {
+                return Err(text(format_args!("its contract asks for DMA memory, and its grant does not give it - its device could not reach memory")));
+            }
+            // Confined where an IOMMU can confine it: the device then reaches its arena and nothing else (6.4).
+            req.hw_flags = if checked.contract.pci_irq {
+                godspeed_sdk::service_context::hwclass::pci_irq(class, checked.contract.pci_bar, true)
+            } else {
+                godspeed_sdk::service_context::hwclass::pci(class, checked.contract.pci_bar, true)
+            };
             req.bdf = 0;
-            req.dma_pages = 0;
+            req.dma_pages = dma.div_ceil(4096) as u32;
+            stood_down = crate::in_tree_driver_of(class);
         }
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
         // A handover-capable start carries a fresh KEY in its spawn mode, which only this supervisor can set: an offer
@@ -427,24 +492,53 @@ impl Installed {
             req.flags |= SPAWN_FLAG_HANDOVER | SPAWN_FLAG_REQ_RECV;
         }
         req.privileges = 0;
+        if let (Some(holder), Some(class)) = (stood_down, checked.contract.pci_class) {
+            // TAKEN OVER, never shared: the built-in driver is stopped and kept stopped while this package holds its
+            // device. The class is recorded FIRST, so the death notice and the reconcile sweep both find the device
+            // held and leave its driver down; it is given back when the package is uninstalled or left down (`holds`).
+            self.class_of(pkg, Some(class));
+            if alive(ctx, holder) {
+                let _ = ctx.kill(holder);
+                let budget = godspeed::driver::wait::Budget::ms(STAND_DOWN_MS);
+                if godspeed::driver::wait::until(ctx, budget, || !alive(ctx, holder)).is_err() {
+                    self.class_of(pkg, None);
+                    return Err(text(format_args!("`{}` drives its device and did not stop within {} ms", holder, STAND_DOWN_MS)));
+                }
+                ctx.log_fmt(format_args!("supervisor: {} stood down - the installed {} drives its device (class {:06x}) until it is uninstalled",
+                    holder, pkg, class));
+            }
+        }
         let mut out = [0u8; 128];
         match ctx.spawn_image(&mut req, &mut out, &peers[..np]) {
             Ok(cap) => {
                 // Nobody asked for a capability to it here; clients reach it by name, as every service. A successor's
                 // goes back to the caller, which hands it to the running version with the offer.
                 let kept = if successor { cap } else { if let Some(c) = cap { gs::cap::remove(ctx, c.into()); } None };
+                let gave = if !driver { "" }
+                    else if req.dma_pages > 0 && checked.contract.pci_irq { ", its device with its interrupt and DMA memory" }
+                    else if req.dma_pages > 0 { ", its device with DMA memory" }
+                    else if checked.contract.pci_irq { ", its device with its interrupt" }
+                    else { ", its device" };
                 ctx.log_fmt(format_args!("supervisor: installed {} {} started ({} bytes, {} peer(s){}, checked from disk)",
-                    pkg, version, checked.size, np, if driver { ", its device" } else { "" }));
+                    pkg, version, checked.size, np, gave));
                 if driver { self.class_of(pkg, checked.contract.pci_class); }
                 Ok(((utility, app), kept, (can_hand_over, key)))
             }
-            Err(e) => Err(text(format_args!("the kernel refused to start it: {:?}", e))),
+            Err(e) => {
+                // Not started: a device taken over goes back to its built-in driver, which the reconcile sweep restarts.
+                if let Some(holder) = stood_down {
+                    self.class_of(pkg, None);
+                    ctx.log_fmt(format_args!("supervisor: installed {} did not start - its device goes back to {}", pkg, holder));
+                }
+                Err(text(format_args!("the kernel refused to start it: {:?}", e)))
+            }
         }
     }
 
     /// Stop `pkg` and forget it. False when it was not installed here.
     pub fn stop(&mut self, ctx: &ServiceContext, pkg: &str) -> bool {
         let Some(i) = self.find(pkg) else { return false };
+        self.give_back(ctx, pkg);
         // Forgotten FIRST, so its death notice finds nothing to restart.
         self.e[i] = None;
         let _ = ctx.kill(pkg);
@@ -461,11 +555,13 @@ impl Installed {
         if exited || e.utility {
             // Finished (it said so), or a utility, which runs for one command and is never kept running.
             ctx.log_fmt(format_args!("supervisor: installed {} ended{} - not restarted", task, how));
+            self.give_back(ctx, task);
             return;
         }
         if e.restarts >= RESTARTS_MAX {
             ctx.log_fmt(format_args!("supervisor: installed {} died{} - restarted {} times already, left down",
                 task, how, RESTARTS_MAX));
+            self.give_back(ctx, task);
             return;
         }
         e.restarts += 1;

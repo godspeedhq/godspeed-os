@@ -16011,10 +16011,25 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
         gs::io::println_fmt(ctx, format_args!("godspeed: {} not {}", spec, if from.is_some() { "upgraded" } else { "installed" }));
         return true;
     }
+    if peers.split(',').any(|p| p == "memory") && !confirm_dma(ctx, release, yes) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} not {}", spec, if from.is_some() { "upgraded" } else { "installed" }));
+        return true;
+    }
     let grant = if peers.is_empty() { "none" } else { peers };
     let mut line = [0u8; 512];
     let cmd = fmt_into(&mut line, format_args!("install {} grant {}", spec, grant));
     godspeed_show(ctx, cmd).is_ok()
+}
+
+/// The second question a driver that asks for DMA memory is given (`docs/developer-services-design.md` 13.1). Asked
+/// on every machine, because none can tell the shell whether its IOMMU confines this device: the Pis and the
+/// VisionFive have no IOMMU at all, and on x86 the kernel confines a device only where it can.
+fn confirm_dma(ctx: &ShellCtx, who: &str, yes: bool) -> bool {
+    gs::io::println_fmt(ctx, format_args!("{} also asks for DMA memory: its device reads and writes memory by itself.", who));
+    gs::io::println(ctx, "Where no IOMMU confines the device - no Raspberry Pi or VisionFive has one - its driver can then");
+    gs::io::print(ctx, "read and write all of this machine's memory. Grant it DMA memory? [y/N]: ");
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); return true; }
+    read_confirm(ctx)
 }
 
 /// The most packages one plan installs, its own included (the package manager's `PLAN_MAX` and the package).
@@ -16122,6 +16137,12 @@ fn install_plan(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &m
     else if !read_confirm(ctx) {
         gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed, nor what it needs", spec));
         return Some(true);
+    }
+    for r in &rows[..n] {
+        if r.asks().split(", ").any(|p| p == "memory") && !confirm_dma(ctx, r.pkg(), yes) {
+            gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed, nor what it needs", spec));
+            return Some(true);
+        }
     }
     for r in &rows[..n] {
         let mut grant = [0u8; 192];
