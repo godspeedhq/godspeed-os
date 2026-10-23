@@ -98,6 +98,18 @@ by VID:PID instead of skipping it; a runtime control transfer that leaves the re
 alone; a bulk IN qTD kept armed, with its completion taken on the interrupt; a bulk OUT; and serving
 `usbfn`, as `xhci` and `dwc2` do.
 
+## 4b. A device for an installed driver package (2026-10-23)
+
+The design above names "an interface class later" for the match table. What was built instead is narrower and
+needs no class: `xhci` and `dwc2` bind, beside the dongle, any device whose first interface is vendor-specific
+(class 0xFF) - the classes a host has no driver of its own for - and report it with the same `usbdev` report.
+The supervisor matches the report against `USB_MATCH` AND against the installed driver packages that name a
+device by `hw_usb`, and a package wins: it is started with the reporting host as its peer, and the built-in
+driver of that device (`wifi-usb`, for the dongle) is kept down while it is installed. The package speaks the
+function protocol through `gs::driver::bus`. One bound device per host still holds. Shown in QEMU with the FTDI
+serial adapter behind `xhci` (`osdev test driver-packages`); `dwc2`'s side is built and unseen, since it serves a
+high-speed device only and QEMU's `raspi2b` offers none. `docs/developer-services-design.md` 13.1 has the rest.
+
 ## 5. Order of work
 
 1. **Finish U2a on the T630:** the dongle's bring-up through `xhci` (DONE 2026-10-06, on the T630 and

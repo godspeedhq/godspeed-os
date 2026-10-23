@@ -102,6 +102,14 @@ and why; read them for the reasoning, not to find out what the library contains.
   knows about a device that the driver cannot read for itself. `gs::program::mode` beside them is the mode
   a program was started in. All counted by `one_way_check.py`, every caller at zero.
 
+- **`bus`** (2026-10-23) - a device reached through the host of the bus it is on, for a device with no registers
+  of its own: `UsbDevice::granted` finds the USB host a driver was given as its peer, and `info`, `control_in`,
+  `control_out`, `bulk_out` and `bulk_in` ask it for the bound device's transfers over the function protocol
+  (`godspeed_sdk::usbfn`), each bounded, with a host's notice named back by `OP_SYNC`. A BUS, not a class: it moves
+  transfers and knows nothing of what the device is, so the rule against a `driver::usb` class API stands. Its
+  first user is a driver package (`hw_usb`, `docs/developer-services-design.md` 13.1); `wifi-usb` still speaks the
+  protocol by hand, the one driver left to convert to it.
+
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
 (1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet
 verified on hardware**). `audio-driver` and `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).

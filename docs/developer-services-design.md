@@ -1184,6 +1184,23 @@ rest is `feat/driver-packages` (2026-10-23):
   supervisor reads a running driver package's contract from the disk again and stands the in-tree driver down
   once more. What the in-tree driver's CLIENTS do is unchanged: they reach it by name, and the package has its
   own name, so `net-stack` does not talk to a package that took the NIC.
+- **A USB device**: `hw_usb = "0403:6001"`, by vendor and product, instead of a PCI class. A USB device has no
+  registers of its own, so the package is the CLIENT of the host that binds it: `xhci` and `dwc2` bind, beside the
+  WiFi dongle, any device whose first interface is vendor-specific (class 0xFF), and report it as they report the
+  dongle (`usbdev`); the supervisor starts the package when its device is reported, with that host as its peer and
+  an endpoint for the host's answers, stops it (kept installed) when the device leaves, and does not restart it
+  while it is gone. The package reaches the device through `gs::driver::bus` (`UsbDevice`: identity, control
+  transfers, bulk OUT, bulk IN), over the function protocol `wifi-usb` already speaks, whose numbers moved to the
+  SDK (`godspeed_sdk::usbfn`) so a package can use them. The open question above is answered by that precedent:
+  the host hands the device to the package exactly as it hands the dongle to `wifi-usb`. Limits, recorded: one such
+  device per host (the first bound keeps the slot, as the dongle always did); a standard class the host does not
+  drive (audio, video, Bluetooth, CDC) is still released, not bound; `dwc2` runs no split transactions for bulk, so
+  on the Pi 2 a full-speed device behind its hub is not bound, and a high-speed one is what it serves; `ehci` binds
+  none (`docs/usb-device-drivers.md` 4).
+
+**How it was shown.** In QEMU on x86, `osdev test kinds` (the template's driver: registers, the interrupt and a DMA
+arena on `edu`) and `osdev test driver-packages` (a package taking the e1000 over from `nic-driver` and giving it
+back; a package driving QEMU's FTDI serial adapter behind `xhci`, a line each way). On hardware: not yet.
 
 ### 13.2 `app`: a program with a screen of its own, while it has focus
 
