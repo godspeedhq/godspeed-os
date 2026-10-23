@@ -1831,3 +1831,60 @@ decryption takes 5.3-5.4 s of a 20 s cable download on the Pi 2 (about 480 cycle
 whether the crypto crates gain from a higher level is a build-wide choice, not an audit's.
 
 **Gates:** every documentation checker green.
+
+## Audit 23 - documents and code comments, the branch before it merges (2026-10-23)
+
+Scope: every file `feat/gs-driver` changed since it left `main` (`origin/main...5765f5da`, 133 files) where a
+step-4 or step-5 change could have left a statement behind - the interrupt waits of `ehci`, `dwc2` and `xhci`
+moved onto `gs::driver::irq`, and a driver's remaining SDK calls wrapped as `gs::driver::input`, `power` and
+`device` and `gs::program::mode` - plus the published site's hand-written stdlib page and the `gs::driver` doc
+comments its API reference is generated from. Comments and documents only: the operator had just run 1000
+rounds of chaos on all five boards on this code, so no code token changed, which the diff was checked for.
+
+**Result.** 18 corrections across 13 files. One code finding, recorded and not fixed: the teaching example
+`examples/driver-skeleton` still receives with `gs::ipc::recv` and tells its interrupt apart with a stub
+`is_interrupt` of its own, so "every driver that takes an interrupt waits through `irq`" was true of
+`services/` and not of the examples; the claim now says `services/`, and `docs/driver-library.md` names the
+example.
+
+**In the site (`website/src/stdlib.md`, site-owned):**
+- It told a driver author to reach for the SDK reference. Drivers are written on `gs::driver`; the page now
+  says so, with a section listing its modules (`registers`, `arena` and `Layout`, `wait`, `delay`, `irq` with
+  `Irq::take`, `input`, `power`, `device`) and a short driver, and that a driver PACKAGE is given registers
+  only.
+- It had no word on the kinds of program a developer makes. A table now gives `service`, `utility`, `app`
+  and `driver`, each with `godspeed new <kind>` and the `gs` module it is written with, and `osdev test kinds`.
+- Its first example said "There is no `exit`: every runnable thing here is a service". Untrue since the
+  `Exit` syscall (CLAUDE.md 14.5 amendment, 2026-10-17); a utility ends with `gs::program::exit`.
+
+**In the stdlib's doc comments (the API reference):**
+- `driver/irq.rs`: the header said `xhci`, `ehci` and `dwc2` "each wrote that out by hand" and stopped
+  there; it now says they wait here since 2026-10-22, and names `Irq::take`. `Irq::seen` counted "by
+  `Irq::wait`" and is counted by `take` too.
+- `driver/registers.rs` and `driver/arena.rs`: "the rest still use the SDK's" - every compiled driver has
+  taken both grants through `gs::driver` since 2026-10-19 and 2026-10-20.
+
+**In code comments:**
+- `xhci`: four comments on the main wait named `recv_within_ms` and `recv_timeout(0)`; the wait is
+  `Irq::wait`, which is what guarantees the deadline is never 0.
+- `dwc2`: `notify`'s header named `console_push` for the newline it pushes; `net.rs` named
+  `ctx.board_mac()`. Both are the `gs::driver` calls now.
+- `probe`: said the SDK exposes its mode via `ctx.probe_mode()`; it reads `gs::program::mode`.
+
+**In documents:**
+- `docs/console-service.md`: the input diagram's `ctx.console_push` is `gs::driver::input::push`.
+- `docs/stdlib-design.md`: "What is still SDK" listed `Mmio`, `Dma` and `device_power` as hardware still on
+  the SDK; a dated note says the first three come through `gs::driver` now and `cpu_clock` is the `power`
+  service's.
+- `backlog/71`: step 5 added to the step-2 record, and the Audit 18 note that four boards owed a card for
+  the layout fixes given a dated note: all five have run that code since, in the step 4 cards and a
+  1000-round run each, the refusal paths unreachable on any.
+- `docs/driver-library.md`: "Current state (2026-10-09)" retitled to the day it describes.
+- `docs/CLAUDE.md`: the index row's "every driver" said `services/`.
+
+**Recorded, not changed:** step 1l's "not yet verified on hardware" stands - its one check, `ehci` near 0%
+CPU in `observe now` with the keyboard unplugged for about 90 s, has not been run.
+
+**Gates:** every documentation checker green, the one-way and quit-wait ratchets green, and the touched
+crates built.
+

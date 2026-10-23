@@ -50,7 +50,7 @@ test for `gs` is whether a contributor must NAME a thing and rely on it. A drive
 window and its DMA arena, so those types come through `gs::driver` too, over the SDK's `Mmio` and `Dma`;
 the end state is no service or driver crate depending on the SDK directly (`backlog/71`).
 
-## Current state (2026-10-09)
+## Current state (2026-10-22)
 
 What exists now. The dated steps after the method sections are the record of how each piece got here,
 and why; read them for the reasoning, not to find out what the library contains.
@@ -80,8 +80,10 @@ and why; read them for the reasoning, not to find out what the library contains.
   With no interrupt routed the same loop is a timed wait that still serves requests. `take` (2026-10-22)
   is the same sorting without blocking, for a driver that drains its endpoint in a bounded loop. Its
   users are `audio-driver` (step 2), `pwm-audio`, which runs on the no-interrupt path, and since step 4
-  (2026-10-22) `ehci`, `dwc2` and `xhci`, whose waits were hand-written until then: every driver that takes
-  an interrupt now waits for it through `irq`.
+  (2026-10-22) `ehci`, `dwc2` and `xhci`, whose waits were hand-written until then: every driver in `services/` that
+  takes an interrupt now waits for it through `irq`. The teaching example `examples/driver-skeleton` does
+  not yet: its serve loop still receives with `gs::ipc::recv` and tells the interrupt apart with a stub
+  `is_interrupt` of its own (recorded by Audit 23, `audits/documentation-audit.md`).
 
 - **`registers` and `arena`** (step 3, 2026-10-19) - the two grants a driver names and relies on.
   `registers(ctx)` is the device's register window (`Registers`: `read8`..`read64`, `write8`..`write64`,

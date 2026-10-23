@@ -806,7 +806,7 @@ pub fn health_check(ctx: &ServiceContext, m: &Registers, d: &Parts, t: &Target, 
 ///
 /// The MAC: the board's own, which the kernel reads from the VideoCore mailbox (outside the DWC2
 /// register window this service was granted) and hands over as InspectKernel query 23
-/// (`ctx.board_mac()`); failing that, whatever the firmware left in the CHIP; failing that, a
+/// (`gs::driver::device::board_mac`); failing that, whatever the firmware left in the CHIP; failing that, a
 /// locally-administered address. Granting the mailbox window itself would be authority out of
 /// proportion to one identity fact. The log names which case happened - see "THREE SOURCES" in the
 /// body.

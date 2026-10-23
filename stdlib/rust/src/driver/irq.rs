@@ -19,7 +19,10 @@
 //! - **A zero deadline.** `recv_timeout(0)` blocks FOREVER, so a computed budget that rounds to zero
 //!   turns a watchdog into a hang.
 //!
-//! This is the one wait, written once, from those three.
+//! This is the one wait, written once, from those three - and since 2026-10-22 it is the wait of all three
+//! of them, and of both audio drivers: every driver in `services/` that takes an interrupt waits for it
+//! here. A driver that drains its endpoint before it blocks takes what is queued with [`Irq::take`], the
+//! same sorting without the wait.
 //!
 //! # The shape
 //!
@@ -118,7 +121,7 @@ impl Irq {
         self.vector
     }
 
-    /// Interrupts seen by [`Irq::wait`] so far - evidence, for a driver to report.
+    /// Interrupts seen by [`Irq::wait`] and [`Irq::take`] so far - evidence, for a driver to report.
     pub fn seen(&self) -> u64 {
         self.seen.get()
     }

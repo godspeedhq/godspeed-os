@@ -125,7 +125,7 @@ fn usb_irq(
 /// This writes OUTPUT to the console, which is not the mechanism that caused trouble before: that was
 /// `console_push`, which injects into the INPUT ring and made the shell reprint its prompt on every
 /// keyboard re-bind. Writing a line does not disturb the shell's input at all. It then pushes ONE
-/// newline (`console_push`) so the shell redraws its prompt - restored, and why it is safe now, in the
+/// newline (`gs::driver::input::push`) so the shell redraws its prompt - restored, and why it is safe now, in the
 /// body.
 ///
 /// Leading newline so the line starts clean rather than merging into a half-typed command, and short

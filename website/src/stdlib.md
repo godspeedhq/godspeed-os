@@ -9,9 +9,27 @@ not need MISCIS, the capability table, or the IPC wire format to read a file.
 Every module carries its own documentation, including what each call blocks on, what authority it
 needs, and which failures are safe to retry.
 
-**[The SDK API reference](api/godspeed_sdk/index.html)** - `godspeed_sdk`, the layer underneath.
-Reach for this when you are writing a driver or a service that needs the raw syscall seam; an
-ordinary program should not have to.
+**[The SDK API reference](api/godspeed_sdk/index.html)** - `godspeed_sdk`, the layer underneath: the
+syscalls themselves, and the audited `unsafe` (CLAUDE.md 18.1). You should not need it. Services and
+drivers alike are written on `gs`, drivers through [`gs::driver`](api/godspeed/driver/index.html)
+(below), and `scripts/one_way_check.py` holds every program in this repository to zero raw SDK calls
+that `gs` covers.
+
+## Four kinds of program
+
+The developer CLI makes each with one command, `godspeed new <kind> <name>`, written on `gs` from its
+first line, with a contract and a README that says how to build and run it:
+
+| Kind | What it is | Written with |
+|---|---|---|
+| `service` | Runs until it is stopped; the supervisor keeps it running and restarts it if it dies | `gs::ipc`, `gs::call`, `gs::fs`, `gs::net`, ... |
+| `utility` | One job for one command line: handed its arguments, writes its output, ends with a status the shell reports; its output pipes like any built-in's | [`gs::program`](api/godspeed/program/index.html) |
+| `app` | A utility that holds the screen and the keyboard while it runs, and gives them back when it ends | [`gs::app`](api/godspeed/app/index.html) |
+| `driver` | Drives one device, named in its contract by PCI class code and register BAR | [`gs::driver`](api/godspeed/driver/index.html) |
+
+A fifth, `library`, is reusable code for the others and runs nowhere on its own. `godspeed package` turns
+a project into a signed package and `godspeed install` puts it on a machine; `osdev test kinds` installs
+one of each of the four, made from the templates untouched, and sees each do its job.
 
 ## Start here
 
@@ -40,8 +58,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         Err(e) => gs::io::report(&ctx, "read", e),
     }
 
-    // A program does not return. There is no `exit`: every runnable thing here is a service, and a
-    // service that has finished its work waits to be stopped.
+    // A program does not return. This one is a SERVICE, which waits to be stopped once its work is
+    // done; a utility ends instead, with `gs::program::exit` or `Output::finish` (CLAUDE.md 14.5).
     loop { gs::task::yield_now(&ctx); }
 }
 ```
@@ -151,6 +169,41 @@ Two exceptions, both of which say so where you reach for them:
   and only you can answer them.
 - **A handle built with `Fs::with_notice`** polls for an operator pressing `q`, which means it takes
   whatever arrives. That is right for a shell, which serves nobody, and wrong for a service.
+
+## If your program drives a DEVICE
+
+A driver holds authority nothing else does - a register window, perhaps a DMA arena and an interrupt -
+and [`gs::driver`](api/godspeed/driver/index.html) is how it uses each. It holds device-NEUTRAL
+mechanisms only: what a register means stays in your driver, and there is no `gs::driver::usb` or
+`::wifi`, ever.
+
+| Module | What it is for |
+|---|---|
+| `registers` | Your device's register window, every access bounds-checked: `gs::driver::registers(&ctx)` |
+| `arena`, `Layout` | Your DMA arena, laid out in named parts, each aligned on its PHYSICAL address and refused by name if it does not fit |
+| `wait` | Waiting for the device, bounded by TIME (`Budget`), not by a count of tries: `wait::until`, `Deadline`, `Since` |
+| `delay` | Holding still for a minimum the device needs and nothing can report the end of: `hold`, `hold_parked` |
+| `irq` | Waiting for your interrupt on the endpoint your clients also send to, without losing a request: `Irq::wait` answers `Interrupt`, `Request` or `Timeout`, and `Irq::take` the same without blocking |
+| `input` | A keyboard driver's keystrokes, pushed to the console: `push`, and `ready` when setup is done |
+| `power` | Cutting and restoring your device's power where the machine can: `power::set` |
+| `device` | What the kernel knows about your device that you cannot read yourself: the board's MAC, the NIC's PCI identity, a controller's base clock, PCI configuration reads |
+
+```rust
+let Some(regs) = gs::driver::registers(&ctx) else {
+    ctx.log("mydev: no device was granted - nothing to drive");
+    gs::ipc::park(&ctx)
+};
+regs.write32(CMD, START);
+if gs::driver::wait::until(&ctx, gs::driver::wait::Budget::ms(10), || regs.read32(STATUS) & BUSY == 0).is_err() {
+    ctx.log("mydev: the device did not finish within 10 ms");   // the CALLER says which wait
+}
+```
+
+A driver installed as a package is given its register window and nothing else today: no DMA arena and
+no interrupt. The drivers in this repository use all of the above. `docs/driver-library.md` is the
+design and the record of each module's arrival.
+
+`gs::program::mode` is the mode a program was started in, for one that does more than one thing.
 
 ## What the library will not do
 

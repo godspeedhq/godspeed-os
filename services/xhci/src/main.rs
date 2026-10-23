@@ -4986,9 +4986,10 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // cores - the destination/placement drift that made the earlier attempt lag
             // (docs/power.md §11). A held key emits no new USB reports, so while one is armed we
             // wake briskly (one 10 ms tick, `base`) to synthesise typematic auto-repeat below; when idle we sleep
-            // ~250 ms as the hot-plug watchdog. Never pass 0 (recv_timeout(0) blocks FOREVER).
+            // ~250 ms as the hot-plug watchdog. Never 0: the kernel's recv_timeout(0) blocks FOREVER, which is
+            // why `Irq::wait` never asks for it.
             // In MILLISECONDS: one 10 ms tick, which is what `rep_ticks.max(1)` (ticks per 10 ms) was
-            // in counter ticks - `recv_within_ms` converts it back to exactly that, and never to 0.
+            // in counter ticks - `Irq::wait` converts it back to exactly that, and never to 0.
             let base: u64 = 10;
             // HID slots whose transfer events something else consumed this pass. BOTH the block
             // server below and the hub status checks further down can swallow a keyboard completion,
@@ -5007,7 +5008,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             let mut disk_gone = false;
             // How long to wait before looking at the event ring ourselves.
             //
-            // Where the controller's MSI reaches us, `recv_within_ms` returns EARLY on the interrupt
+            // Where the controller's MSI reaches us, `Irq::wait` returns EARLY on the interrupt
             // and this is only a lost-wake safety net, so 250 ms costs nothing. When this was written
             // nothing programmed the Pi 4 VL805's MSI, so this timeout WAS the polling interval - and
             // 250 ms per keystroke is a quarter-second of lag on every character typed. (Note
@@ -5030,7 +5031,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             // the 250 ms idle deadline. Typing was slower WITH interrupts working than without, and
             // the "quiet - polling" line never printed to say so.
             //
-            // An interrupt that arrives makes `recv_within_ms` return early regardless, so the short
+            // An interrupt that arrives makes `Irq::wait` return early regardless, so the short
             // deadline costs nothing where MSI is reliable and rescues latency where it is not. The
             // 250 ms deadline is now only for a controller with NO input device bound, where there is
             // nothing whose latency a human can feel.

@@ -10,7 +10,7 @@
 //!
 //! One binary, 193 rows in `table.rs` with different `probe_mode` values. The spawner's request
 //! carries the mode, the kernel writes it into ServiceContextData at spawn time, and the SDK
-//! exposes it via `ctx.probe_mode()`.
+//! exposes it, read through `gs::program::mode`.
 //!
 //! Modes (a selection - the `MODE_*` constants below are the full list):
 //!   0 = PASSIVE         - idle; exists only to be a kill target
