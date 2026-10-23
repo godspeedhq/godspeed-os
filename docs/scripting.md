@@ -158,7 +158,7 @@ let live  = $(read /t.txt)
 echo "running: $live, at $when"
 
 fn make_greeting name { echo "Hello, $name!" }
-let msg = $(make_greeting Ada)             # capture a FUNCTION's output: "Hello, Ada!"
+let msg = $(make_greeting Bankole)         # capture a FUNCTION's output: "Hello, Bankole!"
 echo $msg
 ```
 
@@ -650,7 +650,7 @@ each turned out to need something smaller once actually built - the constitution
 pull a feature into existence, then size it to the *real* need, not the feared one (§26.6.1 - *change
 the representation, do not reach for more stack or a heap*).
 
-- **`$(fn …)`** - **BUILT.** Capture a *function's* output into a value: `let g = $(make_greeting Ada)`.
+- **`$(fn …)`** - **BUILT.** Capture a *function's* output into a value: `let g = $(make_greeting Bankole)`.
   The function runs via the Call machinery under a `CaptureCall` frame, with its body output routed to a
   bounded **512 B** buffer (it lives in the executor frame for the whole run, so it stays small to
   coexist with the pipe path - a captured value is a name, a number, a short line); the
