@@ -1202,7 +1202,11 @@ rest is `feat/driver-packages` (2026-10-23):
 
 **How it was shown.** In QEMU on x86, `osdev test kinds` (the template's driver: registers, the interrupt and a DMA
 arena on `edu`) and `osdev test driver-packages` (a package taking the e1000 over from `nic-driver` and giving it
-back; a package driving QEMU's FTDI serial adapter behind `xhci`, a line each way). On hardware: not yet.
+back; a package driving QEMU's FTDI serial adapter behind `xhci`, a line each way). On hardware: not yet. Two
+packages are made for the cards, signed by the test key (`osdev/fixtures/README.md`): `kind-dongle`, which names the
+RTL8188CUS and so takes it from `wifi-usb` on every board with the dongle, and `kind-nic`, which reads the RTL8168
+of the T630 and the Wyse as well as QEMU's e1000. A board fetches either with `download` from a machine that serves
+the file, after `godspeed trust add` for the test key.
 
 ### 13.2 `app`: a program with a screen of its own, while it has focus
 

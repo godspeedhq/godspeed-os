@@ -103,12 +103,17 @@ and why; read them for the reasoning, not to find out what the library contains.
   a program was started in. All counted by `one_way_check.py`, every caller at zero.
 
 - **`bus`** (2026-10-23) - a device reached through the host of the bus it is on, for a device with no registers
-  of its own: `UsbDevice::granted` finds the USB host a driver was given as its peer, and `info`, `control_in`,
-  `control_out`, `bulk_out` and `bulk_in` ask it for the bound device's transfers over the function protocol
-  (`godspeed_sdk::usbfn`), each bounded, with a host's notice named back by `OP_SYNC`. A BUS, not a class: it moves
-  transfers and knows nothing of what the device is, so the rule against a `driver::usb` class API stands. Its
-  first user is a driver package (`hw_usb`, `docs/developer-services-design.md` 13.1); `wifi-usb` still speaks the
-  protocol by hand, the one driver left to convert to it.
+  of its own: `UsbDevice::granted` finds the USB host a driver was given as its peer (or, for a host spawned after
+  it, one it may reacquire by name - a package may not, so that widens nothing), and `info`, `place`,
+  `control_in`, `control_out`, `control_out_once`, `bulk_out`, `bulk_in` and `replug` ask it for the bound
+  device's transfers over the function protocol (`godspeed_sdk::usbfn`), each bounded, with a host's notice named
+  back by `OP_SYNC`. A BUS, not a class: it moves transfers and knows nothing of what the device is, so the rule
+  against a `driver::usb` class API stands. Its first user was a driver package (`hw_usb`,
+  `docs/developer-services-design.md` 13.1); `wifi-usb` was converted to it the same day (2026-10-23) and is the
+  library's proof on a real driver - **built, and not run anywhere yet**: it is started only when a host reports the
+  dongle, which QEMU has none of, so every transfer it makes through `bus` is owed a hardware card. What it needed
+  that a package had not: `place` (for `wifi hardware usb`), `control_out_once` (a firmware block must reach the
+  chip once, section 6 of `docs/wifi-usb.md`) and `replug` (a chip that took no firmware).
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
 (1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet

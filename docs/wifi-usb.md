@@ -3145,3 +3145,25 @@ that had just left the network, because `/wifi.radio` removed makes both radios 
 after `kill all-services` the dongle's download failed, and for over three minutes every re-scan failed
 Address Device on hub ports 1 and 2 (the disk's port among them), so the run ended with no disk. Recorded
 as `backlog/fixed/83`, with what the gen change does and does not have to do with it.
+
+## 53. `wifi-usb` on `gs::driver::bus` (2026-10-23) - built, NOT SEEN on hardware
+
+`wifi-usb` spoke the function protocol (section 2) by hand: its own request loop, its own `OP_SYNC` handling
+(section 19), and a decoder for each answer. A driver PACKAGE for a USB device reaches its device through
+`gs::driver::bus` (`docs/developer-services-design.md` 13.1), and the operator's rule is one way to write a driver,
+so `wifi-usb` now does the same: every register read and write, the firmware blocks, the bulk IN and OUT, the
+binding, where the dongle is and the replug are `UsbDevice` calls. The host it uses is chosen as before - the peer
+it was wired to, else one it can reacquire by name (the T630's late `xhci`, U2a) - by `UsbDevice::granted` now.
+
+**What is the same:** every request and its bound (2 s), the setup packets, which writes go `once` (the firmware's
+blocks, section 6), and the words of its lines for each outcome the host reports. **What changed:** where the host
+answered something that was not the protocol, or an EAPOL frame was not sent, the line now gives `bus`'s reason in
+words (an EAPOL failure gave the status number); a notice named back by `OP_SYNC` is now
+tried 8 times before it is said, as `bus` does for every driver, where `wifi-usb` tried 4; a frame to send is copied
+once more on its way to the host (into `bus`'s request), a few hundred bytes to 1.5 KiB per frame against a USB
+transfer; and a bulk IN is copied out of the host's answer into a transfer this driver holds rather than read in
+place.
+
+**Seen:** it builds for every board. Nothing of it RUNS in QEMU: the supervisor starts `wifi-usb` only when a host
+reports the dongle, and QEMU has none. **Not seen:** anything at all at runtime. The card is the dongle on each board: bring-up to `R3a done`, a scan, a join, and `kill xhci`
+for the afresh binding (section 52).

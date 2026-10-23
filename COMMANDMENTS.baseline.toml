@@ -307,6 +307,9 @@ reacquire_api = [
   "gs::call::request", "call::request_within", "gs::fs::Fs",
   # `gs::cap::reacquire`, verified the same way (its body must reach one of the five above).
   "gs::cap::reacquire",
+  # `gs::driver::bus`'s `UsbDevice`, verified the same way (2026-10-23): its requests go through
+  # `call::request_within` and `granted` reacquires by name, or the credit is a violation of its own.
+  "UsbDevice::granted",
 ]
 
 # Services that send to a peer and have NO reacquisition path, as of 2026-09-14. SHRINK ONLY, and a

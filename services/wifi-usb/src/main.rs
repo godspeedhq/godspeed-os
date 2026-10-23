@@ -13,7 +13,8 @@
 //! A Realtek RTL8188CUS today: a soft-MAC radio whose register file is reached by a vendor control
 //! request. This service holds no hardware at all. The USB host service that enumerated the dongle -
 //! `dwc2` on the Pi 2, `xhci` on the Pi 4, the VisionFive and the PCs (U2a) - bound it as the radio, and answers `godspeed_wifi::usbfn` for that one device;
-//! every register read, and later the firmware and the frames, is a request to it.
+//! every register read, and later the firmware and the frames, is a request to it, made through
+//! `gs::driver::bus` - the same calls a driver package for a USB device makes (`docs/driver-library.md`).
 //!
 //! **U1, this card: the plumbing.** Wait for the host to report the dongle, then read the same two
 //! registers milestone 1 read inside `dwc2` (`docs/wifi.md`), now through two services, and decode
@@ -35,9 +36,10 @@
 use godspeed as gs;
 use core::cell::RefCell;
 
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::driver::bus::{UsbDevice, UsbError};
+use godspeed_sdk::ServiceContext;
 use godspeed_wifi::station::Station;
-use godspeed_wifi::{usbfn, wire};
+use godspeed_wifi::wire;
 
 mod rtl8188;
 mod rtl_fw;
@@ -59,25 +61,28 @@ const FIRMWARE_FNV: u32 = rtl_fw::decimal(env!("RTL_FW_TMSC_FNV"));
 const DOWNLOAD_TRIES: u32 = 6;
 use rtl8188::{read32, REG_SYS_CFG, REG_SYS_ISO_CTRL};
 
-/// The USB host services that serve `usbfn`. This service is wired at spawn to the one its board has - the
-/// supervisor's spawn row decides, from the board's facts - so it asks whichever of these it holds, and
-/// names no board itself (U2).
-const HOSTS: [&str; 2] = ["dwc2", "xhci"];
-
-/// The host this service was given: the first of `HOSTS` it holds a capability for, else the first it can
-/// REACQUIRE by name. A host spawned after this service is declared but not yet wired: on the T630 (U2a,
-/// 2026-10-06) `xhci` came up after `wifi-usb`, this fell back to `dwc2` - absent there - and the first ask
-/// failed with "the service could not be reached". `dwc2` when neither works, whose requests then fail and
-/// say so.
-fn host_name(ctx: &ServiceContext) -> &'static str {
-    HOSTS.iter().copied().find(|h| gs::ipc::peer(ctx, h).is_some())
-        .or_else(|| HOSTS.iter().copied().find(|h| gs::cap::reacquire(ctx, h)))
-        .unwrap_or(HOSTS[0])
+/// The dongle, through the host this service was given: wired at spawn to the one its board has - the
+/// supervisor's spawn row decides, from the board's facts - or, for a host spawned after this service, the one it
+/// can REACQUIRE by name (on the T630, U2a 2026-10-06, `xhci` came up after `wifi-usb`). `gs::driver::bus` makes
+/// that choice, and bounds each request; this service names no board itself (U2).
+pub(crate) fn dev(ctx: &ServiceContext) -> Result<UsbDevice<'_>, &'static str> {
+    UsbDevice::granted(ctx).ok_or("no USB host was given to this service, and none could be reached by name")
 }
-/// The bound on one request to the host. A control transfer takes milliseconds, but a host retrying a
-/// dongle that does not answer can use up this bound (`xhci`: `CONTROL_TRIES` attempts of `CONTROL_MS`),
-/// so an unanswered request means the host or its dongle is not answering.
-const HOST_SECS: i64 = 2;
+
+/// The host's name, for a log line: `a USB host` when there is none to name.
+fn host_name(ctx: &ServiceContext) -> &'static str {
+    UsbDevice::granted(ctx).map(|d| d.host()).unwrap_or("a USB host")
+}
+
+/// A transfer that did not happen, as this driver's lines have always said it.
+pub(crate) fn said(e: UsbError) -> &'static str {
+    match e {
+        UsbError::NoDevice => "the dongle is no longer bound",
+        UsbError::Failed => "the transfer did not complete",
+        UsbError::BadRequest => "the host refused the request as malformed",
+        UsbError::Host(e) => e.as_str(),
+    }
+}
 
 /// `SYS_CFG` fields, as `rtl8192cu_identify_chip` reads them (`rtl8xxxu.h`): the cut in bits 15:12,
 /// UMC (1) or TSMC (0) in bit 19, a TEST chip in bit 23 (`TRP_VAUX_EN`), and 8192C (1) or 8188C (0) in bit 27.
@@ -86,71 +91,27 @@ const SYS_CFG_VENDOR_UMC: u32 = 1 << 19;
 const SYS_CFG_TEST_CHIP: u32 = 1 << 23;
 const SYS_CFG_TYPE_92C: u32 = 1 << 27;
 
-/// One request to the host, bounded: `gs::call::request_within`, which reacquires the host's cap once if
-/// the send failed - the host is spawned by the supervisor and may be respawned after us (14.3) - and never
-/// re-sends after a deadline. The failure as the stdlib words it.
-pub(crate) fn host(ctx: &ServiceContext, body: &[u8]) -> Result<Message, &'static str> {
-    let ask = |m: &[u8]| gs::call::request_within(ctx, host_name(ctx), &Message::from_bytes(m), HOST_SECS).map_err(|e| e.as_str());
-    let mut r = ask(body)?;
-    // A NOTICE IN PLACE OF THE ANSWER. An instance with no reply mailbox - one spawned past the routing
-    // table's reserve with no mailbox credit to take back (docs/wifi-usb.md 19, 20) - awaits its replies on
-    // its own endpoint, and then the kernel hands
-    // a call the host's next message - its notices included. Taken as the answer, a notice puts every
-    // answer after it one behind: R9's first power cycle stopped at "the host answered something other
-    // than CONTROL" and then every request was "malformed". `OP_SYNC` names the notice and is never
-    // answered, so the call returns the answer still on its way and leaves nothing owed; the host sends
-    // the notice again once this service is quiet. Bounded: a host that keeps sending notices in place of
-    // answers is said, not chased.
-    let mut syncs = 0u32;
-    while let Some(&note) = r.payload_bytes().first().filter(|&&b| b == usbfn::NOTE_BULK_IN || b == usbfn::NOTE_RADIO) {
-        if syncs == SYNC_MAX {
-            return Err("the host's notices kept arriving in place of its answer");
-        }
-        syncs += 1;
-        r = ask(&[usbfn::OP_SYNC, note])?;
-    }
-    Ok(r)
-}
-
-/// Notices taken in place of one answer before `host` gives up on it.
-const SYNC_MAX: u32 = 4;
-
 /// What the host says about the radio: `Some((vid, pid, gen))` when one is bound, `None` when none is or the
 /// host did not answer - the second said once by the caller. `gen` names the binding (`usbfn::OP_INFO`): the
 /// same dongle bound afresh - replugged, or enumerated again by a host that restarted, which resets the
 /// chip - reads differently, so comparing this is how a binding the station was not brought up on is seen.
+///
+/// A notice the host sent in place of an answer - to an instance with no reply mailbox, which awaits its replies
+/// on its own endpoint (docs/wifi-usb.md 19, 20) - is named back by `gs::driver::bus` with `OP_SYNC`, so it never
+/// puts every answer after it one behind (R9's first power cycle); a host that keeps doing so is said.
 pub(crate) fn bound(ctx: &ServiceContext) -> Result<Option<(u16, u16, u32)>, &'static str> {
-    let r = host(ctx, &[usbfn::OP_INFO])?;
-    let p = r.payload_bytes();
-    if p.len() < 2 || p[0] != usbfn::OP_INFO {
-        return Err("answered something other than INFO - not speaking usbfn");
-    }
-    match p[1] {
-        usbfn::ST_OK if p.len() >= usbfn::INFO_GEN_AT + 4 => Ok(Some((
-            u16::from_le_bytes([p[2], p[3]]), u16::from_le_bytes([p[4], p[5]]),
-            u32::from_le_bytes([p[6], p[7], p[8], p[9]])))),
-        usbfn::ST_OK => Err("answered INFO without the binding's gen"),
-        usbfn::ST_NO_DEVICE => Ok(None),
-        _ => Err("answered INFO with an error"),
+    match dev(ctx)?.info() {
+        Ok(b) => Ok(Some((b.vid, b.pid, b.gen))),
+        Err(UsbError::NoDevice) => Ok(None),
+        Err(UsbError::Host(e)) => Err(e.as_str()),
+        Err(_) => Err("answered INFO with an error"),
     }
 }
 
 /// Where the host says the dongle is (`usbfn::OP_INFO`'s optional part), for `wifi hardware usb`. `None`
 /// from a host that does not say, or one that did not answer.
-fn where_bound(ctx: &ServiceContext) -> Option<rx::Where> {
-    let r = host(ctx, &[usbfn::OP_INFO]).ok()?;
-    let p = r.payload_bytes();
-    let w = usbfn::INFO_WHERE_AT;
-    if p.len() < w + 7 || p[0] != usbfn::OP_INFO || p[1] != usbfn::ST_OK {
-        return None;
-    }
-    let n_out = (p[w + 6] as usize).min(4).min(p.len() - (w + 7));
-    let mut outs = [0u8; 4];
-    outs[..n_out].copy_from_slice(&p[w + 7..w + 7 + n_out]);
-    Some(rx::Where {
-        root: p[w], hub: p[w + 1], slot: p[w + 2], in_addr: p[w + 3],
-        in_mps: u16::from_le_bytes([p[w + 4], p[w + 5]]), outs, n_out: n_out as u8,
-    })
+fn where_bound(ctx: &ServiceContext) -> Option<gs::driver::bus::Place> {
+    dev(ctx).ok()?.place()
 }
 
 /// The chip `SYS_CFG` names, as the identity line logs it: `RTL8188C, 1T1R, cut A, TSMC`.
@@ -363,13 +324,11 @@ const FIRST_CHANNEL: u8 = 1;
 /// NAKed): ask the host to do one (`usbfn::OP_REPLUG`). On `ST_OK` the host reports the dongle gone and bound
 /// again, and this driver is stopped and a fresh one started; anything else is said, and the radio stays down.
 fn replug(ctx: &ServiceContext) {
-    let st = host(ctx, &[usbfn::OP_REPLUG]).ok()
-        .and_then(|r| { let p = r.payload_bytes(); (p.len() >= 2 && p[0] == usbfn::OP_REPLUG).then(|| p[1]) });
-    match st {
-        Some(usbfn::ST_OK) => ctx.log("wifi-usb: the chip is not answering - its host is resetting the dongle's port, as a replug would"),
-        Some(usbfn::ST_FAILED) => ctx.log("wifi-usb: the chip is not answering, and its host has reset the dongle as often as it may - unplug it and plug it back"),
-        Some(_) => ctx.log("wifi-usb: the chip is not answering, and this USB host cannot reset the dongle - unplug it and plug it back"),
-        None => ctx.log("wifi-usb: the chip is not answering, and its host did not answer a request to reset it - unplug it and plug it back"),
+    match dev(ctx).map(|d| d.replug()) {
+        Ok(Ok(())) => ctx.log("wifi-usb: the chip is not answering - its host is resetting the dongle's port, as a replug would"),
+        Ok(Err(UsbError::Failed)) => ctx.log("wifi-usb: the chip is not answering, and its host has reset the dongle as often as it may - unplug it and plug it back"),
+        Ok(Err(UsbError::Host(_))) | Err(_) => ctx.log("wifi-usb: the chip is not answering, and its host did not answer a request to reset it - unplug it and plug it back"),
+        Ok(Err(_)) => ctx.log("wifi-usb: the chip is not answering, and this USB host cannot reset the dongle - unplug it and plug it back"),
     }
 }
 

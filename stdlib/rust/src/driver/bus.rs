@@ -53,6 +53,24 @@ impl UsbError {
     }
 }
 
+/// Where the host says the bound device is, from a host that says (`wire::INFO_WHERE_AT`): for a driver's
+/// report of its hardware, never to address it by - the host does that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    /// The root port it is on, from 1.
+    pub root: u8,
+    /// The hub port it is behind, or 0 when it is on the root port itself.
+    pub hub: u8,
+    /// The host's slot for it.
+    pub slot: u8,
+    /// Its bulk IN endpoint's address, or 0 when it has none; and that endpoint's packet size.
+    pub in_addr: u8,
+    pub in_mps: u16,
+    /// Its bulk OUT endpoints' addresses, in the order `bulk_out` counts them: the first `n_out`.
+    pub outs: [u8; 4],
+    pub n_out: u8,
+}
+
 /// Who the bound device is, as its host enumerated it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Bound {
@@ -70,9 +88,12 @@ pub struct UsbDevice<'a> {
 
 impl<'a> UsbDevice<'a> {
     /// The host this driver was given as its peer, or `None` when it was given none - it was not started for a
-    /// USB device.
+    /// USB device. A host spawned after this driver is named but not yet wired, so one this driver may REACQUIRE by
+    /// name is taken next; only a driver allowed to reacquire one can (a package cannot), so this widens nothing.
     pub fn granted(ctx: &'a ServiceContext) -> Option<UsbDevice<'a>> {
-        HOSTS.iter().copied().find(|h| crate::ipc::peer(ctx, h).is_some()).map(|host| UsbDevice { ctx, host })
+        HOSTS.iter().copied().find(|h| crate::ipc::peer(ctx, h).is_some())
+            .or_else(|| HOSTS.iter().copied().find(|h| crate::cap::reacquire(ctx, h)))
+            .map(|host| UsbDevice { ctx, host })
     }
 
     /// The host's name, for a log line.
@@ -95,6 +116,23 @@ impl<'a> UsbDevice<'a> {
         })
     }
 
+    /// Where the host says the device is, or `None` from a host that does not say, or did not answer.
+    pub fn place(&self) -> Option<Place> {
+        let r = self.ask(&[wire::OP_INFO]).ok()?;
+        let p = r.payload_bytes();
+        let w = wire::INFO_WHERE_AT;
+        if status(p, wire::OP_INFO).is_err() || p.len() < w + 7 {
+            return None;
+        }
+        let n_out = (p[w + 6] as usize).min(4).min(p.len() - (w + 7));
+        let mut outs = [0u8; 4];
+        outs[..n_out].copy_from_slice(&p[w + 7..w + 7 + n_out]);
+        Some(Place {
+            root: p[w], hub: p[w + 1], slot: p[w + 2], in_addr: p[w + 3],
+            in_mps: u16::from_le_bytes([p[w + 4], p[w + 5]]), outs, n_out: n_out as u8,
+        })
+    }
+
     /// One control transfer IN on the default endpoint: `setup` is the 8-byte setup packet as USB defines it, and
     /// what the device returned is copied into `out`. How many bytes it returned.
     pub fn control_in(&self, setup: [u8; 8], out: &mut [u8]) -> Result<usize, UsbError> {
@@ -112,15 +150,34 @@ impl<'a> UsbDevice<'a> {
     /// One control transfer OUT on the default endpoint, with `data` as its data stage (at most
     /// `wire::CONTROL_MAX` bytes; the setup packet's length field is the caller's to set to match).
     pub fn control_out(&self, setup: [u8; 8], data: &[u8]) -> Result<(), UsbError> {
+        self.control_out_as(wire::OP_CONTROL, setup, data)
+    }
+
+    /// `control_out`, attempted exactly once: the host does not retry it. For a write whose effect a second attempt
+    /// would repeat - a device that acts on the first copy and NAKs the rest (`wire::OP_CONTROL_ONCE`).
+    pub fn control_out_once(&self, setup: [u8; 8], data: &[u8]) -> Result<(), UsbError> {
+        self.control_out_as(wire::OP_CONTROL_ONCE, setup, data)
+    }
+
+    fn control_out_as(&self, op: u8, setup: [u8; 8], data: &[u8]) -> Result<(), UsbError> {
         if data.len() > wire::CONTROL_MAX {
             return Err(UsbError::BadRequest);
         }
         let mut req = [0u8; 9 + wire::CONTROL_MAX];
-        req[0] = wire::OP_CONTROL;
+        req[0] = op;
         req[1..9].copy_from_slice(&setup);
         req[9..9 + data.len()].copy_from_slice(data);
         let r = self.ask(&req[..9 + data.len()])?;
-        status(r.payload_bytes(), wire::OP_CONTROL)
+        status(r.payload_bytes(), op)
+    }
+
+    /// Ask the host to reset the device's port and bind it afresh, as unplugging it would (`wire::OP_REPLUG`): for a
+    /// device that has stopped answering. On `Ok` the host reports the device gone and then bound again, so this
+    /// driver is stopped and a fresh one started. `Failed` is a host that has reset it as often as it may;
+    /// `BadRequest` one that cannot reset a port (`xhci`).
+    pub fn replug(&self) -> Result<(), UsbError> {
+        let r = self.ask(&[wire::OP_REPLUG])?;
+        status(r.payload_bytes(), wire::OP_REPLUG)
     }
 
     /// One bulk OUT transfer to the device's `out`th bulk OUT endpoint, counted in the order its configuration

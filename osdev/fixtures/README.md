@@ -75,7 +75,10 @@ DEVICE OVER from GodspeedOS. Made 2026-10-23 with `godspeed new driver kind-nic 
 (`godspeed-cli` `feat/driver-packages`) and changed in two places: its contract names the ethernet class
 (`hw_pci_class = "020000"`, `hw_pci_bar = "auto"`, no interrupt and no arena), which `nic-driver` drives, and its
 `src/main.rs` reads the e1000's status and its MAC (`RAL0`/`RAH0`) instead of `edu`'s registers, logging
-`kind-nic: took the ethernet device over - status ..., MAC 52:54:00:12:34:56`. The suite sees the supervisor stand
+`kind-nic: took the ethernet device over - e1000 (8086:100e), status ..., MAC 52:54:00:12:34:56`. Remade the same day
+to know the RTL8168 too, by the NIC identity the kernel reports (`gs::driver::device::nic_vendor_device`): there it reads
+the MAC from IDR0-5 and the PHY status, so the same file takes the NIC over on the T630 and the Wyse. It only reads,
+so `nic-driver` meets the device as it left it. The suite sees the supervisor stand
 `nic-driver` down, keep it down, and start it again once the package is uninstalled. Packaged as the files above.
 
 ## `kind-usb-0.1.0.gsp`
@@ -90,6 +93,17 @@ has received something - logging `kind-usb: drove 0403:6001 through xhci - devic
 bulk OUT ok, bulk IN <n> bytes: "<what arrived>"`. The suite puts the adapter's serial port on a TCP socket, writes
 `hello from the serial port` to it once the package listens, and reads back what the package sent. Packaged as the
 files above.
+
+## `kind-dongle-0.1.0.gsp`
+
+An UNPUBLISHED driver package for a HARDWARE card, not a QEMU suite (QEMU has no RTL8188CUS), signed by the same
+throwaway test key, for all four architectures: a driver that takes a USB DEVICE over from GodspeedOS. Made
+2026-10-23 from a copy of `kind-usb` (above) whose contract names the Realtek RTL8188CUS WiFi dongle,
+`hw_usb = "0bda:8176"`, which `wifi-usb` drives, and whose `src/main.rs` reads, through the dongle's host, its
+identity, its device descriptor and the two registers `wifi-usb` reads first (`SYS_CFG`, `ISO_CTRL`, by vendor
+request 0x05), logging `kind-dongle: took 0bda:8176 over through <host> - device release ..., SYS_CFG ... ISO_CTRL
+...: an RTL8188C, cut <c>, made by <maker>`. It only reads. On the card: `wifi-usb` is stood down at install and
+started again at uninstall, and the radio comes back. Packaged as the files above, with no `--arch`.
 
 ## `gts-root-r4.der`
 

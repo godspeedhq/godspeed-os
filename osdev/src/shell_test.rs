@@ -12421,7 +12421,7 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     check!(log.contains("supervisor: nic-driver stood down - the installed godspeed/kind-nic drives its device until it is uninstalled"),
            "the supervisor stops nic-driver for it, and says so");
-    check!(log.contains("kind-nic: took the ethernet device over - status ") && log.contains("MAC 52:54:00:12:34:56"),
+    check!(log.contains("kind-nic: took the ethernet device over - e1000 (8086:100e), status ") && log.contains("MAC 52:54:00:12:34:56"),
            "and the package drives the e1000 nic-driver had: it reads its status and its MAC");
     // Kept down: give the reconcile sweep time to run, then nic-driver must still not be running.
     let _ = run!(b"sleep 3\r", 60);

@@ -34,7 +34,8 @@ use godspeed_wifi::station::{Link, Outcome, Pulled, ScanStep, Secret, Station};
 use godspeed_wifi::wire;
 
 use godspeed_wifi::supplicant::{self, Handshake, KeyPath, Keys, Step};
-use godspeed_wifi::{data, eapol, mgmt, usbfn};
+use godspeed::driver::bus::UsbError;
+use godspeed_wifi::{data, eapol, mgmt};
 
 use crate::{rtl8188, rtl_rx, rtl_tx, rx};
 
@@ -211,23 +212,15 @@ impl<'l> Dongle<'l> {
             return Err("the frame is longer than this driver sends");
         }
         let desc = rtl_tx::mgmt(frame.len() as u16, seq, group);
-        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + MAX];
-        req[0] = usbfn::OP_BULK_OUT;
-        req[1] = rtl_tx::MGNT_OUT;
-        req[2..2 + rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
-        req[2 + rtl_tx::TX_DESC_LEN..2 + rtl_tx::TX_DESC_LEN + frame.len()].copy_from_slice(frame);
-        match crate::host(ctx, &req[..2 + rtl_tx::TX_DESC_LEN + frame.len()]) {
-            Ok(r) => match r.payload_bytes() {
-                [usbfn::OP_BULK_OUT, usbfn::ST_OK, ..] => Ok(()),
-                [usbfn::OP_BULK_OUT, st, ..] => Err(match *st {
-                    usbfn::ST_NO_DEVICE => "the dongle is no longer bound",
-                    usbfn::ST_BAD_REQUEST => "the host has no such bulk OUT, or refused the transfer as malformed",
-                    _ => "the device or the bus did not take it",
-                }),
-                _ => Err("the host answered something other than BULK_OUT - not speaking it yet"),
-            },
-            Err(why) => Err(why),
-        }
+        let mut out = [0u8; rtl_tx::TX_DESC_LEN + MAX];
+        out[..rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
+        out[rtl_tx::TX_DESC_LEN..rtl_tx::TX_DESC_LEN + frame.len()].copy_from_slice(frame);
+        crate::dev(ctx)?.bulk_out(rtl_tx::MGNT_OUT, &out[..rtl_tx::TX_DESC_LEN + frame.len()]).map_err(|e| match e {
+            UsbError::NoDevice => "the dongle is no longer bound",
+            UsbError::BadRequest => "the host has no such bulk OUT, or refused the transfer as malformed",
+            UsbError::Failed => "the device or the bus did not take it",
+            UsbError::Host(e) => e.as_str(),
+        })
     }
 
     /// One probe request on the channel tuned now - for any network (`ssid` empty: a sweep's) or one by
@@ -790,13 +783,10 @@ impl Station for Dongle<'_> {
         }
         let sgi = a.ht.is_some_and(|h| h.cap & (mgmt::HT_CAP_SGI_20 | mgmt::HT_CAP_SGI_40) != 0);
         let desc = rtl_tx::data(n as u16, seq, keyed, a.wmm, sgi);
-        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + MAX];
-        req[0] = usbfn::OP_BULK_OUT;
-        req[1] = rtl_tx::be_out(self.queues);
-        req[2..2 + rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
-        req[2 + rtl_tx::TX_DESC_LEN..2 + rtl_tx::TX_DESC_LEN + n].copy_from_slice(&frame[..n]);
-        let ok = matches!(crate::host(ctx, &req[..2 + rtl_tx::TX_DESC_LEN + n]),
-                          Ok(r) if r.payload_bytes().get(..2) == Some(&[usbfn::OP_BULK_OUT, usbfn::ST_OK][..]));
+        let mut out = [0u8; rtl_tx::TX_DESC_LEN + MAX];
+        out[..rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
+        out[rtl_tx::TX_DESC_LEN..rtl_tx::TX_DESC_LEN + n].copy_from_slice(&frame[..n]);
+        let ok = crate::dev(ctx).is_ok_and(|d| d.bulk_out(rtl_tx::be_out(self.queues), &out[..rtl_tx::TX_DESC_LEN + n]).is_ok());
         if ok {
             self.sent = self.sent.wrapping_add(1);
             if self.sent == 1 {
@@ -924,16 +914,14 @@ impl KeyPath for Dongle<'_> {
             return false;
         }
         let desc = rtl_tx::eapol(n as u16, seq);
-        let mut req = [0u8; 2 + rtl_tx::TX_DESC_LEN + EAPOL_MAX + data::DATA_OVERHEAD];
-        req[0] = usbfn::OP_BULK_OUT;
-        req[1] = rtl_tx::be_out(self.queues);
-        req[2..2 + rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
-        req[2 + rtl_tx::TX_DESC_LEN..2 + rtl_tx::TX_DESC_LEN + n].copy_from_slice(&frame[..n]);
-        match crate::host(ctx, &req[..2 + rtl_tx::TX_DESC_LEN + n]) {
-            Ok(r) if r.payload_bytes().get(..2) == Some(&[usbfn::OP_BULK_OUT, usbfn::ST_OK][..]) => true,
-            Ok(r) => {
+        let mut out = [0u8; rtl_tx::TX_DESC_LEN + EAPOL_MAX + data::DATA_OVERHEAD];
+        out[..rtl_tx::TX_DESC_LEN].copy_from_slice(&desc);
+        out[rtl_tx::TX_DESC_LEN..rtl_tx::TX_DESC_LEN + n].copy_from_slice(&frame[..n]);
+        match crate::dev(ctx).and_then(|d| Ok(d.bulk_out(rtl_tx::be_out(self.queues), &out[..rtl_tx::TX_DESC_LEN + n]))) {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
                 ctx.log_fmt(format_args!(
-                    "wifi-usb: an EAPOL frame was not sent - the host answered status {:?}", r.payload_bytes().get(1)));
+                    "wifi-usb: an EAPOL frame was not sent - {}", crate::said(e)));
                 false
             }
             Err(why) => {
