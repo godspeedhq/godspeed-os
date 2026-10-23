@@ -331,7 +331,10 @@ reacquire_api = [
 # the unpaid half is kept instead.
 # `xhci` LEFT on 2026-10-06 the same way: `radio::notify_driver` reaches `gs::cap::reacquire` for its new
 # peer, `wifi-usb` (U2a, docs/wifi-usb.md 7). Its `events` emission is the same unpaid half as `dwc2`'s.
-peer_reacquire_debt = ["console", "ehci", "hw-enumerator"]
+# `ehci` LEFT on 2026-10-23 the same way: `bound::Host::report` reaches `gs::cap::reacquire` for its new peer,
+# `supervisor` (the report of the device it binds for a driver of its own). Its `events` emission is the same
+# unpaid half.
+peer_reacquire_debt = ["console", "hw-enumerator"]
 # Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
 # `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
 #
@@ -799,7 +802,10 @@ SpawnImage               = 52
 # so the supervisor starts the dongle's driver when it is there and stops it when it leaves
 # (docs/usb-device-drivers.md). Facts only, `try_send`, never answered - the host names no driver.
 "dwc2" = ["hw:DWC2", "peer:events", "peer:supervisor", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
-"ehci" = ["hw:EHCI", "peer:events", "priv:CONSOLE_PUSH"]
+# `ehci`'s `peer:supervisor` (2026-10-23): the report of the ONE device it binds for an installed driver package
+# (`usbdev`, as host `ehci`; `services/ehci/src/bound.rs`), so the supervisor starts and stops that package with it -
+# the same grant `xhci` and `dwc2` carry for the same report. A `try_send` with no reply, never waited on.
+"ehci" = ["hw:EHCI", "peer:events", "peer:supervisor", "priv:CONSOLE_PUSH"]
 "fs" = ["peer:block-driver", "peer:events", "priv:RESOURCE_MINT"]
 "greet" = ["peer:pong"]
 # examples/stdlib-hello, examples-test build only. It writes and reads a file through `gs::fs`, which is

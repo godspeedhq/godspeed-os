@@ -607,8 +607,8 @@ pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
 /// restartable (6.2) - and never waited on (8.9). (`report` above is the radio's statistics, not this.)
 pub fn report_device(ctx: &ServiceContext, radio: Option<&Radio>) {
     let r = match radio {
-        Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid, pid: r.pid },
-        None => usbdev::Report { present: false, gen: 0, vid: 0, pid: 0 },
+        Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid, pid: r.pid, host: usbdev::HOST_DWC2 },
+        None => usbdev::Report { present: false, gen: 0, vid: 0, pid: 0, host: usbdev::HOST_DWC2 },
     };
     let msg = Message::from_bytes(&usbdev::encode(&r));
     let sent = gs::ipc::try_send(ctx, SUPERVISOR, &msg).is_ok()

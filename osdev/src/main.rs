@@ -1915,6 +1915,13 @@ fn cmd_build_blockdev() { build_blockdev_fs("selftest", ""); }
 /// compiled with `bd_features` (e.g. `io-error-test` to exercise the I/O retry path; `""` for
 /// none).
 fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
+    build_blockdev_fs_with(fs_features, bd_features, "");
+}
+
+/// `build_blockdev_fs`, with `ehci` built with `ehci_features` - before the supervisor that embeds it and the kernel
+/// that embeds the supervisor, so the image carries it. `osdev test driver-packages` builds it with `bind-any-class`;
+/// every other suite builds it plain, so the next build after this one carries the feature no more.
+fn build_blockdev_fs_with(fs_features: &str, bd_features: &str, ehci_features: &str) {
     clean_supervisor();
     // Force a fresh `fs` (and `block-driver` if it gets a feature) so the test features are
     // compiled in even if a prior plain build cached them.
@@ -1940,6 +1947,10 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         if *crate_name == "block-driver" && !bd_features.is_empty() {
             args.push("--features");
             args.push(bd_features);
+        }
+        if *crate_name == "ehci" && !ehci_features.is_empty() {
+            args.push("--features");
+            args.push(ehci_features);
         }
         let status = std::process::Command::new("cargo")
             .args(&args)
@@ -4025,7 +4036,9 @@ fn run_kinds_test() {
 fn run_driver_packages_test() {
     println!("
 === driver-packages: a device taken over, and a USB device through its host ===");
-    build_blockdev_fs("selftest", "");
+    // `ehci` with `bind-any-class`, for this suite only: it binds QEMU's stick for `kind-stick` (`services/ehci`,
+    // `bound::bindable`).
+    build_blockdev_fs_with("selftest", "", "ehci/bind-any-class");
     let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
     if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
     let limine_dir = std::path::Path::new("tools/limine");
@@ -4035,7 +4048,7 @@ fn run_driver_packages_test() {
     let persist = "build/tests/persist_driver_packages.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
     format_superblock(persist);
-    for f in ["kind-nic-0.1.0.gsp", "kind-usb-0.1.0.gsp"] {
+    for f in ["kind-nic-0.1.0.gsp", "kind-usb-0.1.0.gsp", "kind-stick-0.1.0.gsp"] {
         let path = format!("osdev/fixtures/{f}");
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         gsfs_add_file(persist, f, &bytes);

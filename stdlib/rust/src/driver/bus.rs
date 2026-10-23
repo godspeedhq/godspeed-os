@@ -3,7 +3,7 @@
 //!
 //! A USB device has no register window and no DMA arena a driver could be granted: its host controller owns both,
 //! and talks to every device on its bus. So a USB device's driver is the host's CLIENT. The host binds the device
-//! (`xhci` and `dwc2` do, for one device each that they do not drive themselves), the supervisor starts the driver
+//! (`xhci`, `dwc2` and `ehci` do, for one device each that they do not drive themselves), the supervisor starts the driver
 //! the device's VID:PID names with that host as its peer, and the driver asks the host for the device's transfers:
 //! who it is, control transfers on its default endpoint, and its bulk endpoints. That conversation is
 //! `godspeed_sdk::usbfn`; this module is it in the one shape a driver should use.
@@ -20,7 +20,7 @@ pub use godspeed_sdk::usbfn as wire;
 
 /// The hosts that bind a device for a driver of its own. A driver is given exactly one of them as its peer, so
 /// trying each in turn finds the one it was given and no other.
-const HOSTS: [&str; 2] = ["xhci", "dwc2"];
+const HOSTS: [&str; 3] = ["xhci", "dwc2", "ehci"];
 /// The bound on one request to the host. A control transfer takes milliseconds; a host retrying a device that does
 /// not answer can use up this bound, so a request that is not answered in it means the device is not answering.
 const HOST_SECS: i64 = 2;

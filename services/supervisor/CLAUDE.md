@@ -8,7 +8,8 @@ unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 
 - Spawn the services in its `IMAGES` table per placement rules (§9.2); there is no manifest file.
 - Start a USB device's driver when its host reports the device attached, and stop it - without a restart -
-  when the host reports it gone (`USB_MATCH`, `UsbState`, `docs/usb-device-drivers.md`; both hosts, `dwc2` and `xhci`).
+  when the host reports it gone (`USB_MATCH`, `UsbState`, `docs/usb-device-drivers.md`; the hosts `dwc2`, `xhci` and
+  `ehci`, each report naming its host, and each host's report taken for what that host has bound only).
   An installed driver package that names the device (`hw_usb`) comes first (`Installed::usb_report`).
 - Start installed packages from the disk (`installed.rs`, CLAUDE.md 14.1 amendments), a driver package with its one
   device; a device an in-tree driver drives is taken over and that driver kept down while the package holds it

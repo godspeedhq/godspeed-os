@@ -490,6 +490,9 @@ mod board {
     /// And `supervisor`, for the dongle's report (`usbdev`), as `dwc2` has.
     pub const XHCI_PEERS: &[&str] =
         if cfg!(has_wifi_usb) { &["events", "wifi-usb", "supervisor"] } else { &["events"] };
+    /// `ehci`'s send peers: `events`, and `supervisor` for the report of the device it binds for a driver of its own
+    /// (`usbdev`), where the supervisor starts drivers for USB devices at all - the same condition as `xhci`'s.
+    pub const EHCI_PEERS: &[&str] = if cfg!(has_wifi_usb) { &["events", "supervisor"] } else { &["events"] };
     /// The dongle driver's peers: the USB host that serves its dongle, and `fs` for `/system/shared/wifi/keys`. `dwc2` on
     /// the board that has it, `xhci` on the others (U2a).
     pub const WIFI_USB_PEERS: &[&str] = if cfg!(has_dwc2) { &["dwc2", "fs"] } else { &["xhci", "fs"] };
@@ -916,7 +919,7 @@ const USB_IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      }),
     #[cfg(has_ehci)]
     ("ehci", EHCI_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
-     64 * 1024 * 1024, 3, &["events"],
+     64 * 1024 * 1024, 3, board::EHCI_PEERS,
      godspeed_sdk::service_context::privbits::CONSOLE_PUSH, 0,
      godspeed_sdk::service_context::hwclass::EHCI),
     // arm32's USB host: keyboard, mass storage and USB-net all sit behind it, which is why
@@ -1049,9 +1052,14 @@ mod meta;
 mod check;
 mod installed;
 
-/// The built-in driver of a USB device, by its vendor and product (`USB_MATCH`), if this image has one.
-fn in_tree_usb_driver_of(vid: u16, pid: u16) -> Option<&'static str> {
-    USB_MATCH.iter().find(|m| m.vid == vid && m.pid == pid).map(|m| m.driver)
+/// The built-in driver of a USB device, by its vendor and product (`USB_MATCH`), if this image has one - and, given
+/// the host the device is on, only one wired to that host: the dongle bound by `ehci` is not `wifi-usb`'s, whose peer
+/// is `xhci`. `None` for the host when none has said, which matches on any.
+fn in_tree_usb_driver_of(vid: u16, pid: u16, host: Option<u8>) -> Option<&'static str> {
+    USB_MATCH.iter()
+        .find(|m| m.vid == vid && m.pid == pid
+            && host.is_none_or(|h| usbdev::host_name(h).is_some_and(|n| m.peers.contains(&n))))
+        .map(|m| m.driver)
 }
 
 /// This board's USB host that binds a device for a driver of its own, and reports it (`USB_HOSTS`).
@@ -1758,12 +1766,24 @@ const USB_MATCH_MAX: usize = 1;
 const _: () = assert!(USB_MATCH.len() <= USB_MATCH_MAX);
 const USB_ON_DEMAND: bool = !USB_MATCH.is_empty();
 /// The USB hosts that report, asked for their report when this supervisor starts (`usbdev::ASK`).
-const USB_HOSTS: &[&str] = if !USB_ON_DEMAND { &[] } else if cfg!(has_dwc2) { &["dwc2"] } else { &["xhci"] };
+/// A PC has two: `xhci`, and `ehci` for the sockets wired to the USB 2.0 controller (the T630's back ones).
+const USB_HOSTS: &[&str] = if !USB_ON_DEMAND {
+    &[]
+} else if cfg!(has_dwc2) {
+    &["dwc2"]
+} else if cfg!(has_ehci) {
+    &["xhci", "ehci"]
+} else {
+    &["xhci"]
+};
 
 /// Whether each `USB_MATCH` row's device is attached, as its host last reported. A new supervisor knows
 /// nothing - false until a host says otherwise, which it is asked to do at once. Owned by the main loop.
 struct UsbState {
     present: [bool; USB_MATCH_MAX],
+    /// What each host last reported bound (`usbdev::HOST_*`): `present` is worked out from these, so one host
+    /// saying it has nothing never marks absent a device the other has.
+    by_host: [Option<(u16, u16)>; usbdev::HOSTS],
     /// A host has reported at least once. Until then `present` is only this supervisor's starting value,
     /// and "absent" must not be told to anyone (`tell_radio_of_dongle`).
     heard: bool,
@@ -1773,7 +1793,18 @@ struct UsbState {
 }
 
 impl UsbState {
-    const fn new() -> Self { UsbState { present: [false; USB_MATCH_MAX], heard: false, ready: false } }
+    const fn new() -> Self {
+        UsbState { present: [false; USB_MATCH_MAX], by_host: [None; usbdev::HOSTS], heard: false, ready: false }
+    }
+
+    /// Each row's device is present when a host its driver is wired to has it bound.
+    fn recompute(&mut self) {
+        for (i, m) in USB_MATCH.iter().enumerate() {
+            self.present[i] = self.by_host.iter().enumerate().any(|(h, d)| {
+                *d == Some((m.vid, m.pid)) && usbdev::host_name(h as u8).is_some_and(|n| m.peers.contains(&n))
+            });
+        }
+    }
 
     /// Should `name` be running? A device's driver only while its device is attached; everything else,
     /// always. What keeps the restart paths (the death arm, `reconcile`, `converge`) from bringing back a
@@ -1828,44 +1859,57 @@ fn devices_answer(usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
 }
 
 /// A host's report (`usbdev::Report`): start the device's driver if it is attached and not running, stop
-/// it if the device is gone. One host reports today, with one such device, so "absent" means every row.
+/// it if the device is gone. Each host reports only what IT has bound, and a PC has two (`xhci`, `ehci`), so a row is
+/// absent only when no host its driver is wired to has its device (`UsbState::recompute`).
 fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, events: &mut DevEvents,
               inst: &mut installed::Installed, r: usbdev::Report) {
     usb.heard = true;
+    let host = usbdev::host_name(r.host).unwrap_or("?");
+    if let Some(slot) = usb.by_host.get_mut(r.host as usize) {
+        *slot = r.present.then_some((r.vid, r.pid));
+    }
+    usb.recompute();
     // An installed driver package of this device comes first: it is started, and no built-in driver is (`holds`).
-    if inst.usb_report(ctx, r.present, r.vid, r.pid) {
-        if let Some(i) = USB_MATCH.iter().position(|m| m.vid == r.vid && m.pid == r.pid) { usb.present[i] = true; }
-        ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached (binding {}) - an installed package drives it",
-            r.vid, r.pid, r.gen));
+    if inst.usb_report(ctx, r.host, r.present, r.vid, r.pid) {
+        ctx.log_fmt(format_args!("supervisor: USB {:04x}:{:04x} attached on {} (binding {}) - an installed package drives it",
+            r.vid, r.pid, host, r.gen));
         return;
+    }
+    // A row whose device no host it is wired to has bound any more: its driver stopped. On one host's report only that
+    // host's device can have gone - the other's is still counted in `present`.
+    for (i, m) in USB_MATCH.iter().enumerate() {
+        if !usb.present[i] && name_alive(ctx, m.driver) && !inst.holds(m.driver) {
+            match ctx.kill(m.driver) {
+                Ok(()) => {
+                    events.note(ctx, supcmd::EV_DETACHED, m.driver, m.vid, m.pid);
+                    if usb.ready { usb_sound(ctx, map, godspeed_audio::wire::SOUND_UNPLUGGED); }
+                    ctx.log_fmt(format_args!(
+                        "supervisor: {} stopped - its USB device {:04x}:{:04x} is not attached", m.driver, m.vid, m.pid))
+                }
+                Err(e) => ctx.log_fmt(format_args!(
+                    "supervisor: {} could not be stopped ({:?}) - its device is not attached", m.driver, e)),
+            }
+        }
     }
     if !r.present {
         // Said once per report, which is rare: a host reports at its boot, on a plug or unplug, and when a
         // new supervisor asks.
-        ctx.log("supervisor: USB host reports no device with a driver here attached");
-        for (i, m) in USB_MATCH.iter().enumerate() {
-            usb.present[i] = false;
-            if name_alive(ctx, m.driver) {
-                match ctx.kill(m.driver) {
-                    Ok(()) => {
-                        events.note(ctx, supcmd::EV_DETACHED, m.driver, m.vid, m.pid);
-                        if usb.ready { usb_sound(ctx, map, godspeed_audio::wire::SOUND_UNPLUGGED); }
-                        ctx.log_fmt(format_args!(
-                            "supervisor: {} stopped - its USB device {:04x}:{:04x} is not attached", m.driver, m.vid, m.pid))
-                    }
-                    Err(e) => ctx.log_fmt(format_args!(
-                        "supervisor: {} could not be stopped ({:?}) - its device is not attached", m.driver, e)),
-                }
-            }
-        }
+        ctx.log_fmt(format_args!("supervisor: USB host reports no device with a driver here attached ({})", host));
         return;
     }
     let Some(i) = USB_MATCH.iter().position(|m| m.vid == r.vid && m.pid == r.pid) else {
-        ctx.log_fmt(format_args!("supervisor: USB device {:04x}:{:04x} attached - no driver for it here", r.vid, r.pid));
+        ctx.log_fmt(format_args!("supervisor: USB device {:04x}:{:04x} attached on {} - no driver for it here", r.vid, r.pid, host));
         return;
     };
-    usb.present[i] = true;
     let m = &USB_MATCH[i];
+    if !usb.present[i] {
+        // Bound by a host its driver is not wired to: `wifi-usb` reaches the dongle through `xhci` on a PC, so a dongle
+        // on `ehci`'s sockets has no driver here. Said, never started on the wrong host.
+        ctx.log_fmt(format_args!(
+            "supervisor: USB {:04x}:{:04x} attached on {}, which {} is not wired to - not started; plug it into a socket {} serves",
+            r.vid, r.pid, host, m.driver, m.peers.first().copied().unwrap_or("?")));
+        return;
+    }
     if name_alive(ctx, m.driver) {
         // Already running - a repeated report, or a supervisor respawn finding it. Adopted into the map if
         // this supervisor does not hold it yet, so its restarts are wired like any other.

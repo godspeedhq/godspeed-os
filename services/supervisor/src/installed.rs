@@ -28,7 +28,7 @@
 use godspeed::{self as gs, ServiceContext};
 use godspeed_package::{Arch, Kind};
 use godspeed::memory::Region;
-use godspeed_sdk::service_context::{SpawnRequest, SPAWN_FLAG_HANDOVER, SPAWN_FLAG_REQ_CONSOLE, SPAWN_FLAG_REQ_RECV, SPAWN_FLAG_WATCHED};
+use godspeed_sdk::service_context::{usbdev, SpawnRequest, SPAWN_FLAG_HANDOVER, SPAWN_FLAG_REQ_CONSOLE, SPAWN_FLAG_REQ_RECV, SPAWN_FLAG_WATCHED};
 
 /// The word an app's grant uses for the console - the screen and the keyboard while it runs - beside its peers.
 pub const CONSOLE_GRANT: &str = "console";
@@ -133,8 +133,9 @@ pub struct Installed {
     /// A built-in driver an installed package has just given its device back to, for the reconcile sweep to say
     /// why it starts it - not a death notice it missed (`returned`).
     returned: Option<&'static str>,
-    /// The device this board's USB host has bound for a driver of its own, as it last reported: (vendor, product).
-    usb_attached: Option<(u16, u16)>,
+    /// The device each USB host has bound for a driver of its own, as it last reported: (vendor, product), by the
+    /// host's number (`usbdev::HOST_*`). A PC has two such hosts, and one saying it has nothing says nothing of the other.
+    usb_attached: [Option<(u16, u16)>; usbdev::HOSTS],
 }
 
 /// How long the boot read waits for `fs` to answer before it says it gave up. `fs` mounts, and replays its
@@ -145,7 +146,7 @@ const BOOT_WAIT_SECS: i64 = 120;
 
 impl Installed {
     pub fn new() -> Installed {
-        Installed { e: [None; MAX_INSTALLED], image: None, boot_pending: false, boot_since: 0, boot_said: false, returned: None, usb_attached: None }
+        Installed { e: [None; MAX_INSTALLED], image: None, boot_pending: false, boot_since: 0, boot_said: false, returned: None, usb_attached: [None; usbdev::HOSTS] }
     }
 
     /// Is the installed list still to be read (`fs` has not answered yet)? The supervisor's loop then waits
@@ -216,7 +217,18 @@ impl Installed {
     /// the reconcile sweep and the startup convergence all ask, so none of them starts it beside the package.
     pub fn holds(&self, driver: &str) -> bool {
         self.e.iter().flatten().any(|x| x.pci_class.is_some_and(|c| crate::in_tree_driver_of(c) == Some(driver))
-            || x.usb.is_some_and(|(v, p)| crate::in_tree_usb_driver_of(v, p) == Some(driver)))
+            || x.usb.is_some_and(|d| self.in_tree_usb_driver(d) == Some(driver)))
+    }
+
+    /// The host that has `dev` bound, as it last reported - `None` while none has it.
+    fn host_of(&self, dev: (u16, u16)) -> Option<u8> {
+        self.usb_attached.iter().position(|&a| a == Some(dev)).map(|h| h as u8)
+    }
+
+    /// The built-in driver of USB device `dev` where it is bound: one wired to the host that has it, or - while no
+    /// host has said, as after a supervisor restart - the one that names it on any host.
+    fn in_tree_usb_driver(&self, dev: (u16, u16)) -> Option<&'static str> {
+        crate::in_tree_usb_driver_of(dev.0, dev.1, self.host_of(dev))
     }
 
     /// `pkg` no longer drives its device: its class or USB device is forgotten, so a built-in driver it took the device
@@ -231,7 +243,7 @@ impl Installed {
             ctx.log_fmt(format_args!("supervisor: {}'s device (class {:06x}) goes back to {}", pkg, class.unwrap_or(0), holder));
             self.returned = Some(holder);
         }
-        if let Some(((v, p), holder)) = usb.and_then(|(v, p)| crate::in_tree_usb_driver_of(v, p).map(|h| ((v, p), h))) {
+        if let Some(((v, p), holder)) = usb.and_then(|d| self.in_tree_usb_driver(d).map(|h| (d, h))) {
             ctx.log_fmt(format_args!("supervisor: {}'s USB device {:04x}:{:04x} goes back to {}", pkg, v, p, holder));
             self.returned = Some(holder);
         }
@@ -248,22 +260,27 @@ impl Installed {
         }
     }
 
-    /// This board's USB host reported what it has bound for a driver of its own (`usbdev`). True when an installed
-    /// package drives that device - it is started now if it is not running, and the caller starts no built-in driver
-    /// for it; on a report that the device is gone, every installed driver of a USB device is stopped, and kept
-    /// installed, to be started again when its device returns.
-    pub fn usb_report(&mut self, ctx: &ServiceContext, present: bool, vid: u16, pid: u16) -> bool {
-        if !present {
-            self.usb_attached = None;
+    /// USB host `host` reported what it has bound for a driver of its own (`usbdev`). True when an installed package
+    /// drives that device - it is started now if it is not running, and the caller starts no built-in driver for it.
+    /// The device this host had before and has no more - unplugged, or replaced by another - has its installed driver
+    /// stopped, and kept installed, to be started again when its device returns: on THIS host's word only, so a
+    /// report from one host never stops the driver of a device bound on the other.
+    pub fn usb_report(&mut self, ctx: &ServiceContext, host: u8, present: bool, vid: u16, pid: u16) -> bool {
+        let Some(slot) = self.usb_attached.get_mut(host as usize) else { return false };
+        let before = *slot;
+        let now = present.then_some((vid, pid));
+        *slot = now;
+        if let Some(gone) = before.filter(|&d| Some(d) != now && self.host_of(d).is_none()) {
             for x in self.e.iter().flatten() {
-                if x.usb_named.is_some() && alive(ctx, x.name()) {
+                if x.usb_named == Some(gone) && alive(ctx, x.name()) {
                     let _ = ctx.kill(x.name());
                     ctx.log_fmt(format_args!("supervisor: installed {} stopped - its USB device is not attached", x.name()));
                 }
             }
+        }
+        if !present {
             return false;
         }
-        self.usb_attached = Some((vid, pid));
         let Some(i) = self.e.iter().position(|x| x.is_some_and(|x| x.usb_named == Some((vid, pid)))) else { return false };
         let Some(mut e) = self.e[i] else { return false };
         if alive(ctx, e.name()) { return true; }
@@ -380,7 +397,7 @@ impl Installed {
         if c.kind != Kind::Driver { return; }
         let holder = match (c.contract.pci_class, c.contract.usb) {
             (Some(class), _) => { self.class_of(pkg, Some(class)); crate::in_tree_driver_of(class) }
-            (None, Some((v, p))) => { self.usb_of(pkg, Some((v, p))); crate::in_tree_usb_driver_of(v, p) }
+            (None, Some((v, p))) => { self.usb_of(pkg, Some((v, p))); self.in_tree_usb_driver((v, p)) }
             (None, None) => return,
         };
         if let Some(holder) = holder {
@@ -534,20 +551,22 @@ impl Installed {
             if let Some(other) = self.e.iter().flatten().find(|x| x.name() != pkg && x.usb_named == Some((vid, pid))) {
                 return Err(text(format_args!("its USB device {:04x}:{:04x} is driven already by the installed {}", vid, pid, other.name())));
             }
-            let Some(host) = crate::usb_host() else {
+            if crate::usb_host().is_none() {
                 return Err(text(format_args!("this machine has no USB host that binds a device for a driver of its own")));
-            };
-            self.usb_of(pkg, Some((vid, pid)));
-            if self.usb_attached != Some((vid, pid)) {
-                ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - it starts when {} reports its USB device {:04x}:{:04x}",
-                    pkg, version, host, vid, pid));
-                return Ok(((utility, app), None, (false, 0)));
             }
+            self.usb_of(pkg, Some((vid, pid)));
+            // Its peer is the host that HAS its device - on a PC, `xhci` or `ehci` - not one named in advance.
+            let Some(h) = self.host_of((vid, pid)) else {
+                ctx.log_fmt(format_args!("supervisor: installed {} {} checked from disk - it starts when a USB host reports its USB device {:04x}:{:04x}",
+                    pkg, version, vid, pid));
+                return Ok(((utility, app), None, (false, 0)));
+            };
+            let host = usbdev::host_name(h).unwrap_or("xhci");
             if np < peers.len() && !peers[..np].contains(&host) { peers[np] = host; np += 1; }
             // Its host's answers and notices arrive as messages, so it needs an endpoint of its own to receive them.
             req.flags |= SPAWN_FLAG_REQ_RECV;
             usb_host = Some(host);
-            stood_down = crate::in_tree_usb_driver_of(vid, pid);
+            stood_down = crate::in_tree_usb_driver_of(vid, pid, Some(h));
         } else if driver {
             // ONE DEVICE, BY CLASS. The class is the contract's, signed; the operator approved it ("device"); the
             // kernel finds which device of that class this is from its own bus scan (a BDF of 0), exactly as for an
@@ -671,7 +690,7 @@ impl Installed {
             self.give_back(ctx, task);
             return;
         }
-        if e.usb_named.is_some() && self.usb_attached != e.usb_named {
+        if e.usb_named.is_some_and(|d| self.host_of(d).is_none()) {
             // Stopped because its device left (`usb_report`), or died after it did: started again when it returns.
             ctx.log_fmt(format_args!("supervisor: installed {} ended{} - not restarted, its USB device is not attached", task, how));
             return;

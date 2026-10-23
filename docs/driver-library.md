@@ -103,7 +103,7 @@ and why; read them for the reasoning, not to find out what the library contains.
   a program was started in. All counted by `one_way_check.py`, every caller at zero.
 
 - **`bus`** (2026-10-23) - a device reached through the host of the bus it is on, for a device with no registers
-  of its own: `UsbDevice::granted` finds the USB host a driver was given as its peer (or, for a host spawned after
+  of its own: `UsbDevice::granted` finds the USB host a driver was given as its peer (`xhci`, `dwc2` or `ehci`) (or, for a host spawned after
   it, one it may reacquire by name - a package may not, so that widens nothing), and `info`, `place`,
   `control_in`, `control_out`, `control_out_once`, `bulk_out`, `bulk_in` and `replug` ask it for the bound
   device's transfers over the function protocol (`godspeed_sdk::usbfn`), each bounded, with a host's notice named

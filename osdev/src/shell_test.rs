@@ -12337,6 +12337,11 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
     let disk_str = disk.to_string_lossy().replace('\\', "/");
     const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+    // The stick on the USB 2.0 controller: a blank megabyte, since only its INQUIRY answer is read.
+    let stick = "build/tests/ehci_stick.img";
+    let _ = std::fs::write(stick, vec![0u8; 1024 * 1024]);
+    let stick = std::fs::canonicalize(stick).unwrap_or_else(|_| std::path::PathBuf::from(stick));
+    let stick_str = stick.to_string_lossy().replace('\\', "/");
 
     let port = pick_free_port();
     // The FTDI adapter's serial port is a TCP socket this suite connects to: what the USB driver package writes to the
@@ -12366,6 +12371,12 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
         "-device", "qemu-xhci,id=xhci",
         "-chardev", &usb_chardev,
         "-device", "usb-serial,bus=xhci.0,chardev=fser,id=fser_dev",
+        // A USB 2.0 controller with QEMU's mass-storage device straight on its root port: `ehci`, built for this
+        // suite with `bind-any-class`, binds it for a driver of its own - QEMU's EHCI takes no vendor-specific
+        // high-speed device, and a stick moves real bulk transfers - and reports it as host `ehci`.
+        "-device", "usb-ehci,id=ehci",
+        "-drive", &format!("id=stick,format=raw,if=none,file={stick_str}"),
+        "-device", "usb-storage,bus=ehci.0,drive=stick",
         "-monitor", &monitor,
     ]);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -12489,6 +12500,27 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     check!(stale < 5, format!("after nic-driver is given its NIC back, nothing keeps sending on its old capability ({stale} refused)"));
     let out = run!(b"godspeed uninstall godspeed/kind-usb yes\r", 120);
     check!(out.contains("uninstalled"), "kind-usb uninstalls");
+
+    // THE USB 2.0 HOST. `ehci` bound the stick on its root port and reported it as its own host, so a package that
+    // names it is started with `ehci` as its peer - not `xhci`, which reported a device of its own - and reaches it
+    // through `gs::driver::bus` exactly as `kind-usb` reached the adapter: a command out, an answer and a status in.
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("ehci: USB device 46f4:0001 on root port 1 bound for a driver of its own - high speed"),
+           "ehci bound QEMU's stick, straight on its root port, for a driver of its own");
+    check!(log.contains("supervisor: USB device 46f4:0001 attached on ehci - no driver for it here"),
+           "and reported it as host ehci, beside xhci's report of its own device");
+    let stick_out = run!(b"godspeed install /kind-stick-0.1.0.gsp yes\r", 240);
+    check!(stick_out.contains("asks for: device"), "a driver of the stick installs");
+    let _ = collect_until(&buf, &mut cursor, b"kind-stick: drove", Duration::from_secs(60));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    // `ehci` reported the stick at boot, so the package starts at install, with `ehci` - the host that has it - as its
+    // one peer (the drive line below names the host it reached).
+    check!(log.contains("supervisor: installed godspeed/kind-stick 0.1.0 started") && log.contains("1 peer(s), its USB device through its host"),
+           "the supervisor starts it at once, with the host that has the stick as its peer");
+    check!(log.contains("kind-stick: drove 46f4:0001 through ehci - INQUIRY 36 bytes: vendor \"QEMU\", product \"QEMU HARDDISK\"; status 0"),
+           "the package reads the stick's INQUIRY through ehci: a bulk OUT and two bulk INs, through gs::driver::bus");
+    let out = run!(b"godspeed uninstall godspeed/kind-stick yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-stick uninstalls");
 
     let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
     check!(removed.contains("no longer trusted"), "the test key is withdrawn");

@@ -15,7 +15,10 @@ ipc_receive = ["ehci"]
 # publishes with `gs::trace::metric` (the SDK's `metric` under it). It is the ONLY gate on both: holding this send cap is what turns
 # tracing on, and lacking it costs one relaxed load per call and nothing else. Emission is
 # `try_send` with the result discarded, so the sink can never slow or fail this service.
-ipc_send    = ["events"]
+# `supervisor` - the USB device report (`usbdev`, as host `ehci`): the device this host binds for a driver of its
+# own attached or not, so an installed driver package that names it is started and stopped with it
+# (`src/bound.rs`, docs/usb-device-drivers.md), as `xhci` and `dwc2` report theirs.
+ipc_send    = ["events", "supervisor"]
 hw_device   = "ehci"
 hw_interrupt = [41]
 log_write   = true

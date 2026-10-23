@@ -23,9 +23,12 @@
 //!   E3  root ports → rate-matching hub enumeration
 //!   E4  address the keyboard via split transactions
 //!   E5  poll the interrupt endpoint, decode HID, push keystrokes
+//!   B1  bind one vendor-specific device for an installed driver package (`bound.rs`, 2026-10-23)
 
 #![no_std]
 #![no_main]
+
+mod bound;
 
 use godspeed as gs;
 use godspeed::driver::{delay, Part};
@@ -44,12 +47,15 @@ const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 /// never recv's, so a flood-storm (or any stray send) fills its 16-deep queue and it sits at 16/16
 /// FOREVER - `events` stub bug in another guise. recv() parks the task between messages, so the
 /// core still idles; it just no longer clogs. Used at every dead end where ehci has nothing left to
-/// do (no controller MMIO, reset failed, or no high-speed device present at boot).
+/// do (no controller MMIO, reset failed, or no high-speed device present at boot). What it drains is
+/// ANSWERED since 2026-10-23 (`bound::idle`): the supervisor's ask with "nothing bound", and a driver's
+/// request with `ST_NO_DEVICE`, so neither waits out its deadline against a host that is here.
 fn idle_draining(ctx: &ServiceContext) -> ! {
     // Drain by POLLING (try_recv), not a blocking recv: a cross-core flood that must WAKE a deeply-blocked
     // recv on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven
     // poll drains every quantum with no wake needed, parked in between (`sleep_quantum`), not spinning.
-    loop { while gs::ipc::try_recv(ctx).is_some() {} gs::task::sleep_quantum(ctx); }
+    let mut host = bound::Host::new(ctx);
+    bound::idle(ctx, &mut host)
 }
 
 #[allow(unsafe_code)] // the exported entry symbol - see the crate attribute
@@ -161,40 +167,125 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // it. If PED stays 0, the device is low/full-speed directly on the port.
     // ---------------------------------------------------------------------------
     if let Some(p) = first_connected {
-        let off = op + OP_PORTSC0 + p * 4;
-        // Begin reset: set Port Reset, clear Port Enable, preserve the other RW
-        // bits, and write the write-1-to-clear change bits as 0 so we don't clear
-        // them by accident.
-        let keep = mmio.read32(off) & !PORTSC_W1C & !PORTSC_PED;
-        mmio.write32(off, keep | PORTSC_RESET);
-        delay::hold_parked(&ctx, RESET_HOLD); // hold reset >= 50 ms (USB 2.0 §7.1.7.5)
-        // End reset.
-        mmio.write32(off, mmio.read32(off) & !PORTSC_W1C & !PORTSC_RESET);
-        wait(&ctx, &mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
-        delay::hold_parked(&ctx, RECOVERY);   // reset-recovery settle (RECOVERY, 20 ms)
-
-        let psc = mmio.read32(off);
-        let enabled = psc & PORTSC_PED != 0;
-        ctx.log_fmt(format_args!(
-            "ehci: port {} after reset: PORTSC={:#010x} enabled={} -> {}",
-            p + 1, psc, enabled as u8,
-            if enabled {
-                "HIGH-SPEED (hub or HS device on EHCI; keyboard is behind a hub) -> E3b enumerates it"
-            } else {
-                "not high-speed (low/full-speed direct on the port)"
-            }
-        ));
-
-        // E3b/E3c - the device on the port (the high-speed hub) is now enabled at
-        // the default address 0. Build the async schedule, address it, configure
-        // it, and read its hub descriptor.
-        if enabled {
-            enumerate_hub(&ctx, &mmio, op);
+        // E3b/E3c - the device on the port is now enabled at the default address 0. A hub (the T630's
+        // rate-matching hub) is enumerated, and its ports scanned for keyboards and mice for the rest of the
+        // driver's life; anything else on the port is a device on its own, which this host binds for a driver of
+        // its own if it can (`bound.rs`) and watches until it leaves.
+        if reset_root_port(&ctx, &mmio, op, p) {
+            let dma = match godspeed::driver::arena(&ctx) {
+                Some(a) => match lay_out(&ctx, a) { Some(d) => d, None => idle_draining(&ctx) },
+                None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); idle_draining(&ctx) }
+            };
+            // Whether the control-transfer timeout has been said. Owned here, by the function that runs for
+            // the driver's whole life, rather than as a static (invariant 9, backlog/fixed/80 D9): a respawn is a
+            // fresh instance and says it again, which it should.
+            let said = Cell::new(false);
+            let mut host = bound::Host::new(&ctx);
+            root_port(&ctx, &mmio, op, &dma, &said, p, &mut host);
         }
     }
 
     idle_draining(&ctx);
 }
+
+/// Reset root port `p` (from 0) and say what came up. `true` when the port enabled - which EHCI does only for a
+/// HIGH-SPEED device: for the back keyboard (low-speed) that means a high-speed hub (the integrated rate-matching
+/// hub) with the keyboard behind it. A low- or full-speed device straight on the port stays disabled.
+fn reset_root_port(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize, p: usize) -> bool {
+    let off = op + OP_PORTSC0 + p * 4;
+    // Begin reset: set Port Reset, clear Port Enable, preserve the other RW
+    // bits, and write the write-1-to-clear change bits as 0 so we don't clear
+    // them by accident.
+    let keep = mmio.read32(off) & !PORTSC_W1C & !PORTSC_PED;
+    mmio.write32(off, keep | PORTSC_RESET);
+    delay::hold_parked(ctx, RESET_HOLD); // hold reset >= 50 ms (USB 2.0 §7.1.7.5)
+    // End reset.
+    mmio.write32(off, mmio.read32(off) & !PORTSC_W1C & !PORTSC_RESET);
+    wait(ctx, mmio, off, PORTSC_RESET, false); // controller finishes (~2 ms)
+    delay::hold_parked(ctx, RECOVERY);   // reset-recovery settle (RECOVERY, 20 ms)
+
+    let psc = mmio.read32(off);
+    let enabled = psc & PORTSC_PED != 0;
+    ctx.log_fmt(format_args!(
+        "ehci: port {} after reset: PORTSC={:#010x} enabled={} -> {}",
+        p + 1, psc, enabled as u8,
+        if enabled {
+            "HIGH-SPEED (hub or HS device on EHCI; keyboard is behind a hub) -> E3b enumerates it"
+        } else {
+            "not high-speed (low/full-speed direct on the port)"
+        }
+    ));
+    enabled
+}
+
+/// Root port `p`, enabled, its device at address 0: a hub is enumerated (`enumerate_hub`, which does not return
+/// while the hub works); a device on its own is bound if it can be and SERVED until the port says it left, then the
+/// port is watched for the next device. Returns only when a hub's own bring-up fails.
+fn root_port(
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize, dma: &Parts, said: &Cell<bool>, p: usize,
+    host: &mut bound::Host,
+) {
+    let hw = bound::Hw { mmio, dma, op, said };
+    let off = op + OP_PORTSC0 + p * 4;
+    let irq = gs::driver::irq::Irq::granted(ctx);
+    loop {
+        // What is on the port: its device descriptor's class, at the default address.
+        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
+        if control_retry(ctx, mmio, dma, op, said, &Ep::hs(0, 64), &setup, 18, true, 3).is_none() {
+            ctx.log_fmt(format_args!("ehci: the device on root port {} did not answer its descriptor", p + 1));
+        } else if dma.ctl.read8(DATA_BUF + 4) == 0x09 {
+            enumerate_hub(ctx, mmio, op, dma, said, host);
+            return;
+        } else {
+            let gen = host.next_gen();
+            host.dev = bound::try_bind(ctx, &hw, Ep::hs(0, 64), p as u8 + 1, 0, gen);
+        }
+        host.report_if_changed(ctx);
+        // Serve the bound device's driver - or answer that nothing is bound - until the port is empty. The port is
+        // read on every wake; a request wakes at once, and the deadline bounds how long an unplug goes unseen.
+        while mmio.read32(off) & PORTSC_CCS != 0 {
+            serve_wake(ctx, mmio, op, &irq, &hw, host, None);
+        }
+        host.unbind(ctx);
+        host.report_if_changed(ctx);
+        ctx.log_fmt(format_args!("ehci: root port {} is empty - waiting for a device", p + 1));
+        loop {
+            while mmio.read32(off) & PORTSC_CCS == 0 {
+                serve_wake(ctx, mmio, op, &irq, &hw, host, None);
+            }
+            delay::hold_parked(ctx, DEBOUNCE); // connect-debounce before reset
+            if reset_root_port(ctx, mmio, op, p) {
+                break;
+            }
+            // Not high-speed: nothing this host can reach on that port without a companion. Wait for it to leave.
+            while mmio.read32(off) & PORTSC_CCS != 0 {
+                serve_wake(ctx, mmio, op, &irq, &hw, host, None);
+            }
+        }
+    }
+}
+
+/// One wait of `ROOT_WATCH_MS` at most: a message is served (`bound::Host::serve`), an interrupt acknowledged.
+fn serve_wake(
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize, irq: &gs::driver::irq::Irq, hw: &bound::Hw,
+    host: &mut bound::Host, ring: Option<u32>,
+) {
+    match irq.wait(ctx, Budget::ms(ROOT_WATCH_MS)) {
+        Woke::Request(m) => host.serve(ctx, Some(hw), ring, &m),
+        Woke::Interrupt => {
+            let sts = mmio.read32(op + OP_USBSTS);
+            if sts & STS_INT_BITS != 0 {
+                mmio.write32(op + OP_USBSTS, sts & STS_INT_BITS);
+            }
+            irq.rearm(ctx);
+        }
+        Woke::Timeout => {}
+    }
+}
+
+/// How long a root-port watch waits before it reads the port again: how long an unplug or a plug goes unseen
+/// with no request arriving to wake it sooner. A watchdog, as `POLL_DEADLINE_MS` is.
+const ROOT_WATCH_MS: u64 = 250;
 
 // --- EHCI async-schedule registers + DMA layout for the control transfer ---
 const OP_CTRLDSSEGMENT: usize = 0x10; // high 32 bits of 64-bit data-structure addrs
@@ -228,11 +319,16 @@ const QTD_ERRMASK: u32 = (1 << 3) | (1 << 4) | (1 << 5); // XactErr | Babble | B
 /// directly (`hs`); for the low-speed keyboard behind it we go through the hub's
 /// transaction translator via split transactions (`low`, carrying the hub address
 /// and downstream port).
+#[derive(Clone, Copy)]
 struct Ep { addr: u8, max_packet: u32, speed: u32, hub_addr: u8, port: u8 }
 impl Ep {
     /// High-speed device addressed directly (speed=2, no split).
     fn hs(addr: u8, max_packet: u32) -> Ep {
         Ep { addr, max_packet, speed: 2, hub_addr: 0, port: 0 }
+    }
+    /// Full-speed device behind a hub TT (speed=0, split via hub/port).
+    fn full(addr: u8, max_packet: u32, hub_addr: u8, port: u8) -> Ep {
+        Ep { addr, max_packet, speed: 0, hub_addr, port }
     }
     /// Low-speed device behind a hub TT (speed=1, split via hub/port).
     fn low(addr: u8, max_packet: u32, hub_addr: u8, port: u8) -> Ep {
@@ -261,14 +357,8 @@ const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 struct Parts {
     ctl: Part,
     poll: Part,
-}
-
-impl Parts {
-    /// Both parts, as the whole arena was zeroed before.
-    fn zero(&self) {
-        self.ctl.zero();
-        self.poll.zero();
-    }
+    /// The bound device's bulk transfers (`bound.rs`): their queue head, descriptor and buffers.
+    bulk: Part,
 }
 
 /// Lay the arena out, said once; `None`, said with the part that did not fit, is no arena.
@@ -277,6 +367,7 @@ fn lay_out(ctx: &ServiceContext, a: godspeed::driver::Arena) -> Option<Parts> {
     let laid = (|| Ok::<_, godspeed::driver::arena::NoRoom>(Parts {
         ctl: l.take("control transfer", CONTROL_BYTES, 4096)?,
         poll: l.take("poll slots", MAX_HID * POLL_STRIDE, POLL_STRIDE)?,
+        bulk: l.take("bulk transfers", bound::BULK_BYTES, 4096)?,
     }))();
     match laid {
         Ok(p) => {
@@ -302,7 +393,20 @@ fn control(
     ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
     op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool,
 ) -> Option<usize> {
-    dma.zero();
+    control_data(ctx, mmio, dma, op, said, ep, setup, data_len, in_dir, &[])
+}
+
+/// `control`, with `out` as an OUT transfer's data stage (`data_len` bytes of it), for a driver's request to the
+/// device this host bound for it (`bound.rs`). Only the control part is zeroed: the keyboard ring in the poll part
+/// may be live, and the bound device's bulk part is its own.
+fn control_data(
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
+    op: usize, said: &Cell<bool>, ep: &Ep, setup: &[u8; 8], data_len: usize, in_dir: bool, out: &[u8],
+) -> Option<usize> {
+    dma.ctl.zero();
+    for (i, &b) in out.iter().take(data_len).enumerate() {
+        dma.ctl.write8(DATA_BUF + i, b);
+    }
 
     let qh_phys     = dma.ctl.phys_at(QH_OFF) as u32;
     let setup_phys  = dma.ctl.phys_at(QTD_SETUP) as u32;
@@ -434,16 +538,11 @@ fn control(
 /// descriptor (downstream port count), then run the E6 hot-plug loop over its ports
 /// for the rest of the driver's life. Returns only when a step of the hub's own
 /// bring-up fails.
-fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize) {
-    let dma = match godspeed::driver::arena(&ctx) {
-        Some(a) => match lay_out(ctx, a) { Some(p) => p, None => return },
-        None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); return; }
-    };
-    // Whether the control-transfer timeout has been said. Owned here, by the function that runs for
-    // the driver's whole life, rather than as a static (invariant 9, backlog/fixed/80 D9): a respawn is a
-    // fresh instance and says it again, which it should.
-    let said_cell = Cell::new(false);
-    let said = &said_cell;
+fn enumerate_hub(
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize, dma: &Parts, said: &Cell<bool>,
+    host: &mut bound::Host,
+) {
+    let dma = *dma;
 
     // E3b: device descriptor at the default address 0.
     let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
@@ -506,7 +605,8 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
     let mut failed_rescans = 0u32;
     const MAX_FAILED_RESCANS: u32 = 3;
     loop {
-        let (devs, ndev, any_failed) = scan_devices(ctx, mmio, &dma, op, said, mps0, nports);
+        let (devs, ndev, any_failed) = scan_devices(ctx, mmio, &dma, op, said, mps0, nports, host);
+        host.report_if_changed(ctx);
         if ndev == 0 {
             // A BOUND, where this used to be a binary choice between two wrong answers.
             //
@@ -530,7 +630,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
                 continue;
             }
             ctx.log("ehci: no boot keyboard/mouse attached - waiting for a connection");
-            wait_for_connection(ctx, mmio, &dma, op, said, mps0, nports);
+            wait_for_connection(ctx, mmio, &dma, op, said, mps0, nports, host);
             announce = true; // whatever connects after a wait is a real plug event
             failed_rescans = 0; // a real plug event starts a fresh episode
             continue;
@@ -541,7 +641,7 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
                 notify(ctx, if d.is_mouse { "mouse connected (ehci)" } else { "keyboard connected (ehci)" });
             }
         }
-        let gone = poll_devices(ctx, mmio, &dma, op, &devs[..ndev]);
+        let gone = poll_devices(ctx, mmio, &dma, op, said, mps0, &devs[..ndev], host);
         notify(ctx, if devs[gone].is_mouse { "mouse disconnected (ehci)" } else { "keyboard disconnected (ehci)" });
         announce = true; // the next connect (after re-scan) is a real plug event
         delay::hold_parked(ctx, DEBOUNCE); // let the port status settle before re-scan
@@ -555,8 +655,9 @@ fn enumerate_hub(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: u
 /// before resetting the next port is what lets two devices coexist.
 fn scan_devices(
     ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
-    op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
+    op: usize, said: &Cell<bool>, mps0: u32, nports: u8, host: &mut bound::Host,
 ) -> ([HidDev; MAX_HID], usize, bool) {
+    let hw = bound::Hw { mmio, dma, op, said };
     // Power every downstream port (the hub does individual power switching), let
     // power settle, then enumerate each connected port.
     for port in 1..=nports {
@@ -577,6 +678,12 @@ fn scan_devices(
         ctx.log_fmt(format_args!(
             "ehci: hub port {}: status={:#06x} connected={} low_speed={}",
             port, status, (status & 1) as u8, ((status >> 9) & 1) as u8));
+        // The device bound for a driver of its own is left alone while it is there: re-resetting its port would
+        // reset it under its driver every time a keyboard came or went.
+        if host.dev.is_some_and(|b| b.hub_port == port) {
+            if status & 1 != 0 { continue; }
+            host.unbind(ctx);
+        }
         if status & 1 == 0 { continue; } // nothing connected
 
         // A high-speed device on a hub port (status bit 10) is mass storage or a
@@ -596,7 +703,7 @@ fn scan_devices(
         // FULL re-reset (+ connect-debounce + longer recovery) each attempt - the
         // Logitech keyboard's first SETUP after a single reset XactErrs, the
         // Microsoft mouse needs only one.
-        let kep = Ep::low(0, 8, 1, port);
+        let mut kep = Ep::low(0, 8, 1, port);
         let dd  = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
         let mut got = false;
         let mut high_speed = false; // device enabled at high speed after reset
@@ -619,11 +726,30 @@ fn scan_devices(
             // reset, 0x0503 after), so this is where we can finally tell. Abandon it
             // without retrying or marking the port faulty - it isn't.
             if (pstat >> 10) & 1 != 0 {
-                ctx.log_fmt(format_args!(
-                    "ehci: hub port {} enabled high-speed (mass storage / hub) - not a HID, skipping",
-                    port));
+                // Unless it is a device this host binds for a driver of its own (`bound.rs`): read at high speed,
+                // straight through the hub, with no translator.
+                if host.dev.is_none() {
+                    let gen = host.next_gen();
+                    host.dev = bound::try_bind(ctx, &hw, Ep::hs(0, 64), 1, port, gen);
+                }
+                if host.dev.is_none() {
+                    ctx.log_fmt(format_args!(
+                        "ehci: hub port {} enabled high-speed (mass storage / hub) - not a HID, skipping",
+                        port));
+                }
                 high_speed = true;
                 break;
+            }
+            // FULL speed (neither the low- nor the high-speed bit): the translator is asked for full-speed
+            // transactions, and the default endpoint's packet size is read first, since a full-speed device's
+            // may be up to 64 and an 18-byte answer in one packet would overrun the 8 asked for. Low speed is
+            // always 8, as before.
+            if (pstat >> 9) & 1 == 0 {
+                let d8 = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00]; // Get_Descriptor(Device), 8
+                let fs = Ep::full(0, 8, 1, port);
+                if control_retry(ctx, mmio, dma, op, said, &fs, &d8, 8, true, 6).is_some() {
+                    kep = Ep::full(0, (dma.ctl.read8(DATA_BUF + 7) as u32).max(8), 1, port);
+                }
             }
 
             // Retry the descriptor read several times within this reset before
@@ -704,6 +830,11 @@ fn scan_devices(
         let is_kbd   = iclass == 0x03 && iproto == 1;
         let is_mouse = iclass == 0x03 && iproto == 2;
         if !(is_kbd || is_mouse) {
+            if host.dev.is_none() && bound::bindable(iclass) {
+                let gen = host.next_gen();
+                host.dev = bound::try_bind(ctx, &hw, kep, 1, port, gen);
+                if host.dev.is_some() { continue; }
+            }
             ctx.log_fmt(format_args!("ehci: hub port {} is not a boot keyboard/mouse - skipping", port));
             continue;
         }
@@ -740,8 +871,9 @@ fn scan_devices(
 /// transfers while nothing usable is attached.
 fn wait_for_connection(
     ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
-    op: usize, said: &Cell<bool>, mps0: u32, nports: u8,
+    op: usize, said: &Cell<bool>, mps0: u32, nports: u8, host: &mut bound::Host,
 ) {
+    let hw = bound::Hw { mmio, dma, op, said };
     // Returns Some(true/false) on a successful status read, None if the read
     // itself failed. Distinguishing "read failed (state unknown)" from "read OK,
     // not connected" matters: a device whose split status reads are intermittently
@@ -764,7 +896,13 @@ fn wait_for_connection(
         for port in 1..=nports {
             match status(port) {
                 Some(true) if base & (1 << port) == 0 => return, // a new device appeared
-                Some(false) => base &= !(1 << port), // a known device left; reuse its port
+                Some(false) => {
+                    base &= !(1 << port); // a known device left; reuse its port
+                    if host.dev.is_some_and(|b| b.hub_port == port) {
+                        host.unbind(ctx);
+                        host.report_if_changed(ctx);
+                    }
+                }
                 _ => {}                              // unchanged, or unknown (read failed)
             }
         }
@@ -782,8 +920,11 @@ fn wait_for_connection(
         // hold, the recovery settle, the connect-debounce before a port reset - which are one-shot
         // steps rather than a loop.
         // Drain our IPC endpoint while we idle here with no HID attached (the active path drains in
-        // poll_devices). Without it a flood-storm clogs our 16-deep queue permanently - see xhci.
-        while gs::ipc::try_recv(ctx).is_some() {}
+        // poll_devices). Without it a flood-storm clogs our 16-deep queue permanently - see xhci. What is drained
+        // is served: the supervisor's ask, and the bound device's driver (`bound.rs`).
+        while let Some(m) = gs::ipc::try_recv(ctx) {
+            host.serve(ctx, Some(&hw), None, &m);
+        }
         gs::task::sleep_ms(ctx, HOTPLUG_POLL_MS); // no HID attached: park - and actually park
     }
 }
@@ -870,8 +1011,11 @@ fn arm_int(dma: &Parts, qh: usize, toggle: u32) {
 /// we act on it, and re-arm with the data toggle flipped.
 fn poll_devices(
     ctx: &ServiceContext, mmio: &godspeed::driver::Registers, dma: &Parts,
-    op: usize, devs: &[HidDev],
+    op: usize, said: &Cell<bool>, mps0: u32, devs: &[HidDev], host: &mut bound::Host,
 ) -> usize {
+    let hw = bound::Hw { mmio, dma, op, said };
+    let ring = dma.poll.phys() as u32;
+    let mut bound_check = wait::Since::now(ctx);
     let n = devs.len();
     ctx.log_fmt(format_args!(
         "ehci: polling {} device(s) - type at the gsh> prompt; mouse events log here", n));
@@ -1101,10 +1245,34 @@ fn poll_devices(
                 irq.rearm(ctx);
                 true
             }
-            Woke::Request(_) | Woke::Timeout => false,
+            // The supervisor's ask, or the bound device's driver: served, and the schedule pointed back at the
+            // keyboard ring after any transfer (`bound.rs`). Anything else is dropped, as before.
+            Woke::Request(m) => {
+                host.serve(ctx, Some(&hw), Some(ring), &m);
+                false
+            }
+            Woke::Timeout => false,
         };
+        // Is the bound device still on its hub port? Asked of the hub at most once a second, as an unplug of it
+        // raises nothing this loop sees - its driver's transfers would only start failing.
+        if let Some(b) = host.dev {
+            if bound_check.passed(ctx, Budget::ms(BOUND_CHECK_MS)) {
+                bound_check = wait::Since::now(ctx);
+                let setup = [0xA3, 0x00, 0x00, 0x00, b.hub_port, 0x00, 0x04, 0x00]; // Get_Status
+                let gone = control(ctx, mmio, dma, op, said, &Ep::hs(1, mps0), &setup, 4, true).is_some()
+                    && dma.ctl.read16(DATA_BUF) & 1 == 0;
+                bound::point_async(ctx, mmio, op, ring);
+                if gone {
+                    host.unbind(ctx);
+                    host.report_if_changed(ctx);
+                }
+            }
+        }
     }
 }
+
+/// How often the keyboard loop asks the hub whether the bound device is still on its port.
+const BOUND_CHECK_MS: u64 = 1_000;
 
 /// Consecutive errored interrupt completions before a device is declared
 /// unplugged. A present device never errors (it NAKs while idle), so this only

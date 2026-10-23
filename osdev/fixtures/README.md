@@ -94,6 +94,17 @@ bulk OUT ok, bulk IN <n> bytes: "<what arrived>"`. The suite puts the adapter's 
 `hello from the serial port` to it once the package listens, and reads back what the package sent. Packaged as the
 files above.
 
+## `kind-stick-0.1.0.gsp`
+
+An UNPUBLISHED driver package for `osdev test driver-packages`, signed by the same throwaway test key, for `x86_64`
+only: a driver of a USB device behind GodspeedOS's USB 2.0 host, `ehci`. Made 2026-10-23 from a copy of `kind-usb`
+whose contract names QEMU's USB mass-storage device, `hw_usb = "46f4:0001"`, and whose `src/main.rs` sends it a SCSI
+INQUIRY by the bulk-only transport through `gs::driver::bus` - the command block by bulk OUT, then the 36-byte answer
+and the status by bulk IN, each asked again (5 ms apart, for up to 5 s) until it comes, since `ehci` answers "nothing
+yet" rather than waiting - logging `kind-stick: drove 46f4:0001 through ehci - INQUIRY 36 bytes: vendor "QEMU",
+product "QEMU HARDDISK"; status 0`. A stick is not vendor-specific, so a real `ehci` does not bind it: the suite
+builds `ehci` with `bind-any-class`, and no image does. Packaged as the files above.
+
 ## `kind-dongle-0.1.0.gsp`
 
 An UNPUBLISHED driver package for a HARDWARE card, not a QEMU suite (QEMU has no RTL8188CUS), signed by the same
