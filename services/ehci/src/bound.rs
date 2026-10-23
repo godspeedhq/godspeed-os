@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The ONE device this host binds for a driver of its own (2026-10-23): what `xhci` and `dwc2` do for a USB device
 //! an installed driver package names (`hw_usb`, `docs/developer-services-design.md` 13.1), done on the USB 2.0
-//! controller - the T630's back sockets, behind its rate-matching hub, or any device straight on a root port.
+//! controller - the T630's back sockets, behind its rate-matching hub, or a device straight on the root port that had
+//! one at boot (the first such port, which is then watched for a replug; no other root port is).
 //!
 //! A device whose first interface is vendor-specific (class 0xFF) and that is not a boot keyboard or mouse - which
 //! this host drives itself - is addressed, configured, its bulk endpoints found, and reported to the supervisor
@@ -150,6 +151,8 @@ impl Host {
             return;
         }
         let op = p.first().copied().unwrap_or(0);
+        // The function protocol's range, `OP_INFO` to `OP_REPLUG` less the supervisor's ask: what
+        // `godspeed_wifi::usbfn::is_request` says, written out because this host does not link `sdk/wifi`.
         if !(usbfn::OP_INFO..=usbfn::OP_REPLUG).contains(&op) || op == usbdev::ASK {
             return;
         }
@@ -203,7 +206,7 @@ const CONTROL_TRIES: u32 = 3;
 
 /// Would this host bind a device whose first interface is class `class` for a driver of its own? Vendor-specific
 /// only: a device of a standard class has, or will have, a driver of its own kind. The `bind-any-class` feature binds
-/// any class but a hub, for `osdev test driver-packages` - QEMU's EHCI has no vendor-specific high-speed device, and
+/// any class but a hub or a HID, for `osdev test driver-packages` - QEMU's EHCI has no vendor-specific high-speed device, and
 /// its mass-storage device moves real bulk transfers - and is never built into an image.
 pub fn bindable(class: u8) -> bool {
     class == 0xFF || (cfg!(feature = "bind-any-class") && class != 0x09 && class != 0x03)

@@ -12324,8 +12324,11 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
 
 /// `osdev test driver-packages`: what a driver package can be given beyond `osdev test kinds`' registers, interrupt
 /// and DMA arena - a device TAKEN OVER from a GodspeedOS driver (`kind-nic`, the e1000 from `nic-driver`), and a USB
-/// device reached through its host (`kind-usb`, QEMU's FTDI serial adapter behind `xhci`). Both made with the CLI's
-/// driver template (`osdev/fixtures/README.md`). Its own disk, because a test disk's root holds only so many files.
+/// device reached through its host (`kind-usb`, QEMU's FTDI serial adapter behind `xhci`), through a supervisor restart
+/// and an unplug and a replug, with `net-stack` checked not to keep sending on `nic-driver`'s old capability; a USB
+/// device behind the USB 2.0 host (`kind-stick`, QEMU's stick on `ehci`, built with `bind-any-class`); and the RTL8168
+/// card's package refusing QEMU's e1000 (`kind-rtl`). Each made from the CLI's driver template
+/// (`osdev/fixtures/README.md`). Its own disk, because a test disk's root holds only so many files.
 pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     let qemu      = crate::qemu::qemu_binary();
     let image_str = image_path.to_string_lossy().replace('\\', "/");

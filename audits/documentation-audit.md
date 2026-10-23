@@ -1964,3 +1964,95 @@ package and given its NIC back they went on sending on the dead one - 549 refuse
 - until `net-stack` itself restarted. They reacquire after a failure now (`reacquire_after`). `osdev test
 driver-packages` gained the supervisor restart, the unplug and replug, and the stale-capability count: 18/0.
 Finding 7 is a release order, and stands.
+
+
+## Audit 25 - documents and code comments, `ehci`, `wifi-usb` on `bus`, and the cards (2026-10-23)
+
+Scope: everything `feat/driver-packages` changed since Audit 24 (`56a0a7c7`..`34d5560b`: the six fixes, `wifi-usb` on
+`gs::driver::bus`, `ehci` binding a device for a package, the host byte in `usbdev`, the card fixtures) and the
+operator's decision of the same day on contributors and the SDK, in this repository and in `godspeed-cli` (since
+`48d2ce0`); then every document elsewhere those changes made false. Read in three parts - code comments, documents,
+the CLI - by three independent readers, each finding checked against the code before it was taken. Comments and
+documents only: the Rust diff in both repositories was checked to touch no code token, and one log line changed by
+mistake on the way was put back and recorded below instead.
+
+**Result.** 21 files corrected here and 6 in `godspeed-cli`, and 11 code findings recorded, not fixed.
+
+**In the constitution:**
+- `CLAUDE.md` 14.1, the drivers amendment of the same day: "Its host (`xhci`, `dwc2`)" - `ehci` binds one too.
+
+**In documents:**
+- `docs/CLAUDE.md`: the `usb-device-drivers.md` row still called `ehci` "a RECORDED LIMITATION" that drives nothing;
+  the `developer-services-design.md` row said section 13 was not built; the `wifi-usb.md` row had no section 53.
+- `docs/usb-device-drivers.md`: the report "has no host in it yet" and "two hosts report"; `ehci`'s grant of the
+  supervisor was missing from section 3.
+- `docs/wifi-usb.md` 2, the protocol table: `OP_INFO`'s where-part "`xhci` only", `OP_BULK_IN` "armed again" (not on
+  `ehci`), and no row at all for `OP_REPLUG`.
+- `docs/driver-library.md`: "Current state (2026-10-22)" holds a 2026-10-23 entry; `wifi-usb` was missing from
+  the converted drivers.
+- `docs/developer-services-design.md` 13.1: the list of `UsbDevice` calls lacked `place`, `control_out_once` and
+  `replug`.
+- `utilities/56_wifi.md`: "`xhci` fills them in" - `ehci` does too.
+- `backlog/71`: the operator's decision on contributors and the SDK, beside the question it answers.
+- `website/src/stdlib.md` (the book): a driver package from outside this repository may call the SDK, outside the
+  promise.
+- `osdev/CLAUDE.md`: `driver-packages` is 27 checks, with the stick through `ehci` and `kind-rtl`, not 18.
+- `osdev/fixtures/README.md`: not every file there is baked into a QEMU disk (`kind-dongle`).
+- `contracts/schema/service.schema.json` (descriptions only): `hw_usb`'s hosts gain `ehci`; `hw_dma`'s "no Raspberry
+  Pi or VisionFive has one" understated where an arena reaches all of memory - also an Intel PC (no confinement but
+  AMD-Vi's, 6.4) and any PC device left in passthrough.
+
+**In code comments:**
+- `services/ehci/src/main.rs`: the interrupt wait still said nothing sends this driver a request it answers;
+  `idle_draining`'s comment had lost its code to `bound::idle` and missed two of its dead ends; `Parts` said two
+  parts.
+- `services/ehci/src/bound.rs`: "any device straight on a root port" - only the first port connected at boot;
+  `bind-any-class` excludes a HID as well as a hub; why `serve` writes the protocol's range out.
+- `stdlib/rust/src/driver/bus.rs`: "a package cannot" reacquire its host - it can, the kernel minting by name for a
+  peer the task was spawned with (`AcquireSendCap`), which is what keeps it from widening anything; `HOSTS`' two-step
+  lookup; `Place.slot` is `ehci`'s USB address; `replug` and `bulk_in` described `xhci` and `dwc2` only.
+- `sdk/rust/src/usbfn.rs`, `sdk/wifi/src/usbfn.rs`: the hosts, `OP_BULK_IN`, `OP_REPLUG` and the where-part each
+  left `ehci` out; "every host routes by this" - `ehci` does not link that crate.
+- `services/supervisor/src/main.rs`, `installed.rs`: `usb_host`, `UsbState` and the USB install path each spoke of
+  one host per board.
+- `osdev/src/main.rs`, `osdev/src/shell_test.rs`: the suite's docs named two fixtures of four.
+
+**In `godspeed-cli`:**
+- `templates/driver/README.md`: its new SDK paragraph overstated twice ("does not break", "it is added there") and
+  said "copy any of them" of drivers that are GPL-2.0-only; "restarted if it dies" (five times a boot); the install
+  questions unnamed; the IOMMU understatement; a USB driver's keys (`hw_dma` is not a `hw_pci_*` key), its calls and
+  its hosts.
+- `site/kinds.html`: the same, and the SDK paragraph it lacked.
+- `README.md`: "a driver against GodspeedOS 0.30.0 or later" - the template needs the release after.
+- `docs/package-format.md`: the 2 MiB bound and `hw_usb`'s exclusions, which the supervisor enforces.
+- `crates/godspeed-package/src/manifest.rs`: `Kind::Driver` named the PCI keys only.
+- `templates/driver/contracts/contract.toml`: the IOMMU understatement.
+
+**Code findings, recorded and not fixed (an audit changes no code):**
+1. `xhci`'s console notice for the dongle LEAVING regressed in `56a0a7c7` from "WiFi dongle removed (xhci)" to
+   "USB device removed (xhci)": the removal arm runs after `radio` is already `None`, so it cannot tell the dongle.
+2. `ehci`'s arena line (`lay_out`) still names two parts; the bulk part is not in it.
+3. The shell's DMA question (`confirm_dma`) says "no Raspberry Pi or VisionFive has one", the understatement the
+   documents above corrected: an Intel PC confines nothing either.
+4. A device moved from one host to the other while its package runs: if the new host's report arrives before the old
+   host's absent one, `host_of` finds it and the package is not stopped, so it keeps its old host as its peer and is
+   answered `ST_NO_DEVICE` with no restart onto the new one. Narrow - an unplug normally reports first.
+5. `ehci` handles only the first root port connected at boot: a device on a second root port, or on any root port
+   when none was connected at boot, is never bound (the document records it as a limit).
+6. After a supervisor restart and before any report, `in_tree_usb_driver` matches on any host, so `adopt_device`
+   for a package holding the dongle on `ehci` would stand down a `wifi-usb` running for a dongle on `xhci`. Unlikely
+   (two dongles), low severity.
+7. `supcmd::DEVICES` (`devices_answer`) names `USB_HOSTS.first()` - `xhci` on a PC - as the host on every USB row,
+   whichever host has the device, so `hardware` can name the wrong host for a dongle on `ehci`.
+8. On an image without `wifi-usb`, `USB_HOSTS` is empty and the hosts have no `supervisor` peer, so every USB driver
+   package is refused ("no USB host that binds a device"). No document says so; it may be intended.
+9. When `ehci`'s report to the supervisor cannot be sent, nothing retries it until the binding changes or the
+   supervisor asks (`usbdev::ASK`); the log says so once.
+10. `godspeed check` (CLI) does not enforce what the supervisor refuses at install: `hw_dma` over 2 MiB, and `hw_usb`
+    with `hw_pci_irq`, `hw_dma` or `hw_pci_class`. A package passes `check`, `package` and `verify` and is refused
+    only on the machine.
+11. `godspeed new driver` defaults to the latest release, v0.30.0 until the next one, whose schema has no `hw_dma`,
+    so a new driver project fails its own `check` - Audit 24's finding 7, the release order, as a user meets it.
+
+**Gates:** every documentation checker green in this repository (dash, refs, symbols, index, facts, line refs,
+commands, comment symbols, foreign words, site, spdx) and the platform file's check.

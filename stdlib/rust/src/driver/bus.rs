@@ -19,7 +19,8 @@ use godspeed_sdk::{Message, ServiceContext};
 pub use godspeed_sdk::usbfn as wire;
 
 /// The hosts that bind a device for a driver of its own. A driver is given exactly one of them as its peer, so
-/// trying each in turn finds the one it was given and no other.
+/// trying each in turn finds the one it was given: the one it holds a capability to, else the one it may reacquire
+/// by name (`UsbDevice::granted`).
 const HOSTS: [&str; 3] = ["xhci", "dwc2", "ehci"];
 /// The bound on one request to the host. A control transfer takes milliseconds; a host retrying a device that does
 /// not answer can use up this bound, so a request that is not answered in it means the device is not answering.
@@ -61,7 +62,7 @@ pub struct Place {
     pub root: u8,
     /// The hub port it is behind, or 0 when it is on the root port itself.
     pub hub: u8,
-    /// The host's slot for it.
+    /// The host's slot for it (`xhci`), or its USB address (`ehci`).
     pub slot: u8,
     /// Its bulk IN endpoint's address, or 0 when it has none; and that endpoint's packet size.
     pub in_addr: u8,
@@ -89,7 +90,8 @@ pub struct UsbDevice<'a> {
 impl<'a> UsbDevice<'a> {
     /// The host this driver was given as its peer, or `None` when it was given none - it was not started for a
     /// USB device. A host spawned after this driver is named but not yet wired, so one this driver may REACQUIRE by
-    /// name is taken next; only a driver allowed to reacquire one can (a package cannot), so this widens nothing.
+    /// name is taken next. The kernel mints a capability by name only for a peer this driver was spawned with (or for
+    /// a holder of `ACQUIRE_ANY`), so this reaches no host the driver was not given, and widens nothing.
     pub fn granted(ctx: &'a ServiceContext) -> Option<UsbDevice<'a>> {
         HOSTS.iter().copied().find(|h| crate::ipc::peer(ctx, h).is_some())
             .or_else(|| HOSTS.iter().copied().find(|h| crate::cap::reacquire(ctx, h)))
@@ -174,7 +176,7 @@ impl<'a> UsbDevice<'a> {
     /// Ask the host to reset the device's port and bind it afresh, as unplugging it would (`wire::OP_REPLUG`): for a
     /// device that has stopped answering. On `Ok` the host reports the device gone and then bound again, so this
     /// driver is stopped and a fresh one started. `Failed` is a host that has reset it as often as it may;
-    /// `BadRequest` one that cannot reset a port (`xhci`).
+    /// `BadRequest` one that cannot reset a port (`xhci`, `ehci`).
     pub fn replug(&self) -> Result<(), UsbError> {
         let r = self.ask(&[wire::OP_REPLUG])?;
         status(r.payload_bytes(), wire::OP_REPLUG)
@@ -196,7 +198,9 @@ impl<'a> UsbDevice<'a> {
 
     /// The bulk IN transfer the host holds from the device, copied into `out`: how many bytes, 0 when it holds
     /// none. The host keeps one IN armed and arms it again as each is collected, so the first call is what starts
-    /// receiving; it sends `wire::NOTE_BULK_IN` when one is held, for a driver that waits rather than asks.
+    /// receiving; it sends `wire::NOTE_BULK_IN` when one is held, for a driver that waits rather than asks (`xhci`,
+    /// `dwc2`). `ehci` holds nothing and sends no notice: each call waits up to 20 ms for the device and returns what
+    /// came, so a driver there asks again rather than waiting to be told.
     pub fn bulk_in(&self, out: &mut [u8]) -> Result<usize, UsbError> {
         let r = self.ask(&[wire::OP_BULK_IN])?;
         let p = r.payload_bytes();

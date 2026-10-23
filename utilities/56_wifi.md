@@ -835,7 +835,7 @@ onboard radio's revision, firmware version and clock are illustrative, and both 
   the firmware reported for the dongle, and the chip ID and firmware version for the onboard radio.
 - **The bus lines on a USB radio come from its host**, which the driver relays: host, port path, slot,
   endpoints and the IN packet size. `usbfn::OP_INFO`'s answer carries them after the IDs, from
-  `usbfn::INFO_WHERE_AT`; `xhci` fills them in, `dwc2` not yet. The driver does not work them out itself,
+  `usbfn::INFO_WHERE_AT`; `xhci` and `ehci` fill them in, `dwc2` not yet. The driver does not work them out itself,
   because only the host enumerated the device.
 - **On the onboard radio** the bus facts are the driver's own, since the driver is its host.
 

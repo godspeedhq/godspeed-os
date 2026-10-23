@@ -50,7 +50,22 @@ test for `gs` is whether a contributor must NAME a thing and rely on it. A drive
 window and its DMA arena, so those types come through `gs::driver` too, over the SDK's `Mmio` and `Dma`;
 the end state is no service or driver crate depending on the SDK directly (`backlog/71`).
 
-## Current state (2026-10-22)
+### A contributor's driver (operator, 2026-10-23)
+
+**`gs::driver` is the documented way to write a driver, and the one the compatibility promise covers.** A driver
+package may also call the SDK directly - it may copy what an in-tree driver does, or reach a mechanism `gs::driver`
+does not have yet - and nothing refuses it: a package's authority comes from its signed contract and the operator's
+answers at install, never from which library it calls, so the SDK confers nothing the contract did not grant. What
+it costs is the PROMISE: the SDK is what the kernel can do, and it may change between releases where `gs::driver`
+does not (grow-only, above). A package written on raw SDK calls can stop building, or stop working, on a later
+release, and nothing warns its author; `scripts/one_way_check.py` reads this tree, never a contributor's package.
+
+So the rule stands where it was for THIS tree - in-tree drivers are written on `gs::driver`, held there by the one-way
+check, and are left as they are - and for a contributor it is advice with its reason, not a gate. A mechanism a
+contributor had to take from the SDK is a gap in `gs::driver`, closed here when it is found in a real driver, as
+every mechanism above was.
+
+## Current state (2026-10-23)
 
 What exists now. The dated steps after the method sections are the record of how each piece got here,
 and why; read them for the reasoning, not to find out what the library contains.
@@ -117,7 +132,8 @@ and why; read them for the reasoning, not to find out what the library contains.
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
 (1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet
-verified on hardware**). `audio-driver` and `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
+verified on hardware**), `wifi-usb` (`bus`, 2026-10-23 - built, not yet run on hardware). `audio-driver` and
+`pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
 
 **What a driver still takes from the SDK, and why it is not here.** Two things, neither a hardware call:
 

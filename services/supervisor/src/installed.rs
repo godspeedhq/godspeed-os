@@ -536,8 +536,8 @@ impl Installed {
         // A USB driver's host, which it reaches its device through: its peer, beside the ones its grant names.
         let mut usb_host: Option<&'static str> = None;
         if driver && checked.contract.usb.is_some() {
-            // ONE USB DEVICE, BY VENDOR AND PRODUCT. A USB device has no registers of its own: this board's host binds
-            // it, reports it, and serves its transfers to the one driver given that host as a peer
+            // ONE USB DEVICE, BY VENDOR AND PRODUCT. A USB device has no registers of its own: the USB host it is
+            // plugged into binds it, reports it, and serves its transfers to the one driver given that host as a peer
             // (`gs::driver::bus`). So it is started only while the host reports it attached, and no interrupt or DMA
             // arena is its to have - those are the host's.
             let Some((vid, pid)) = checked.contract.usb else { return Err(text(format_args!("no USB device"))) };

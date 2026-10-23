@@ -13,7 +13,8 @@ needs, and which failures are safe to retry.
 syscalls themselves, and the audited `unsafe` (CLAUDE.md 18.1). You should not need it. Services and
 drivers alike are written on `gs`, drivers through [`gs::driver`](api/godspeed/driver/index.html)
 (below), and `scripts/one_way_check.py` holds every program in this repository to zero raw SDK calls
-that `gs` covers.
+that `gs` covers. A driver package from outside this repository may call it too, but outside the compatibility
+promise: the SDK can change between releases where `gs` does not (`docs/driver-library.md`).
 
 ## Four kinds of program
 

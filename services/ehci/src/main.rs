@@ -45,15 +45,13 @@ const CAP_HCCPARAMS:  usize = 0x08; // u32 - capability parameters
 
 /// Idle forever by DRAINING our IPC endpoint, never `ctx.park()`. A registered driver that parks
 /// never recv's, so a flood-storm (or any stray send) fills its 16-deep queue and it sits at 16/16
-/// FOREVER - `events` stub bug in another guise. recv() parks the task between messages, so the
-/// core still idles; it just no longer clogs. Used at every dead end where ehci has nothing left to
-/// do (no controller MMIO, reset failed, or no high-speed device present at boot). What it drains is
-/// ANSWERED since 2026-10-23 (`bound::idle`): the supervisor's ask with "nothing bound", and a driver's
-/// request with `ST_NO_DEVICE`, so neither waits out its deadline against a host that is here.
+/// FOREVER - `events` stub bug in another guise. The drain parks between looks, so the core still
+/// idles; it just no longer clogs. Used at every dead end where ehci has nothing left to do (no
+/// controller MMIO, reset failed, no DMA arena, a hub that would not come up, or no high-speed device
+/// present at boot). What it drains is ANSWERED since 2026-10-23 (`bound::idle`, which does the
+/// polling and says why it polls): the supervisor's ask with "nothing bound", and a driver's request
+/// with `ST_NO_DEVICE`, so neither waits out its deadline against a host that is here.
 fn idle_draining(ctx: &ServiceContext) -> ! {
-    // Drain by POLLING (try_recv), not a blocking recv: a cross-core flood that must WAKE a deeply-blocked
-    // recv on an AP is unreliable under QEMU TCG (the drain flaked in the flood-storm pin); the self-driven
-    // poll drains every quantum with no wake needed, parked in between (`sleep_quantum`), not spinning.
     let mut host = bound::Host::new(ctx);
     bound::idle(ctx, &mut host)
 }
@@ -350,9 +348,10 @@ const MAX_HID: usize = 2;
 /// enumeration and polling never alias.
 const POLL_STRIDE: usize = 0x100; // QH @ +0x00, qTD @ +0x40, report buf @ +0x80
 
-/// The arena in its two parts, taken by name through `gs::driver::arena` (`docs/driver-library.md`
+/// The arena in its three parts, taken by name through `gs::driver::arena` (`docs/driver-library.md`
 /// step 3): the control transfer's structures at 0x0 and the poll slots at 0x400, where the offset
-/// constants put them. An access past a part ends the driver naming it.
+/// constants put them, and the bound device's bulk transfers after them (`bound.rs`, `BULK_BYTES`). An
+/// access past a part ends the driver naming it.
 #[derive(Clone, Copy)]
 struct Parts {
     ctl: Part,
@@ -1206,9 +1205,9 @@ fn poll_devices(
         // because a task that must re-arm itself is never absent from the run queue for long.
         //
         // The wait is `gs::driver::irq`'s (2026-10-22): it tells the interrupt from anything else that
-        // arrives, so only the interrupt is acked and re-armed. Nothing sends this driver a request it
-        // answers, so a message that is not the interrupt is dropped, as the hand-written drain dropped
-        // it - one per wake, and each wake runs a pass, so a flood empties at the loop's own rate. The
+        // arrives, so only the interrupt is acked and re-armed. A message that is not the interrupt is served
+        // if it is the supervisor's ask or the bound device's driver (`bound::Host::serve`, below) and dropped
+        // otherwise - one per wake, and each wake runs a pass, so a flood empties at the loop's own rate. The
         // work is still driven by reading the controller at the top of the pass: what wakes us changed,
         // not what we do when woken.
         // A report that turned up on a pass no interrupt woke means interrupts are NOT covering HID

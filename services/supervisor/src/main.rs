@@ -1062,7 +1062,9 @@ fn in_tree_usb_driver_of(vid: u16, pid: u16, host: Option<u8>) -> Option<&'stati
         .map(|m| m.driver)
 }
 
-/// This board's USB host that binds a device for a driver of its own, and reports it (`USB_HOSTS`).
+/// The first of this board's USB hosts that bind a device for a driver of its own (`USB_HOSTS`), `None` where there
+/// is none. Asked only whether there is one: a package's peer is the host that reports its device
+/// (`Installed::host_of`).
 fn usb_host() -> Option<&'static str> {
     USB_HOSTS.first().copied()
 }
@@ -1756,7 +1758,8 @@ struct UsbMatch {
     peers: &'static [&'static str],
 }
 
-/// The table, wherever the dongle's driver is embedded: both of its hosts, `dwc2` and `xhci`, report.
+/// The table, wherever the dongle's driver is embedded: both of its hosts, `dwc2` and `xhci`, report it; `ehci`
+/// reports too, and no row is wired to it (`UsbState::recompute`).
 const USB_MATCH: &[UsbMatch] = if cfg!(has_wifi_usb) {
     &[UsbMatch { vid: 0x0bda, pid: 0x8176, driver: "wifi-usb", peers: board::WIFI_USB_PEERS }]
 } else {
@@ -1777,7 +1780,8 @@ const USB_HOSTS: &[&str] = if !USB_ON_DEMAND {
     &["xhci"]
 };
 
-/// Whether each `USB_MATCH` row's device is attached, as its host last reported. A new supervisor knows
+/// Whether each `USB_MATCH` row's device is attached, worked out from what each host last reported (`by_host`,
+/// `recompute`). A new supervisor knows
 /// nothing - false until a host says otherwise, which it is asked to do at once. Owned by the main loop.
 struct UsbState {
     present: [bool; USB_MATCH_MAX],

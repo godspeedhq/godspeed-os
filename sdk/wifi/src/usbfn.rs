@@ -27,7 +27,7 @@
 ///
 /// A host that knows where the radio is may go on, for `wifi hardware <radio>` (`utilities/56_wifi.md` 11a):
 /// `[root port, hub port (0 = on the root port itself), slot, bulk IN address, bulk IN max packet lo, hi,
-/// bulk OUT count, bulk OUT address...]` (`INFO_WHERE_AT` onwards). `xhci` does; `dwc2` does not yet, and a
+/// bulk OUT count, bulk OUT address...]` (`INFO_WHERE_AT` onwards). `xhci` and `ehci` do; `dwc2` does not yet, and a
 /// driver reads only what the reply carries.
 pub use godspeed_sdk::usbfn::OP_INFO;
 /// Where an `OP_INFO` answer's gen starts.
@@ -96,11 +96,11 @@ pub use godspeed_sdk::usbfn::NOTE_BULK_IN;
 /// until the dongle is replugged (2026-10-22). `ST_OK`: the host will, after answering - it reports the radio
 /// gone and then bound again, so the supervisor stops this driver and starts a fresh one, as for a real
 /// replug. `ST_FAILED`: it has already done so as often as its bound allows, and says so. `ST_BAD_REQUEST`:
-/// a host that cannot (`xhci`, which does not take it yet).
+/// a host that cannot (`xhci` and `ehci`, which do not take it).
 pub use godspeed_sdk::usbfn::OP_REPLUG;
 
-/// Is `op` a request a driver sends its host - `OP_INFO` to `OP_SYNC`, and `OP_REPLUG`? Every host routes by
-/// this and by nothing else, so a new op cannot fall into another protocol's range. `OP_REPLUG` did: `dwc2`
+/// Is `op` a request a driver sends its host - `OP_INFO` to `OP_SYNC`, and `OP_REPLUG`? Every host that links this
+/// crate routes by this and by nothing else (`ehci`, which does not, writes the same range out), so a new op cannot fall into another protocol's range. `OP_REPLUG` did: `dwc2`
 /// routed `OP_INFO..=OP_SYNC` here and everything above 0x10 to the network, whose answer to an op it does not
 /// know is `[op, 0]` - and 0 is `ST_OK`, so a driver was told its dongle was being reset and nothing was
 /// (Pi 2, 2026-10-22).

@@ -57,7 +57,9 @@ that the earlier draft did not face. The draft leaves `gs::driver` OUT of the co
 contributor works through `gs::driver` and, where it has no mechanism yet, the SDK's `ctx.mmio()` and
 `ctx.dma_region()` (13 and 12 call sites across nine drivers on 2026-10-11). Under this bar, either the
 built `gs::driver` mechanisms are covered, with the set allowed to GROW but not change, or driver
-contributions are named as outside what v1 makes easy.
+contributions are named as outside what v1 makes easy. (Decided 2026-10-23, `docs/driver-library.md`, "A
+contributor's driver": the in-tree drivers stay on `gs::driver`, held there by `one_way_check.py`; a contributor's
+driver package may call the SDK too, outside the promise and unchecked, and is told so.)
 
 **Decided the same day: `gs::driver` is covered, grow-only.** The mechanisms it has (`wait`, `delay`,
 `irq`) freeze with the rest of the surface; new mechanisms may be added, existing ones may not change.

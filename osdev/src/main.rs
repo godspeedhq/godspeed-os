@@ -4031,8 +4031,9 @@ fn run_kinds_test() {
     crate::shell_test::run_kinds(&image_path, persist, 2);
 }
 
-/// `osdev test driver-packages`: a driver package that takes a device over from a GodspeedOS driver, and one that
-/// drives a USB device through its host (`shell_test::run_driver_packages`). Two fixtures, on a disk of their own.
+/// `osdev test driver-packages`: a driver package that takes a device over from a GodspeedOS driver (`kind-nic`), one
+/// that drives a USB device through `xhci` (`kind-usb`), one through `ehci` (`kind-stick`), and the RTL8168 card's
+/// package refusing QEMU's e1000 (`kind-rtl`) (`shell_test::run_driver_packages`). Four fixtures, on a disk of their own.
 fn run_driver_packages_test() {
     println!("
 === driver-packages: a device taken over, and a USB device through its host ===");

@@ -107,12 +107,12 @@
         "hw_usb": {
           "type": "string",
           "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$",
-          "description": "An INSTALLED driver package's USB device, by its vendor and product IDs (`0403:6001`). A USB device has no register window of its own: its host (`xhci`, `dwc2`) binds it and the supervisor starts this driver when the host reports it attached, with that host as its peer; the driver asks the host for its transfers through `gs::driver::bus`. Stopped when the device leaves, started again when it returns. A device a GodspeedOS driver drives (the RTL8188CUS dongle, `wifi-usb`) is taken over while this package is installed (docs/developer-services-design.md 13.1). Mutually exclusive with `hw_pci_class`."
+          "description": "An INSTALLED driver package's USB device, by its vendor and product IDs (`0403:6001`). A USB device has no register window of its own: its host (`xhci`, `dwc2`, `ehci`) binds it and the supervisor starts this driver when the host reports it attached, with that host as its peer; the driver asks the host for its transfers through `gs::driver::bus`. Stopped when the device leaves, started again when it returns. A device a GodspeedOS driver drives (the RTL8188CUS dongle, `wifi-usb`) is taken over while this package is installed (docs/developer-services-design.md 13.1). Mutually exclusive with `hw_pci_class`."
         },
         "hw_dma": {
           "type": "string",
           "pattern": "^[0-9]+(KiB|MiB)$",
-          "description": "An INSTALLED driver package's DMA arena: memory its device reads and writes itself, as a size (`64KiB`, `1MiB`), at most 2MiB. The kernel allocates it wherever it chooses and the driver lays it out with `gs::driver::arena`; a size is not an address, so naming one reaches nothing it was not granted. The operator approves it at install by a question of its own, because where no IOMMU confines the device (no Raspberry Pi or VisionFive has one) a driver with an arena can reach all of memory (CLAUDE.md 6.4; docs/developer-services-design.md 13.1). In-tree drivers name their arena in the supervisor's spawn row instead, so none of them declares it."
+          "description": "An INSTALLED driver package's DMA arena: memory its device reads and writes itself, as a size (`64KiB`, `1MiB`), at most 2MiB. The kernel allocates it wherever it chooses and the driver lays it out with `gs::driver::arena`; a size is not an address, so naming one reaches nothing it was not granted. The operator approves it at install by a question of its own, because where no IOMMU confines the device (every Raspberry Pi and the VisionFive, an Intel PC, a PC device left in passthrough) a driver with an arena can reach all of memory (CLAUDE.md 6.4; docs/developer-services-design.md 13.1). In-tree drivers name their arena in the supervisor's spawn row instead, so none of them declares it."
         },
         "cpu_clock": {
           "type": "boolean",

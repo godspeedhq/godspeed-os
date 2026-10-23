@@ -1191,8 +1191,8 @@ rest is `feat/driver-packages` (2026-10-23):
   WiFi dongle, any device whose first interface is vendor-specific (class 0xFF), and `ehci` one too (2026-10-23,
   `docs/usb-device-drivers.md` 4c), and each reports it as the dongle is reported (`usbdev`, naming the host); the supervisor starts the package when its device is reported, with that host as its peer and
   an endpoint for the host's answers, stops it (kept installed) when the device leaves, and does not restart it
-  while it is gone. The package reaches the device through `gs::driver::bus` (`UsbDevice`: identity, control
-  transfers, bulk OUT, bulk IN), over the function protocol `wifi-usb` already speaks, whose numbers moved to the
+  while it is gone. The package reaches the device through `gs::driver::bus` (`UsbDevice`: identity and where it is, control
+  transfers and once-only ones, bulk OUT, bulk IN, and a replug request, which `xhci` and `ehci` refuse), over the function protocol `wifi-usb` already speaks, whose numbers moved to the
   SDK (`godspeed_sdk::usbfn`) so a package can use them. The open question above is answered by that precedent:
   the host hands the device to the package exactly as it hands the dongle to `wifi-usb`. Limits, recorded: one such
   device per host (the first bound keeps the slot, as the dongle always did); a standard class the host does not

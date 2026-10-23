@@ -38,12 +38,13 @@ is due when a scan exists, not before.
 
 | Op | Request | Reply |
 |---|---|---|
-| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`). `gen` names the binding: it differs from the previous bind, and from a restarted host's where the counter is calibrated and running (`usbfn::next_gen` says where it is not); the driver compares it, not only the IDs |
+| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` and `ehci`, not `dwc2` (`wifi hardware <radio>`). `gen` names the binding: it differs from the previous bind, and from a restarted host's where the counter is calibrated and running (`usbfn::next_gen` says where it is not); the driver compares it, not only the IDs |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
-| `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
+| `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again (`ehci` holds none: it runs one IN of up to 20 ms when asked) |
 | `OP_BULK_OUT` 0x24 | `[op, out, transfer...]` - `out` the OUT endpoint's position in the configuration descriptor | `[op, status]` |
 | `OP_SYNC` 0x25 | `[op, notice]` - never answered: names a notice the driver took in place of an answer (section 19) | none |
+| `OP_REPLUG` 0x27 | `[op]` | `[op, status]` - `dwc2` resets the device's port and binds it afresh; `xhci` and `ehci` answer `ST_BAD_REQUEST` |
 | `NOTE_BULK_IN` 0x2E | sent by the HOST to the driver, `[note]`, no reply cap: a transfer is held | none |
 | `NOTE_RADIO` 0x2F | sent by the HOST to the driver, `[note]`, no reply cap | none |
 

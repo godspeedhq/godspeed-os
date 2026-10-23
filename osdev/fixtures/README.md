@@ -1,6 +1,7 @@
 # osdev/fixtures
 
-Files a QEMU suite bakes into a test disk. Not built here; each says how it was made, so it can be made again.
+Files a QEMU suite bakes into a test disk, and packages made for the hardware cards (`kind-dongle`, and `kind-rtl`'s
+real use). Not built here; each says how it was made, so it can be made again.
 
 ## `hello-utility-0.9.0.gsp`
 

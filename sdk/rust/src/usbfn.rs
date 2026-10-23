@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The USB FUNCTION PROTOCOL's numbers: what a USB host service (`xhci`, `dwc2`) answers for the one device it
+//! The USB FUNCTION PROTOCOL's numbers: what a USB host service (`xhci`, `dwc2`, `ehci`) answers for the one device it
 //! binds for a driver of its own, and what that driver asks. A driver package speaks it through
 //! `gs::driver::bus`; the WiFi dongle's driver through `godspeed_wifi::usbfn`, which re-exports these and says
 //! what each one means in full (`sdk/wifi/src/usbfn.rs`). Every request starts with its op, and every reply with
@@ -15,7 +15,8 @@ pub const INFO_WHERE_AT: usize = 10;
 pub const OP_CONTROL: u8 = 0x21;
 /// `OP_CONTROL`, attempted exactly once: the host does not retry it.
 pub const OP_CONTROL_ONCE: u8 = 0x22;
-/// `[op]` -> `[op, status, transfer...]`: the bulk IN transfer the host holds, if any; the IN armed again.
+/// `[op]` -> `[op, status, transfer...]`: the bulk IN transfer the host holds, if any; the IN armed again (`ehci`
+/// holds none: it waits briefly for the device and answers what came).
 pub const OP_BULK_IN: u8 = 0x23;
 /// `[op, out, transfer...]` -> `[op, status]`: one bulk OUT transfer to the device's `out`th bulk OUT endpoint.
 pub const OP_BULK_OUT: u8 = 0x24;
@@ -23,7 +24,7 @@ pub const OP_BULK_OUT: u8 = 0x24;
 pub const OP_SYNC: u8 = 0x25;
 /// Sent by the host, unanswered: a bulk IN transfer is held - ask `OP_BULK_IN`.
 pub const NOTE_BULK_IN: u8 = 0x2E;
-/// `[op]` -> `[op, status]`: reset the device's port and bind it afresh (`dwc2` takes it; `xhci` answers `ST_BAD_REQUEST`).
+/// `[op]` -> `[op, status]`: reset the device's port and bind it afresh (`dwc2` takes it; `xhci` and `ehci` answer `ST_BAD_REQUEST`).
 pub const OP_REPLUG: u8 = 0x27;
 /// Sent by the host, unanswered: the binding changed - ask `OP_INFO`.
 pub const NOTE_RADIO: u8 = 0x2F;

@@ -57,8 +57,9 @@ the supervisor's commands, and there is one message carrying the state instead o
 
 **As built (Pi 2, `docs/wifi-usb.md` 26):** `sdk/rust/src/service_context.rs` `usbdev`. One message,
 `REPORT` - present or not, the binding count, VID:PID - instead of separate attached and detached
-messages: each report is the host's whole state for its device, so a duplicate is harmless. The host and
-port are not in it yet; two hosts report (`dwc2` and `xhci`), each with one such device. The binding
+messages: each report is the host's whole state for its device, so a duplicate is harmless. The host is in
+it since 2026-10-23 (byte 11, `HOST_DWC2`, `HOST_XHCI`, `HOST_EHCI`; section 4c); the port is not. Three hosts
+report (`dwc2`, `xhci`, `ehci`), each with one such device. The binding
 generation was a count restarting with each host instance until 2026-10-12; it is now the gen above, and
 `OP_INFO` carries it.
 
@@ -67,7 +68,7 @@ generation was a count restarting with each host instance until 2026-10-12; it i
 - **Not the kernel.** The supervisor already spawns and kills services; the hosts already send it
   nothing, and will send it this.
 - **New grants, pinned with their reasons:** `dwc2` and `xhci` each gain the supervisor as a peer, for
-  the reports.
+  the reports (`ehci` too, 2026-10-23).
 - **`wifi-usb`** is no longer started at boot. It is spawned with its dongle already bound, and the
   supervisor stops it on the report that the dongle is gone (decided in the first card: the driver does
   not exit by itself). On every board that embeds it, since `xhci` reports too (`docs/wifi-usb.md` 27),

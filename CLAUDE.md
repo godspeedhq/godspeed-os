@@ -1991,7 +1991,7 @@ Every syscall checks the calling task's capability table, populated at spawn tim
 >   stopped while the package is installed, and starts it again when the package is uninstalled, ends, or is left
 >   down. One holder per device, which the kernel does not enforce for a PCI device and the supervisor does.
 > - **A USB device, by vendor and product** (`hw_usb`): no hardware authority of its own at all. Its host (`xhci`,
->   `dwc2`) binds it and serves its transfers to the one driver given that host as a send peer (`gs::driver::bus`),
+>   `dwc2`, and `ehci` since the same day) binds it and serves its transfers to the one driver given that host as a send peer (`gs::driver::bus`),
 >   so the package is the host's client, as `wifi-usb` always was.
 >
 > **The TCB consequence, stated as 6.4 requires.** A driver package granted a DMA arena on a machine whose IOMMU
