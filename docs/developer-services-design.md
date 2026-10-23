@@ -1155,7 +1155,9 @@ A register-only class (no arena) carries no such warning.
 
 **What it needs, and costs:**
 - A contract key the supervisor reads (`[device] class = "02:00"`, or `usb = "0bda:8179"`), validated by the
-  schema and narrowed like peers: the grant is never wider than the contract.
+  schema and narrowed like peers: the grant is never wider than the contract. *(As built: `hw_pci_class` and
+  `hw_pci_bar` under `[capabilities]`, the keys the in-tree drivers' contracts already used, and `hw_usb =
+  "vvvv:pppp"`; `hw_pci_irq` and `hw_dma` beside them.)*
 - The supervisor: a per-device holder, and a spawn path that fills `hw_flags`/`bdf` from the approved class
   (the fields `spawn_by_image` already sets for in-tree drivers). No kernel change: the kernel already grants by
   class from the request, and refuses raw addresses.

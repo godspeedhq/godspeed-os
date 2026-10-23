@@ -8662,7 +8662,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let _ = run!(b"godspeed remove godspeed/hello-app\r", 60);
         let _ = run!(b"godspeed remove godspeed/hello-service\r", 60);
 
-        // A DRIVER: its device by PCI class, approved at install, found by the OS, registers only.
+        // A DRIVER: its device by PCI class, approved at install, found by the OS - registers only, as the published
+        // `hello-driver` 0.3.0 asks (`osdev test kinds` covers the interrupt and DMA, `driver-packages` a device taken over and a USB device).
         let df = run!(b"godspeed fetch godspeed/hello-driver\r", 240);
         check!(df.contains("a driver: `godspeed install` starts it with its device"), "`godspeed fetch` says what installing a driver does");
         let di = run!(b"godspeed install godspeed/hello-driver yes\r", 180);

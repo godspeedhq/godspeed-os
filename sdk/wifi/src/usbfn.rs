@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! THE USB RADIO'S FUNCTION PROTOCOL: what a USB host service (`dwc2`, and `xhci` since U2a) answers for the one
-//! device it has bound as a WiFi radio, and what `wifi-usb` asks. ONE definition, read by both sides.
+//! device it has bound as a WiFi radio, and what `wifi-usb` asks. ONE definition, read by both sides. Since
+//! 2026-10-23 a host binds any vendor-specific device the same way, for an installed driver package, which asks the
+//! same ops through `gs::driver::bus`; where this file says "the radio", read "the bound device" for that case.
 //!
 //! **Narrow on purpose.** A host binds a radio by its VID:PID - a vendor-class device, so there is no class
 //! to match on - and then serves exactly that device: who it is, and its control transfers. It is not a

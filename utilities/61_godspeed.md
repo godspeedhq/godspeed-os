@@ -258,6 +258,21 @@ way; a package that dies is restarted from the disk up to 5 times a boot and the
 **What it is given:** the approved peers, never `supervisor`, an endpoint if its contract declares `ipc_receive`, its
 contract's memory limit up to 64 MiB, and **no privilege**, which is not asked and cannot be granted.
 
+**A driver** is asked about its device as well (`device`): a PCI device by class - its registers, and its interrupt
+when the contract asks - or a USB device by vendor and product, reached through its host and started only while it
+is attached. One that asks for a DMA arena lists `memory` too and is then asked a SECOND question, because where no
+IOMMU confines the device its driver can read and write all of memory:
+
+```
+godspeed/kind-driver 0.1.0 asks for: device, memory (no privilege) and starts at every boot, driving that device. Install it and grant them? [y/N]: y
+godspeed/kind-driver 0.1.0 also asks for DMA memory: its device reads and writes memory by itself.
+Where no IOMMU confines the device - no Raspberry Pi or VisionFive has one - its driver can then
+read and write all of this machine's memory. Grant it DMA memory? [y/N]:
+```
+
+A device a GodspeedOS driver already drives is taken over: that driver is stopped while the package is installed
+and started again when it is uninstalled (`docs/developer-services-design.md` 13.1).
+
 `godspeed upgrade <pkg>` (or `all`) looks up the newest release of each installed package on the registry it came
 from, fetches and verifies it, and installs it in the old one's place with the same question, now naming the
 version change: a new release may ask for more. One already newest is said to be up to date. `godspeed uninstall`

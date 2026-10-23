@@ -1888,3 +1888,66 @@ CPU in `observe now` with the keyboard unplugged for about 90 s, has not been ru
 **Gates:** every documentation checker green, the one-way and quit-wait ratchets green, and the touched
 crates built.
 
+
+## Audit 24 - documents and code comments, driver packages (2026-10-23)
+
+Scope: every file `feat/driver-packages` changed since it left `main` (`main...d530cb71`, 28 files in this
+repository and 6 in `godspeed-cli`), and every document that describes what an installed driver package is given,
+which the branch changed: an interrupt, a DMA arena, a device taken over from an in-tree driver, and a USB device
+through its host. Comments and documents only; the Rust diff was checked to touch no code token.
+
+**Result.** 19 corrections across 15 files (12 here, 3 in `godspeed-cli`), and 7 code findings recorded, not fixed.
+
+**In the constitution:**
+- `CLAUDE.md` 14.1 had no word on driver packages at all - not even v0.30.0's register grant. An amendment
+  (2026-10-23, drivers) records what one is given, that a device an in-tree driver drives is taken over, that a USB
+  driver holds no hardware authority of its own, and the 6.4 consequence: a package with a DMA arena on a machine
+  that does not confine its device is trust-critical, which is why the arena is its own question and why that
+  question is asked on every machine.
+
+**In documents:**
+- `website/src/stdlib.md` (the published book): "a driver installed as a package is given its register window and
+  nothing else today" - false since this branch. It says what is given, and the module table gains `bus`.
+- `utilities/61_godspeed.md` 4b: said nothing of a driver's question. It shows `device` and `memory`, the second
+  question word for word, and the takeover.
+- `docs/developer-services-design.md` 13.1: its "what it needs" bullet named contract keys never built
+  (`[device] class`, `usb = ...`); a note gives the keys as built.
+- `services/supervisor/CLAUDE.md`: its responsibilities gain installed packages, the takeover and the USB report.
+
+**In code comments:**
+- `services/supervisor/src/main.rs`: inserting `in_tree_usb_driver_of` above `in_tree_driver_of` had split that
+  function from its doc comment, which also said "a driver package is not given a device the OS already drives".
+  The comment is back on its function and says what the function is for now.
+- `services/supervisor/src/installed.rs`: the module header named a PCI device only; `give_back` said "its class";
+  the takeover comment said a device goes back on uninstall or left-down, and it goes back when the package ends
+  too.
+- `sdk/wifi/src/usbfn.rs`, `services/dwc2/src/rtl.rs`, `services/xhci/src/radio.rs` (`report_device`): each
+  described the dongle alone; each now says a vendor-specific device is bound the same way.
+- `sdk/rust/src/usbfn.rs`: `OP_REPLUG` says `xhci` answers it with `ST_BAD_REQUEST`.
+- `osdev/src/shell_test.rs`: the `godspeed` suite's "registers only" names the published `hello-driver` 0.3.0 it
+  is about, and where the new grants are tested.
+
+**In `godspeed-cli`:**
+- `docs/package-format.md`: a driver's contract names `hw_pci_irq`, `hw_dma` and `hw_usb` too.
+- `site/index.html` and `site/reference.html`: "a driver against v0.30.0" - the new template asks for an interrupt
+  and a DMA arena, which v0.30.0's schema refuses, so it needs the release after it; both say so.
+
+**Code findings, recorded and not fixed (an audit changes no code):**
+1. `Installed::adopt_device` reads a running driver package's PCI class again after a supervisor respawn, and
+   ignores a USB device: a respawned supervisor does not record that a package holds the dongle, so `holds` is
+   false and `wifi-usb` could be started beside it.
+2. `godspeed-pm`'s `device` row says "a built-in driver of that device is stopped while this one is installed" for
+   every driver, also one whose device no built-in driver drives (the `edu` template).
+3. `dwc2`'s `rtl::configure` logs "RTL8188CUS" for any device it binds, and `xhci`'s log calls a bound device "the
+   WiFi dongle" after its bind line (both already said in the comments).
+4. A USB driver package that ends itself, or is left down after its restarts, has its device forgotten
+   (`give_back`), so a replug does not start it again; only a reboot or a reinstall does.
+5. When a package drives the dongle, `usb_report` marks the dongle present for `USB_MATCH`, so the onboard radio is
+   told the dongle is attached (`tell_radio_of_dongle`) and may stand down for a dongle `wifi-usb` does not drive.
+6. On a restart of a USB driver package (an entry already listed) whose stand-down of `wifi-usb` times out, the
+   recorded USB device is not cleared, so `wifi-usb` stays down while the package is not running.
+7. Release order: the CLI's driver template now needs the OS release after v0.30.0; released first, a
+   `godspeed new driver` checked against v0.30.0 is refused on `hw_dma`.
+
+**Gates:** every documentation checker green (dash, refs, symbols, index, facts, line refs, commands, comment
+symbols, foreign words, site, spdx), and `osdev build` built.

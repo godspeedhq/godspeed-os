@@ -23,7 +23,7 @@ pub const OP_BULK_OUT: u8 = 0x24;
 pub const OP_SYNC: u8 = 0x25;
 /// Sent by the host, unanswered: a bulk IN transfer is held - ask `OP_BULK_IN`.
 pub const NOTE_BULK_IN: u8 = 0x2E;
-/// `[op]` -> `[op, status]`: reset the device's port and bind it afresh.
+/// `[op]` -> `[op, status]`: reset the device's port and bind it afresh (`dwc2` takes it; `xhci` answers `ST_BAD_REQUEST`).
 pub const OP_REPLUG: u8 = 0x27;
 /// Sent by the host, unanswered: the binding changed - ask `OP_INFO`.
 pub const NOTE_RADIO: u8 = 0x2F;

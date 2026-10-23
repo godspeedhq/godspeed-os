@@ -11,6 +11,10 @@
 //! than asking on a timer (U1b), and REPORTS it to the supervisor (`usbdev`), which starts and stops the
 //! driver with the dongle (`docs/usb-device-drivers.md`).
 //!
+//! **Not only the dongle, since 2026-10-23.** Any high-speed device whose first interface is vendor-specific is
+//! bound here the same way (`vendor_specific`), for an installed driver package that names it; the Realtek's two
+//! reads are sent to the Realtek alone. `configure`'s log lines still say "RTL8188CUS" for such a device.
+//!
 //! **Receive (R3b):** one bulk IN on `CH_RADIO_RX`, armed in the background once `wifi-usb` first asks
 //! `OP_BULK_IN`, taken on the USB interrupt (`service`), held until collected, with `usbfn::NOTE_BULK_IN`
 //! sent to say so. It stands aside for every other non-periodic transfer (`chan::program_ping`) and is put

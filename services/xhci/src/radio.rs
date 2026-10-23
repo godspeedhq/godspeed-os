@@ -650,7 +650,8 @@ pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
     report_device(ctx, radio);
 }
 
-/// This host's report on the dongle, to the supervisor (`usbdev`): its whole state, not a change, so an
+/// This host's report on the dongle - or the vendor-specific device bound in its place (`binds`) - to the
+/// supervisor (`usbdev`): its whole state, not a change, so an
 /// `ASK` is answered by sending it again. `try_send`, reacquired by name once - the supervisor is
 /// restartable (6.2) - and never waited on (8.9). Loud when a dongle's report cannot be delivered: it then
 /// has no driver and nothing else will say so. Quiet when "nothing attached" cannot be: that is every boot

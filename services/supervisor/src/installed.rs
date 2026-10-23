@@ -15,9 +15,10 @@
 //!
 //! **What it is given:** no privilege at all, a send capability to each peer that the grant names AND the contract
 //! requests (never `supervisor`), an endpoint if its contract declares `ipc_receive`, and its contract's memory limit
-//! up to [`MEMORY_MAX`]; a driver, its one device by class - the registers, the interrupt its contract asks for and a DMA
-//! arena the operator granted (`memory`) - taken over from a built-in driver if one holds it. It runs under its package
-//! name, `publisher/name`, which no built-in service can hold.
+//! up to [`MEMORY_MAX`]; a driver, its one device - a PCI device by class, with the registers, the interrupt its
+//! contract asks for and a DMA arena the operator granted (`memory`), or a USB device by vendor and product, through
+//! its host - taken over from a built-in driver if one holds it. It runs under its package name, `publisher/name`,
+//! which no built-in service can hold.
 //!
 //! **What it is not, recorded rather than hidden (26.7):** the grant file and the trust record are as protected as
 //! `/system` is. Anything that can write there can widen a grant up to what the signed contract requests, or swap the
@@ -214,8 +215,8 @@ impl Installed {
             || x.usb.is_some_and(|(v, p)| crate::in_tree_usb_driver_of(v, p) == Some(driver)))
     }
 
-    /// `pkg` no longer drives its device: its class is forgotten, so a built-in driver it took the device from is
-    /// wanted again, and said.
+    /// `pkg` no longer drives its device: its class or USB device is forgotten, so a built-in driver it took the device
+    /// from is wanted again, and said.
     fn give_back(&mut self, ctx: &ServiceContext, pkg: &str) {
         let Some(i) = self.find(pkg) else { return };
         let Some(mut e) = self.e[i] else { return };
@@ -589,7 +590,7 @@ impl Installed {
         if let Some(holder) = stood_down {
             // TAKEN OVER, never shared: the built-in driver is stopped and kept stopped while this package holds its
             // device. The device is recorded FIRST, so the death notice and the reconcile sweep both find it held and
-            // leave its driver down; it is given back when the package is uninstalled or left down (`holds`).
+            // leave its driver down; it is given back when the package is uninstalled, ends, or is left down (`holds`).
             if usb_host.is_none() { self.class_of(pkg, checked.contract.pci_class); }
             if alive(ctx, holder) {
                 let _ = ctx.kill(holder);

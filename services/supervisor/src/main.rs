@@ -1049,8 +1049,6 @@ mod meta;
 mod check;
 mod installed;
 
-/// The in-tree driver whose spawn row names PCI class `class`, if one does: a driver package is not given a device
-/// the OS already drives (`installed.rs`).
 /// The built-in driver of a USB device, by its vendor and product (`USB_MATCH`), if this image has one.
 fn in_tree_usb_driver_of(vid: u16, pid: u16) -> Option<&'static str> {
     USB_MATCH.iter().find(|m| m.vid == vid && m.pid == pid).map(|m| m.driver)
@@ -1061,6 +1059,8 @@ fn usb_host() -> Option<&'static str> {
     USB_HOSTS.first().copied()
 }
 
+/// The in-tree driver whose spawn row names PCI class `class`, if one does: the driver a package that names that class
+/// takes the device over from (`installed.rs`, `Installed::holds`).
 fn in_tree_driver_of(class: u32) -> Option<&'static str> {
     use godspeed_sdk::service_context::hwclass;
     IMAGES.iter().chain(USB_IMAGES.iter())

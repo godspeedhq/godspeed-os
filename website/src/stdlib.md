@@ -187,6 +187,7 @@ mechanisms only: what a register means stays in your driver, and there is no `gs
 | `input` | A keyboard driver's keystrokes, pushed to the console: `push`, and `ready` when setup is done |
 | `power` | Cutting and restoring your device's power where the machine can: `power::set` |
 | `device` | What the kernel knows about your device that you cannot read yourself: the board's MAC, the NIC's PCI identity, a controller's base clock, PCI configuration reads |
+| `bus` | A device with no registers of its own, reached through its bus's host: a USB device's identity, control transfers and bulk transfers (`UsbDevice`). A bus, not a class |
 
 ```rust
 let Some(regs) = gs::driver::registers(&ctx) else {
@@ -199,8 +200,11 @@ if gs::driver::wait::until(&ctx, gs::driver::wait::Budget::ms(10), || regs.read3
 }
 ```
 
-A driver installed as a package is given its register window and nothing else today: no DMA arena and
-no interrupt. The drivers in this repository use all of the above. `docs/driver-library.md` is the
+A driver installed as a package is given what its contract names and the operator approves: its register
+window, its interrupt, and a DMA arena (asked about by a question of its own, because where no IOMMU confines
+the device a driver with an arena can reach all of memory) - or, for a USB device, its host through `bus`. A
+device a GodspeedOS driver drives is taken over while the package is installed. All but the registers arrived
+after v0.30.0 (`docs/developer-services-design.md` 13.1). The drivers in this repository use all of the above. `docs/driver-library.md` is the
 design and the record of each module's arrival.
 
 `gs::program::mode` is the mode a program was started in, for one that does more than one thing.
