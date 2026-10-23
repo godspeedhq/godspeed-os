@@ -509,6 +509,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 radio_port = p;
                                                 radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                                 radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
+                                            } else if radio.is_none() && rtl::vendor_specific(&ctx, &m, &d, &dt) {
+                                                // Any other vendor-specific device, for a driver package that names it:
+                                                // bound as the dongle is, and reported; the supervisor decides its driver.
+                                                radio_port = p;
+                                                radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                                radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver did:
                                                 // ask the device its size, then read block 0. Capacity
@@ -824,6 +830,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                     radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
                                     notify(&ctx, format_args!("usb: WiFi dongle connected (port {})", port));
+                                    radio_port = port;
+                                    rtl::announce(&ctx, radio.as_ref());
+                                } else if radio.is_none() && rtl::vendor_specific(&ctx, &m, &d, &dt) {
+                                    // Another vendor-specific device, plugged in after boot: bound for a driver of its own.
+                                    radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                    radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
+                                    notify(&ctx, format_args!("usb: USB device {:04x}:{:04x} connected (port {})", hvid, hpid, port));
                                     radio_port = port;
                                     rtl::announce(&ctx, radio.as_ref());
                                 } else if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {

@@ -188,6 +188,7 @@ const RX_ERROR_TRIES: u32 = 3;
 
 /// The descriptor kinds and the bulk transfer type, as USB 2.0 chapter 9 numbers them.
 const DESC_CONFIG: u8 = 0x02;
+const DESC_INTERFACE: u8 = 0x04;
 const DESC_ENDPOINT: u8 = 0x05;
 const EP_TYPE_BULK: u8 = 0x02;
 /// A high-speed bulk endpoint's packet size, the only one USB 2.0 allows it. A smaller one means the dongle
@@ -203,7 +204,13 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid
     stop(ctx, mmio);
     let e = configure(ctx, mmio, dma, t)
         .unwrap_or(Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 });
-    let _ = probe(ctx, mmio, dma, t);
+    // The Realtek's two register reads are vendor requests only that chip understands: another device bound for a
+    // driver of its own (`vendor_specific`) is not sent them.
+    if vid == VID && pid == PID {
+        let _ = probe(ctx, mmio, dma, t);
+    } else {
+        ctx.log_fmt(format_args!("dwc2-svc: USB device {:04x}:{:04x}, vendor-specific - configured, bound for a driver of its own", vid, pid));
+    }
     Radio {
         t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
         sync_bulk: false, sync_radio: false, last_req: None, ring_len: [0; RX_SLOTS], ring_at: [None; RX_SLOTS], ring_head: 0, ring_n: 0, full_at: None,
@@ -212,6 +219,29 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid
         outs: e.outs, n_out: e.n_out, out_mps: e.out_mps, pid_out: [chan::PID_DATA0; MAX_OUT],
         tx: TxStats::default(),
     }
+}
+
+/// Is this device's first interface vendor-specific (class 0xFF)? Then this host binds it as it binds the dongle,
+/// for a driver of its own - an installed driver package that names it (`hw_usb`,
+/// `docs/developer-services-design.md` 13.1). Read from the start of its configuration descriptor; a device that
+/// does not answer is not one. One such device per host, as the dongle always was.
+pub fn vendor_specific(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> bool {
+    let mut buf = [0u8; 32];
+    if !chan::control(ctx, mmio, dma, t, &[0x80, 0x06, 0, DESC_CONFIG, 0, 0, 32, 0], &mut buf, true, 32) {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + 6 <= buf.len() {
+        let len = buf[i] as usize;
+        if len < 2 {
+            return false;
+        }
+        if buf[i + 1] == DESC_INTERFACE {
+            return buf[i + 5] == 0xFF;
+        }
+        i += len;
+    }
+    false
 }
 
 /// Read the configuration descriptor, find the bulk IN endpoint and the bulk OUTs, and SET_CONFIGURATION.
