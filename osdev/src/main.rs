@@ -4015,6 +4015,9 @@ fn run_kinds_test() {
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         gsfs_add_file(persist, &f, &bytes);
     }
+    // And a driver that takes a device over from a GodspeedOS driver: the e1000, from `nic-driver`.
+    let nic = std::fs::read("osdev/fixtures/kind-nic-0.1.0.gsp").unwrap_or_else(|e| panic!("kind-nic-0.1.0.gsp: {e}"));
+    gsfs_add_file(persist, "kind-nic-0.1.0.gsp", &nic);
     gsfs_layout(persist);
     crate::shell_test::run_kinds(&image_path, persist, 2);
 }

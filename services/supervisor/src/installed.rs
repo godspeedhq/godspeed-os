@@ -123,6 +123,9 @@ pub struct Installed {
     /// When the boot read was first asked, in seconds of uptime, and whether the wait has been said.
     boot_since: i64,
     boot_said: bool,
+    /// A built-in driver an installed package has just given its device back to, for the reconcile sweep to say
+    /// why it starts it - not a death notice it missed (`returned`).
+    returned: Option<&'static str>,
 }
 
 /// How long the boot read waits for `fs` to answer before it says it gave up. `fs` mounts, and replays its
@@ -133,7 +136,7 @@ const BOOT_WAIT_SECS: i64 = 120;
 
 impl Installed {
     pub fn new() -> Installed {
-        Installed { e: [None; MAX_INSTALLED], image: None, boot_pending: false, boot_since: 0, boot_said: false }
+        Installed { e: [None; MAX_INSTALLED], image: None, boot_pending: false, boot_since: 0, boot_said: false, returned: None }
     }
 
     /// Is the installed list still to be read (`fs` has not answered yet)? The supervisor's loop then waits
@@ -215,7 +218,13 @@ impl Installed {
         self.e[i] = Some(e);
         if let Some(holder) = crate::in_tree_driver_of(class) {
             ctx.log_fmt(format_args!("supervisor: {}'s device (class {:06x}) goes back to {}", pkg, class, holder));
+            self.returned = Some(holder);
         }
+    }
+
+    /// Was `driver` given its device back since the sweep last asked? Asked once: the answer is taken.
+    pub fn returned(&mut self, driver: &str) -> bool {
+        if self.returned == Some(driver) { self.returned = None; true } else { false }
     }
 
     /// Record the device class `pkg` was started with.

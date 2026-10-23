@@ -2008,7 +2008,7 @@ fn respawn_retry(ctx: &ServiceContext, map: &mut NameCapMap, name: &str) -> bool
 /// and a dropped name is silently never restarted (the "fs gone from observe after a storm" bug).
 /// `acquire_*_cap` cannot detect this (the kernel directory keeps a dead name), so we scan REAL liveness
 /// via `task_stat`. Returns how many it respawned. (One pass; the death-loop backstop.)
-fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, inst: &installed::Installed, events: &mut DevEvents) -> u32 {
+fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, inst: &mut installed::Installed, events: &mut DevEvents) -> u32 {
     let alive = managed_alive(ctx);
     let mut n = 0;
     for i in 0..MANAGED_N {
@@ -2024,7 +2024,11 @@ fn reconcile(ctx: &ServiceContext, map: &mut NameCapMap, usb: &UsbState, inst: &
         // do (§IX, audit U3; the M5 fix reached the arms but not this backstop).
         if respawn_retry(ctx, map, MANAGED[i]) {
             n += 1;
-            ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
+            if inst.returned(MANAGED[i]) {
+                ctx.log_fmt(format_args!("supervisor: {} started again - an installed package gave its device back", MANAGED[i]));
+            } else {
+                ctx.log_fmt(format_args!("supervisor: reconcile respawned {} (missed death notification)", MANAGED[i]));
+            }
             events.note(ctx, supcmd::EV_SWEPT, MANAGED[i], 0, 0);
         }
     }
@@ -2568,7 +2572,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // 16-deep endpoint overflowed under a storm, or we were ourselves dead and respawning when it was
         // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
         // gone from observe after a storm" bug). Cheap when nothing is dead.
-        reconcile(&ctx, &mut name_map, &usb, &inst, &mut events);
+        reconcile(&ctx, &mut name_map, &usb, &mut inst, &mut events);
         tell_radio_of_dongle(&ctx, &name_map, &usb, &mut told_radio);
         name_map.release_handoff(&ctx);
     }

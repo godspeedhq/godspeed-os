@@ -12305,6 +12305,32 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
     let listed = run!(b"godspeed list installed\r", 60);
     check!(listed.contains("godspeed/kind-driver") && listed.contains("running"), "and it is listed as running");
 
+    // A DRIVER THAT TAKES A DEVICE OVER: its class is ethernet, which `nic-driver` drives. Installing it stops
+    // `nic-driver` and keeps it stopped; uninstalling it gives the device back and `nic-driver` starts again.
+    let nic = run!(b"godspeed install /kind-nic-0.1.0.gsp yes\r", 240);
+    check!(nic.contains("asks for: device") && !nic.contains("Grant it DMA memory?"),
+           "a driver of a device GodspeedOS drives installs, and with no arena it is not asked about DMA memory");
+    let _ = collect_until(&buf, &mut cursor, b"took the ethernet device over", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("supervisor: nic-driver stood down - the installed godspeed/kind-nic drives its device (class 020000)"),
+           "the supervisor stops nic-driver for it, and says so");
+    check!(log.contains("kind-nic: took the ethernet device over - status ") && log.contains("MAC 52:54:00:12:34:56"),
+           "and the package drives the e1000 nic-driver had: it reads its status and its MAC");
+    // Kept down: give the reconcile sweep time to run, then nic-driver must still not be running.
+    let _ = run!(b"sleep 3\r", 60);
+    let tasks = run!(b"status\r", 60);
+    let after = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(!after.contains("reconcile respawned nic-driver") && !tasks.lines().any(|l| l.split_whitespace().nth(1) == Some("nic-driver"))
+               && tasks.lines().any(|l| l.split_whitespace().nth(1) == Some("net-stack")),
+           "and nic-driver stays stopped while the package holds its device");
+    let out = run!(b"godspeed uninstall godspeed/kind-nic yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-nic uninstalls");
+    let _ = collect_until(&buf, &mut cursor, b"nic-driver started again", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("godspeed/kind-nic's device (class 020000) goes back to nic-driver")
+               && log.contains("supervisor: nic-driver started again - an installed package gave its device back"),
+           "uninstalled, it gives the device back, and the supervisor starts nic-driver again");
+
     // CLEANUP: all four uninstalled, and the key withdrawn.
     for k in KINDS {
         let out = run!(format!("godspeed uninstall godspeed/kind-{k} yes\r").as_bytes(), 120);

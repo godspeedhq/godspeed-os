@@ -68,6 +68,16 @@ GODSPEED_SIGNING_KEY=<the seed> GODSPEED_OS=<this checkout> godspeed package --a
 
 Remake them when a template changes, or when the OS's program layout does.
 
+## `kind-nic-0.1.0.gsp`
+
+An UNPUBLISHED driver package for `osdev test kinds`, signed by the same throwaway test key: a driver that TAKES A
+DEVICE OVER from GodspeedOS. Made 2026-10-23 with `godspeed new driver kind-nic --publisher godspeed`
+(`godspeed-cli` `feat/driver-packages`) and changed in two places: its contract names the ethernet class
+(`hw_pci_class = "020000"`, `hw_pci_bar = "auto"`, no interrupt and no arena), which `nic-driver` drives, and its
+`src/main.rs` reads the e1000's status and its MAC (`RAL0`/`RAH0`) instead of `edu`'s registers, logging
+`kind-nic: took the ethernet device over - status ..., MAC 52:54:00:12:34:56`. The suite sees the supervisor stand
+`nic-driver` down, keep it down, and start it again once the package is uninstalled. Packaged as the files above.
+
 ## `gts-root-r4.der`
 
 Google Trust Services' **GTS Root R4**, the ECDSA P-384 root that `speed.cloudflare.com`'s chain reaches, for
