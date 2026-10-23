@@ -104,6 +104,11 @@
           "type": "boolean",
           "description": "This driver takes an interrupt, so the kernel allocates a vector and programs MSI/MSI-X at spawn. Without it the driver polls. Reconciled against the supervisor's spawn row: a contract that stops declaring it while the row still asks for a vector is a FAIL, not a silent downgrade."
         },
+        "hw_usb": {
+          "type": "string",
+          "pattern": "^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$",
+          "description": "An INSTALLED driver package's USB device, by its vendor and product IDs (`0403:6001`). A USB device has no register window of its own: its host (`xhci`, `dwc2`) binds it and the supervisor starts this driver when the host reports it attached, with that host as its peer; the driver asks the host for its transfers through `gs::driver::bus`. Stopped when the device leaves, started again when it returns. A device a GodspeedOS driver drives (the RTL8188CUS dongle, `wifi-usb`) is taken over while this package is installed (docs/developer-services-design.md 13.1). Mutually exclusive with `hw_pci_class`."
+        },
         "hw_dma": {
           "type": "string",
           "pattern": "^[0-9]+(KiB|MiB)$",

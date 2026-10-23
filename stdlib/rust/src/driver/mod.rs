@@ -14,7 +14,9 @@
 //! (`arena`). And so are the calls a driver made to the SDK for what its grants carry with them: the input
 //! it hands the console (`input`), its device's power (`power`), and what the kernel knows about the device
 //! that the driver cannot read for itself (`device`) - each the SDK's own call, so that a driver is written
-//! on this module and nothing beside it (step 5).
+//! on this module and nothing beside it (step 5). And a device that has no registers of its own, because it is
+//! on a bus whose host owns them - a USB device - is reached through that host (`bus`), as a bus and never as a
+//! class: it moves transfers and knows nothing of what the device is.
 //!
 //! **There are no device CLASSES here, and there will not be.** No driver::wifi, driver::audio or
 //! driver::usb: a class API is a guess about what every device of that kind will need, made before
@@ -43,6 +45,9 @@
 //! the kernel already offers, put in the one shape a driver should reach for.
 
 pub mod arena;
+// A device reached through its bus's host, not registers of its own: a USB device's transfers (2026-10-23).
+#[cfg(not(test))]
+pub mod bus;
 pub mod delay;
 pub mod device;
 pub mod input;

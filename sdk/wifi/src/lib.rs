@@ -62,5 +62,6 @@ pub mod serve;
 pub mod sdio;
 pub mod station;
 pub mod supplicant;
-pub mod usbfn;
+/// The USB function protocol, which moved to the SDK so a driver package can speak it too (`godspeed_sdk::usbfn`).
+pub use godspeed_sdk::usbfn;
 pub mod wire;

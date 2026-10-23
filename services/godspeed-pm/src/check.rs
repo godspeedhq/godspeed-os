@@ -95,6 +95,8 @@ pub struct Contract {
     pub pci_irq: bool,
     /// `hw_dma`: the DMA arena it asks for, in bytes - memory its device reads and writes itself; 0 for none.
     pub dma_bytes: u64,
+    /// `hw_usb`: the USB device a driver drives, as (vendor, product); `None` for anything else.
+    pub usb: Option<(u16, u16)>,
     /// `handover`: it can hand its state to a newer version of itself and end (`gs::handover`).
     pub handover: bool,
 }
@@ -140,7 +142,7 @@ fn size_of(s: &str) -> Option<u64> {
 /// The contract's name, version, send peers, receive endpoint and memory limit.
 fn contract(c: &str) -> Result<(&str, &str, Contract), Text> {
     let mut out = Contract { peers: [[0; PEER_MAX]; MAX_PEERS], lens: [0; MAX_PEERS], np: 0, receives: false, memory_limit: 0,
-                             pci_class: None, pci_bar: 7, pci_irq: false, dma_bytes: 0, handover: false };
+                             pci_class: None, pci_bar: 7, pci_irq: false, dma_bytes: 0, usb: None, handover: false };
     let (mut name, mut version) = (None, None);
     let mut table = "";
     for (n, l) in lines(c) {
@@ -167,6 +169,12 @@ fn contract(c: &str) -> Result<(&str, &str, Contract), Text> {
             Line::Pair("hw_pci_bar", Val::Int(b)) if table == "capabilities" && b <= 5 => out.pci_bar = b as u32,
             Line::Pair("hw_pci_bar", Val::Str("auto")) if table == "capabilities" => out.pci_bar = 7,
             Line::Pair("hw_pci_irq", Val::Bool(b)) if table == "capabilities" => out.pci_irq = b,
+            Line::Pair("hw_usb", Val::Str(s)) if table == "capabilities" => {
+                let bad = || text(format_args!("contract.toml line {}: hw_usb is the vendor and product, four hex digits each: \"0403:6001\"", n));
+                let (v, p) = s.split_once(':').ok_or_else(bad)?;
+                if v.len() != 4 || p.len() != 4 { return Err(bad()); }
+                out.usb = Some((u16::from_str_radix(v, 16).map_err(|_| bad())?, u16::from_str_radix(p, 16).map_err(|_| bad())?));
+            }
             Line::Pair("hw_dma", Val::Str(s)) if table == "capabilities" => {
                 out.dma_bytes = size_of(s).ok_or_else(|| text(format_args!("contract.toml line {}: `{}` is not a size", n, s)))?;
             }

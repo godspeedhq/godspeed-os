@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! THE USB RADIO'S FUNCTION PROTOCOL: what a USB host service (`dwc2`, and `xhci` since U2a) answers for the one
-//! device it has bound as a WiFi radio, and what `wifi-usb` asks. ONE definition, read by both sides.
+//! THE USB FUNCTION PROTOCOL: what a USB host service (`dwc2`, and `xhci` since U2a) answers for the one device it
+//! has bound for a driver of its own - the WiFi dongle for `wifi-usb`, or the device an installed driver package
+//! names - and what that driver asks. ONE definition, read by both sides. It was `sdk/wifi`'s while the dongle was
+//! the only such device; it moved here (2026-10-23) when driver packages needed it too, and `sdk/wifi` re-exports
+//! it as `godspeed_wifi::usbfn`, so the radio's code reads as before. A package reaches it through
+//! `gs::driver::bus` (`docs/developer-services-design.md` 13.1). Its doc comments still say "radio" where the
+//! dongle is the device they were written for; every op is the same for any device a host binds.
 //!
 //! **Narrow on purpose.** A host binds a radio by its VID:PID - a vendor-class device, so there is no class
 //! to match on - and then serves exactly that device: who it is, and its control transfers. It is not a
@@ -132,9 +137,9 @@ pub const CONTROL_MAX: usize = 256;
 /// (`rtl8xxxu_submit_rx_urb`); a driver that turns the chip's receive aggregation on must keep its batches
 /// under it. A whole number of packets, because a device that sends more than the host asked for is babble.
 pub const BULK_IN_MAX: usize = 3584;
-const _: () = assert!(BULK_IN_MAX + 2 <= godspeed_sdk::ipc::MAX_PAYLOAD);
+const _: () = assert!(BULK_IN_MAX + 2 <= crate::ipc::MAX_PAYLOAD);
 const _: () = assert!(BULK_IN_MAX % 512 == 0);
 
 /// The most one bulk OUT transfer carries: the rest of an IPC message after the op and the endpoint byte. A
 /// full-length frame with its 32-byte descriptor is about 2,400 bytes, so this is room, not a squeeze.
-pub const BULK_OUT_MAX: usize = godspeed_sdk::ipc::MAX_PAYLOAD - 2;
+pub const BULK_OUT_MAX: usize = crate::ipc::MAX_PAYLOAD - 2;

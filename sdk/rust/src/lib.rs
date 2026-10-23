@@ -74,6 +74,7 @@ pub mod record;
 pub mod service_context;
 /// IPC trace emission - the client half of the trace ring `events` holds (`utilities/47_events.md`).
 pub mod trace;
+pub mod usbfn;
 pub(crate) mod syscall;
 
 pub use capability::{CapHandle, CapError};
