@@ -272,9 +272,9 @@ A package of kind `utility` (`godspeed new utility` in the CLI) is installed exa
 checked, asked about once - but it is NOT started at install or at boot. It runs when its name is typed:
 
 ```
-gsh> hello-utility Ada
-hello, Ada
-gsh> hello-utility Ada | match Ada | count
+gsh> hello-utility Bankole
+hello, Bankole
+gsh> hello-utility Bankole | match Bankole | count
 1
 ```
 
