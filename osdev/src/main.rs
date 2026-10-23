@@ -4048,7 +4048,7 @@ fn run_driver_packages_test() {
     let persist = "build/tests/persist_driver_packages.img";
     std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
     format_superblock(persist);
-    for f in ["kind-nic-0.1.0.gsp", "kind-usb-0.1.0.gsp", "kind-stick-0.1.0.gsp"] {
+    for f in ["kind-nic-0.1.0.gsp", "kind-usb-0.1.0.gsp", "kind-stick-0.1.0.gsp", "kind-rtl-0.1.0.gsp"] {
         let path = format!("osdev/fixtures/{f}");
         let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         gsfs_add_file(persist, f, &bytes);

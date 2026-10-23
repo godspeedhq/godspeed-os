@@ -12455,7 +12455,12 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     check!(usb.contains("asks for: device") && usb.contains("its USB device through its host, checked from disk"),
            "a driver of a USB device installs, and the supervisor starts it with its host as its peer");
     // The line goes to the adapter's serial port once the package listens, so the adapter has it when it is asked.
-    let _ = collect_until(&buf, &mut cursor, b"kind-usb: listening", Duration::from_secs(30));
+    // The package can say so before the install's prompt returns, and the install's output has then been read past
+    // it - waiting for it again sat out 30 s while the package's 10 s window closed (3 failures in 6 runs,
+    // 2026-10-23). So it is looked for in what the install said first.
+    if !usb.contains("kind-usb: listening") {
+        let _ = collect_until(&buf, &mut cursor, b"kind-usb: listening", Duration::from_secs(30));
+    }
     if let Some(p) = usb_line.as_mut() { let _ = p.write_all(b"hello from the serial port
 "); }
     let _ = collect_until(&buf, &mut cursor, b"kind-usb: drove", Duration::from_secs(30));
@@ -12511,7 +12516,10 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
            "and reported it as host ehci, beside xhci's report of its own device");
     let stick_out = run!(b"godspeed install /kind-stick-0.1.0.gsp yes\r", 240);
     check!(stick_out.contains("asks for: device"), "a driver of the stick installs");
-    let _ = collect_until(&buf, &mut cursor, b"kind-stick: drove", Duration::from_secs(60));
+    // As for `kind-usb` above: the line may already be in what the install said.
+    if !stick_out.contains("kind-stick: drove") {
+        let _ = collect_until(&buf, &mut cursor, b"kind-stick: drove", Duration::from_secs(60));
+    }
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     // `ehci` reported the stick at boot, so the package starts at install, with `ehci` - the host that has it - as its
     // one peer (the drive line below names the host it reached).
@@ -12521,6 +12529,21 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
            "the package reads the stick's INQUIRY through ehci: a bulk OUT and two bulk INs, through gs::driver::bus");
     let out = run!(b"godspeed uninstall godspeed/kind-stick yes\r", 120);
     check!(out.contains("uninstalled"), "kind-stick uninstalls");
+
+    // THE HARDWARE CARD'S PACKAGE, in QEMU: `kind-rtl` uses the RTL8168's interrupt and DMA, and QEMU has no RTL8168 -
+    // its e1000 has no MSI, so no interrupt is routed either. What QEMU can show is the path to it: a driver asking
+    // for an interrupt and DMA memory on a device without MSI is asked the DMA question, takes the NIC over, says it
+    // is not the chip it drives and touches nothing, and gives the NIC back.
+    let rtl = run!(b"godspeed install /kind-rtl-0.1.0.gsp yes\r", 240);
+    check!(rtl.contains("also asks for DMA memory"), "kind-rtl, which asks for DMA memory, is asked about it");
+    if !rtl.contains("kind-rtl: took") {
+        let _ = collect_until(&buf, &mut cursor, b"kind-rtl: took", Duration::from_secs(30));
+    }
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("kind-rtl: took the ethernet device over - 8086:100e, not the RTL8168 this package drives, so it touches nothing"),
+           "on QEMU's e1000 it takes the NIC over and touches nothing, saying why");
+    let out = run!(b"godspeed uninstall godspeed/kind-rtl yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-rtl uninstalls");
 
     let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
     check!(removed.contains("no longer trusted"), "the test key is withdrawn");

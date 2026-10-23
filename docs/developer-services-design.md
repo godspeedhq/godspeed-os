@@ -1203,11 +1203,22 @@ rest is `feat/driver-packages` (2026-10-23):
 **How it was shown.** In QEMU on x86, `osdev test kinds` (the template's driver: registers, the interrupt and a DMA
 arena on `edu`) and `osdev test driver-packages` (a package taking the e1000 over from `nic-driver` and giving it
 back; a package driving QEMU's FTDI serial adapter behind `xhci`, a line each way; a package reading QEMU's stick's
-INQUIRY through `ehci`, which binds it in that test build only). On hardware: not yet. Two
+INQUIRY through `ehci`, which binds it in that test build only). On hardware: not yet. Three
 packages are made for the cards, signed by the test key (`osdev/fixtures/README.md`): `kind-dongle`, which names the
-RTL8188CUS and so takes it from `wifi-usb` on every board with the dongle, and `kind-nic`, which reads the RTL8168
-of the T630 and the Wyse as well as QEMU's e1000. A board fetches either with `download` from a machine that serves
-the file, after `godspeed trust add` for the test key.
+RTL8188CUS and so takes it from `wifi-usb` on every board with the dongle; `kind-nic`, which reads the RTL8168 of the
+T630 and the Wyse as well as QEMU's e1000; and `kind-rtl`, which uses the RTL8168's interrupt and DMA - the only
+package that shows those two grants on hardware, since `edu` is QEMU's. A board fetches each with `download` from a
+machine that serves the file, after `godspeed trust add` for the test key.
+
+**The cards owed** (none run yet):
+
+| Board | What it shows |
+|---|---|
+| T630 | `kind-nic`, then `kind-rtl`: the RTL8168 taken from `nic-driver` and given back, its interrupt and its DMA, the arena IOMMU-confined; `kind-dongle` in a front socket (`xhci`) and in a back one (`ehci`, behind the rate-matching hub) |
+| Wyse | `kind-nic` and `kind-rtl` as on the T630, unconfined; `kind-dongle` through `xhci` |
+| Pi 2 | `wifi-usb` on `gs::driver::bus`: bring-up, scan, join; then `kind-dongle` through `dwc2`, the network over the cable |
+| Pi 4, VisionFive | `wifi-usb` on `gs::driver::bus`; `kind-dongle` through `xhci` |
+| All five | chaos and `selfcheck`, since the supervisor and all three USB hosts changed |
 
 ### 13.2 `app`: a program with a screen of its own, while it has focus
 
