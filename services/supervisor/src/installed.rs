@@ -465,6 +465,9 @@ impl Installed {
             } else {
                 godspeed_sdk::service_context::hwclass::pci(class, checked.contract.pci_bar, true)
             };
+            // An interrupt is delivered as a message, so it needs an endpoint: the kernel routes the vector to the task's
+            // endpoint at spawn, and to nothing when it has none (`irq: ... routed: NO - discarded`).
+            if checked.contract.pci_irq { req.flags |= SPAWN_FLAG_REQ_RECV; }
             req.bdf = 0;
             req.dma_pages = dma.div_ceil(4096) as u32;
             stood_down = crate::in_tree_driver_of(class);

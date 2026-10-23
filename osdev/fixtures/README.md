@@ -54,8 +54,11 @@ Four UNPUBLISHED package files for `osdev test kinds`: one of every kind a devel
 scaffolds it - nothing edited - signed by the same throwaway test key as `hello-utility-0.9.0.gsp`, for `x86_64` only.
 The suite installs each from its file and sees it do its job: the service starts, the utility answers `hello, Ada`
 and pipes, the app holds the screen until a key, and the driver drives QEMU's `edu` through `gs::driver`
-(`kind-driver: device id 0x010000ed, alive true, 5! = 120`). Made 2026-10-22 with the CLI's templates as conformed to
-`gs::driver` that day (`godspeed-cli` `feat/dependencies`), against this checkout:
+by its registers, its interrupt and its DMA arena (`kind-driver: device id 0x010000ed, alive true, 5! = 120 by
+interrupt, 64 bytes through DMA and back intact`). The service, utility and app were made 2026-10-22 with the CLI's
+templates as conformed to `gs::driver` that day (`godspeed-cli` `feat/dependencies`); the driver was made again
+2026-10-23 from the template that asks for an interrupt and an arena (`godspeed-cli` `feat/driver-packages`). Each
+against this checkout:
 
 ```text
 GODSPEED_OS=<this checkout> godspeed new <kind> kind-<kind> --publisher godspeed

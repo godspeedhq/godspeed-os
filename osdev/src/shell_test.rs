@@ -12291,14 +12291,17 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
     let again = run!(b"version\r", 60);
     check!(!back.is_empty() && again.contains("GodspeedOS"), "a key gives the console back, and the shell answers");
 
-    // A DRIVER: the operator approves the device, the OS finds which it is, and the driver drives it.
+    // A DRIVER: the operator approves the device and, by a second question, its DMA memory; the OS finds which device
+    // it is and routes its interrupt; and the driver drives it by all three.
     let drv = run!(b"godspeed install /kind-driver-0.1.0.gsp yes\r", 240);
-    check!(drv.contains("asks for: device") && drv.contains("started (") && drv.contains("its device, checked from disk"),
-           "the driver installs, asking for its device, and the supervisor starts it with that device");
-    let _ = collect_until(&buf, &mut cursor, b"5! = 120", Duration::from_secs(30));
+    check!(drv.contains("asks for: device, memory") && drv.contains("Grant it DMA memory?"),
+           "the driver installs, asking for its device, and for its DMA memory by a question of its own");
+    check!(drv.contains("its device with its interrupt and DMA memory, checked from disk"),
+           "and the supervisor starts it with its device, its interrupt and its DMA arena");
+    let _ = collect_until(&buf, &mut cursor, b"through DMA and back", Duration::from_secs(30));
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
-    check!(log.contains("kind-driver: device id 0x010000ed, alive true, 5! = 120"),
-           "the driver reads `edu`'s identity, its liveness register and a factorial, through gs::driver");
+    check!(log.contains("kind-driver: device id 0x010000ed, alive true, 5! = 120 by interrupt, 64 bytes through DMA and back intact"),
+           "the driver reads `edu`'s registers, waits for its interrupt, and moves a buffer through DMA and back, all through gs::driver");
     let listed = run!(b"godspeed list installed\r", 60);
     check!(listed.contains("godspeed/kind-driver") && listed.contains("running"), "and it is listed as running");
 
