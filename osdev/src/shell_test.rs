@@ -12343,6 +12343,9 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     // adapter's bulk OUT arrives on it, and a line written to it is what the package reads back through the bulk IN.
     // (A file chardev would do for output, but QEMU on Windows takes no input from one.)
     let usb_port = pick_free_port();
+    // QEMU's monitor, to unplug the adapter and plug it back in - on loopback only, since it controls the machine.
+    let mon_port = pick_free_port();
+    let monitor = format!("tcp:127.0.0.1:{mon_port},server=on,wait=off");
     let usb_chardev = format!("socket,id=fser,host=127.0.0.1,port={usb_port},server=on,wait=off");
     let mut cmd = std::process::Command::new(&qemu);
     cmd.args([
@@ -12362,7 +12365,8 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
         // driver claims - `xhci` binds it as vendor-specific and reports it.
         "-device", "qemu-xhci,id=xhci",
         "-chardev", &usb_chardev,
-        "-device", "usb-serial,bus=xhci.0,chardev=fser",
+        "-device", "usb-serial,bus=xhci.0,chardev=fser,id=fser_dev",
+        "-monitor", &monitor,
     ]);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("driver-packages: QEMU launch failed: {e}"); std::process::exit(1); } };
@@ -12453,6 +12457,36 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     let wrote = usb_wire.lock().unwrap().clone();
     check!(String::from_utf8_lossy(&wrote).contains("hello from a Godspeed driver package"),
            "and what it sent came out of the adapter's serial port");
+    // A SUPERVISOR RESTART, then an UNPLUG and a REPLUG. The respawned supervisor must read the running package's
+    // device again (`adopt_device`), or the unplug would not stop it; and the replug must start it again.
+    let storm = run!(b"chaos kill-storm supervisor 1\r", 60);
+    check!(storm.contains("recovered: 1/1"), "the supervisor is killed while kind-usb runs, and comes back");
+    let _ = run!(b"sleep 5\r", 60);
+    let monitor_cmd = |cmd: &str| {
+        if let Some(mut m) = retry_tcp_connect(mon_port, Duration::from_secs(5)) {
+            thread::sleep(Duration::from_millis(500));
+            let _ = m.write_all(cmd.as_bytes());
+            thread::sleep(Duration::from_millis(500));
+        }
+    };
+    monitor_cmd("device_del fser_dev\n");
+    let _ = collect_until(&buf, &mut cursor, b"its USB device is not attached", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("supervisor: installed godspeed/kind-usb stopped - its USB device is not attached"),
+           "unplugged after the supervisor's restart, the package is stopped: the new supervisor knew its device");
+    let drove_before = log.matches("kind-usb: drove").count();
+    monitor_cmd("device_add usb-serial,bus=xhci.0,chardev=fser,id=fser_dev\n");
+    let _ = collect_until(&buf, &mut cursor, b"kind-usb: listening", Duration::from_secs(30));
+    if let Some(p) = usb_line.as_mut() { let _ = p.write_all(b"hello from the serial port\n"); }
+    let _ = collect_until(&buf, &mut cursor, b"kind-usb: drove", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.matches("kind-usb: drove").count() > drove_before,
+           "plugged back in, it is started again and drives the adapter again");
+    // And the network came back with `nic-driver`: no send on a dead capability once it was given its NIC again.
+    let back = log.find("nic-driver started again").unwrap_or(log.len());
+    let after = &log[back..];
+    let stale = after.matches("gen mismatch").count();
+    check!(stale < 5, format!("after nic-driver is given its NIC back, nothing keeps sending on its old capability ({stale} refused)"));
     let out = run!(b"godspeed uninstall godspeed/kind-usb yes\r", 120);
     check!(out.contains("uninstalled"), "kind-usb uninstalls");
 

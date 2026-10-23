@@ -133,6 +133,12 @@ pub fn binds(ids: u32, first_iclass: Option<u8>) -> bool {
     is_radio(ids) || first_iclass == Some(0xFF)
 }
 
+/// What this host's log calls the device it bound: the dongle by the name its lines always had, which documents
+/// quote, and any other device by what it is to this host.
+pub fn what(ids: u32) -> &'static str {
+    if is_radio(ids) { "the WiFi dongle" } else { "the bound USB device" }
+}
+
 /// Where the runtime control transfers begin on the dongle's EP0 ring: past the enumeration's own - the
 /// device descriptor at 0, the configuration descriptor at 48, Set Configuration at 96, ending at 128.
 pub const EP0_RUNTIME_START: usize = 128;
@@ -214,6 +220,11 @@ impl Radio {
         self.out_dci[..self.n_out].copy_from_slice(&dci[..self.n_out]);
         self.out_cur = [0; MAX_OUT];
         self.out_pcs = [1; MAX_OUT];
+    }
+
+    /// What the log calls it (`what`).
+    pub fn what(&self) -> &'static str {
+        what(self.vid() as u32 | (self.pid() as u32) << 16)
     }
 
     pub fn vid(&self) -> u16 {
@@ -386,7 +397,7 @@ fn repair(
     // What the repair left, measured: on the Pi 4 (2026-10-06) every transfer after one timed out with
     // the controller's dequeue still at the ring's start.
     ctx.log_fmt(format_args!(
-        "xhci: the WiFi dongle's EP0 repaired ({} this pass) - endpoint state {}, dequeue {:?}",
+        "xhci: {}'s EP0 repaired ({} this pass) - endpoint state {}, dequeue {:?}", r.what(),
         r.repairs, ep0_state(hc, r), ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES)));
     true
 }
@@ -426,7 +437,7 @@ fn control(
     if !r.checked {
         r.checked = true;
         ctx.log_fmt(format_args!(
-            "xhci: the WiFi dongle's EP0 - the controller's dequeue {:?} (offset, cycle), this host's cursor {:#x} pcs={}",
+            "xhci: {}'s EP0 - the controller's dequeue {:?} (offset, cycle), this host's cursor {:#x} pcs={}", r.what(),
             ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES), r.cur, r.pcs));
     }
     for _ in 0..tries {
@@ -438,7 +449,7 @@ fn control(
         // The first few per pass only (`repairs` is per pass).
         if !matches!(got, Some(1) | Some(13)) && r.repairs < 4 {
             ctx.log_fmt(format_args!(
-                "xhci: the WiFi dongle's control transfer failed - cc={} (0 = no event within {} ms), setup={:02x?}, {} {} byte(s), TD at ring offset {:#x} pcs={}; the controller stopped at {:?} (offset, cycle), endpoint state {} (1 running, 2 halted, 3 stopped, 4 error)",
+                "xhci: {}'s control transfer failed - cc={} (0 = no event within {} ms), setup={:02x?}, {} {} byte(s), TD at ring offset {:#x} pcs={}; the controller stopped at {:?} (offset, cycle), endpoint state {} (1 running, 2 halted, 3 stopped, 4 error)", r.what(),
                 got.unwrap_or(0), CONTROL_MS, setup, if data_in { "IN" } else { "OUT" }, len, at, r.pcs,
                 ep0_hw_dequeue(hc.dma, r.dev_idx, hc.ctx_size, EP0_RING_BYTES), ep0_state(hc, r)));
         }
@@ -455,7 +466,7 @@ fn control(
             _ => {
                 if !repair(ctx, hc, r, ev_idx, ev_cycle, cmd_idx) {
                     ctx.log_fmt(format_args!(
-                        "xhci: the WiFi dongle on port {} (slot {}) failed a control transfer and its EP0 could not be repaired ({} repairs this pass)",
+                        "xhci: {} on port {} (slot {}) failed a control transfer and its EP0 could not be repaired ({} repairs this pass)", r.what(),
                         r.port, r.slot, r.repairs));
                     out[1] = usbfn::ST_FAILED;
                     return Err(());
@@ -750,7 +761,7 @@ pub fn bulk_done(ctx: &ServiceContext, r: &mut Radio, cc: u32, res: u32) {
         r.rx = Rx::Held(len);
         r.rx_frames = r.rx_frames.wrapping_add(1);
         if r.rx_frames == 1 {
-            ctx.log_fmt(format_args!("xhci: the WiFi dongle's first bulk IN transfer - {} bytes (U2b)", len));
+            ctx.log_fmt(format_args!("xhci: {}'s first bulk IN transfer - {} bytes (U2b)", r.what(), len));
         }
         r.note_owed = !tell_bulk(ctx);
     } else {
@@ -758,7 +769,7 @@ pub fn bulk_done(ctx: &ServiceContext, r: &mut Radio, cc: u32, res: u32) {
         r.rx_failed = r.rx_failed.wrapping_add(1);
         if r.rx_failed <= 3 {
             ctx.log_fmt(format_args!(
-                "xhci: the WiFi dongle's bulk IN transfer failed - cc={} ({} so far); repaired on the next ask",
+                "xhci: {}'s bulk IN transfer failed - cc={} ({} so far); repaired on the next ask", r.what(),
                 cc, r.rx_failed));
         }
         // Told as a held transfer would be, so the driver asks - and the ask is what repairs it.
@@ -881,19 +892,19 @@ fn bulk_out(
     if cc == Some(1) {
         r.tx_frames = r.tx_frames.wrapping_add(1);
         if r.tx_frames == 1 {
-            ctx.log_fmt(format_args!("xhci: the WiFi dongle's first bulk OUT transfer - {} bytes (U2c)", data.len()));
+            ctx.log_fmt(format_args!("xhci: {}'s first bulk OUT transfer - {} bytes (U2c)", r.what(), data.len()));
         }
         return usbfn::ST_OK;
     }
     r.tx_failed = r.tx_failed.wrapping_add(1);
     if r.tx_failed <= 3 {
         ctx.log_fmt(format_args!(
-            "xhci: the WiFi dongle's bulk OUT {} failed - cc={} (0 = no completion within {} ms), {} byte(s); endpoint state {} ({} so far)",
+            "xhci: {}'s bulk OUT {} failed - cc={} (0 = no completion within {} ms), {} byte(s); endpoint state {} ({} so far)", r.what(),
             idx, cc.unwrap_or(0), OUT_MS, data.len(),
             hc.dma.slices.read32(device_ctx_off(r.dev_idx) + dci as usize * hc.ctx_size) & 0x7, r.tx_failed));
     }
     if !repair_out(ctx, hc, r, idx, ev_idx, ev_cycle, cmd_idx) && r.tx_failed <= 3 {
-        ctx.log("xhci: the WiFi dongle's bulk OUT could not be repaired - the next frame may not go out");
+        ctx.log_fmt(format_args!("xhci: {}'s bulk OUT could not be repaired - the next frame may not go out", r.what()));
     }
     usbfn::ST_FAILED
 }

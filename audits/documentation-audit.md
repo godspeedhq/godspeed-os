@@ -1951,3 +1951,16 @@ through its host. Comments and documents only; the Rust diff was checked to touc
 
 **Gates:** every documentation checker green (dash, refs, symbols, index, facts, line refs, commands, comment
 symbols, foreign words, site, spdx), and `osdev build` built.
+
+**Fixed afterwards, at the operator's word ("Fix them", 2026-10-23), in code:** findings 1 to 6. A respawned
+supervisor reads a USB driver package's device again (`adopt_device`); the install note says "if a built-in driver
+drives that device"; `dwc2` and `xhci` name a bound device by what it is (`rtl::configure`'s `what`,
+`radio::what`), the dongle keeping the wording documents quote; a USB driver's NAMED device (`usb_named`) is kept
+when it gives the device back, so a replug starts it again with a fresh restart allowance; the onboard radio is
+told the dongle is absent while a package holds it; and a failed stand-down or spawn forgets the USB device it
+recorded. Testing them found one more, fixed with them: `net-stack`'s two fast paths to `nic-driver`
+(`nic_req_ms`, `nic_drain_ms`) never reacquired a stale capability, so after `nic-driver` was stood down for a
+package and given its NIC back they went on sending on the dead one - 549 refused sends in one run, and no link
+- until `net-stack` itself restarted. They reacquire after a failure now (`reacquire_after`). `osdev test
+driver-packages` gained the supervisor restart, the unplug and replug, and the stale-capability count: 18/0.
+Finding 7 is a release order, and stands.

@@ -13,7 +13,7 @@
 //!
 //! **Not only the dongle, since 2026-10-23.** Any high-speed device whose first interface is vendor-specific is
 //! bound here the same way (`vendor_specific`), for an installed driver package that names it; the Realtek's two
-//! reads are sent to the Realtek alone. `configure`'s log lines still say "RTL8188CUS" for such a device.
+//! reads are sent to the Realtek alone. `configure` names the RTL8188CUS only when it is the Realtek.
 //!
 //! **Receive (R3b):** one bulk IN on `CH_RADIO_RX`, armed in the background once `wifi-usb` first asks
 //! `OP_BULK_IN`, taken on the USB interrupt (`service`), held until collected, with `usbfn::NOTE_BULK_IN`
@@ -206,7 +206,8 @@ const HS_BULK_MPS: u16 = 512;
 /// `wifi-usb` reaches its registers and says itself what failed.
 pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
     stop(ctx, mmio);
-    let e = configure(ctx, mmio, dma, t)
+    let what = if vid == VID && pid == PID { "RTL8188CUS" } else { "the bound USB device" };
+    let e = configure(ctx, mmio, dma, t, what)
         .unwrap_or(Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 });
     // The Realtek's two register reads are vendor requests only that chip understands: another device bound for a
     // driver of its own (`vendor_specific`) is not sent them.
@@ -250,7 +251,7 @@ pub fn vendor_specific(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &
 
 /// Read the configuration descriptor, find the bulk IN endpoint and the bulk OUTs, and SET_CONFIGURATION.
 /// `None`, said, on any failure; an `ep_in` of 0 when it configured but has no high-speed bulk IN.
-fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> Option<Eps> {
+fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, what: &str) -> Option<Eps> {
     const TRIES: u32 = 4;
     let ctl = |setup: &[u8; 8], buf: &mut [u8], data_in: bool, len: usize| -> bool {
         (0..TRIES).any(|i| {
@@ -262,19 +263,19 @@ fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) ->
     };
     let mut head = [0u8; 9];
     if !ctl(&[0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0], &mut head, true, 9) {
-        ctx.log("dwc2-svc: RTL8188CUS - the configuration descriptor did not come back; no receive");
+        ctx.log_fmt(format_args!("dwc2-svc: {} - the configuration descriptor did not come back; no receive", what));
         return None;
     }
     let want = (u16::from_le_bytes([head[2], head[3]]) as usize).min(chan::DATA_LEN);
     let cfg_val = head[5];
     let mut full = [0u8; chan::DATA_LEN];
     if !ctl(&[0x80, 0x06, 0, DESC_CONFIG, 0, 0, (want & 0xFF) as u8, (want >> 8) as u8], &mut full, true, want) {
-        ctx.log("dwc2-svc: RTL8188CUS - the configuration descriptor did not come back; no receive");
+        ctx.log_fmt(format_args!("dwc2-svc: {} - the configuration descriptor did not come back; no receive", what));
         return None;
     }
     let mut none: [u8; 0] = [];
     if !ctl(&[0x00, 0x09, cfg_val, 0, 0, 0, 0, 0], &mut none, false, 0) {
-        ctx.log_fmt(format_args!("dwc2-svc: RTL8188CUS - SET_CONFIGURATION {} FAILED; no receive", cfg_val));
+        ctx.log_fmt(format_args!("dwc2-svc: {} - SET_CONFIGURATION {} FAILED; no receive", what, cfg_val));
         return None;
     }
     let (ep, mps) = bulk_in(&full, want).unwrap_or((0, 0));
@@ -284,20 +285,20 @@ fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) ->
     // does not run for bulk, exactly as for the IN below: none is kept, and transmit is off, said.
     if e.n_out > 0 && e.out_mps != HS_BULK_MPS {
         ctx.log_fmt(format_args!(
-            "dwc2-svc: RTL8188CUS bulk OUT is {} bytes, not high-speed - no transmit", e.out_mps));
+            "dwc2-svc: {} bulk OUT is {} bytes, not high-speed - no transmit", what, e.out_mps));
         e.n_out = 0;
     }
     if ep == 0 || mps != HS_BULK_MPS {
         ctx.log_fmt(format_args!(
-            "dwc2-svc: RTL8188CUS configured ({}) but no high-speed bulk IN (endpoint {}, {} bytes) - control only, no receive",
-            cfg_val, ep, mps));
+            "dwc2-svc: {} configured ({}) but no high-speed bulk IN (endpoint {}, {} bytes) - control only, no receive",
+            what, cfg_val, ep, mps));
         return Some(e);
     }
     e.ep_in = ep;
     e.in_mps = mps;
     ctx.log_fmt(format_args!(
-        "dwc2-svc: RTL8188CUS configured ({}) - bulk IN endpoint {}, {} bytes, received on channel {}; {} bulk OUT ({:?}), sent on channel {}",
-        cfg_val, ep, mps, CH_RADIO_RX, e.n_out, &e.outs[..e.n_out], chan::CH_BULK));
+        "dwc2-svc: {} configured ({}) - bulk IN endpoint {}, {} bytes, received on channel {}; {} bulk OUT ({:?}), sent on channel {}",
+        what, cfg_val, ep, mps, CH_RADIO_RX, e.n_out, &e.outs[..e.n_out], chan::CH_BULK));
     Some(e)
 }
 

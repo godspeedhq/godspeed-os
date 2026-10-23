@@ -319,7 +319,7 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
                 if checked.contract.pci_irq { " and its interrupt" } else { "" })),
         };
         r.entry(&[C::S("device"), C::S(gives.as_str()),
-                  C::S("a built-in driver of that device is stopped while this one is installed, and started again when it is uninstalled")]);
+                  C::S("if a built-in driver drives that device, it is stopped while this one is installed, and started again when it is uninstalled")]);
         // DMA memory is its own row, and the shell asks about it by a question of its own (13.1): whether an IOMMU
         // confines the device is not something this machine can be asked, so the warning is always given.
         if checked.contract.dma_bytes > 0 {

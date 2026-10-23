@@ -1913,13 +1913,15 @@ fn usb_sound(ctx: &ServiceContext, map: &NameCapMap, kind: u8) {
 /// that "absent" is only a starting value, and acting on it would stand the onboard radio in at every
 /// boot, ahead of the dongle's driver. Only where both radios exist: the onboard driver and a USB device
 /// driver for the dongle.
-fn tell_radio_of_dongle(ctx: &ServiceContext, map: &NameCapMap, usb: &UsbState, told: &mut Option<(u32, bool)>) {
+fn tell_radio_of_dongle(ctx: &ServiceContext, map: &NameCapMap, usb: &UsbState, inst: &installed::Installed,
+                        told: &mut Option<(u32, bool)>) {
     if !cfg!(has_wifi_driver) || !usb.heard {
         return;
     }
     let Some(row) = USB_MATCH.iter().position(|m| m.driver == "wifi-usb") else { return };
     let Some(slot) = map.get("wifi-driver") else { return };
-    let now = (slot, usb.present[row]);
+    // A dongle an installed package drives is not `wifi-usb`'s radio: the onboard one is told it is absent.
+    let now = (slot, usb.present[row] && !inst.holds("wifi-usb"));
     if *told == Some(now) {
         return;
     }
@@ -2591,7 +2593,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // sent (the kernel says which, `UNHEARD` / dropped). It would otherwise stay dead forever (the "fs
         // gone from observe after a storm" bug). Cheap when nothing is dead.
         reconcile(&ctx, &mut name_map, &usb, &mut inst, &mut events);
-        tell_radio_of_dongle(&ctx, &name_map, &usb, &mut told_radio);
+        tell_radio_of_dongle(&ctx, &name_map, &usb, &inst, &mut told_radio);
         name_map.release_handoff(&ctx);
     }
 }

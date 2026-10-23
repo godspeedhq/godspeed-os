@@ -2763,13 +2763,26 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 /// five-second budget expired before it was answered: `serve: the echo was not accepted`, on a
 /// connection that was working perfectly. Bounded in work is not bounded in time (§26.6).
 fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: u64) -> Option<Message> {
-    ctx.request_with_reply_ms_sifted("nic-driver", msg, ms, |m| {
+    let r = ctx.request_with_reply_ms_sifted("nic-driver", msg, ms, |m| {
         let badge = gs::resource::last_badge(ctx);
         match gs::ipc::take_sent_cap(ctx) {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             None => true,
         }
-    })
+    });
+    reacquire_after(ctx, r)
+}
+
+/// A fast path's answer, with the driver reacquired by name when there was none - for the NEXT call, never a
+/// retry of this one (a poll that is skipped is better than one that blocks, above). `nic_req` reacquires on a
+/// failure and these two did not, so a `nic-driver` that restarted - or was stood down while an installed driver
+/// package held the NIC and started again when it gave it back - left both polls sending on its dead capability
+/// for good: hundreds of refused sends, and no link afterwards (`osdev test driver-packages`, 2026-10-23).
+fn reacquire_after(ctx: &ServiceContext, r: Option<Message>) -> Option<Message> {
+    if r.is_none() {
+        let _ = gs::cap::reacquire(ctx, "nic-driver");
+    }
+    r
 }
 
 /// Say where this service's time went while the connection just released was read (`tcp::Spent`), and start
@@ -2819,13 +2832,14 @@ fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Optio
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment
     // for a client to speak into a wait that would have swallowed it.
-    ctx.request_with_reply_ms_sifted("nic-driver", &Message::from_bytes(&[9u8]), ms, |m| {
+    let r = ctx.request_with_reply_ms_sifted("nic-driver", &Message::from_bytes(&[9u8]), ms, |m| {
         let badge = gs::resource::last_badge(ctx);
         match gs::ipc::take_sent_cap(ctx) {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             None => true,
         }
-    })
+    });
+    reacquire_after(ctx, r)
 }
 
 /// Ask `nic-driver` for waiting frames (op 9). The PACING of an empty answer is the caller's.

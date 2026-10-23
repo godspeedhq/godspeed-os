@@ -664,7 +664,7 @@ fn configure_radio_bulk(
     .unwrap_or(0);
     if ce != 1 {
         ctx.log_fmt(format_args!(
-            "xhci: the WiFi dongle's bulk Configure Endpoint failed (completion={}) - receive and send will not start", ce));
+            "xhci: the bound device's bulk Configure Endpoint failed (completion={}) - receive and send will not start", ce));
         return false;
     }
     true
@@ -1055,15 +1055,15 @@ fn contain_radio(
     }
     if r.hub_slot == 0 {
         ctx.log_fmt(format_args!(
-            "xhci: the WiFi dongle on root port {} (slot {}) does not answer on its control endpoint - its slot released and its port disabled; nothing else is reset. Unplug it and plug it in again to retry it",
+            "xhci: {} on root port {} (slot {}) does not answer on its control endpoint - its slot released and its port disabled; nothing else is reset. Unplug it and plug it in again to retry it", r.what(),
             r.port, r.slot));
     } else {
         ctx.log_fmt(format_args!(
-            "xhci: the WiFi dongle behind hub slot {} port {} (slot {}) does not answer on its control endpoint - its slot released and the port left alone; nothing else is reset. Unplug it and plug it in again to retry it",
+            "xhci: {} behind hub slot {} port {} (slot {}) does not answer on its control endpoint - its slot released and the port left alone; nothing else is reset. Unplug it and plug it in again to retry it", r.what(),
             r.hub_slot, r.hub_port, r.slot));
     }
     radio::announce(ctx, None);
-    notify(ctx, "WiFi dongle stopped answering - left alone (xhci)");
+    notify(ctx, if r.what() == "the WiFi dongle" { "WiFi dongle stopped answering - left alone (xhci)" } else { "USB device stopped answering - left alone (xhci)" });
 }
 
 /// Print a hot-plug notice on the console, then nudge the shell to redraw its
@@ -2024,7 +2024,8 @@ fn read_config_and_bind(
         // its registers, and the bulk endpoints configured below for its frames (U2b, U2c).
         // AND ANY VENDOR-SPECIFIC DEVICE, for an installed driver package that names it (`radio::binds`). It is bound
         // exactly as the dongle is - the same slot, slice, rings and `usbfn` - and the supervisor decides from the
-        // host's report which driver it gets, if any. The rest of this host's log still calls it the dongle.
+        // host's report which driver it gets, if any. The log names it by what it is (`radio::what`): the dongle keeps the
+        // wording documents quote, and any other device is "the bound USB device".
         if radio::binds(ids, first_iclass) {
             if control(
                 dma, mmio, dboff, ir0, slot, dev_idx, 96, ev_idx, ev_cycle, 0x00, 9, cfg_val as u32, 0, 0, 0,
@@ -2068,7 +2069,7 @@ fn read_config_and_bind(
                 // U2c: and its bulk OUTs, in the same Configure Endpoint, so frames can be sent.
                 let eps = radio::parse_eps(&dma.config_buf, 0, 64);
                 if eps.in_addr == 0 {
-                    ctx.log("xhci: the WiFi dongle's configuration names no bulk IN - receive will not start");
+                    ctx.log_fmt(format_args!("xhci: {}'s configuration names no bulk IN - receive will not start", radio::what(ids)));
                 } else {
                     let in_dci = (eps.in_addr & 0xF) as u32 * 2 + 1;
                     let mut out_dci = [0u32; 3];
@@ -2081,14 +2082,14 @@ fn read_config_and_bind(
                         r.set_bulk_in(in_dci, eps.in_mps);
                         r.set_bulk_out(&out_dci[..eps.n_out]);
                         ctx.log_fmt(format_args!(
-                            "xhci: the WiFi dongle's bulk IN {:#04x} (DCI {}, mps {}) and {} bulk OUT(s) {:?} (mps {}) configured - receive and send ready (U2b, U2c)",
-                            eps.in_addr, in_dci, eps.in_mps, eps.n_out, &out_dci[..eps.n_out], eps.out_mps));
+                            "xhci: {}'s bulk IN {:#04x} (DCI {}, mps {}) and {} bulk OUT(s) {:?} (mps {}) configured - receive and send ready (U2b, U2c)",
+                            radio::what(ids), eps.in_addr, in_dci, eps.in_mps, eps.n_out, &out_dci[..eps.n_out], eps.out_mps));
                     }
                 }
                 return (None, None, Some(r), cfg_val);
             }
             ctx.log_fmt(format_args!(
-                "xhci: the WiFi dongle on port {} (slot {}) did not take Set Configuration - not bound", port, slot));
+                "xhci: {} on port {} (slot {}) did not take Set Configuration - not bound", radio::what(ids), port, slot));
             return (None, None, None, cfg_val);
         }
         // No boot-HID interrupt-IN endpoint. Before giving up on the device, check whether it is a
@@ -4455,7 +4456,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if Some(radio_now) != radio_was_bound {
             radio::announce(&ctx, radio.as_ref());
             if announce && radio_was_bound.is_some() {
-                notify(&ctx, if radio_now.is_some() { "WiFi dongle connected (xhci)" } else { "WiFi dongle removed (xhci)" });
+                let dongle = radio.as_ref().is_none_or(|r| r.what() == "the WiFi dongle");
+                notify(&ctx, match (radio_now.is_some(), dongle) {
+                    (true, true) => "WiFi dongle connected (xhci)",
+                    (true, false) => "USB device connected (xhci)",
+                    (false, _) => "USB device removed (xhci)",
+                });
             }
         }
         radio_was_bound = Some(radio_now);

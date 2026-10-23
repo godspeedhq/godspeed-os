@@ -80,8 +80,12 @@ struct Entry {
     app: bool,
     /// A driver's device class, once it has been started with it: one installed driver per class.
     pci_class: Option<u32>,
-    /// ...or the USB device (vendor, product) a driver drives, through its host: one installed driver per device.
+    /// ...or the USB device (vendor, product) a driver HOLDS, through its host: one installed driver per device. Taken
+    /// away when it gives the device back (`give_back`).
     usb: Option<(u16, u16)>,
+    /// The USB device its contract NAMES, kept when it gives the device back: a replug finds the package by it, and
+    /// starts it again (`usb_report`).
+    usb_named: Option<(u16, u16)>,
     /// The running version's contract declares `handover`: it can hand its state to a successor and end.
     handover: bool,
     /// The key it was started with (`gs::handover::mode`): an offer must carry it, so nobody else can make it hand over.
@@ -233,10 +237,14 @@ impl Installed {
         }
     }
 
-    /// Record the USB device `pkg` drives.
+    /// Record the USB device `pkg` holds - and, when it holds one, that its contract names it.
     fn usb_of(&mut self, pkg: &str, usb: Option<(u16, u16)>) {
         if let Some(i) = self.find(pkg) {
-            if let Some(mut e) = self.e[i] { e.usb = usb; self.e[i] = Some(e); }
+            if let Some(mut e) = self.e[i] {
+                e.usb = usb;
+                if usb.is_some() { e.usb_named = usb; }
+                self.e[i] = Some(e);
+            }
         }
     }
 
@@ -248,7 +256,7 @@ impl Installed {
         if !present {
             self.usb_attached = None;
             for x in self.e.iter().flatten() {
-                if x.usb.is_some() && alive(ctx, x.name()) {
+                if x.usb_named.is_some() && alive(ctx, x.name()) {
                     let _ = ctx.kill(x.name());
                     ctx.log_fmt(format_args!("supervisor: installed {} stopped - its USB device is not attached", x.name()));
                 }
@@ -256,8 +264,13 @@ impl Installed {
             return false;
         }
         self.usb_attached = Some((vid, pid));
-        let Some(e) = self.e.iter().flatten().find(|x| x.usb == Some((vid, pid))).copied() else { return false };
+        let Some(i) = self.e.iter().position(|x| x.is_some_and(|x| x.usb_named == Some((vid, pid)))) else { return false };
+        let Some(mut e) = self.e[i] else { return false };
         if alive(ctx, e.name()) { return true; }
+        // Its device attached again - a replug, or a host that bound it afresh: a new start, with a fresh allowance of
+        // restarts, whether it had ended itself or been left down before.
+        e.restarts = 0;
+        self.e[i] = Some(e);
         let (pkg, version) = (e.name(), e.version());
         let Some((publisher, name)) = split(pkg) else { return true };
         let mut p = [0u8; NAME_MAX];
@@ -365,9 +378,12 @@ impl Installed {
     fn adopt_device(&mut self, ctx: &ServiceContext, publisher: &str, name: &str, pkg: &str, version: &str) {
         let Ok(c) = check::package(ctx, publisher, name, version, this_arch(), &mut |_, _| true) else { return };
         if c.kind != Kind::Driver { return; }
-        let Some(class) = c.contract.pci_class else { return };
-        self.class_of(pkg, Some(class));
-        if let Some(holder) = crate::in_tree_driver_of(class) {
+        let holder = match (c.contract.pci_class, c.contract.usb) {
+            (Some(class), _) => { self.class_of(pkg, Some(class)); crate::in_tree_driver_of(class) }
+            (None, Some((v, p))) => { self.usb_of(pkg, Some((v, p))); crate::in_tree_usb_driver_of(v, p) }
+            (None, None) => return,
+        };
+        if let Some(holder) = holder {
             if alive(ctx, holder) {
                 let _ = ctx.kill(holder);
                 ctx.log_fmt(format_args!("supervisor: {} stood down again - the installed {} still drives its device", holder, pkg));
@@ -391,10 +407,11 @@ impl Installed {
     fn remember(&mut self, slot: usize, pkg: &str, version: &str, restarts: u32, (utility, app): (bool, bool)) {
         let pci_class = self.e[slot].and_then(|x| x.pci_class);
         let usb = self.e[slot].and_then(|x| x.usb);
+        let usb_named = self.e[slot].and_then(|x| x.usb_named);
         let handover = self.e[slot].is_some_and(|x| x.handover);
         let key = self.e[slot].map_or(0, |x| x.key);
         let mut e = Entry { name: [0; NAME_MAX], nl: pkg.len(), version: [0; 24], vl: version.len(), restarts, utility, app, pci_class,
-                            usb, handover, key };
+                            usb, usb_named, handover, key };
         e.name[..pkg.len()].copy_from_slice(pkg.as_bytes());
         e.version[..version.len()].copy_from_slice(version.as_bytes());
         self.e[slot] = Some(e);
@@ -514,7 +531,7 @@ impl Installed {
             if checked.contract.pci_irq || checked.contract.dma_bytes > 0 {
                 return Err(text(format_args!("it drives a USB device and asks for an interrupt or DMA memory, which are its host's - it reaches its device through the host")));
             }
-            if let Some(other) = self.e.iter().flatten().find(|x| x.name() != pkg && x.usb == Some((vid, pid))) {
+            if let Some(other) = self.e.iter().flatten().find(|x| x.name() != pkg && x.usb_named == Some((vid, pid))) {
                 return Err(text(format_args!("its USB device {:04x}:{:04x} is driven already by the installed {}", vid, pid, other.name())));
             }
             let Some(host) = crate::usb_host() else {
@@ -596,7 +613,7 @@ impl Installed {
                 let _ = ctx.kill(holder);
                 let budget = godspeed::driver::wait::Budget::ms(STAND_DOWN_MS);
                 if godspeed::driver::wait::until(ctx, budget, || !alive(ctx, holder)).is_err() {
-                    if usb_host.is_none() { self.class_of(pkg, None); }
+                    if usb_host.is_none() { self.class_of(pkg, None); } else { self.usb_of(pkg, None); }
                     return Err(text(format_args!("`{}` drives its device and did not stop within {} ms", holder, STAND_DOWN_MS)));
                 }
                 ctx.log_fmt(format_args!("supervisor: {} stood down - the installed {} drives its device until it is uninstalled",
@@ -623,7 +640,7 @@ impl Installed {
             Err(e) => {
                 // Not started: a device taken over goes back to its built-in driver, which the reconcile sweep restarts.
                 if let Some(holder) = stood_down {
-                    if usb_host.is_none() { self.class_of(pkg, None); }
+                    if usb_host.is_none() { self.class_of(pkg, None); } else { self.usb_of(pkg, None); }
                     ctx.log_fmt(format_args!("supervisor: installed {} did not start - its device goes back to {}", pkg, holder));
                 }
                 Err(text(format_args!("the kernel refused to start it: {:?}", e)))
@@ -654,7 +671,7 @@ impl Installed {
             self.give_back(ctx, task);
             return;
         }
-        if e.usb.is_some() && self.usb_attached != e.usb {
+        if e.usb_named.is_some() && self.usb_attached != e.usb_named {
             // Stopped because its device left (`usb_report`), or died after it did: started again when it returns.
             ctx.log_fmt(format_args!("supervisor: installed {} ended{} - not restarted, its USB device is not attached", task, how));
             return;
