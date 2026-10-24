@@ -12587,6 +12587,21 @@ pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
     let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
     let disk_str = disk.to_string_lossy().replace('\\', "/");
     let port = pick_free_port();
+    // A plain web server on this host, on loopback only, reached from the guest at QEMU's host address (10.0.2.2):
+    // how a board fetches a package from a PC on its own network, by an address rather than a name.
+    let local = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the local web server");
+    let local_port = local.local_addr().map(|a| a.port()).unwrap_or(0);
+    thread::spawn(move || {
+        for conn in local.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let mut req = [0u8; 2048];
+            let _ = c.read(&mut req);
+            let body = b"hello from the PC, by its address\n";
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = c.write_all(head.as_bytes());
+            let _ = c.write_all(body);
+        }
+    });
     let mut cmd = std::process::Command::new(&qemu);
     cmd.args([
         "-drive",   &format!("format=raw,file={image_str},if=ide"),
@@ -12628,6 +12643,14 @@ pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
     }}; }
     let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
     let _ = run!(b"godspeed config\r", 60);
+    // BY ADDRESS, first because it is quick: a link whose host is an IP address is that address, not a name to ask a
+    // resolver about (which answers "no such name", 2026-10-24, the VisionFive fetching a card's package from a PC).
+    let by_ip = run!(format!("download http://10.0.2.2:{local_port}/hello.txt\r").as_bytes(), 60);
+    let saved = run!(b"read /users/default/hello.txt\r", 30);
+    println!("download: by address it said:\n{}\n{}", by_ip.trim_end_matches("gsh>").trim(), saved.trim_end_matches("gsh>").trim());
+    check!(by_ip.contains("/users/default/hello.txt") && saved.contains("hello from the PC, by its address"),
+           "`download` of a plain http link by IP address saves the file, with no name to resolve");
+    let _ = run!(b"delete /users/default/hello.txt\r", 30);
     let copied = run!(b"copy /gts-root-r4.der /system/services/godspeed/roots/gts-root-r4.der\r", 30);
     check!(!copied.contains("error") && !copied.contains("not found"), "GTS Root R4 is beside the registry's root");
     let _ = run!(b"godspeed config set timeout-secs 20\r", 30);

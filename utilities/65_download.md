@@ -17,6 +17,9 @@ absolute.
   server's name. A link that fails a check is not downloaded, and the answer says which check failed.
 - **`http://`** is taken, and the answer says `NOT checked`: nothing proves the bytes are the ones the server
   sent, and anyone between here and there could have changed them.
+- **A host that is an IP address** (`http://192.168.4.40:8000/file`) is that address: no name server is asked
+  (since 2026-10-24; a resolver answers "no such name" for one, so such a link used to fail). An `https://` link
+  by address is still checked, and fails unless the server's certificate names that address.
 - **Redirects** are followed, up to five. A link that began `https://` and is redirected to `http://` is
   refused: a link that looked checked never quietly becomes one that is not. Typing the `http://` link yourself
   is the way to take it.

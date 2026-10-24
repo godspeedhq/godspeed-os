@@ -358,22 +358,24 @@ pub fn url(s: &str) -> Result<Url<'_>, &'static str> {
 /// path ending in `/`, no query) do not apply to one page read and thrown away. `base` is the whole path.
 pub fn page(s: &str) -> Result<Url<'_>, &'static str> {
     let rest = s.strip_prefix("https://").ok_or("an address to check is https:// only: the transport is TLS")?;
-    page_parts(rest, 443)
+    page_parts(rest, 443, true)
 }
 
 /// A link `download` takes: `https://` (checked by TLS, `true`) or plain `http://` (`false`), port 443 or 80 by
-/// default, any path and query.
+/// default, any path and query. A plain link's host may be an IPv4 address (`http://192.168.4.40:8000/f`): nothing
+/// is checked against its name, so nothing needs one - the way a board fetches a file from a PC on its network.
 pub fn link(s: &str) -> Result<(Url<'_>, bool), &'static str> {
     if let Some(rest) = s.strip_prefix("https://") {
-        return page_parts(rest, 443).map(|u| (u, true));
+        return page_parts(rest, 443, true).map(|u| (u, true));
     }
     if let Some(rest) = s.strip_prefix("http://") {
-        return page_parts(rest, 80).map(|u| (u, false));
+        return page_parts(rest, 80, false).map(|u| (u, false));
     }
     Err("a link begins http:// or https://")
 }
 
-fn page_parts(rest: &str, default_port: u16) -> Result<Url<'_>, &'static str> {
+/// `tls`: the host is checked against a certificate, so it must be a name. Otherwise an IPv4 address will do too.
+fn page_parts(rest: &str, default_port: u16, tls: bool) -> Result<Url<'_>, &'static str> {
     let (authority, path) = match rest.find(['/', '?']) {
         Some(i) if rest.as_bytes()[i] == b'/' => (&rest[..i], &rest[i..]),
         Some(_) => return Err("a query goes after a path: https://host/path?query"),
@@ -386,10 +388,29 @@ fn page_parts(rest: &str, default_port: u16) -> Result<Url<'_>, &'static str> {
         Some((h, p)) => (h, p.parse::<u16>().ok().filter(|&p| p != 0).ok_or("the port is a number, 1 to 65535")?),
         None => (authority, default_port),
     };
-    if !is_dns_name(host) {
-        return Err("the host must be a DNS name, which TLS checks the certificate against");
+    if !is_dns_name(host) && (tls || !is_ipv4(host)) {
+        return Err(if tls {
+            "the host must be a DNS name, which TLS checks the certificate against"
+        } else {
+            "the host must be a DNS name or an IPv4 address"
+        });
     }
     Ok(Url { host, port, base: path })
+}
+
+/// Dotted-quad IPv4, each part 1 to 3 digits and at most 255 - what `gs::net::Ipv4::parse` takes, which is what
+/// resolves it without asking a name server. Written here because this file is host-tested on its own.
+fn is_ipv4(h: &str) -> bool {
+    let mut parts = 0;
+    for f in h.split('.') {
+        let ok = !f.is_empty() && f.len() <= 3 && f.bytes().all(|c| c.is_ascii_digit())
+            && f.parse::<u16>().is_ok_and(|v| v <= 255);
+        if !ok || parts == 4 {
+            return false;
+        }
+        parts += 1;
+    }
+    parts == 4
 }
 
 /// Letters, digits and hyphens in dot-separated labels, and not an address: TLS needs a name to check.
@@ -547,6 +568,18 @@ mod tests {
         assert_eq!(link("http://example.com").map(|(u, t)| (u.port, u.base, t)), Ok((80, "/", false)));
         assert_eq!(link("http://example.com:8080/f.bin").map(|(u, _)| u.port), Ok(8080));
         assert!(link("ftp://example.com/f").is_err());
+    }
+
+    /// A plain link may name a machine by its address; a checked one may not, since TLS checks a name.
+    #[test]
+    fn a_plain_link_may_be_an_address() {
+        assert_eq!(link("http://192.168.4.40:8000/kind-dongle-0.1.0.gsp").map(|(u, t)| (u.host, u.port, u.base, t)),
+                   Ok(("192.168.4.40", 8000, "/kind-dongle-0.1.0.gsp", false)));
+        assert_eq!(link("http://10.0.2.2/f").map(|(u, _)| u.port), Ok(80));
+        assert!(link("https://192.168.4.40/f").is_err(), "https by address: TLS has no name to check");
+        for bad in ["http://256.1.1.1/f", "http://1.2.3/f", "http://1.2.3.4.5/f", "http://1.2.3.0255/f", "http://1..3.4/f"] {
+            assert!(link(bad).is_err(), "{bad}");
+        }
     }
 
     use super::*;
