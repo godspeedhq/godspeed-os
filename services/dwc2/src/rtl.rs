@@ -86,6 +86,13 @@ pub struct Radio {
     /// A `NOTE_BULK_IN` the driver's queue refused, sent again on a later pass: nothing is armed until the
     /// held transfer is collected, so a notice lost for good would stop receive for good.
     note_owed: bool,
+    /// `wifi-usb` IS NOT RUNNING, at the last notice that could not be sent: an installed package drives the
+    /// device instead (`hw_usb`), or the driver has not started. Until its name resolves again a notice LOOKS
+    /// THE NAME UP and sends nothing (`tell_bulk`). It sent before: the owed notice went out on the dead
+    /// instance's cap on every pass, refused each time and logged by the kernel - a gen mismatch line every few
+    /// milliseconds for as long as a package held the dongle (VisionFive, 2026-10-24), found on the VisionFive's `xhci`
+    /// with the same code, and as `nic-driver`'s radio bridge did before its `gone` (`backlog/fixed/88`).
+    driver_gone: bool,
     /// Notices the driver took in place of an answer and named in an `OP_SYNC` (`usbfn::OP_SYNC`), sent
     /// again once it has been quiet for `DRIVER_QUIET_MS` - so they reach its serve loop, not its next call.
     sync_bulk: bool,
@@ -217,7 +224,7 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid
         ctx.log_fmt(format_args!("dwc2-svc: USB device {:04x}:{:04x}, vendor-specific - configured, bound for a driver of its own", vid, pid));
     }
     Radio {
-        t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
+        t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false, driver_gone: false,
         sync_bulk: false, sync_radio: false, last_req: None, ring_len: [0; RX_SLOTS], ring_at: [None; RX_SLOTS], ring_head: 0, ring_n: 0, full_at: None,
         replug_asked: false, replug_allowed: true,
         errs_run: 0, stats: RxStats::default(),
@@ -391,7 +398,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
         }
     }
     if r.note_owed && r.ring_n > 0 {
-        r.note_owed = !tell_bulk(ctx);
+        r.note_owed = !tell_bulk(ctx, &mut r.driver_gone);
     }
     let at = match r.rx {
         Rx::Armed { at } => at,
@@ -426,7 +433,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
         // Told when the ring stops being empty; once a transfer is collected and more wait, a notice is owed
         // again (`bulk_in_request`), so the driver - which, with the cable carrying the link, collects only
         // when told - empties the ring one notice at a time.
-        if r.ring_n == 1 && !tell_bulk(ctx) {
+        if r.ring_n == 1 && !tell_bulk(ctx, &mut r.driver_gone) {
             r.note_owed = true;
             r.stats.notes_late = r.stats.notes_late.wrapping_add(1);
         }
@@ -541,10 +548,25 @@ pub fn report(ctx: &ServiceContext, r: &Radio) {
         s.held_ms, s.held_max_ms, RX_SLOTS, s.full_ms));
 }
 
-fn tell_bulk(ctx: &ServiceContext) -> bool {
+/// `NOTE_BULK_IN` to the driver: `try_send`, and reacquired by name once if the cap is stale. A name that does not
+/// resolve marks the driver gone (`Radio::driver_gone`), and while it is gone the name is looked up and nothing sent.
+fn tell_bulk(ctx: &ServiceContext, gone: &mut bool) -> bool {
     let msg = Message::from_bytes(&[usbfn::NOTE_BULK_IN]);
-    gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
-        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok())
+    if *gone {
+        if !gs::cap::reacquire(ctx, DRIVER) {
+            return false;
+        }
+        *gone = false;
+        return gs::ipc::try_send(ctx, DRIVER, &msg).is_ok();
+    }
+    if gs::ipc::try_send(ctx, DRIVER, &msg).is_ok() {
+        return true;
+    }
+    if gs::cap::reacquire(ctx, DRIVER) {
+        return gs::ipc::try_send(ctx, DRIVER, &msg).is_ok();
+    }
+    *gone = true;
+    false
 }
 
 /// The dongle on the Pi 2's hub, confirmed on hardware twice - `bugs/3` recorded it via this driver and

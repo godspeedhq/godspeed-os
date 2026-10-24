@@ -173,6 +173,13 @@ pub struct Radio {
     in_pcs: u32,
     rx: Rx,
     note_owed: bool,
+    /// `wifi-usb` IS NOT RUNNING, at the last notice that could not be sent: an installed package drives the
+    /// device instead (`hw_usb`), or the driver has not started. Until its name resolves again a notice LOOKS
+    /// THE NAME UP and sends nothing (`tell_bulk`). It sent before: the owed notice went out on the dead
+    /// instance's cap on every pass, refused each time and logged by the kernel - a gen mismatch line every few
+    /// milliseconds for as long as a package held the dongle (VisionFive, 2026-10-24), as `nic-driver`'s radio
+    /// bridge did before its `gone` (`backlog/fixed/88`).
+    driver_gone: bool,
     in_repairs: u32,
     /// Transfers received and failed, for the log.
     rx_frames: u32,
@@ -199,7 +206,7 @@ pub struct Radio {
 impl Radio {
     pub fn new(slot: u32, dev_idx: usize, port: u32, ids: u32) -> Self {
         Radio { slot, dev_idx, port, ids, gen: 0, hub_slot: 0, hub_port: 0, cur: EP0_RUNTIME_START, pcs: 1, repairs: 0, checked: false,
-                in_dci: 0, in_mps: 0, in_cur: 0, in_pcs: 1, rx: Rx::Off, note_owed: false, in_repairs: 0,
+                in_dci: 0, in_mps: 0, in_cur: 0, in_pcs: 1, rx: Rx::Off, note_owed: false, driver_gone: false, in_repairs: 0,
                 rx_frames: 0, rx_failed: 0,
                 out_dci: [0; MAX_OUT], n_out: 0, out_cur: [0; MAX_OUT], out_pcs: [1; MAX_OUT], out_repairs: 0,
                 tx_frames: 0, tx_failed: 0, sync_bulk: false, sync_radio: false, syncs: 0, last_req: None }
@@ -763,7 +770,7 @@ pub fn bulk_done(ctx: &ServiceContext, r: &mut Radio, cc: u32, res: u32) {
         if r.rx_frames == 1 {
             ctx.log_fmt(format_args!("xhci: {}'s first bulk IN transfer - {} bytes (U2b)", r.what(), len));
         }
-        r.note_owed = !tell_bulk(ctx);
+        r.note_owed = !tell_bulk(ctx, &mut r.driver_gone);
     } else {
         r.rx = Rx::Failed(cc);
         r.rx_failed = r.rx_failed.wrapping_add(1);
@@ -773,7 +780,7 @@ pub fn bulk_done(ctx: &ServiceContext, r: &mut Radio, cc: u32, res: u32) {
                 cc, r.rx_failed));
         }
         // Told as a held transfer would be, so the driver asks - and the ask is what repairs it.
-        r.note_owed = !tell_bulk(ctx);
+        r.note_owed = !tell_bulk(ctx, &mut r.driver_gone);
     }
 }
 
@@ -794,14 +801,29 @@ pub fn service(ctx: &ServiceContext, r: &mut Radio) {
         }
     }
     if r.note_owed && matches!(r.rx, Rx::Held(_) | Rx::Failed(_)) {
-        r.note_owed = !tell_bulk(ctx);
+        r.note_owed = !tell_bulk(ctx, &mut r.driver_gone);
     }
 }
 
-fn tell_bulk(ctx: &ServiceContext) -> bool {
+/// `NOTE_BULK_IN` to the driver: `try_send`, and reacquired by name once if the cap is stale. A name that does not
+/// resolve marks the driver gone (`Radio::driver_gone`), and while it is gone the name is looked up and nothing sent.
+fn tell_bulk(ctx: &ServiceContext, gone: &mut bool) -> bool {
     let msg = Message::from_bytes(&[usbfn::NOTE_BULK_IN]);
-    gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
-        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok())
+    if *gone {
+        if !gs::cap::reacquire(ctx, DRIVER) {
+            return false;
+        }
+        *gone = false;
+        return gs::ipc::try_send(ctx, DRIVER, &msg).is_ok();
+    }
+    if gs::ipc::try_send(ctx, DRIVER, &msg).is_ok() {
+        return true;
+    }
+    if gs::cap::reacquire(ctx, DRIVER) {
+        return gs::ipc::try_send(ctx, DRIVER, &msg).is_ok();
+    }
+    *gone = true;
+    false
 }
 
 /// The bulk IN after a failed transfer: its ring cleared and the endpoint reset to the ring's start
