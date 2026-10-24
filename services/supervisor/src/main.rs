@@ -1803,11 +1803,18 @@ impl UsbState {
 
     /// Each row's device is present when a host its driver is wired to has it bound.
     fn recompute(&mut self) {
-        for (i, m) in USB_MATCH.iter().enumerate() {
-            self.present[i] = self.by_host.iter().enumerate().any(|(h, d)| {
-                *d == Some((m.vid, m.pid)) && usbdev::host_name(h as u8).is_some_and(|n| m.peers.contains(&n))
-            });
+        for i in 0..USB_MATCH.len() {
+            self.present[i] = self.host_of(i).is_some();
         }
+    }
+
+    /// The host that has row `i`'s device bound, among those its driver is wired to; `None` when none has.
+    fn host_of(&self, i: usize) -> Option<&'static str> {
+        let m = USB_MATCH.get(i)?;
+        self.by_host.iter().enumerate().find_map(|(h, d)| {
+            let name = usbdev::host_name(h as u8)?;
+            (*d == Some((m.vid, m.pid)) && m.peers.contains(&name)).then_some(name)
+        })
     }
 
     /// Should `name` be running? A device's driver only while its device is attached; everything else,
@@ -1850,9 +1857,13 @@ fn devices_answer(usb: &UsbState, out: &mut [u8; DEVICES_REPLY_MAX]) -> usize {
         let name = row.0.as_bytes();
         if put(&[b"H", &hw.to_le_bytes(), &[name.len() as u8], name], out, &mut n) { count += 1; }
     }
-    let host = USB_HOSTS.first().copied().unwrap_or("");
+    // The host named on each row is the one that has the device bound, among those its driver is wired to; one not
+    // attached is named by this board's first host. Today every row is wired to one host, so the two agree; a driver
+    // wired to two (a PC has `xhci` and `ehci`) would otherwise be shown on the first whichever had it.
+    let first = USB_HOSTS.first().copied().unwrap_or("");
     for (i, m) in USB_MATCH.iter().enumerate() {
         let attached = usb.present.get(i).copied().unwrap_or(false) as u8;
+        let host = usb.host_of(i).unwrap_or(first);
         if put(&[b"U", &m.vid.to_le_bytes(), &m.pid.to_le_bytes(), &[attached],
                  &[host.len() as u8], host.as_bytes(), &[m.driver.len() as u8], m.driver.as_bytes()], out, &mut n) {
             count += 1;
