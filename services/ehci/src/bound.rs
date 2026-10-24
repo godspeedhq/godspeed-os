@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! The ONE device this host binds for a driver of its own (2026-10-23): what `xhci` and `dwc2` do for a USB device
 //! an installed driver package names (`hw_usb`, `docs/developer-services-design.md` 13.1), done on the USB 2.0
-//! controller - the T630's back sockets, behind its rate-matching hub, or a device straight on the root port that had
-//! one at boot (the first such port, which is then watched for a replug; no other root port is).
+//! controller - the T630's back sockets, behind its rate-matching hub, or a device straight on any root port, every one
+//! watched for a plug while nothing is bound (`root_ports` in `main.rs`).
 //!
 //! A device whose first interface is vendor-specific (class 0xFF) and that is not a boot keyboard or mouse - which
 //! this host drives itself - is addressed, configured, its bulk endpoints found, and reported to the supervisor

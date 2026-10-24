@@ -131,8 +131,12 @@ polled the schedule is pointed back at their ring after each one (`services/ehci
 device and says what came, nothing included, so a driver asks again (`gs::driver::bus` callers already do; `wifi-usb`
 does not, which is why it is not started here). A device behind the hub is watched by asking the hub at most once a
 second, and a device on a root port by reading the port on every wake (at most 250 ms apart); a re-scan for keyboards
-leaves the bound device's port alone. As before, `ehci` resets only the FIRST connected root port at boot, and a root
-port with nothing on it at boot is not watched for a plug.
+leaves the bound device's port alone. Every root port is watched (2026-10-24; until then only the first one connected
+at boot was, Audit 25's finding 5): the first with a high-speed device on it is taken, a port whose device is not
+high-speed or not bound is passed over until it leaves, and when the bound device leaves every port is watched again.
+Once a hub is found it is enumerated for the driver's life and no other root port is watched; the T630's back sockets
+are all behind its one rate-matching hub, so there that costs nothing (a second hub on another root port would not be
+seen - not on any board here, recorded).
 
 **The report names its host.** `usbdev`'s report gained a byte, the host (`HOST_DWC2`, `HOST_XHCI`, `HOST_EHCI`),
 because a PC now has two hosts that report and "nothing attached" from one said nothing of the other. The supervisor

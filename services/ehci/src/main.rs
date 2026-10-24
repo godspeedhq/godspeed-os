@@ -142,7 +142,6 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // Port census: with the controller running and CONFIGFLAG set, a device on a
     // back socket should now read connected=1. PORTSC is one 32-bit reg per port.
-    let mut first_connected: Option<usize> = None;
     for p in 0..n_ports as usize {
         let psc = mmio.read32(op + OP_PORTSC0 + p * 4);
         ctx.log_fmt(format_args!(
@@ -152,38 +151,71 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
             (psc & PORTSC_PED != 0) as u8,
             (psc & PORTSC_OWNER != 0) as u8,
         ));
-        if psc & PORTSC_CCS != 0 && first_connected.is_none() {
-            first_connected = Some(p);
-        }
     }
 
-    // ---------------------------------------------------------------------------
-    // E3a - reset the first connected port and see if it enables. EHCI only
-    // enables a port for a HIGH-SPEED device; if PED comes up, the thing on that
-    // port is high-speed - for the back keyboard (low-speed) that means a
-    // high-speed hub (the integrated rate-matching hub), with the keyboard behind
-    // it. If PED stays 0, the device is low/full-speed directly on the port.
-    // ---------------------------------------------------------------------------
-    if let Some(p) = first_connected {
-        // E3b/E3c - the device on the port is now enabled at the default address 0. A hub (the T630's
-        // rate-matching hub) is enumerated, and its ports scanned for keyboards and mice for the rest of the
-        // driver's life; anything else on the port is a device on its own, which this host binds for a driver of
-        // its own if it can (`bound.rs`) and watches until it leaves.
-        if reset_root_port(&ctx, &mmio, op, p) {
-            let dma = match godspeed::driver::arena(&ctx) {
-                Some(a) => match lay_out(&ctx, a) { Some(d) => d, None => idle_draining(&ctx) },
-                None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); idle_draining(&ctx) }
-            };
-            // Whether the control-transfer timeout has been said. Owned here, by the function that runs for
-            // the driver's whole life, rather than as a static (invariant 9, backlog/fixed/80 D9): a respawn is a
-            // fresh instance and says it again, which it should.
-            let said = Cell::new(false);
-            let mut host = bound::Host::new(&ctx);
-            root_port(&ctx, &mmio, op, &dma, &said, p, &mut host);
+    let dma = match godspeed::driver::arena(&ctx) {
+        Some(a) => match lay_out(&ctx, a) { Some(d) => d, None => idle_draining(&ctx) },
+        None => { ctx.log("ehci: no DMA arena granted - cannot enumerate; idling"); idle_draining(&ctx) }
+    };
+    // Whether the control-transfer timeout has been said. Owned here, by the function that runs for the driver's
+    // whole life, rather than as a static (invariant 9, backlog/fixed/80 D9): a respawn is a fresh instance and says
+    // it again, which it should.
+    let said = Cell::new(false);
+    let mut host = bound::Host::new(&ctx);
+    root_ports(&ctx, &mmio, op, &dma, &said, (n_ports as usize).min(PORTS_MAX), &mut host)
+}
+
+/// The most root ports watched: HCSPARAMS' field is four bits.
+const PORTS_MAX: usize = 15;
+
+/// E3a - every root port, for the driver's life: the first with a high-speed device on it is taken (`root_port`), and
+/// when that device leaves, every port is watched again. EHCI enables a port only for a HIGH-SPEED device; for the back
+/// keyboard (low-speed) that means a high-speed hub - the T630's integrated rate-matching hub - with the keyboard
+/// behind it. A port whose device is not high-speed stays disabled, and is passed over until that device leaves.
+///
+/// A hub is enumerated and its ports scanned for the rest of the driver's life (`enumerate_hub` does not return while
+/// the hub works), so once one is found no other root port is watched; the T630's back sockets are all behind its one.
+fn root_ports(
+    ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize, dma: &Parts, said: &Cell<bool>,
+    n_ports: usize, host: &mut bound::Host,
+) -> ! {
+    let hw = bound::Hw { mmio, dma, op, said };
+    let irq = gs::driver::irq::Irq::granted(ctx);
+    // Ports passed over (not high-speed, a hub that did not come up, a device not bound), each until it leaves.
+    let mut passed = 0u32;
+    // The first look has no debounce: a device connected at boot has been there since power-on.
+    let mut booting = true;
+    loop {
+        let p = 'found: loop {
+            for q in 0..n_ports {
+                if mmio.read32(op + OP_PORTSC0 + q * 4) & PORTSC_CCS == 0 {
+                    passed &= !(1 << q);
+                    continue;
+                }
+                if passed & (1 << q) != 0 {
+                    continue;
+                }
+                if !booting {
+                    delay::hold_parked(ctx, DEBOUNCE); // connect-debounce before reset
+                }
+                if reset_root_port(ctx, mmio, op, q) {
+                    break 'found q;
+                }
+                passed |= 1 << q;
+            }
+            if booting {
+                booting = false;
+                ctx.log("ehci: no high-speed device on a root port - watching every port for one");
+            }
+            // Nothing to serve but answers: say so once (a report only when it differs), then wait for a plug.
+            host.report_if_changed(ctx);
+            serve_wake(ctx, mmio, op, &irq, &hw, host, None);
+        };
+        booting = false;
+        if !root_port(ctx, mmio, op, dma, said, p, &irq, &hw, host) {
+            passed |= 1 << p;
         }
     }
-
-    idle_draining(&ctx);
 }
 
 /// Reset root port `p` (from 0) and say what came up. `true` when the port enabled - which EHCI does only for a
@@ -217,50 +249,40 @@ fn reset_root_port(ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op:
 }
 
 /// Root port `p`, enabled, its device at address 0: a hub is enumerated (`enumerate_hub`, which does not return
-/// while the hub works); a device on its own is bound if it can be and SERVED until the port says it left, then the
-/// port is watched for the next device. Returns only when a hub's own bring-up fails.
+/// while the hub works); a device on its own is bound if it can be and SERVED until the port says it left. `true`
+/// when the port is empty again, `false` when its device is to be passed over until it leaves: a hub whose own
+/// bring-up failed, or a device not bound (it did not answer, or is not one this host binds).
+#[allow(clippy::too_many_arguments)]
 fn root_port(
     ctx: &ServiceContext, mmio: &godspeed::driver::Registers, op: usize, dma: &Parts, said: &Cell<bool>, p: usize,
-    host: &mut bound::Host,
-) {
-    let hw = bound::Hw { mmio, dma, op, said };
+    irq: &gs::driver::irq::Irq, hw: &bound::Hw, host: &mut bound::Host,
+) -> bool {
     let off = op + OP_PORTSC0 + p * 4;
-    let irq = gs::driver::irq::Irq::granted(ctx);
-    loop {
-        // What is on the port: its device descriptor's class, at the default address.
-        let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
-        if control_retry(ctx, mmio, dma, op, said, &Ep::hs(0, 64), &setup, 18, true, 3).is_none() {
-            ctx.log_fmt(format_args!("ehci: the device on root port {} did not answer its descriptor", p + 1));
-        } else if dma.ctl.read8(DATA_BUF + 4) == 0x09 {
-            enumerate_hub(ctx, mmio, op, dma, said, host);
-            return;
-        } else {
-            let gen = host.next_gen();
-            host.dev = bound::try_bind(ctx, &hw, Ep::hs(0, 64), p as u8 + 1, 0, gen);
-        }
-        host.report_if_changed(ctx);
-        // Serve the bound device's driver - or answer that nothing is bound - until the port is empty. The port is
-        // read on every wake; a request wakes at once, and the deadline bounds how long an unplug goes unseen.
-        while mmio.read32(off) & PORTSC_CCS != 0 {
-            serve_wake(ctx, mmio, op, &irq, &hw, host, None);
-        }
-        host.unbind(ctx);
-        host.report_if_changed(ctx);
-        ctx.log_fmt(format_args!("ehci: root port {} is empty - waiting for a device", p + 1));
-        loop {
-            while mmio.read32(off) & PORTSC_CCS == 0 {
-                serve_wake(ctx, mmio, op, &irq, &hw, host, None);
-            }
-            delay::hold_parked(ctx, DEBOUNCE); // connect-debounce before reset
-            if reset_root_port(ctx, mmio, op, p) {
-                break;
-            }
-            // Not high-speed: nothing this host can reach on that port without a companion. Wait for it to leave.
-            while mmio.read32(off) & PORTSC_CCS != 0 {
-                serve_wake(ctx, mmio, op, &irq, &hw, host, None);
-            }
-        }
+    // What is on the port: its device descriptor's class, at the default address.
+    let setup = [0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 0x12, 0x00]; // Get_Descriptor(Device), 18
+    if control_retry(ctx, mmio, dma, op, said, &Ep::hs(0, 64), &setup, 18, true, 3).is_none() {
+        ctx.log_fmt(format_args!("ehci: the device on root port {} did not answer its descriptor", p + 1));
+    } else if dma.ctl.read8(DATA_BUF + 4) == 0x09 {
+        enumerate_hub(ctx, mmio, op, dma, said, host);
+        return false;
+    } else {
+        let gen = host.next_gen();
+        host.dev = bound::try_bind(ctx, hw, Ep::hs(0, 64), p as u8 + 1, 0, gen);
     }
+    host.report_if_changed(ctx);
+    if host.dev.is_none() {
+        // Nothing bound: the other ports are watched while this one's device stays, passed over.
+        return false;
+    }
+    // Serve the bound device's driver - or answer that nothing is bound - until the port is empty. The port is read
+    // on every wake; a request wakes at once, and the deadline bounds how long an unplug goes unseen.
+    while mmio.read32(off) & PORTSC_CCS != 0 {
+        serve_wake(ctx, mmio, op, irq, hw, host, None);
+    }
+    host.unbind(ctx);
+    host.report_if_changed(ctx);
+    ctx.log_fmt(format_args!("ehci: root port {} is empty - watching every root port for a device", p + 1));
+    true
 }
 
 /// One wait of `ROOT_WATCH_MS` at most: a message is served (`bound::Host::serve`), an interrupt acknowledged.
@@ -371,8 +393,8 @@ fn lay_out(ctx: &ServiceContext, a: godspeed::driver::Arena) -> Option<Parts> {
     match laid {
         Ok(p) => {
             ctx.log_fmt(format_args!(
-                "ehci: arena laid out - control transfer at {:#x}, poll slots at {:#x} ({} of {} bytes)",
-                p.ctl.offset(), p.poll.offset(), l.used(), l.len()));
+                "ehci: arena laid out - control transfer at {:#x}, poll slots at {:#x}, bulk transfers at {:#x} ({} of {} bytes)",
+                p.ctl.offset(), p.poll.offset(), p.bulk.offset(), l.used(), l.len()));
             Some(p)
         }
         Err(e) => {

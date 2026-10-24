@@ -12379,7 +12379,7 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
         // high-speed device, and a stick moves real bulk transfers - and reports it as host `ehci`.
         "-device", "usb-ehci,id=ehci",
         "-drive", &format!("id=stick,format=raw,if=none,file={stick_str}"),
-        "-device", "usb-storage,bus=ehci.0,drive=stick",
+        "-device", "usb-storage,bus=ehci.0,drive=stick,id=stick_dev",
         "-monitor", &monitor,
     ]);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -12532,6 +12532,19 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
            "the package reads the stick's INQUIRY through ehci: a bulk OUT and two bulk INs, through gs::driver::bus");
     let out = run!(b"godspeed uninstall godspeed/kind-stick yes\r", 120);
     check!(out.contains("uninstalled"), "kind-stick uninstalls");
+    // EVERY ROOT PORT is watched, not only the one that had a device at boot (Audit 25's finding 5): the stick is
+    // unplugged from port 1 and plugged into port 3, and `ehci` must find and bind it there. A drive made with
+    // `-drive` goes with its device, so the second plug is given a drive of its own.
+    monitor_cmd("device_del stick_dev\n");
+    let _ = collect_until(&buf, &mut cursor, b"ehci: root port 1 is empty", Duration::from_secs(30));
+    monitor_cmd(&format!("drive_add 0 if=none,id=stick2,format=raw,file={stick_str}\n"));
+    monitor_cmd("device_add usb-storage,bus=ehci.0,port=3,drive=stick2,id=stick_dev2\n");
+    let _ = collect_until(&buf, &mut cursor, b"on root port 3 bound", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    let moved = log.rfind("ehci: root port 1 is empty").map(|i| &log[i..]).unwrap_or("");
+    check!(moved.contains("ehci: USB device 46f4:0001 on root port 3 bound for a driver of its own")
+               && moved.contains("supervisor: USB device 46f4:0001 attached on ehci"),
+           "unplugged and plugged into another root port, the stick is found there, bound and reported again");
 
     // THE HARDWARE CARD'S PACKAGE, in QEMU: `kind-rtl` uses the RTL8168's interrupt and DMA, and QEMU has no RTL8168 -
     // its e1000 has no MSI, so no interrupt is routed either. What QEMU can show is the path to it: a driver asking
