@@ -12495,13 +12495,39 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
             thread::sleep(Duration::from_millis(500));
         }
     };
+    // The unplug comes while a QUESTION is open, and its notice must not answer it: the hosts pushed an Enter
+    // after a notice until 2026-10-24, which answered `godspeed install` N on the VisionFive. The question is
+    // `uninstall`'s, answered `n` by this suite only after the notice, so the package stays installed.
+    send(&mut write_half, b"godspeed uninstall godspeed/kind-usb\r");
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(60));
+    let asked_at = buf.lock().unwrap().len();
     monitor_cmd("device_del fser_dev\n");
     let _ = collect_until(&buf, &mut cursor, b"its USB device is not attached", Duration::from_secs(30));
+    let _ = collect_until(&buf, &mut cursor, b"USB device removed (xhci)", Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(2));
+    let while_asked = String::from_utf8_lossy(&buf.lock().unwrap()[asked_at..]).to_string();
+    check!(while_asked.contains("USB device removed (xhci)") && !while_asked.contains("gsh>"),
+           "a device's notice while a [y/N] question is open does not answer it: the question is still open");
+    let declined = run!(b"n\r", 60);
+    check!(!declined.contains("uninstalled godspeed"), "and the answer typed after it is the one taken");
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     check!(log.contains("supervisor: installed godspeed/kind-usb stopped - its USB device is not attached"),
            "unplugged after the supervisor's restart, the package is stopped: the new supervisor knew its device");
     let drove_before = log.matches("kind-usb: drove").count();
+    // The replug comes while a line is HALF TYPED at the prompt, and its notice must not run it: the prompt is
+    // drawn again under the notice with the line kept, and the rest of the line finishes it.
+    send(&mut write_half, b"echo half");
+    thread::sleep(Duration::from_millis(500));
+    let typed_at = buf.lock().unwrap().len();
     monitor_cmd("device_add usb-serial,bus=xhci.0,chardev=fser,id=fser_dev\n");
+    let _ = collect_until(&buf, &mut cursor, b"USB device connected (xhci)", Duration::from_secs(30));
+    // The prompt drawn again under the notice, with the line - read past here, so the wait for the prompt below
+    // is the one after the command, not this one.
+    let _ = collect_until(&buf, &mut cursor, b"gsh> echo half", Duration::from_secs(10));
+    let finished = run!(b" done\r", 60);
+    let around = String::from_utf8_lossy(&buf.lock().unwrap()[typed_at..]).to_string();
+    check!(finished.contains("half done") && !around.contains("\nhalf\r") && !around.contains("\nhalf\n"),
+           "a device's notice while a line is half typed does not run it: the line is kept and finished");
     let _ = collect_until(&buf, &mut cursor, b"kind-usb: listening", Duration::from_secs(30));
     if let Some(p) = usb_line.as_mut() { let _ = p.write_all(b"hello from the serial port\n"); }
     let _ = collect_until(&buf, &mut cursor, b"kind-usb: drove", Duration::from_secs(30));

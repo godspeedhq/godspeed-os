@@ -137,9 +137,10 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // events and once from the console, which shares the same line.
     gs::io::print(ctx, "\r\n");
     gs::io::println_fmt(ctx, args);
-    // GIVE THE PROMPT BACK. The shell reads byte 10 as Enter, so this makes it redraw `gsh>`
-    // under the notice - otherwise the cursor is left below a line the user did not type and
-    // the machine looks like it is waiting for something.
+    // GIVE THE PROMPT BACK, so the cursor is not left below a line the user did not type and the
+    // machine does not look like it is waiting for something. A signal the shell redraws `gsh>` on
+    // (`NOTICE_SIGNAL`); it was byte 10, Enter, until 2026-10-24, and an Enter answers a `[y/N]`
+    // question waiting on the console or runs a half-typed line (`xhci`'s `notify`, the VisionFive card).
     //
     // This exact call was reverted once ("the cure was worse than the complaint"): it fired on
     // every keyboard RE-BIND, and re-binds were happening constantly during the wedge storms,
@@ -147,7 +148,7 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // mechanism but its trigger - this is reachable only from a hot-plug event, which is a
     // person physically plugging something in. That cannot storm, and it is bounded by the
     // one thing no software defect can accelerate.
-    gs::driver::input::push(&ctx, 10);
+    gs::driver::input::notice_shown(&ctx);
 }
 
 /// Answer a request `dispatch` could not route (an empty payload) with `STATUS_ERR`, instead of consuming

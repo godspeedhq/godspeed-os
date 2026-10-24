@@ -1078,7 +1078,9 @@ fn notify(ctx: &ServiceContext, msg: &str) {
     // 'U' of "USB:". (Serial is unaffected.)
     gs::io::print(ctx, "\n USB: ");
     gs::io::print(ctx, msg);
-    gs::driver::input::push(&ctx, b'\n');
+    // The prompt back under the notice: a signal the shell redraws on, not an Enter, which would answer a
+    // `[y/N]` question waiting on the console (a plug answered `godspeed install` N, VisionFive 2026-10-24).
+    gs::driver::input::notice_shown(&ctx);
 }
 
 fn idle(ctx: &ServiceContext) -> ! {

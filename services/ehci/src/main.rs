@@ -1302,17 +1302,18 @@ const BOUND_CHECK_MS: u64 = 1_000;
 const DISCONNECT_ERR_THRESHOLD: u32 = 250;
 
 /// Print a hot-plug notice on the console, then nudge the shell to redraw its
-/// prompt by injecting a newline into the input ring (which this driver already
+/// prompt by pushing `NOTICE_SIGNAL` into the input ring (which this driver already
 /// feeds). The notice is async output that would otherwise leave the prompt
-/// scrolled up; the leading "\n" starts it on its own line and the injected
-/// newline supplies the terminating break + triggers a fresh `gsh> `.
+/// scrolled up; the leading "\n" starts it on its own line, and the shell ends it
+/// and draws a fresh `gsh> ` with the half-typed line. It pushed a real newline
+/// until 2026-10-24, which answered any `[y/N]` question waiting on the console.
 fn notify(ctx: &ServiceContext, msg: &str) {
     // Leading "\n " - the space is sacrificial: the framebuffer drops the first
     // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the
     // 'U' of "USB:". (Serial is unaffected.)
     gs::io::print(ctx, "\n USB: ");
     gs::io::print(ctx, msg);
-    gs::driver::input::push(&ctx, b'\n');
+    gs::driver::input::notice_shown(&ctx);
 }
 
 // THE USB RESET TIMINGS are held PARKED by `gs::driver::delay::hold_parked`, which is this driver's

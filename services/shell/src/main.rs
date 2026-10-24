@@ -903,6 +903,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 line.reprint(&ctx);
                 notice_above = true;
             }
+            // A USB host printed a device notice over the prompt (`USB: WiFi dongle connected (xhci)`): end its
+            // line and draw the prompt again under it, with what was being typed. The hosts sent an Enter for
+            // this until 2026-10-24, which RAN a half-typed line here, and answered a `[y/N]` waiting elsewhere.
+            gs::io::keys::NOTICE_SIGNAL => {
+                gs::io::print(ctx, "\r\n");
+                line.reprint(&ctx);
+            }
             b'\r' | b'\n' => {
                 notice_above = false;
                 // We own echo now, so move to a fresh line ourselves (the kernel used
@@ -26856,6 +26863,13 @@ fn read_confirm(ctx: &ShellCtx) -> bool {
         let b = ctx.console_read();
         match b {
             b'\r' | b'\n' => { gs::io::println(ctx, ""); break; }
+            // A USB host's notice printed over the question: not an answer. The question is still open, so
+            // the answer so far goes on a fresh line under the notice. A plug used to send an Enter here,
+            // which answered N (`godspeed install` on the VisionFive, 2026-10-24).
+            gs::io::keys::NOTICE_SIGNAL => {
+                gs::io::print(ctx, "\r\n[y/N]: ");
+                if let Ok(s) = core::str::from_utf8(&buf[..len]) { gs::io::print(ctx, s); }
+            }
             0x08 | 0x7f => { if len > 0 { len -= 1; gs::io::print(ctx, "\x08 \x08"); } }
             0x20..=0x7e => {
                 if len < buf.len() {
