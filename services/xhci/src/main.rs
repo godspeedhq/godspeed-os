@@ -4456,11 +4456,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         if Some(radio_now) != radio_was_bound {
             radio::announce(&ctx, radio.as_ref());
             if announce && radio_was_bound.is_some() {
-                let dongle = radio.as_ref().is_none_or(|r| r.what() == "the WiFi dongle");
+                // Which device, from this pass's binding or, for a removal, the last pass's: by then `radio`
+                // is already `None`, so it cannot say what left.
+                let dongle = radio_now.or(radio_was_bound.flatten()).is_some_and(radio::is_radio);
                 notify(&ctx, match (radio_now.is_some(), dongle) {
                     (true, true) => "WiFi dongle connected (xhci)",
                     (true, false) => "USB device connected (xhci)",
-                    (false, _) => "USB device removed (xhci)",
+                    (false, true) => "WiFi dongle removed (xhci)",
+                    (false, false) => "USB device removed (xhci)",
                 });
             }
         }
