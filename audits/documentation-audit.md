@@ -2056,3 +2056,20 @@ mistake on the way was put back and recorded below instead.
 
 **Gates:** every documentation checker green in this repository (dash, refs, symbols, index, facts, line refs,
 commands, comment symbols, foreign words, site, spdx) and the platform file's check.
+
+**Follow-up 2026-10-24, on the operator's word: five of the findings fixed, one withdrawn.** Each in a commit of its
+own, the code checked by `osdev test driver-packages`.
+- Finding 1: `xhci`'s removal notice says which device left again, from the previous pass's binding
+  ("WiFi dongle removed (xhci)").
+- Finding 2: `ehci`'s arena line names its bulk part.
+- Finding 3: the DMA question (`confirm_dma`, and `godspeed-pm`'s `memory` row and `utilities/61_godspeed.md`) names
+  an Intel PC and any device the kernel leaves unconfined.
+- Finding 5: `ehci` watches every root port (`root_ports`): the first with a high-speed device is taken, a port whose
+  device is not high-speed or not bound is passed over until it leaves, and a device plugged in after boot, on any
+  port, is found. The suite now moves the stick from port 1 to port 3 and sees it bound there.
+- Finding 7 is WITHDRAWN: it described something that cannot happen today. `UsbState::present` counts a device only
+  on a host its driver is wired to, and `wifi-usb` - the one row - is wired to `xhci` alone on a PC, so a row was never
+  attached on `ehci` and naming `USB_HOSTS.first()` was always the host it was attached on. `devices_answer` now names
+  the host that has the device anyway (`UsbState::host_of`), which only matters for a driver wired to two hosts. The
+  audit's check against the code read the host name and missed what `present` already required.
+- Open still: 4, 6, 8, 9, 10 and 11.
