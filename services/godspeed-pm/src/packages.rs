@@ -815,7 +815,7 @@ fn keep(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, how: &Keep<'_>, 
                 return Ok(None);
             }
         }
-        let already = !inspect && fs.exists(dest.as_str()).unwrap_or(false);
+        let already = !inspect && kept_here(ctx, &mut fs, dest, arch);
         if !already && !inspect {
             // WHERE IT CAME FROM, whole. This was built in a 200-byte path buffer, which a registry line, a key and
             // a date already fill: `published` was cut off every copy, and with it the retired-key rule the boot check
@@ -947,6 +947,27 @@ pub fn unpack(ctx: &ServiceContext, r: &mut Rows, reg: &config::Registry<'_>, ma
             r.fail(item, file, text.as_str());
         }
     }
+}
+
+/// Whether the copy already kept at `dest` is one this machine can run: its folder holds THIS machine's binary. A
+/// copy holds one machine's binary alone (`store`), and a disk moves between machines - the VisionFive's USB stick
+/// booted on a Pi 4 (2026-10-24) held `riscv64.elf`, was taken as already fetched, and `godspeed install` stopped at
+/// "its aarch64 binary is missing" with nothing to say how to go on. A copy for another machine is not this one's: it
+/// is taken away here, said, and kept again from the registry or the file, which hold every machine's.
+fn kept_here(ctx: &ServiceContext, fs: &mut gs::fs::Fs<'_>, dest: Path, arch: godspeed_package::Arch) -> bool {
+    if !fs.exists(dest.as_str()).unwrap_or(false) {
+        return false;
+    }
+    let mut bin = dest;
+    bin.push("/").push(arch.artifact_file());
+    if fs.exists(bin.as_str()).unwrap_or(false) {
+        return true;
+    }
+    let _ = fs.delete_all(dest.as_str());
+    ctx.log_fmt(format_args!(
+        "godspeed: {} held another machine's binary and not this one's ({}) - replaced from the source",
+        dest.as_str(), arch.artifact_file()));
+    false
 }
 
 /// Keep a checked release in `dest`: its binary for `arch` streamed from `s` into a staging folder and checked
@@ -1133,7 +1154,7 @@ fn keep_local(ctx: &ServiceContext, s: &mut dyn Source, r: &mut Rows, k: &mut Lo
     let vtext = cell(format_args!("{}", version));
     let dest = local_dir(name, vtext.as_str());
     let mut fs = gs::fs::Fs::new(ctx);
-    let already = !k.inspect && fs.exists(dest.as_str()).unwrap_or(false);
+    let already = !k.inspect && kept_here(ctx, &mut fs, dest, arch);
     if k.inspect {
         let mut bin = pkg;
         bin.push(arch.artifact_file());

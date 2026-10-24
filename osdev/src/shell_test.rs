@@ -12565,6 +12565,17 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
            "the package reads the stick's INQUIRY through ehci: a bulk OUT and two bulk INs, through gs::driver::bus");
     let out = run!(b"godspeed uninstall godspeed/kind-stick yes\r", 120);
     check!(out.contains("uninstalled"), "kind-stick uninstalls");
+    // A DISK FROM ANOTHER MACHINE: the fetched copy stays after the uninstall, holding this machine's binary alone.
+    // Renamed to look like the VisionFive's, it is the USB stick moved to a Pi 4 (2026-10-24), where `install` took it
+    // as already fetched and stopped at "its aarch64 binary is missing". From the file again it must be replaced.
+    let _ = run!(b"rename /system/packages/godspeed/kind-stick/0.1.0/x86_64.elf riscv64.elf\r", 30);
+    let again = run!(b"godspeed install /kind-stick-0.1.0.gsp yes\r", 240);
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("held another machine's binary and not this one's") && again.contains("unpacked from")
+               && !again.contains("binary is missing"),
+           "a fetched copy holding another machine's binary is replaced from the file, and the install goes on");
+    let out = run!(b"godspeed uninstall godspeed/kind-stick yes\r", 120);
+    check!(out.contains("uninstalled"), "and it uninstalls again");
     // EVERY ROOT PORT is watched, not only the one that had a device at boot (Audit 25's finding 5): the stick is
     // unplugged from port 1 and plugged into port 3, and `ehci` must find and bind it there. A drive made with
     // `-drive` goes with its device, so the second plug is given a drive of its own.
@@ -12585,8 +12596,10 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     // is not the chip it drives and touches nothing, and gives the NIC back.
     let rtl = run!(b"godspeed install /kind-rtl-0.1.0.gsp yes\r", 240);
     check!(rtl.contains("also asks for DMA memory"), "kind-rtl, which asks for DMA memory, is asked about it");
-    if !rtl.contains("kind-rtl: took") {
-        let _ = collect_until(&buf, &mut cursor, b"kind-rtl: took", Duration::from_secs(30));
+    // The END of its line, not its start: a check that waits for `kind-rtl: took` reads the line before the rest of
+    // it has arrived when anything is printed just before it (2026-10-24, net-stack's "not running" line).
+    if !rtl.contains("so it touches nothing") && !rtl.contains("tally by DMA") {
+        let _ = collect_until(&buf, &mut cursor, b"touches nothing", Duration::from_secs(30));
     }
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     check!(log.contains("kind-rtl: took the ethernet device over - 8086:100e, not the RTL8168 this package drives, so it touches nothing"),
