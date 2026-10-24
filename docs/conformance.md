@@ -491,7 +491,8 @@ Two more defects, again found only by running it:
 
 ### And the floor is now held mechanically
 
-`README.md` declares Python 3.8, and a hand-measured number is right on the day it is taken.
+A hand-measured floor is right on the day it is taken. `README.md` quoted it (3.8) until 2026-10-24; it now
+sends a contributor to `FLOOR` in `scripts/python_floor_check.py` instead, so there is one copy.
 `scripts/python_floor_check.py` fails if any tracked script uses a feature newer than `FLOOR`, and it
 makes the same function-local-annotation distinction the measurement did: at module or class level
 `list[str]` genuinely needs 3.9, inside a function body it never evaluates. Proved by planting a

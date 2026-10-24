@@ -2,14 +2,15 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """The declared minimum Python version must be the TRUE one.
 
-`README.md` tells a contributor they need Python 3.8 or newer. That number was measured by hand on
+A contributor needs to know the oldest Python this repository runs on. The number was measured by hand on
 2026-09-26 - and a number measured by hand is right on the day it is taken and silently wrong
 afterwards, which is the lesson `shared_surface_check.py` was written for. The next script that uses a
 `match` statement raises the real floor to 3.10 and nothing would say so; a contributor on 3.8 would
 get a `SyntaxError` from a checker, which is the worst possible first experience of this repository.
 
-So: the floor is declared in ONE place (`FLOOR` below, and `README.md` quotes it), and this fails if
-any tracked Python uses a feature newer than that.
+So: the floor is declared in ONE place, `FLOOR` below - `README.md` sends a contributor here rather than
+quoting it, so there is no second copy to drift - and this fails if any tracked Python uses a feature
+newer than that.
 
 WHAT IT CHECKS, and why the list is short. Only features whose ABSENCE is a hard error on the floor
 version - a `SyntaxError` or a `TypeError` at import - are worth gating. Style differences are not.
@@ -50,8 +51,8 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# THE DECLARED FLOOR. Change this only with the README, and only knowing that a contributor on the
-# old floor will get a SyntaxError rather than a message.
+# THE DECLARED FLOOR, and the only copy of it (README.md points here). Change it only knowing that a
+# contributor on the old floor will get a SyntaxError rather than a message.
 FLOOR = (3, 8)
 
 # (version, name, pattern, applies_to_line) - `applies_to_line` may refuse a match by context.
@@ -144,12 +145,12 @@ def main():
         print()
         print("Either rewrite it to work on %d.%d, or RAISE the floor deliberately: change `FLOOR` in"
               % (FLOOR[0], FLOOR[1]))
-        print("this file and the Requirements line in README.md together. A contributor on the old")
+        print("this file, which is where README.md sends a contributor to find it. A contributor on the old")
         print("floor gets a SyntaxError from a checker, which is the worst first experience this")
         print("repository can offer - so the number must never drift upward by accident.")
         return 1
 
-    print("python floor: %d tracked script(s) all run on Python %d.%d, the version README.md declares"
+    print("python floor: %d tracked script(s) all run on Python %d.%d, the declared floor"
           % (scanned, FLOOR[0], FLOOR[1]))
     return 0
 

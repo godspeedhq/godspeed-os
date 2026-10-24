@@ -8,6 +8,11 @@ A capability-based microkernel OS written in Rust. Every privileged action requi
 
 > **New here?** [**GETTING_STARTED.md**](GETTING_STARTED.md) takes you from zero to your first running service in a few minutes.
 >
+> **Writing software for GodspeedOS without building the OS?** The developer CLI,
+> [**godspeed-cli**](https://github.com/godspeedhq/godspeed-cli), creates, builds, packages and publishes a
+> service, utility, app, driver or library, and a Godspeed machine fetches and installs it with `godspeed fetch`
+> and `godspeed install` at its `gsh>` prompt.
+>
 > **Contributing?** [**CONTRIBUTING.md, "Learn from a real change"**](CONTRIBUTING.md#learn-from-a-real-change) points every kind of contribution - a service, a driver, the kernel, a utility, a test, the docs, a gate, a chaos find - at code in the tree and a merged commit that did exactly that.
 
 ---
@@ -21,11 +26,10 @@ requirement (§26.11), and a diagram you can redraw from memory is the only proo
                ┌────────────────────────────────────────────────────────┐
  applications  │ shell  observe  chaos  edit  examples...               │
                ├────────────────────────────────────────────────────────┤
- services      │ fs  net-stack  console  events  time                   │
+ services      │ fs  net-stack  console  events  time  ...              │
                ├────────────────────────────────────────────────────────┤
- DRIVERS       │ block-driver  nic-driver  xhci  ehci  dwc2             │
- (userspace)   │ wifi-driver  wifi-usb  audio-driver  pwm-audio         │
-               │ each one a service, with only what it asked for        │
+ DRIVERS       │ block-driver  nic-driver  xhci  ehci  dwc2  ...        │
+ (userspace)   │ each one a service, with only what it asked for        │
                └────────────────────────────────────────────────────────┘
                          ▲
                          │  spawns each, and RESTARTS it when it dies
@@ -49,7 +53,7 @@ requirement (§26.11), and a diagram you can redraw from memory is the only proo
                          │  arch::imp - the only seam, and the only unsafe
                ┌────────────────────────────────────────────────────────┐
  hardware      │ x86_64   ARM (Pi 2)   AArch64 (Pi 4)   RISC-V (VF2)    │
-               │ four ISAs, three memory models, one kernel             │
+               │ four ISAs, one kernel                                  │
                └────────────────────────────────────────────────────────┘
 ```
 
@@ -57,9 +61,9 @@ Three things to take from it:
 
 - **The kernel spawns exactly one service.** Everything else is spawned by the supervisor, which is
   itself an ordinary restartable service. The kernel is the only thing that cannot be killed.
-- **Drivers live in userspace.** `xhci`, `nic-driver` and the rest are services holding a capability
-  to a memory-mapped region and an interrupt line - nothing more. A crashed driver is a restart, not
-  a reboot.
+- **Drivers live in userspace.** `xhci`, `nic-driver` and the rest are services holding only what they
+  were granted: their device's registers, its interrupt, and, for a device that does DMA, a DMA arena. A
+  crashed driver is a restart, not a reboot.
 - **Authority points downward and is always explicit.** Nothing is ambient: a service can do exactly
   what its spawn request was granted and no more, checked on every privileged syscall.
 
@@ -72,14 +76,13 @@ service. Each one is *mechanism*: the kernel enforces the rule and never decides
    service cannot read or write another's memory. Touching anything outside your mapped region is a
    page fault, and the service is killed rather than left running in an undefined state.
 
-2. **Scheduling.** Every CPU core has its own queue of runnable tasks and takes them in turn. A 10 ms
-   timer forces the switch whether the running task cooperates or not, so no service can hold a core
-   by refusing to yield.
+2. **Scheduling.** Every CPU core has its own queue of runnable tasks and takes them in turn. A timer
+   forces the switch whether the running task cooperates or not, so no service can hold a core by
+   refusing to yield.
 
 3. **IPC** - *inter-process communication*, how isolated services talk to each other. The kernel
-   copies each message from sender to receiver: at most 4 KiB, into a queue that holds 16 before the
-   sender has to wait. The copy is deliberate - sharing the memory instead would undo the isolation
-   in (1).
+   copies each message from sender to receiver, into a bounded queue; a sender to a full queue waits.
+   The copy is deliberate - sharing the memory instead would undo the isolation in (1).
 
 4. **Capabilities.** A capability is an unforgeable token naming one resource, the rights held over
    it, and a generation number. Every privileged syscall is checked against the caller's table, and
@@ -100,21 +103,21 @@ module serves none of the six.
 ## Portability
 
 One arch-neutral kernel sits behind a single seam, `arch::imp`; everything CPU-specific lives in
-`arch/<isa>/`. Adding an ISA is bounded to that directory plus the twelve registration files
+`arch/<isa>/`. Adding an ISA is bounded to that directory plus the registration files
 `docs/porting.md` marks; every `osdev build` refuses neutral code that reaches hardware outside the seam.
 
 | target | status |
 |---|---|
-| **x86-64** | **Full OS.** The `os-usb.img` you flash: 4 cores, shell, AHCI storage, networking, USB (xHCI + EHCI), WiFi through a USB dongle, sound through the HD Audio codec (speaker and headphones), IOMMU-confined drivers. Verified on an HP T630 (AMD GX-420GI) and a Dell Wyse 5070 (Intel J5005). |
-| **AArch64** (Raspberry Pi 4) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4-core SMP, GENET gigabit ethernet, the onboard CYW43455 WiFi (WPA2), USB keyboard and mass storage through the VL805 xHCI over PCIe, sound through the 3.5 mm jack, journalled filesystem. |
-| **32-bit ARM** (Raspberry Pi 2) | **Full OS.** Same neutral kernel: 4-core SMP, USB keyboard, USB mass storage, USB ethernet and a USB WiFi dongle - all through the one DWC2 controller - sound through the 3.5 mm jack, plus the filesystem and the shell. |
-| **RISC-V 64** (StarFive VisionFive 2 Lite) | **Full OS.** Boots to an interactive `gsh>` on real hardware: 4 harts on a JH7110, 1080p60 HDMI from a cold start, USB keyboard and mass storage through the onboard hub, DWMAC gigabit ethernet at zero packet loss, the onboard AIC8800 WiFi (WPA2), Sv39 paging, journalled filesystem. It has no audio output, and `audio` says so. The first port finished with **no arch-neutral kernel code naming the ISA**. |
+| **x86-64** | **Full OS**, verified on an HP T630 and a Dell Wyse 5070: SMP, the shell, AHCI storage, networking, USB (xHCI and EHCI), WiFi through a USB dongle, sound through the HD Audio codec, and IOMMU-confined drivers. |
+| **AArch64** (Raspberry Pi 4) | **Full OS** on real hardware: SMP, GENET ethernet, the onboard WiFi, USB through the VL805 xHCI over PCIe, sound through the 3.5 mm jack, the journalled filesystem. |
+| **32-bit ARM** (Raspberry Pi 2) | **Full OS** on real hardware, on the same neutral kernel: SMP, USB keyboard, mass storage, ethernet and a WiFi dongle, all through the one DWC2 controller, sound through the 3.5 mm jack, the filesystem and the shell. |
+| **RISC-V 64** (StarFive VisionFive 2 Lite) | **Full OS** on real hardware: SMP on a JH7110, HDMI, USB through the onboard hub, DWMAC ethernet, the onboard WiFi, Sv39 paging, the journalled filesystem. It has no audio output, and `audio` says so. The first port finished with **no arch-neutral kernel code naming the ISA**. |
 | RISC-V 32, LoongArch | Compile and boot to their UART. |
 | s390x | Compiles clean (big-endian). |
 
-All four full ports are validated the same way and to the same bar: `selfcheck` (500-odd assertions),
-then `chaos max-carnage` killing every service repeatedly, then `selfcheck` again, then a USB hotplug,
-then `selfcheck` once more - **zero failures, zero kernel panics, zero liveness wedges**.
+All four full ports are validated the same way and to the same bar: `selfcheck`, then `chaos max-carnage`
+killing every service repeatedly, then `selfcheck` again, then a USB hotplug, then `selfcheck` once more -
+**no failures, no kernel panics, no liveness wedges**.
 
 See **[docs/multi-arch.md](docs/multi-arch.md)** for the proof, **[docs/arm32-status.md](docs/arm32-status.md)**
 and **[docs/aarch64.md](docs/aarch64.md)** for the two Pi ports,
@@ -124,7 +127,9 @@ and **[docs/aarch64.md](docs/aarch64.md)** for the two Pi ports,
 ## Writing a device driver
 
 A driver is an ordinary service. **It needs no kernel source change** - you name the device by its
-industry-standard PCI class code, and the kernel supplies the rest:
+industry-standard PCI class code, and the kernel supplies the rest. There are two ways to ship one.
+
+**In the tree**, as a row in the supervisor's image table:
 
 ```
    supervisor IMAGES[]:
@@ -133,28 +138,36 @@ industry-standard PCI class code, and the kernel supplies the rest:
                     the device's OWN claim ───┘      │  └─ confine it behind the IOMMU
                     about what it is                 └──── which BAR holds its registers
 
-   the kernel then grants:  MMIO window · DMA arena · BDF · IOMMU domain · MSI vector
+   the kernel then grants:  MMIO window · BDF · MSI vector, and where the row asks,
+                            a DMA arena in its own IOMMU domain
 ```
 
 `0x0C0330` means "xHCI controller" everywhere, forever. The kernel records what is on the bus and holds
 no opinion about any of it - no per-class statics, no vendor whitelist, no branch that decides *this is
 the xHCI*. What it cannot do is decide *which* device you meant when there are two of a class; the
-supervisor names one, and that wins.
+supervisor names one, and that wins. An in-tree driver ships inside the image, so adding one means a
+rebuild and a reflash - and the cost of a kernel change is not compile time, it is that editing kernel
+source reopens *"is the kernel still correct?"*. Linking a new driver crate against unchanged kernel code
+reopens nothing.
 
-The image still ships inside the build, so adding a driver means a rebuild and a reflash. That is not
-the expensive part: the cost of a kernel change is not compile time, it is that editing kernel source
-reopens *"is the kernel still correct?"*. Linking a new driver crate against unchanged, battle-tested
-kernel code reopens nothing.
+**As a package**, with no rebuild at all: its contract names the device (`hw_pci_class`, `hw_pci_bar`),
+the developer CLI packages and signs it, and the operator installs it on a running machine and approves the
+device. GodspeedOS 0.29.0 and 0.30.0 give a driver package its device's registers only; the release after
+0.30.0 adds its interrupt, a DMA arena (asked about separately, because on a machine whose IOMMU does not
+confine the device it is kernel-equivalent reach), taking over a device an in-tree driver handles, and USB
+devices by vendor and product. `docs/developer-services-design.md` 13.1 has the whole of it.
 
 ## How it works
 
 **Capabilities** - every privileged action requires an explicit, unforgeable token. A capability carries a resource ID, a rights set, and a generation number. Stale capabilities return `EndpointDead`. Forged ones return `CapNotHeld`. There is no ambient authority.
 
-**IPC** - synchronous message passing with bounded queues (16 messages per endpoint). Services are pinned to CPU cores. Cross-core sends route through the kernel's routing table and wake the receiver via IPI. Zero-copy is permanently rejected - isolation is more important.
+**IPC** - synchronous message passing with bounded queues. Services are pinned to CPU cores. Cross-core sends route through the kernel's routing table and wake the receiver via IPI. Zero-copy is permanently rejected - isolation is more important.
 
 **Supervisor:** the service with restart authority. When a service is killed, its endpoint generation is bumped. All outstanding capabilities immediately become stale. Clients detect `EndpointDead`, look up the new instance by name via the kernel's name directory, and resume. The new instance may be on a different core, which is invisible to callers. The supervisor is itself restartable: if it dies, the **kernel respawns it** and it reconciles with the still-running services. The only unkillable component is the kernel.
 
-**Scheduler** - per-core run queues, round-robin, 10 ms preemption quantum enforced by the local timer. Services are placed at spawn and never migrate. Yield is advisory; preemption is not.
+**Scheduler** - per-core run queues, round-robin, with a preemption quantum enforced by the local timer. Services are placed at spawn and never migrate. Yield is advisory; preemption is not.
+
+The constants behind these - the message size, the queue depth, the quantum - are in `CLAUDE.md` (§8.5, §9.1).
 
 ---
 
@@ -178,23 +191,23 @@ These distil into the **[Ten Commandments of Godspeed](COMMANDMENTS.md)**, the h
 
 GodspeedOS treats testing as architecture. The suite is layered - each layer must pass before the next is meaningful.
 
-| Suite | Purpose | Status |
-|-------|---------|--------|
-| Identity (15 tests, 24 cases) | Pin constitutional invariants | 24/24 ✅ |
-| Property (P1-P10) | Universal correctness under random inputs | 10/10 |
-| Fuzz (F1-F8) | Kernel never panics on user-controllable input | Active |
-| Stress (S1-S10) | No drift, leaks, or corruption over time | Active |
-| Performance (B1-B10) | Latency / throughput baselines | Active |
-| Adversarial (A1-A15) | Capability isolation under direct attack | Active |
-| Chaos (C1-C7) | Graceful degradation under partial failures | Active |
+| Suite | Purpose |
+|-------|---------|
+| Identity | Pin constitutional invariants (`CLAUDE.md` §22) |
+| Property (P1-P10) | Universal correctness under random inputs |
+| Fuzz (F1-F8) | Kernel never panics on user-controllable input |
+| Stress (S1-S10) | No drift, leaks, or corruption over time |
+| Performance (B1-B10) | Latency / throughput baselines |
+| Adversarial (A1-A15) | Capability isolation under direct attack |
+| Chaos (C1-C7) | Graceful degradation under partial failures |
 
 The layers above are categories - each generalises over many inputs. Below them sit **scenario tests**,
 which do the opposite: one situation, forced deliberately, because waiting for it is not practical.
 
-| Scenario | What it forces | Status |
-|----------|----------------|--------|
-| `peer-storm` | Kills `block-driver` every 60 ms for 20 s while the shell drives file I/O - the window where a service's peer is unreachable, manufactured rather than waited for. Every outage must END; a permanent one is the bug. | 7/7 ✅ |
-| `adopt-storm` | Storms the **supervisor** itself, so its reconciliation path runs over and over: 84 deaths and 462 service adoptions in one run, with the filesystem still working afterwards. | 7/7 ✅ |
+| Scenario | What it forces |
+|----------|----------------|
+| `peer-storm` | Kills `block-driver` over and over while the shell drives file I/O - the window where a service's peer is unreachable, manufactured rather than waited for. Every outage must END; a permanent one is the bug. |
+| `adopt-storm` | Storms the **supervisor** itself, so its reconciliation path runs over and over, with the filesystem still working afterwards. |
 
 They exist because two failures could not be reproduced any other way: the hardware they appear on
 restarts services faster than a test can catch, and one of the two ARM ports cannot mount a disk under
@@ -204,33 +217,22 @@ emulation at all. `peer-storm` found a real protocol desync on its first outing 
 ### Static analysis & unsafe audit
 
 Every `unsafe` block is inventoried in `audits/unsafe-audit.md` and enforced by
-`scripts/unsafe_check.py` - counts may not grow without a written SAFETY argument.
-The inventory grows as the system does - four CPU ports and userspace drivers all need it - so the
-check is that every line is ACCOUNTED for, not that the count stays still.
-
-The first row below is from the **current tree** (re-run `python scripts/unsafe_check.py` to reproduce
-it). The other three are **dated evidence** from the boot-verified pass of 2026-05-31 on the AMD T630
-(`milestones/testing/static-analysis-audit.md`) and are not re-measured on every change - they sat
-under a "figures below are from the current tree" line that made three-month-old numbers read as live:
-
-| Check | Result |
-|-------|--------|
-| Unsafe confined to permitted layers (§18.1) **(current tree)** | audit passes: 1222 lines across 78 files, no unaccounted additions |
-| Safety / correctness lints (static-mut refs, fn-casts, redundant `unsafe`) *(2026-05-31)* | ✅ 0 |
-| Kernel build warnings *(2026-05-31)* | 104 → 57 (remaining are intentional unwired architecture) |
-| Hardware boot regression *(2026-05-31, T630)* | ✅ clean - 4 cores, cross-core ping/pong to 83k+ msgs, zero faults |
+`scripts/unsafe_check.py`: an `unsafe` line the audit does not account for fails the build, and a count
+may not grow without a written SAFETY argument. `python scripts/unsafe_check.py` reports the current
+inventory. Every service, example, the standard library and `osdev` carry `#![deny(unsafe_code)]`, so the
+compiler refuses `unsafe` there before any script runs.
 
 ---
 
 ## Getting started
 
-**Want to write a service?** See [**GETTING_STARTED.md**](GETTING_STARTED.md) - a 5-minute, copy-`examples/00-hello` walkthrough. The rest of this section is about building and booting the OS itself.
+**Want to write a service?** See [**GETTING_STARTED.md**](GETTING_STARTED.md) - a short, copy-`examples/00-hello` walkthrough. The rest of this section is about building and booting the OS itself.
 
-**Requirements:** Rust nightly, pinned to an exact date in `rust-toolchain.toml` (`nightly-2026-05-16`; rustup installs it for you), QEMU on your PATH, **Python 3.8 or newer on your PATH as `python`**, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
+**Requirements:** Rust nightly, pinned to an exact date in `rust-toolchain.toml` (rustup installs it for you), QEMU on your PATH, **Python 3 on your PATH as `python`**, an x86_64 host, and the Limine bootloader binaries (one-time setup below). The same commands work on Linux, macOS, and Windows - `osdev` handles the platform differences, and there is no Makefile to keep in sync.
 
-**Python is not optional, so it is stated plainly rather than discovered.** `osdev build` runs the enforcement layer - the checkers in `scripts/` that hold the Ten Commandments, the contracts, the arch boundary and the documentation - and it **refuses to build** if it cannot run one of them, because a checker that cannot run is not a checker that passed. Building for a non-x86 board needs it too: `scripts/board.py` and the three per-board scripts are the only way to produce a Raspberry Pi or VisionFive image. The floor is **3.8**, set by one walrus operator in `scripts/commandments.py`; `docs/conformance.md` records how that was measured and why the `list[str]` annotations in four checkers do NOT raise it to 3.9.
+**Python is not optional, so it is stated plainly rather than discovered.** `osdev build` runs the enforcement layer - the checkers in `scripts/` that hold the Ten Commandments, the contracts, the arch boundary and the documentation - and it **refuses to build** if it cannot run one of them, because a checker that cannot run is not a checker that passed. Building for a non-x86 board needs it too: `scripts/board.py` and the three per-board scripts are the only way to produce a Raspberry Pi or VisionFive image. The oldest Python they run on is `FLOOR` in `scripts/python_floor_check.py`, which fails if any script needs a newer one; `docs/conformance.md` records how it was measured.
 
-**Set up Limine (once).** GodspeedOS boots via the Limine bootloader, whose binaries are not committed (`tools/` is gitignored). Download a Limine binary release (https://github.com/limine-bootloader/limine/releases - the project tracks the 12.x line) and copy these into `tools/limine/`:
+**Set up Limine (once).** GodspeedOS boots via the Limine bootloader, whose binaries are not committed (`tools/` is gitignored). Download the Limine binary release the release workflow uses (`LIMINE_VERSION` in `.github/workflows/release.yml`, from https://github.com/limine-bootloader/limine/releases) and copy these into `tools/limine/`:
 
 - `BOOTX64.EFI` - the UEFI bootloader (used by `osdev image`),
 - `limine-bios.sys` - the BIOS stage,
@@ -273,7 +275,7 @@ py scripts/conform.py --list
 ```
 
 A clean tree says `0 would be fixed, 0 need a decision - N checks ran, N passed`. The count of checks
-that RAN is there on purpose: a run that silently skipped twelve of them and printed a clean verdict is
+that RAN is there on purpose: a run that silently skipped some of them and printed a clean verdict is
 the failure the whole thing exists to prevent.
 
 **The codes are readable.** `GS0001`..`GS0010` are the Ten Commandments - the number IS the numeral, so
@@ -339,45 +341,28 @@ website/      documentation site (mdBook; renders this repo's docs)
 API references under `/api`:
 
 - [**`godspeed`** - the standard library](https://godspeedhq.github.io/godspeed-os/api/godspeed/),
-  imported as `gs`. **This is what you write a program against** - 164 public items across the 13 modules below, plus 33 in the `driver` tier (counting free functions, constants and types, plus the methods on those types and every re-export; recounted 2026-10-09, `docs/stdlib-brief.md` has the method; `scripts/stdlib_gap_check.py --list` shows the other side of the same surface):
-
-  | Module | Covers |
-  |--------|--------|
-  | [`fs`](https://godspeedhq.github.io/godspeed-os/api/godspeed/fs/index.html) | files and directories, streaming, `open` as a capability |
-  | [`net`](https://godspeedhq.github.io/godspeed-os/api/godspeed/net/index.html) | sockets, listeners, connections, DNS - a socket IS a capability |
-  | [`ipc`](https://godspeedhq.github.io/godspeed-os/api/godspeed/ipc/index.html) | messages between services: send, receive, and giving a capability away |
-  | [`cap`](https://godspeedhq.github.io/godspeed-os/api/godspeed/cap/index.html) | capability rights, acquiring, duplicating, dropping |
-  | [`file`](https://godspeedhq.github.io/godspeed-os/api/godspeed/file/index.html) | a file held as a real kernel capability |
-  | [`task`](https://godspeedhq.github.io/godspeed-os/api/godspeed/task/index.html) | yielding, waiting, uptime, and whether the wall clock can be trusted |
-  | [`call`](https://godspeedhq.github.io/godspeed-os/api/godspeed/call/index.html) | bounded request/reply, safe for a caller that also serves |
-  | [`io`](https://godspeedhq.github.io/godspeed-os/api/godspeed/io/index.html) | console output |
-  | [`error`](https://godspeedhq.github.io/godspeed-os/api/godspeed/error/index.html) | one error type, and `retry_is_safe` |
-  | [`resource`](https://godspeedhq.github.io/godspeed-os/api/godspeed/resource/index.html) | minting and revoking a delegated resource capability |
-  | [`record`](https://godspeedhq.github.io/godspeed-os/api/godspeed/record/index.html) | typed tables, and the views derived from them |
-  | [`trace`](https://godspeedhq.github.io/godspeed-os/api/godspeed/trace/index.html) | metrics, the IPC event ring, and the log tail - publish, and read back |
-  | [`addr`](https://godspeedhq.github.io/godspeed-os/api/godspeed/addr/index.html) | IPv4 addresses |
-  | [`driver`](https://godspeedhq.github.io/godspeed-os/api/godspeed/driver/index.html) | for drivers: bounded hardware waits, delays, and the interrupt the kernel granted |
-
+  imported as `gs`. **This is what you write a program against**: files, the network, IPC, capabilities,
+  bounded waits and request/reply, typed records, a program that runs and ends (`gs::program`, `gs::app`),
+  and, for drivers, `gs::driver`. Its API reference lists every module.
   [**Writing a program for GodspeedOS**](https://godspeedhq.github.io/godspeed-os/stdlib.html) is the
   place to start.
 - [**`godspeed-sdk`** - the layer underneath](https://godspeedhq.github.io/godspeed-os/api/godspeed_sdk/),
-  the raw syscall seam and the audited MMIO/DMA accessors a driver needs. **Reach for it only if you
-  are writing a driver.** That rule is measured rather than asserted: 13 of the 15 examples name only
-  `gs`, and the two that do not are `driver-skeleton` (MMIO and DMA, which is precisely what the SDK
-  exists for, CLAUDE.md §18.1) and `holder`, which hand-rolls one protocol on purpose so it is visible.
+  the raw syscall seam and the audited MMIO/DMA accessors. **Reach for it only if you are writing a
+  driver** (CLAUDE.md §18.1); everything else is written on `gs`.
 
 Two sections worth knowing about:
 [**the services**](https://godspeedhq.github.io/godspeed-os/services.html) - what each one is, what it
 may *not* do, and diagrams of how they reach each other over endpoints - and
-[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), all 59 of them, each with
-its full specification.
+[**the utilities**](https://godspeedhq.github.io/godspeed-os/utilities.html), every one of them, each
+with its full specification.
 
 The docs in this repo also render as a browsable site built with
 [mdBook](https://rust-lang.github.io/mdBook/). The site is a
-**derived view**: every page is an `{{#include}}` of the real file, so it never duplicates or drifts
-from the source. Acronyms link to the glossary and carry a hover definition, injected at build time so
-the markdown stays plain. A GitHub Action rebuilds and republishes it on every push to `main` that touches a
-doc, so editing `CLAUDE.md` or a `docs/` file updates the site automatically.
+**derived view**: most pages are an `{{#include}}` of the real file, so they never duplicate or drift
+from the source, and the few written for the site are checked against the repository by
+`scripts/site_check.py`. Acronyms link to the glossary and carry a hover definition, injected at build
+time so the markdown stays plain. A GitHub Action rebuilds and republishes it on every push to `main`
+that touches a doc, so editing `CLAUDE.md` or a `docs/` file updates the site automatically.
 
 Preview or update it locally:
 
@@ -387,7 +372,8 @@ cd website
 mdbook serve --open           # live-reload preview at http://localhost:3000
 ```
 
-How the includes work, how the gallery screenshots are captured, and the launch checklist are in
+`bash website/sync.sh` builds the whole site as the Action does, the API references included. How the
+includes work, how the gallery screenshots are captured, and the launch checklist are in
 [`website/README.md`](website/README.md).
 
 ---
