@@ -521,6 +521,11 @@ mod board {
     /// own `know.rs`, so the two cannot disagree about which question it is.
     pub const ASK_NET_PEERS: &[&str] = if cfg!(has_dwc2) {
         &["shell", "supervisor", "net-stack", "wifi-usb"]
+    } else if cfg!(has_wifi_driver) && cfg!(has_wifi_usb) {
+        // Both radios, where a board has two (the Pi 4 and the VisionFive, with the dongle in): this row has
+        // room for both, and was given only the onboard one, so "is the network up?" called the dongle's
+        // driver silent - it had never been asked (2026-10-24). `ask`'s own row has no room for a second.
+        &["shell", "supervisor", "net-stack", "wifi-driver", "wifi-usb"]
     } else if cfg!(has_wifi_driver) {
         &["shell", "supervisor", "net-stack", "wifi-driver"]
     } else {

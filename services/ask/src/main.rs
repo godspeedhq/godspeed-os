@@ -398,6 +398,9 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
     let mut ssid_lens = [0usize; 2];
     let mut statuses = [Got::<Radio>::Absent, Got::<Radio>::Absent];
     let mut present = [false; 2];
+    // Whether this row is given each running driver as a send peer (`RadioFact::given`): one it is not given is
+    // not asked, and the answer says so.
+    let mut given = [true; 2];
     if need_radios {
         let (s0, s1) = ssids.split_at_mut(1);
         let bufs = [&mut s0[0], &mut s1[0]];
@@ -405,12 +408,13 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
         for buf in bufs {
             if tt.live(RADIOS[i]) {
                 present[i] = true;
-                if ask_radio_status { statuses[i] = radio_status(ctx, RADIOS[i], buf, &mut ssid_lens[i]); }
+                given[i] = gs::ipc::peer(ctx, RADIOS[i]).is_some();
+                if ask_radio_status && given[i] { statuses[i] = radio_status(ctx, RADIOS[i], buf, &mut ssid_lens[i]); }
             }
             i += 1;
         }
     }
-    let mut radios = [RadioFact { driver: "", status: Got::Absent }; 2];
+    let mut radios = [RadioFact { driver: "", status: Got::Absent, given: true }; 2];
     let mut nr = 0usize;
     for i in 0..2 {
         if !present[i] { continue; }
@@ -419,7 +423,7 @@ fn answer(ctx: &ServiceContext, kind: Kind, event: know::Event, known: &[&str], 
                 Got::Yes(Radio::Up { associated, joined_secs, ssid: core::str::from_utf8(&ssids[i][..ssid_lens[i]]).unwrap_or("") }),
             other => other,
         };
-        radios[nr] = RadioFact { driver: RADIOS[i], status };
+        radios[nr] = RadioFact { driver: RADIOS[i], status, given: given[i] };
         nr += 1;
     }
 

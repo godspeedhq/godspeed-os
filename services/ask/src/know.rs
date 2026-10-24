@@ -626,6 +626,13 @@ pub struct RadioFact<'a> {
     /// The driver service, `wifi-driver` or `wifi-usb`.
     pub driver: &'a str,
     pub status: Got<Radio<'a>>,
+    /// Whether this question's row is GIVEN the driver as a send peer. A running driver it is not given is
+    /// never asked, which is not the driver failing to answer: a task has at most six send peers, and the
+    /// health row's six are the storage chain's and the onboard radio's, so a board with two radios - the
+    /// Pi 4, the VisionFive, with the dongle in - cannot reach the second from it. It used to be asked
+    /// anyway, through nothing, and called silent (`hole`), which failed every `selfcheck` there with the
+    /// dongle plugged in (2026-10-24). Said as an UNKNOWN instead, as `ehci` is left out of the storage chain.
+    pub given: bool,
 }
 
 /// The storage chain below `fs`, each link asked the same read-only question - "how big is your disk?" -
@@ -1107,6 +1114,13 @@ impl core::fmt::Display for Upper<'_> {
     }
 }
 
+/// A running radio driver this question's row is not given (`RadioFact::given`): left out, and said.
+fn not_given(a: &mut Answer, driver: &str) {
+    a.unknown(format_args!(
+        "`{}` is running, and this question is not given a way to ask it (a task has at most six send peers), so its radio is left out",
+        driver));
+}
+
 fn hole(a: &mut Answer, what: &str) {
     a.status = Status::SourceSilent;
     a.unknown(format_args!("{} did not answer, so what it knows is a hole in this answer", what));
@@ -1161,6 +1175,7 @@ fn health(f: &Facts, a: &mut Answer) -> &'static str {
         Got::Absent => { holes += 1; a.unknown(format_args!("storage could not be asked - `fs` is not running")); }
     }
     for r in f.radios {
+        if !r.given { not_given(a, r.driver); continue; }
         match r.status {
             // NO RADIO ANSWERED is two different machines - one with none fitted (QEMU, a board without the
             // part) and one whose radio is broken - and nothing here can tell them apart.
@@ -1369,6 +1384,7 @@ fn network(f: &Facts, a: &mut Answer) -> &'static str {
         }
     }
     for r in f.radios {
+        if !r.given { not_given(a, r.driver); continue; }
         match r.status {
             Got::Yes(Radio::Up { associated: true, ssid, .. }) => a.fact(r.driver_src(), format_args!("`{}` is joined to `{}`", r.driver, ssid)),
             Got::Yes(Radio::Up { associated: false, .. }) => a.fact(r.driver_src(), format_args!("`{}` is up and not joined to any network", r.driver)),
@@ -2021,7 +2037,7 @@ mod tests {
     #[test]
     fn a_firmware_fault_before_a_restart_is_what_came_before_not_why() {
         let t = [Task { name: "wifi-driver", restarts: 1, up_secs: 30 }];
-        let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_TRAPPED)) }];
+        let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_TRAPPED)), given: true }];
         let ev = [Ev { at: 70, code: EV_RESTARTED, name: "wifi-driver" }];
         let f = Facts { now: 100, tasks: &t, expected: Got::Yes(&["wifi-driver"]),
                         events: Got::Yes(Events { since: 5, recorded: 1, list: &ev }), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent, death: Got::Absent, about: None, caps: Got::Absent, holders: Got::Absent, authorities: AUTH };
@@ -2038,7 +2054,7 @@ mod tests {
     #[test]
     fn a_link_drop_with_no_restart_is_not_a_restart() {
         let t = [Task { name: "wifi-usb", restarts: 0, up_secs: 900 }];
-        let radios = [RadioFact { driver: "wifi-usb", status: Got::Yes(Radio::Up { associated: false, ssid: "", joined_secs: 0 }) }];
+        let radios = [RadioFact { driver: "wifi-usb", status: Got::Yes(Radio::Up { associated: false, ssid: "", joined_secs: 0 }), given: true }];
         let f = Facts { now: 900, tasks: &t, expected: Got::Yes(&["wifi-usb"]), events: ev_none(), drive: Got::Absent, radios: &radios, chain: None, net: Got::Absent, death: Got::Absent, about: None, caps: Got::Absent, holders: Got::Absent, authorities: AUTH };
         let a = ask(Kind::Wifi, Event::Disconnect, &f);
         assert_eq!(verdict(&a), b"NO RESTART RECORDED");
@@ -2148,15 +2164,31 @@ mod tests {
         assert!(!a.any_text("UNHEALTHY"));
     }
 
+    /// A second radio driver running that this row is not given (the dongle on a Pi 4 or a VisionFive) is not
+    /// asked, and that is not a silent source: the question is answered, and the answer says what it left out.
+    #[test]
+    fn a_radio_this_row_is_not_given_is_left_out_not_a_hole() {
+        let t = tasks_ok();
+        let radios = [
+            RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Up { associated: true, ssid: "home", joined_secs: 5 }), given: true },
+            RadioFact { driver: "wifi-usb", status: Got::Absent, given: false },
+        ];
+        let f = Facts { now: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &radios, chain: None, net: Got::Absent, death: Got::Absent, about: None, caps: Got::Absent, holders: Got::Absent, authorities: AUTH };
+        let a = ask(Kind::Health, Event::Unnamed, &f);
+        assert_eq!(a.status, Status::Answered);
+        assert!(a.has(Label::Unknown, "`wifi-usb` is running, and this question is not given a way to ask it"));
+        assert!(!a.any_text("did not answer"));
+    }
+
     #[test]
     fn no_radio_answering_is_not_called_a_fault() {
         let t = tasks_ok();
-        let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_NO_RADIO)) }];
+        let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_NO_RADIO)), given: true }];
         let f = Facts { now: 100, tasks: &t, expected: Got::Yes(ALL), events: ev_none(), drive: mounted(), radios: &radios, chain: None, net: Got::Absent, death: Got::Absent, about: None, caps: Got::Absent, holders: Got::Absent, authorities: AUTH };
         let a = ask(Kind::Health, Event::Unnamed, &f);
         assert_eq!(verdict(&a), b"HEALTHY");
         assert!(a.has(Label::Unknown, "whether this machine has a radio fitted"));
-        let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_TRAPPED)) }];
+        let radios = [RadioFact { driver: "wifi-driver", status: Got::Yes(Radio::Down(DOWN_TRAPPED)), given: true }];
         let f = Facts { radios: &radios, ..f };
         assert_eq!(verdict(&ask(Kind::Health, Event::Unnamed, &f)), b"DEGRADED");
     }
