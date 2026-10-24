@@ -27,7 +27,8 @@ there and why, so when in doubt, open the one nearest the code you are editing.
 | I want to ... | Start here |
 |---------------|-----------|
 | Understand the philosophy before touching anything | [`COMMANDMENTS.md`](COMMANDMENTS.md), then skim [`CLAUDE.md`](CLAUDE.md) |
-| Write a new userspace service | [`GETTING_STARTED.md`](GETTING_STARTED.md) - the 5-minute quickstart (copy [`examples/00-hello/`](examples/00-hello/), read its `CLAUDE.md` + [the standard library guide](website/src/stdlib.md); [`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md) is the layer underneath) |
+| Write a new userspace service | [`GETTING_STARTED.md`](GETTING_STARTED.md) - the quickstart (copy [`examples/00-hello/`](examples/00-hello/), read its `CLAUDE.md` + [the standard library guide](website/src/stdlib.md); [`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md) is the layer underneath) |
+| Write a service, utility, app or driver outside this repository, and install it on a machine | [godspeed-cli](https://github.com/godspeedhq/godspeed-cli) - `godspeed new`, `package` and `publish`; the machine's side is [`utilities/61_godspeed.md`](utilities/61_godspeed.md) |
 | Learn one pattern (IPC, caps, composition, persistence, drivers) | The matching `examples/*/CLAUDE.md` (index: [`examples/README.md`](examples/README.md)) |
 | Add or change a syscall | `kernel/src/syscall/CLAUDE.md`, then `syscall/mod.rs` |
 | Add a new CPU architecture | [`kernel/src/arch/CLAUDE.md`](kernel/src/arch/CLAUDE.md) (the seam + the five-place checklist) |
@@ -48,8 +49,8 @@ every file that kind of change has to touch. Nothing here is a toy written for t
 
 | I want to ... | Read and run this | Then read this commit | What to copy from it |
 |---|---|---|---|
-| **Write a service** | [`examples/counter`](examples/counter/) (restart with state), then [`services/power`](services/power/src/main.rs) - 247 lines, a whole real service on `gs` | [`7dfe3fbd`](https://github.com/godspeedhq/godspeed-os/commit/7dfe3fbd) - every service moved onto `gs` | Use `gs` and nothing under it: `scripts/one_way_check.py` holds every crate at zero raw SDK calls that `gs` covers |
-| **Write a driver that streams** (a DMA ring kept fed) | [`services/pwm-audio`](services/pwm-audio/src/main.rs) - the Pis' jack, about 950 lines | [`13be2d55`](https://github.com/godspeedhq/godspeed-os/commit/13be2d55), then [`3ac042c2`](https://github.com/godspeedhq/godspeed-os/commit/3ac042c2) - the Pi 4's one underrun per tone | Measure before fixing: a one-line instrument first, the fix second, each with a prediction, each tested on the board |
+| **Write a service** | [`examples/counter`](examples/counter/) (restart with state), then [`services/power`](services/power/src/main.rs) - a whole real service on `gs` | [`7dfe3fbd`](https://github.com/godspeedhq/godspeed-os/commit/7dfe3fbd) - every service moved onto `gs` | Use `gs` and nothing under it: `scripts/one_way_check.py` holds every crate at zero raw SDK calls that `gs` covers |
+| **Write a driver that streams** (a DMA ring kept fed) | [`services/pwm-audio`](services/pwm-audio/src/main.rs) - the Pis' jack | [`13be2d55`](https://github.com/godspeedhq/godspeed-os/commit/13be2d55), then [`3ac042c2`](https://github.com/godspeedhq/godspeed-os/commit/3ac042c2) - the Pi 4's one underrun per tone | Measure before fixing: a one-line instrument first, the fix second, each with a prediction, each tested on the board |
 | **Support new hardware in a driver** | [`services/audio-driver`](services/audio-driver/src/main.rs) - Intel HD Audio, its `PLAYABLE` table of verified codecs | [`3787e6dc`](https://github.com/godspeedhq/godspeed-os/commit/3787e6dc) (a new codec, and the mixer its path needs), [`533003cd`](https://github.com/godspeedhq/godspeed-os/commit/533003cd) (the vendor's bring-up, as Linux does it) | Copy what the reference driver writes, never a value built from bit names (`kernel/src/arch/CLAUDE.md`); read every register back and log it |
 | **Write a driver from scratch** | [`examples/driver-skeleton`](examples/driver-skeleton/) and [`examples/e1000`](examples/e1000/) | - | The grant, the interrupt, the re-arm, the serve loop, restart from cold |
 | **Change the kernel** | [`kernel/src/task/mod.rs`](kernel/src/task/mod.rs) `pci_dev`, [`kernel/src/arch/x86_64/pci.rs`](kernel/src/arch/x86_64/pci.rs) `bar_len` | [`7956c174`](https://github.com/godspeedhq/godspeed-os/commit/7956c174) (K1, a driver's window is its BAR), [`39746569`](https://github.com/godspeedhq/godspeed-os/commit/39746569) (K2, the device the supervisor names) | New `unsafe` only in `arch/`, recorded in `audits/unsafe-audit.md`; every other port answers the new seam member; QEMU first, then a board |
@@ -140,7 +141,7 @@ Every `all-services` run prints its **seed** when it starts and again in its rep
 on has:
 
 - the **seed** and the **round** it broke at;
-- the **commit**, from the first line of the boot banner (`GodspeedOS 0.22.0 x86_64 (f54aafef) - kernel`);
+- the **commit**, from the boot banner (`GodspeedOS <version> <arch> (<commit>) - kernel`);
 - the **machine** - the board, or the QEMU command line and `-smp`;
 - the **serial log**, the whole of it. It matters more than anything else on this list: `events log
   boot` holds only the boot, and the supervisor's `hardware events` record restarts whenever chaos kills
@@ -261,8 +262,9 @@ still saying one thing, the gate no longer noticing, and nobody finding out unti
 document.
 
 Before you open a pull request, run **`osdev conform --check`**. It runs every gate a build runs and
-gives you one verdict instead of twenty-four. It needs Python 3.8 or newer on your `PATH` as `python`,
-which is a declared dependency of this project alongside Rust and QEMU.
+gives you one verdict instead of one per gate. It needs Python on your `PATH` as `python`, which is a
+declared dependency of this project alongside Rust and QEMU; the oldest version it runs on is `FLOOR` in
+`scripts/python_floor_check.py`.
 
 ## A note on scope
 
@@ -274,8 +276,10 @@ smaller coherent system is preferred over a larger impressive one.
 ## Adding an architecture
 
 GodspeedOS is one arch-neutral codebase behind a single seam, `crate::arch::imp`. A new instruction
-set architecture is **bounded to `kernel/src/arch/<isa>/`** - you write that directory and, apart from
-two `#[cfg(target_arch)]` lines and the build plumbing, nothing else in the kernel changes. Five ISA
+set architecture is **bounded to `kernel/src/arch/<isa>/`** - you write that directory, and register it
+in the few files [`docs/porting.md`](docs/porting.md) marks `+` (a module line, a linker script, a target
+block, the SDK's syscall body and the board facts above the kernel). `scripts/port_scope_check.py` fails a
+port that edits anything else. Five ISA
 families (x86-64, AArch64, RISC-V, LoongArch, s390x) and both word sizes have been proven this way;
 the proof is `docs/multi-arch.md`.
 
@@ -317,7 +321,9 @@ string, change **every** copy together: `about` and `version` output (`services/
 ## License
 
 By contributing, you agree your contributions are licensed under the project's terms: the OS is
-**GPL-2.0-only** (root `LICENSE`); the SDK and the examples are **Apache-2.0** (`sdk/LICENSE`). New
-source files should carry the matching `SPDX-License-Identifier` header for their directory.
+**GPL-2.0-only** (root `LICENSE`); the SDK (`sdk/rust`), the standard library (`stdlib/rust`) and the
+examples are **Apache-2.0** (`sdk/LICENSE`); the protocol crates `sdk/wifi`, `sdk/tls` and `sdk/audio`
+are GPL-2.0-only. Each file's `SPDX-License-Identifier` header is what decides, and a new file carries the
+one its directory uses; [`docs/licensing.md`](docs/licensing.md) has the reasoning.
 
 Welcome aboard. Build something that survives the fire.
