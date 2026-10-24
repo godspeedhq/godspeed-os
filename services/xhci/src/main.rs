@@ -1068,10 +1068,11 @@ fn contain_radio(
 
 /// Print a hot-plug notice on the console, then nudge the shell to redraw its
 /// prompt. The notice is asynchronous output that lands wherever the cursor was,
-/// leaving the prompt scrolled up; injecting a newline into the input ring (which
-/// this driver already feeds) makes the shell print a fresh `gsh> `. The leading
-/// "\n" starts the notice on its own line; the injected newline supplies the
-/// terminating line break, so there is no blank line.
+/// leaving the prompt scrolled up; pushing `NOTICE_SIGNAL` into the input ring
+/// (which this driver already feeds) makes the shell end the notice's line and print
+/// a fresh `gsh> ` with the line being typed. The leading "\n" starts the notice on
+/// its own line. It pushed a newline until 2026-10-24, which answered any question
+/// waiting on the console.
 fn notify(ctx: &ServiceContext, msg: &str) {
     // Leading "\n " - the space is sacrificial: the framebuffer drops the first
     // glyph drawn on a freshly-scrolled line, so we let it eat a space, not the

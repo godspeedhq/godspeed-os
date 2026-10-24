@@ -1809,6 +1809,20 @@ not recur, so it is intermittent - and when it happens, the repair leaves an end
 time out. That is this host's to fix. The instrument stays in, silent unless a transfer fails: the next
 occurrence says the endpoint's state at the failure and what the repair left.
 
+*(2026-10-24, the Pi 4 driver-package card: the claim that the dead endpoint is this host's is withdrawn.* The
+fault came on two of three plugs in one boot, the first failing block at a different address each time (`0x1300`,
+then `0x1f80`), and each time the endpoint was repaired to state 3 with its dequeue at the ring's start and every
+transfer after timed out. Three things now say the CHIP is what stops answering, not the endpoint: the Pi 2's
+`dwc2` found the same - after a block whose STATUS stage fails, the chip NAKs every read until it loses power
+(section 6, R2b, and its 2026-10-11 sighting) - and an endpoint NAKed without end is one the controller reports
+nothing on; `backlog/fixed/83` measured that on this hub neither a port reset (dozens of re-scans) nor a port power
+cut (ten, the VL805's port power being logical only) revives it, and an unplug did twice in two; and Linux's
+`rtl8xxxu` sends this firmware exactly as `wifi-usb` does, 128-byte vendor writes in a plain loop with no delay and
+one try per block (`writeN_block_size = 128`, `rtl8xxxu_writeN`; `core.c` from kernel.org, SHA-256 begins
+`23d275e80527e2a1`). So there is nothing in the reference to copy, nothing a host-side retry or reset is shown to
+cure, and the same dongle came up on every plug that day on the VisionFive's hub. Still open: why a 128-byte OUT
+through the VL805 to this dongle fails intermittently - a property of that link, not yet measured.)*
+
 The U2a work on the Pi 4, in order of what each run showed: the reports and the hub-port unplug watch
 (confirmed), the wrap's TRB Error located at the Link's slot (measured), a zeroed next page and a cleared
 ring (both refuted as the cure, both kept as correct ring hygiene), the eager Link (confirmed).
