@@ -1978,8 +1978,8 @@ Every syscall checks the calling task's capability table, populated at spawn tim
 >
 > **Amendment 2026-10-23 (drivers): an installed `driver` is given ONE DEVICE, by what the bus says it is, and the
 > authority that device carries - which on a machine with no IOMMU puts it inside the TCB (6.4).** Not recorded when
-> the first part shipped: v0.30.0 gave a driver package its device's register window and nothing else, and this
-> section said nothing of it. What a driver package is given now (`docs/developer-services-design.md` 13.1,
+> the first part shipped: v0.29.0 gave a driver package its device's register window and nothing else, v0.30.0
+> the same, and this section said nothing of it. What a driver package is given now (`docs/developer-services-design.md` 13.1,
 > `services/supervisor/src/installed.rs`), each named in its signed contract and approved by the operator:
 >
 > - **A PCI device, by class** (`hw_pci_class`): the kernel resolves which device from its own bus scan, exactly as

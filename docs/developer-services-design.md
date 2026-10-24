@@ -1165,7 +1165,7 @@ A register-only class (no arena) carries no such warning.
 - Open: what a USB-class driver's host does (it must hand the device to the package, as `dwc2`/`xhci` hand the
   dongle to `wifi-usb` today - that protocol, `usbfn`, is the precedent).
 
-**What was built, and in what order.** The register grant came first (v0.30.0): a package named its PCI class and
+**What was built, and in what order.** The register grant came first (v0.29.0, and still all of it in v0.30.0): a package named its PCI class and
 was given that device's registers and nothing else, and a class an in-tree driver handled was refused. That was
 one of the five things this section asks for, and the operator's goal for `gs::driver` was all of them, so the
 rest is `feat/driver-packages` (2026-10-23):
