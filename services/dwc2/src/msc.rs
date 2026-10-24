@@ -524,8 +524,8 @@ pub const OP_CAPACITY: u8 = 3;
 pub const OP_WRITE_ZEROS: u8 = 4;
 pub const OP_FLUSH: u8 = 5;
 /// A run of consecutive blocks, `[op, lba:u64, count:u8, count x 512]` (`block-driver`'s
-/// `OP_WRITE_BLOCKS`). GATHERED with the runs it follows on from and written with them as ONE WRITE(10)
-/// (`GATHER_SECTORS`, `write_held`), as `xhci` does on the Pi 4.
+/// `OP_WRITE_BLOCKS`). GATHERED with the runs it follows on from and written with them (`GATHER_SECTORS`,
+/// `write_held`) - as `xhci` does on the Pi 4, except that here each block is its own WRITE(10) (`write_blocks`).
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;
@@ -537,26 +537,55 @@ pub const STATUS_ERR: u8 = 1;
 /// `xhci`'s (`backlog/57`): a refusal by a device and the absence of one are different facts.
 pub const STATUS_NO_DISK: u8 = 2;
 
-/// WRITE(10): `count` consecutive blocks from the start of the arena's data buffer, as one command.
+/// WRITE(10): `count` consecutive blocks from the start of the arena's data buffer, ONE BLOCK PER COMMAND.
 ///
-/// **One command per run, not per block.** A 512-byte block per WRITE(10) cost the stick a command's
-/// whole turnaround for every block: on the Pi 2 a 10 MB download spent 43-50 s of its 60-71 s writing
-/// (2026-10-22), as the Pi 4 did before its runs went as one command (`b2f91e9a`, 40 s to 9.8 s).
+/// **One command per block, again (2026-10-24).** From 2026-10-22 a run went as one WRITE(10) of up to the
+/// gather's 64 blocks, because a block per command cost the stick a command's whole turnaround each time (a
+/// 10 MB download on the Pi 2 spent 43-50 s of its 60-71 s writing; as one command, 28-35 s in all). On the
+/// Pi 2 that multi-block write STALLS THE STICK: in `selfcheck`'s package fetch, with the cable or the dongle
+/// carrying the download, a WRITE(10) of several blocks has its data stage never halt (`bulk ep 2 channel never
+/// halted`), and every transfer after it fails until power is cut - the gathered blocks were already answered
+/// as written, so they are lost, and `fs` later refuses the file by its CRC. Seen on four runs, in v0.30.0's
+/// image as well as this branch's; one block per command ran four `selfcheck`s with no disk failure at all.
+///
+/// So the run is written a block at a time: each block is moved to the buffer's start (block 0 is saved and put
+/// back, so a retry of this call - `with_busy_retry` - sends the run it was given) and written as its own
+/// WRITE(10). The speed of 2026-10-22 is given back. **Still open, recorded rather than guessed:** why a
+/// multi-packet bulk OUT through this core never completes. The likeliest place is a long data stage's
+/// NAK/PING handling, which this driver programs from its first packet where Linux's `dwc2` resumes from the
+/// packet it reached (`docs/wifi-usb.md` 6, R2c) - not measured.
 pub fn write_blocks(
     ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, count: u16,
 ) -> bool {
-    let cdb = [
-        0x2Au8, 0,
-        (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
-        0, (count >> 8) as u8, count as u8, 0,
-    ];
-    bot(ctx, mmio, dma, t, disk, &cdb, false, count as usize * 512).is_some()
+    let mut first = [0u8; 512];
+    for (k, b) in first.iter_mut().enumerate() {
+        *b = dma.disk.read8(k);
+    }
+    let mut ok = true;
+    for i in 0..count as usize {
+        if i > 0 {
+            for k in 0..512 {
+                let b = dma.disk.read8(i * 512 + k);
+                dma.disk.write8(k, b);
+            }
+        }
+        let l = lba + i as u32;
+        let cdb = [0x2Au8, 0, (l >> 24) as u8, (l >> 16) as u8, (l >> 8) as u8, l as u8, 0, 0, 1, 0];
+        if bot(ctx, mmio, dma, t, disk, &cdb, false, 512).is_none() {
+            ok = false;
+            break;
+        }
+    }
+    for (k, b) in first.iter().enumerate() {
+        dma.disk.write8(k, *b);
+    }
+    ok
 }
 
 /// WRITE GATHERING. A stick answers each Bulk-Only command after its own turnaround, so a file written a
 /// seven-block run at a time paid it per run: on the Pi 2 a 10 MB download spent 16-19 s of its 28-35 s on
 /// the stick with each run one command (2026-10-22). Consecutive runs are kept in the disk buffer and
-/// written as ONE command when it is full, when a run that does not follow on arrives, before any other
+/// written together - one block per command since 2026-10-24 (`write_blocks` says why) - when it is full, when a run that does not follow on arrives, before any other
 /// request (a read, a single write, a flush), and after `GATHER_IDLE_MS` with nothing new - the rules
 /// xhci's gather keeps on the Pi 4, without its overlap: this driver waits for each transfer.
 ///
