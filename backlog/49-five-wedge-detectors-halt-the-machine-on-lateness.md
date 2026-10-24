@@ -136,6 +136,15 @@ supervisor respawn here comes close to the allowance whenever it fires on this h
 not measured. The rerun on the same build: 276 passed, 0 failed, 2 skipped, no panic. The serial log is kept
 with the session, not in the tree.
 
+**A fourth time, 2026-10-24, the same line and the same shape in a different test**: `osdev test script`, in
+`selfcheck`'s `chaos kill-storm supervisor 1`, on `feat/driver-packages` (`ask`'s radio rows and the supervisor's
+`ask-net` peers, on top of the morning's USB-host, `net-stack` and `download` changes - all userspace).
+`7825082374` ticks against `7799560200` allowed, 1.0033x, core 0 running `shell`, 0 timer interrupts and 0 halts
+since its last stamp, as the supervisor was respawned (`respawning (#1)`). Eight checks failed behind it (3
+passed). The rerun on the same build: 11 passed, 0 failed, no panic. So it is not one test's timing: it is a
+supervisor respawn on this host, whichever test asks for one. The serial log was overwritten by the rerun; the
+panic line is quoted here as it was read.
+
 ## Next step
 
 The operator's call on scope. `backlog/fixed/48`'s instance is the one with a measurement behind it and the
