@@ -26,7 +26,7 @@ first line, with a contract and a README that says how to build and run it:
 | `service` | Runs until it is stopped; the supervisor keeps it running and restarts it if it dies | `gs::ipc`, `gs::call`, `gs::fs`, `gs::net`, ... |
 | `utility` | One job for one command line: handed its arguments, writes its output, ends with a status the shell reports; its output pipes like any built-in's | [`gs::program`](api/godspeed/program/index.html) |
 | `app` | A utility that holds the screen and the keyboard while it runs, and gives them back when it ends | [`gs::app`](api/godspeed/app/index.html) |
-| `driver` | Drives one device, named in its contract by PCI class code and register BAR | [`gs::driver`](api/godspeed/driver/index.html) |
+| `driver` | Drives one device, named in its contract by PCI class code and register BAR, or a USB device by vendor and product | [`gs::driver`](api/godspeed/driver/index.html) |
 
 A fifth, `library`, is reusable code for the others and runs nowhere on its own. `godspeed package` turns
 a project into a signed package and `godspeed install` puts it on a machine; `osdev test kinds` installs

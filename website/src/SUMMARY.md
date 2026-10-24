@@ -107,10 +107,10 @@
 - [Introspection capability](design/introspection.md)
 - [The unsafe audit](design/unsafe-audit.md)
 - [Licensing](design/licensing.md)
+- [Networking](design/networking.md)
 
 # Forward-Looking
 
-- [Networking](design/networking.md)
 - [Cluster mode](design/cluster.md)
 
 # The System, Running

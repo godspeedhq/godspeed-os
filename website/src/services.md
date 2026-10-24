@@ -6,7 +6,8 @@ below is an **IPC endpoint** - a message copied by the kernel from one address s
 under a capability that had to be granted (§8, §7).
 
 This page is the map. It is written from the supervisor's own `IMAGES` table, which is the single
-place a service's name, image, core, peers, privileges and device class are declared.
+place a service's name, image, core, peers, privileges and device class are declared. The rows that
+exist only for the test suites (the probes and the ping/pong examples) are left out.
 
 ---
 
@@ -173,8 +174,15 @@ Pi 4 and the VisionFive 2.
 
 Ring-0 code parsing descriptors supplied by whatever was plugged in is exactly what §4.4 forbids, so
 these are ordinary services holding only what their contract grants. **They cannot reboot the machine**
-- `REBOOT` lives with the shell alone (SEC-2). Where an IOMMU confines them, a compromise is bounded to
-the granted DMA arena and they leave the trusted computing base entirely (§6.4).
+- `REBOOT` lives with the shell alone (SEC-2). Where an IOMMU confines one, a compromise is bounded to
+its granted DMA arena and it leaves the trusted computing base (§6.4). Today that is `xhci` on x86
+alone: `ehci` runs in IOMMU passthrough even where there is one, and the Pis and the VisionFive have no
+IOMMU at all, so there `dwc2` and `xhci` can point their DMA anywhere and stay in the trusted computing
+base.
+
+A host also serves an installed USB **driver package**: when a device the package names by vendor and
+product is plugged in, the host binds it and carries the package's transfers to it (`gs::driver::bus`),
+so the package needs no hardware authority of its own (§14.1, the 2026-10-23 amendment).
 
 ### `nic-driver` and `net-stack` - the network
 
@@ -184,7 +192,7 @@ the granted DMA arena and they leave the trusted computing base entirely (§6.4)
        │                            └──▶ GENET (Pi 4, on the SoC; the radio when the cable is out)
        │                            └──▶ dwmac (VisionFive 2, on the SoC)
        ▼
-   ARP · IPv4 · ICMP · UDP · DHCP · DNS
+   ARP · IPv4 · ICMP · UDP · DHCP · DNS · TCP
        │
        └──▶ a socket is a capability (the same mechanism as a file)
 ```
@@ -269,9 +277,10 @@ machine down itself - only the shell can.
                                      └──▶ a ring of sound in its DMA arena, refilled per period
 ```
 
-Intel High Definition Audio, x86 only, built so far in QEMU. The stream interrupts as each period of
-the ring is played and the driver refills it then; its DMA is confined behind the IOMMU where there is
-one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
+Intel High Definition Audio, x86 only, heard on the Dell Wyse 5070 and the HP T630, speaker and
+headphones on both. The stream interrupts as each period of the ring is played and the driver refills it
+then, where the controller has MSI; where it has none (the T630) the driver polls. Its DMA is confined
+behind the IOMMU where there is one. On its death the kernel stops the controller's DMA and releases the confinement, keyed on the
 device it was given rather than its name.
 
 **Peers:** `fs`, for its settings file `/system/services/audio-driver/settings`.
@@ -341,6 +350,31 @@ Instead a capture opens with a header and closes with a footer, so a file with n
 that it died.
 
 **Peers:** `events`, `fs`.
+
+### `ask`, `godspeed-pm`, `copier`, `chaos`, `observe` - programs started on demand
+
+None of these is started at boot and none is in `MANAGED`, so nothing restarts them: each is started
+for one job and ends, or is ended, when the job is done.
+
+- **`ask`** answers one question about the machine (`ask "is my system healthy?"`). The shell starts it,
+  hands it the question and reads back a record table of facts, inferences and unknowns. It only reads:
+  `INTROSPECT` for the task table, and requests to the supervisor, `fs`, the storage chain and the radio
+  drivers on this board. A network question starts it under a second row, `ask-net`, whose peers are
+  `net-stack` and the radio drivers, because no one row may hold more than six.
+- **`godspeed-pm`** is the machine's package manager, started by the shell for one `godspeed` command.
+  It sends to the shell for the answer, `fs` for its settings and trust roots, `net-stack` for the
+  registry's connection, `time` for the date a certificate is checked against, and the supervisor, which
+  starts and stops an installed package for it. It holds no privilege.
+- **`copier`** runs one detached job without owning the prompt - `background copy`, a tree delete, a
+  check, a scrub - so a long job cannot take the shell down with it. It is not restarted, because a
+  copier that came back would not know what it was copying. It sends to `fs`, and to the board's audio
+  driver for the "done" sound a finished job makes.
+- **`chaos`** is `chaos max-carnage`'s loop. It cannot live in the shell, because the shell is one of
+  its targets. It holds `SPAWN`, `INTROSPECT`, `SERVICE_CONTROL` and `ACQUIRE_ANY`, and the console's
+  input so that `q` reaches it, and it never kills itself.
+- **`observe`** is the live task view: every task's core, state, memory, restarts, queue depth and CPU
+  use. It holds `INTROSPECT` and nothing else. It runs under three rows, `observe`, `observe-now` and
+  `observe-live`, one binary that each row starts in a different mode.
 
 ### `hw-enumerator` - hardware discovery in userspace
 

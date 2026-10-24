@@ -32,7 +32,8 @@ IPC endpoints). Authority is never ambient or inherited - it is this list, and o
 `observe` is a live, full-screen view of every service the system is running - scheduler slot, name,
 core, state, memory against its contract limit, restart count, IPC queue depth, CPU share, and
 uptime. It reads structured per-service state the kernel and supervisor already track; there is no
-`/proc` text to parse. Here all eight services are healthy.
+`/proc` text to parse. This capture is from July 2026, when the system ran eight services, all
+healthy here; it runs more than twice as many now.
 
 ![The observe live view](images/observe.png)
 
@@ -69,10 +70,12 @@ capability-scoped: `run` can do only what the shell already holds.
 ## Maximum carnage: `chaos max-carnage`
 
 This is the fire (Commandment II). `chaos max-carnage all-services` storms every live service at
-once - kill-storms, queue floods, system-wide memory pressure, and spawn-storms - round after round,
-forever, until you abort it. The table counts the punishment each service has taken: by round 28,
-`fs` and `shell` have been killed 28 times each (they are reply-style services, torn down every
-round), the `supervisor` itself 5 times, the drivers flooded 28 times.
+once - kill-storms, queue floods, system-wide memory pressure, and spawn-storms - for exactly the
+number of rounds you type (`chaos max-carnage all-services 100`), or until you press `q`. Each round
+picks a random subset of the live services, the shell and the supervisor included, floods each one it
+can and kills every one it picked. The table counts the punishment each service has taken. This
+capture is from July 2026, when every round still tore down `fs` and `shell`: by round 28 they had
+been killed 28 times each, the `supervisor` itself 5 times, the drivers flooded 28 times.
 
 And the line that is the whole point:
 
