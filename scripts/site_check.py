@@ -241,8 +241,30 @@ def check_services_covered():
                 "- refusing to call a check passed that read nothing"]
     managed = set(re.findall(r'"([a-z0-9-]+)"', m.group(1)))
     managed -= {"counter", "supervisor"}          # a test service, and the page's own subject
-    return ["services.md does not mention `%s`, which the supervisor manages (`MANAGED`)"
-            % n for n in sorted(managed) if "`%s`" % n not in page]
+    out = ["services.md does not mention `%s`, which the supervisor manages (`MANAGED`)"
+           % n for n in sorted(managed) if "`%s`" % n not in page]
+
+    # AND FROM ITS IMAGE TABLES. The page says it is written from `IMAGES`, and checking `MANAGED`
+    # alone let five programs the supervisor starts on demand - `ask`, `godspeed-pm`, `copier`,
+    # `chaos`, `observe` - go unmentioned, `godspeed-pm` among them, the package manager two releases
+    # were about. A row is required when its program is a crate under `services/`; the rows for
+    # `examples/` crates are the test suites' worked examples, and a row sharing another's binary
+    # under a second name (`ask-net`, `observe-now`) has no crate of its own. Both are told apart by
+    # the tree, not by a list kept here.
+    rows = []
+    for table in ("IMAGES", "USB_IMAGES"):
+        t = re.search(r"const %s:[^=]*=\s*&\[(.*?)\n\];" % table, code, re.S)
+        if not t:
+            return out + ["site_check: cannot find `const %s` in services/supervisor/src/main.rs - "
+                          "refusing to call a check passed that read nothing" % table]
+        rows += re.findall(r'\(\s*"([a-z0-9-]+)",\s*[A-Z0-9_]+_ELF', t.group(1))
+    if not rows:
+        return out + ["site_check: the supervisor's image tables have no rows this could read"]
+    for name in sorted(set(rows) - managed - {"supervisor"}):
+        if os.path.isdir(os.path.join(ROOT, "services", name)) and "`%s`" % name not in page:
+            out.append("services.md does not mention `%s`, which the supervisor can start (`IMAGES`)"
+                       % name)
+    return out
 
 
 def main():

@@ -6,8 +6,8 @@ below is an **IPC endpoint** - a message copied by the kernel from one address s
 under a capability that had to be granted (§8, §7).
 
 This page is the map. It is written from the supervisor's own `IMAGES` table, which is the single
-place a service's name, image, core, peers, privileges and device class are declared. The rows that
-exist only for the test suites (the probes and the ping/pong examples) are left out.
+place a service's name, image, core, peers, privileges and device class are declared. The rows for
+the worked examples under `examples/`, which the test suites start, are left out.
 
 ---
 
@@ -371,7 +371,9 @@ for one job and ends, or is ended, when the job is done.
   driver for the "done" sound a finished job makes.
 - **`chaos`** is `chaos max-carnage`'s loop. It cannot live in the shell, because the shell is one of
   its targets. It holds `SPAWN`, `INTROSPECT`, `SERVICE_CONTROL` and `ACQUIRE_ANY`, and the console's
-  input so that `q` reaches it, and it never kills itself.
+  input so that `q` reaches it, and it never kills itself. Its spawn-storm ammunition, and the victim
+  of `chaos mem-pressure`, is **`mem-pressure`**: it allocates up to its memory limit, checks that a
+  refused allocation stays refused, and waits to be killed, which is how its memory comes back.
 - **`observe`** is the live task view: every task's core, state, memory, restarts, queue depth and CPU
   use. It holds `INTROSPECT` and nothing else. It runs under three rows, `observe`, `observe-now` and
   `observe-live`, one binary that each row starts in a different mode.
