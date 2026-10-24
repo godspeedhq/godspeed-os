@@ -12451,6 +12451,13 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     check!(log.contains("godspeed/kind-nic's device (class 020000) goes back to nic-driver")
                && log.contains("supervisor: nic-driver started again - an installed package gave its device back"),
            "uninstalled, it gives the device back, and the supervisor starts nic-driver again");
+    // WHILE THE PACKAGE HELD THE NIC, nothing sent on nic-driver's dead capability: net-stack looks the name up and
+    // sends nothing while it does not resolve (`Displaced::nic_gone`). It sent every few milliseconds before - 218
+    // refused sends, each a kernel log line, in one run (2026-10-24).
+    let held = log.find("supervisor: nic-driver stood down").map(|i| &log[i..]).unwrap_or("");
+    let held = &held[..held.find("nic-driver started again").unwrap_or(held.len())];
+    let refused = held.matches("gen mismatch").count();
+    check!(refused < 5, format!("while the package held the NIC, nothing kept sending to nic-driver ({refused} refused)"));
 
     // A DRIVER OF A USB DEVICE: no registers of its own. `xhci` bound the adapter at boot and reported it, so the
     // package starts when it is installed, with `xhci` as its peer, and drives the device through it.
