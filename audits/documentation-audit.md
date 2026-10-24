@@ -2057,7 +2057,7 @@ mistake on the way was put back and recorded below instead.
 **Gates:** every documentation checker green in this repository (dash, refs, symbols, index, facts, line refs,
 commands, comment symbols, foreign words, site, spdx) and the platform file's check.
 
-**Follow-up 2026-10-24, on the operator's word: five of the findings fixed, one withdrawn.** Each in a commit of its
+**Follow-up 2026-10-24, on the operator's word: four of the findings fixed, one withdrawn.** Each in a commit of its
 own, the code checked by `osdev test driver-packages`.
 - Finding 1: `xhci`'s removal notice says which device left again, from the previous pass's binding
   ("WiFi dongle removed (xhci)").
