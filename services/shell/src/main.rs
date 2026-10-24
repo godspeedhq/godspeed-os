@@ -16023,11 +16023,13 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
 
 /// The second question a driver that asks for DMA memory is given (`docs/developer-services-design.md` 13.1). Asked
 /// on every machine, because none can tell the shell whether its IOMMU confines this device: the Pis and the
-/// VisionFive have no IOMMU at all, and on x86 the kernel confines a device only where it can.
+/// VisionFive have no IOMMU at all, an Intel PC has none the kernel uses (it confines with AMD-Vi only,
+/// CLAUDE.md 6.4), and on an AMD PC the kernel confines a device only where it can.
 fn confirm_dma(ctx: &ShellCtx, who: &str, yes: bool) -> bool {
     gs::io::println_fmt(ctx, format_args!("{} also asks for DMA memory: its device reads and writes memory by itself.", who));
-    gs::io::println(ctx, "Where no IOMMU confines the device - no Raspberry Pi or VisionFive has one - its driver can then");
-    gs::io::print(ctx, "read and write all of this machine's memory. Grant it DMA memory? [y/N]: ");
+    gs::io::println(ctx, "Where no IOMMU confines the device - every Raspberry Pi and the VisionFive, an Intel PC, and");
+    gs::io::println(ctx, "any device the kernel leaves unconfined - its driver can then read and write all of this");
+    gs::io::print(ctx, "machine's memory. Grant it DMA memory? [y/N]: ");
     if yes { gs::io::println(ctx, "yes (given on the command line)"); return true; }
     read_confirm(ctx)
 }

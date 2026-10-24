@@ -325,7 +325,7 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
         if checked.contract.dma_bytes > 0 {
             let gives = cell(format_args!("a DMA arena of {} KiB, memory its device reads and writes itself", checked.contract.dma_bytes.div_ceil(1024)));
             r.entry(&[C::S("memory"), C::S(gives.as_str()),
-                      C::S("where no IOMMU confines the device (no Raspberry Pi or VisionFive has one), its driver can read and write all of memory")]);
+                      C::S("where no IOMMU confines the device (every Raspberry Pi and the VisionFive, an Intel PC, any device left unconfined), its driver can read and write all of memory")]);
         }
     }
     for p in checked.contract.peers() {
