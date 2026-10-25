@@ -34,13 +34,14 @@ back on a **different core**: identity is stable, location is not (§11, §14.2)
   exposed for dev-mode use; it is subject to the same strict placement rules. The
   shell does not check for a dev mode, and a `<core>` that is not a number is
   ignored (the restart proceeds unplaced).
-- The shell's `restart` is the SDK's `ServiceContext::restart`: a `kill` whose
-  result is discarded, then a spawn through the supervisor. A service that was not
-  running is therefore simply spawned. Results print `restarted: <name>` or
+- The shell's `restart` is the SDK's `ServiceContext::restart`: a `kill`, then a
+  spawn through the supervisor. A `kill` that finds nothing to kill is tolerated, so
+  a service that was not running is simply spawned; any other refusal of the `kill`
+  ends the restart as a failure. Results print `restarted: <name>` or
   `restart failed: <name>` (an `Err`).
 - **Same guards as `kill`** (it is the kill half): requires `SERVICE_CONTROL`.
-  There is NO trusted-root refusal, and the shell refuses only `supervisor` and
-  `shell` - `xhci` and `ehci` pass straight through. See `11_kill.md` §3, corrected
+  There is NO trusted-root refusal, and the shell refuses only `supervisor`,
+  `shell` and the `observe` variants - `xhci` and `ehci` pass straight through. See `11_kill.md` §3, corrected
   2026-09-26; this said the trusted root was refused and that xhci/ehci were
   guarded, and neither is true.
 - **Client recovery is the client's job** (§14.3): a client of the restarted
@@ -62,5 +63,5 @@ back on a **different core**: identity is stable, location is not (§11, §14.2)
 ## 6. Conformance
 
 Conforms: own `restart help` / `restart version` (with a real example, per `0_conventions.md`); listed by the shell's
-top-level `help` under **Services** as `restart <name> [core]`. See
+top-level `help` under **Services** as `restart <name>[,name,...] [core]`. See
 `0_conventions.md` §3.

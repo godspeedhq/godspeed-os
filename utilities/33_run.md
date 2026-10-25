@@ -73,8 +73,9 @@ column, …). Verifying *correct output* (not just "didn't error") is the job of
 
 - A script is one `fs` file, streamed in and **minified** as it loads (comments, blank lines and
   indentation stripped), so `SCRIPT_MAX` (7112 bytes = 2 x `IO_CHUNK`) bounds the CODE, not the
-  raw file. Code past it is reported (`run: script CODE exceeds 7112 bytes - truncated ...`), and
-  the truncated script still runs.
+  raw file. A script whose code does not fit is refused, and none of it runs
+  (`run: script CODE exceeds 7112 bytes - refused, none of it was run ...`). A read that fails part
+  way is refused the same way (`run: could not read all of <path> - ...`).
 - **Scripts cannot nest.** A `run` inside a script is refused (`run` at depth > 0). This is a
   hard rule, not a nicety: unbounded `run`-calls-`run` recursion would overflow the bounded user
   stack (`execute`/`pipe_run` are `#[inline(never)]` so the per-line nesting stays shallow - the

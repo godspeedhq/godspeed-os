@@ -1,8 +1,8 @@
 # Structured records - typed pipes (PowerShell/nushell-style)
 
 > **Status:** Built + QEMU-verified (`osdev test shell`, `osdev test files`): the `Table` model,
-> eleven shell-side record producers (`wifi list` the eleventh; `wifi hardware` and `hardware`'s
-> tables have joined since) plus the `roster` service, `where` / `select` / `sort`, `to json` / `to yaml` / the grid, `from json`,
+> eleven shell-side record producers (`wifi list` the eleventh; `wifi hardware`, `hardware`'s
+> tables, `ask` and the reports of `godspeed` have joined since) plus the `roster` service, `where` / `select` / `sort`, `to json` / `to yaml` / the grid, `from json`,
 > the binary wire codec, and the unified byte-or-record pipeline. What is NOT built is listed under
 > *What's built vs next*. Non-normative - does not amend `CLAUDE.md`.
 
@@ -74,7 +74,7 @@ grammar is deliberately **terse and code-like**, not an English sentence:
 The text filters (`match`/`count`/`sort`/`first`/`last`) stay - for genuinely-text streams like
 a file's contents. A pipeline is routed to the **record** path when its first stage is a record
 producer (`is_record_producer` - `status`, `dir`, `caps`, `drives`, `find`, `uptime`, `events`,
-`trace`, `jobs`, `observe now` - and `wifi list` / `wifi hardware` and the table forms of
+`trace`, `jobs`, `ask`, `godspeed`'s reports, `observe now` - and `wifi list` / `wifi hardware` and the table forms of
 `hardware`, routed by name beside it in `pipe_run`), else
 the **byte** path. They coexist; the default rendering (no `to`) is the table grid. A *text*
 filter applied to a record stream (e.g. `dir | match foo`) is a loud, guided error - use

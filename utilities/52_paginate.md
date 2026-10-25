@@ -10,18 +10,18 @@ Trails `CLAUDE.md`; does not amend it.
 `<producer> | paginate` shows a long stream one screenful at a time, with keys to scroll.
 
 ```
-paginate 0.4.0 - read long output a screenful at a time
+paginate 0.4.0 - read long output a screenful at a time (pipe stage)
 
 usage:
-  <producer> | paginate    page the piped stream (text or records)
-  paginate version         print the version
-  paginate help            print this message
-
-keys:
-  up / down                scroll one line
-  PgUp / PgDn, space       move a page
-  Home / End               jump to the top / the end
-  q                        quit back to the prompt
+  <producer> | paginate         page any long output - text or records
+      e.g. read /long.txt | paginate
+  dir /big | paginate           a record stream keeps its column header pinned while you scroll
+      e.g. dir /big | paginate
+                                arrows scroll a line; PgUp/PgDn and space move a page; Home/End jump; q quits
+                                in a script or a capture it just prints - there is nobody to press a key
+      e.g. run /s.gsh
+  paginate version
+  paginate help
 ```
 
 It takes no arguments and must be the **last** stage: it reads the stream, it does not pass
@@ -118,7 +118,8 @@ Scrollback is the safety net for output you did not expect to be long. `paginate
 reach for when you already know it will be.
 
 Between them they retired `help`'s built-in pager (2026-09-18, once scrollback was verified on a
-board). `trace` keeps its own, and the pinned column header in the row above is exactly why.
+board). `trace` still pages its own views, through the same `paginate_table` (section 7), and the
+pinned column header in the row above is exactly why.
 
 ## 7. Implementation
 

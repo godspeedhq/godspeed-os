@@ -9,7 +9,7 @@ All QEMU-based tests. Tests in this tree boot the OS in QEMU; they are integrati
 | `identity/`   | CLAUDE.md mapping each §22 Test to its entry in `osdev/src/validator.rs` / `main.rs` |
 | `harness/`    | CLAUDE.md describing the harness (the code is `osdev/src/qemu.rs` + `validator.rs`) |
 | `perf/`       | `baseline.json`, rewritten by every `osdev test perf` run, + CLAUDE.md |
-| `post_v1/`    | Verification-roadmap notes (coverage, unsafe audit, static analysis, mutation, property) |
+| `post_v1/`    | Verification-roadmap notes (static analysis, mutation, property, subsystem property); `1_CODE_COVERAGE/` and `2_UNSAFE_AUDIT/` hold only a `.gitkeep` |
 | `1_IDENTITY/` ... `14_CHAOS_BRUTAL/` | Committed serial logs from past runs - snapshots, not tests. A run writes to `build/tests/<same name>/`; the committed copies predate later cases (no Test 11/15, A11-A15 or C1B) |
 
 There are no per-category test directories: the property, fuzz, stress, adversarial and chaos suites

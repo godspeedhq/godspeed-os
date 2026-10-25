@@ -13,7 +13,8 @@ needs, and which failures are safe to retry.
 syscalls themselves, and the audited `unsafe` (CLAUDE.md 18.1). You should not need it. Services and
 drivers alike are written on `gs`, drivers through [`gs::driver`](api/godspeed/driver/index.html)
 (below), and `scripts/one_way_check.py` holds every program in this repository to zero raw SDK calls
-that `gs` covers.
+that `gs` covers. A driver package from outside this repository may call it too, but outside the compatibility
+promise: the SDK can change between releases where `gs` does not (`docs/driver-library.md`).
 
 ## Four kinds of program
 
@@ -25,7 +26,7 @@ first line, with a contract and a README that says how to build and run it:
 | `service` | Runs until it is stopped; the supervisor keeps it running and restarts it if it dies | `gs::ipc`, `gs::call`, `gs::fs`, `gs::net`, ... |
 | `utility` | One job for one command line: handed its arguments, writes its output, ends with a status the shell reports; its output pipes like any built-in's | [`gs::program`](api/godspeed/program/index.html) |
 | `app` | A utility that holds the screen and the keyboard while it runs, and gives them back when it ends | [`gs::app`](api/godspeed/app/index.html) |
-| `driver` | Drives one device, named in its contract by PCI class code and register BAR | [`gs::driver`](api/godspeed/driver/index.html) |
+| `driver` | Drives one device, named in its contract by PCI class code and register BAR, or a USB device by vendor and product | [`gs::driver`](api/godspeed/driver/index.html) |
 
 A fifth, `library`, is reusable code for the others and runs nowhere on its own. `godspeed package` turns
 a project into a signed package and `godspeed install` puts it on a machine; `osdev test kinds` installs
@@ -187,6 +188,7 @@ mechanisms only: what a register means stays in your driver, and there is no `gs
 | `input` | A keyboard driver's keystrokes, pushed to the console: `push`, and `ready` when setup is done |
 | `power` | Cutting and restoring your device's power where the machine can: `power::set` |
 | `device` | What the kernel knows about your device that you cannot read yourself: the board's MAC, the NIC's PCI identity, a controller's base clock, PCI configuration reads |
+| `bus` | A device with no registers of its own, reached through its bus's host: a USB device's identity, control transfers and bulk transfers (`UsbDevice`). A bus, not a class |
 
 ```rust
 let Some(regs) = gs::driver::registers(&ctx) else {
@@ -199,8 +201,11 @@ if gs::driver::wait::until(&ctx, gs::driver::wait::Budget::ms(10), || regs.read3
 }
 ```
 
-A driver installed as a package is given its register window and nothing else today: no DMA arena and
-no interrupt. The drivers in this repository use all of the above. `docs/driver-library.md` is the
+A driver installed as a package is given what its contract names and the operator approves: its register
+window, its interrupt, and a DMA arena (asked about by a question of its own, because where no IOMMU confines
+the device a driver with an arena can reach all of memory) - or, for a USB device, its host through `bus`. A
+device a GodspeedOS driver drives is taken over while the package is installed. All but the registers arrived
+after v0.30.0 (`docs/developer-services-design.md` 13.1). The drivers in this repository use all of the above. `docs/driver-library.md` is the
 design and the record of each module's arrival.
 
 `gs::program::mode` is the mode a program was started in, for one that does more than one thing.

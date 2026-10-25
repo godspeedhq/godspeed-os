@@ -34,16 +34,17 @@ the register file this needs a host-side MLME - scan, authenticate, associate - 
 serve loop the Broadcom and AIC8800 run moves into `sdk/wifi` so both WiFi services share it. That move
 is due when a scan exists, not before.
 
-## 2. The protocol (`sdk/wifi/src/usbfn.rs`)
+## 2. The protocol (`sdk/wifi/src/usbfn.rs`; its numbers are `sdk/rust/src/usbfn.rs` since 2026-10-23, re-exported)
 
 | Op | Request | Reply |
 |---|---|---|
-| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` only (`wifi hardware <radio>`). `gen` names the binding: it differs from the previous bind, and from a restarted host's where the counter is calibrated and running (`usbfn::next_gen` says where it is not); the driver compares it, not only the IDs |
+| `OP_INFO` 0x20 | `[op]` | `[op, status, vid(2), pid(2), gen(4)]`, then where it is, from `INFO_WHERE_AT` - `xhci` and `ehci`, not `dwc2` (`wifi hardware <radio>`). `gen` names the binding: it differs from the previous bind, and from a restarted host's where the counter is calibrated and running (`usbfn::next_gen` says where it is not); the driver compares it, not only the IDs |
 | `OP_CONTROL` 0x21 | `[op, setup(8), data out...]` | `[op, status, data in...]` |
 | `OP_CONTROL_ONCE` 0x22 | as `OP_CONTROL`, attempted exactly once | as `OP_CONTROL` |
-| `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again |
+| `OP_BULK_IN` 0x23 | `[op]` | `[op, status, transfer...]` - the held bulk IN transfer, or none; the host's IN armed again (`ehci` holds none: it runs one IN of up to 20 ms when asked) |
 | `OP_BULK_OUT` 0x24 | `[op, out, transfer...]` - `out` the OUT endpoint's position in the configuration descriptor | `[op, status]` |
 | `OP_SYNC` 0x25 | `[op, notice]` - never answered: names a notice the driver took in place of an answer (section 19) | none |
+| `OP_REPLUG` 0x27 | `[op]` | `[op, status]` - `dwc2` resets the device's port and binds it afresh; `xhci` and `ehci` answer `ST_BAD_REQUEST` |
 | `NOTE_BULK_IN` 0x2E | sent by the HOST to the driver, `[note]`, no reply cap: a transfer is held | none |
 | `NOTE_RADIO` 0x2F | sent by the HOST to the driver, `[note]`, no reply cap | none |
 
@@ -1808,6 +1809,20 @@ not recur, so it is intermittent - and when it happens, the repair leaves an end
 time out. That is this host's to fix. The instrument stays in, silent unless a transfer fails: the next
 occurrence says the endpoint's state at the failure and what the repair left.
 
+*(2026-10-24, the Pi 4 driver-package card: the claim that the dead endpoint is this host's is withdrawn.* The
+fault came on two of three plugs in one boot, the first failing block at a different address each time (`0x1300`,
+then `0x1f80`), and each time the endpoint was repaired to state 3 with its dequeue at the ring's start and every
+transfer after timed out. Three things now say the CHIP is what stops answering, not the endpoint: the Pi 2's
+`dwc2` found the same - after a block whose STATUS stage fails, the chip NAKs every read until it loses power
+(section 6, R2b, and its 2026-10-11 sighting) - and an endpoint NAKed without end is one the controller reports
+nothing on; `backlog/fixed/83` measured that on this hub neither a port reset (dozens of re-scans) nor a port power
+cut (ten, the VL805's port power being logical only) revives it, and an unplug did twice in two; and Linux's
+`rtl8xxxu` sends this firmware exactly as `wifi-usb` does, 128-byte vendor writes in a plain loop with no delay and
+one try per block (`writeN_block_size = 128`, `rtl8xxxu_writeN`; `core.c` from kernel.org, SHA-256 begins
+`23d275e80527e2a1`). So there is nothing in the reference to copy, nothing a host-side retry or reset is shown to
+cure, and the same dongle came up on every plug that day on the VisionFive's hub. Still open: why a 128-byte OUT
+through the VL805 to this dongle fails intermittently - a property of that link, not yet measured.)*
+
 The U2a work on the Pi 4, in order of what each run showed: the reports and the hub-port unplug watch
 (confirmed), the wrap's TRB Error located at the Link's slot (measured), a zeroed next page and a cleared
 ring (both refuted as the cure, both kept as correct ring hygiene), the eager Link (confirmed).
@@ -3145,3 +3160,30 @@ that had just left the network, because `/wifi.radio` removed makes both radios 
 after `kill all-services` the dongle's download failed, and for over three minutes every re-scan failed
 Address Device on hub ports 1 and 2 (the disk's port among them), so the run ended with no disk. Recorded
 as `backlog/fixed/83`, with what the gen change does and does not have to do with it.
+
+## 53. `wifi-usb` on `gs::driver::bus` (2026-10-23) - built; hardware-verified 2026-10-24 on the VisionFive, the Pi 4 and the Pi 2 (note at the end)
+
+`wifi-usb` spoke the function protocol (section 2) by hand: its own request loop, its own `OP_SYNC` handling
+(section 19), and a decoder for each answer. A driver PACKAGE for a USB device reaches its device through
+`gs::driver::bus` (`docs/developer-services-design.md` 13.1), and the operator's rule is one way to write a driver,
+so `wifi-usb` now does the same: every register read and write, the firmware blocks, the bulk IN and OUT, the
+binding, where the dongle is and the replug are `UsbDevice` calls. The host it uses is chosen as before - the peer
+it was wired to, else one it can reacquire by name (the T630's late `xhci`, U2a) - by `UsbDevice::granted` now.
+
+**What is the same:** every request and its bound (2 s), the setup packets, which writes go `once` (the firmware's
+blocks, section 6), and the words of its lines for each outcome the host reports. **What changed:** where the host
+answered something that was not the protocol, or an EAPOL frame was not sent, the line now gives `bus`'s reason in
+words (an EAPOL failure gave the status number); a notice named back by `OP_SYNC` is now
+tried 8 times before it is said, as `bus` does for every driver, where `wifi-usb` tried 4; a frame to send is copied
+once more on its way to the host (into `bus`'s request), a few hundred bytes to 1.5 KiB per frame against a USB
+transfer; and a bulk IN is copied out of the host's answer into a transfer this driver holds rather than read in
+place.
+
+**Seen:** it builds for every board. Nothing of it RUNS in QEMU: the supervisor starts `wifi-usb` only when a host
+reports the dongle, and QEMU has none. **Not seen:** anything at all at runtime. The card is the dongle on each board: bring-up to `R3a done`, a scan, a join, and `kill xhci`
+for the afresh binding (section 52).
+
+*(Note 2026-10-25: seen since. On the driver-package cards of 2026-10-24 (`docs/developer-services-design.md`
+13.1) `wifi-usb` on `gs::driver::bus` joined on the VisionFive and the Pi 2 - on the Pi 2 with `selfcheck` 659 run,
+0 failed, on the dongle and on the cable - and on the Pi 4 it stood down for a driver package and was given the
+dongle back. The T630 and the Wyse cards are still owed.)*

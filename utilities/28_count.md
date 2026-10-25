@@ -18,10 +18,10 @@ layperson reads correctly. Its natural partner is a pipe - *"how many?"* after a
 ## 2. Usage
 
 ```
-count 0.4.0 - count lines, words, and bytes
+count 0.4.0 - count lines/words/bytes (byte stream) or ROWS (record stream)
 
 usage:
-  <producer> | count   count piped input
+  <producer> | count   count piped bytes, or rows of a record stream
   count <path>         count a file
   count version        print the version
   count help           print this message

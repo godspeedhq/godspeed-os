@@ -88,7 +88,7 @@ against `services/fs` is this exact shape, fully grown.
 
 - **`examples/resource-server`** - the owner/mint half this client exercises (read it first).
 - `services/fs` + the shell `fcap` command (**CLAUDE.md §22 Test 14**) - the production resource
-  server and the same three properties proven against a real file (`osdev test file-cap`, 15 assertions today).
+  server and the same three properties proven against a real file (`osdev test file-cap`, 16 assertions today).
 - `examples/cap-grant` - capability **transfer** (the operation that *moves* the cap to holder).
 - **Commandments VII, VIII, IX, X** in `COMMANDMENTS.md`.
 - **CLAUDE.md** §7.10 (delegated resource capabilities), §7.3 (cap properties), §7.5 (generations /

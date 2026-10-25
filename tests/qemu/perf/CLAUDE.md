@@ -42,9 +42,9 @@ Results go to `tests/qemu/perf/baseline.json`. **Comparison is manual**: nothing
 
 ## Windows / TCG harness note
 
-On Windows, QEMU's `-serial file:path` backend holds an exclusive write lock on the serial log file while QEMU is running. `poll_serial` (in `osdev/src/validator.rs`) handles this by retrying read failures until the deadline, then applying the same 600 ms QEMU-flush grace period used for normal content timeouts. The final error reported is always `"timeout - lines not seen: ..."` regardless of whether the failure was a read error or a content miss - this avoids masking real content failures with a confusing "serial file unreadable" message.
+On Windows, QEMU's `-serial file:path` backend holds an exclusive write lock on the serial log file while QEMU is running. `poll_serial` (in `osdev/src/validator.rs`) handles this by retrying read failures until the deadline, then applying the same 600 ms QEMU-flush grace period used for normal content timeouts. The final error reported is `"timeout - lines not seen: ..."` (or, for a line that was printed but corrupted by a concurrent writer, a `SERIAL SPLICE` diagnosis) whether the failure was a read error or a content miss - never a confusing "serial file unreadable" message.
 
-B2 and B4 are the benchmarks most sensitive to this: they are spawned late in the supervisor sequence (~165 services ahead of them) and have lower iteration counts, so the serial log is produced close to the timeout boundary.
+B2 and B4 were the benchmarks most sensitive to this when they ran in the full build, spawned late (~165 services ahead of them) with lower iteration counts, so their serial lines landed close to the timeout boundary. `osdev test perf` now builds the `perf-only` supervisor (`cmd_build_perf`), whose probe set is the 13 perf probes alone.
 
 ## Format
 

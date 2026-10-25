@@ -1975,6 +1975,36 @@ Every syscall checks the calling task's capability table, populated at spawn tim
 > not. Still no privilege bit: the console is a spawn flag, and a service or a utility is never given it. The
 > residual is SEC-2's (6.4): a holder of the keyboard can read what is typed while it runs, which is exactly what the
 > operator was asked to approve. The kernel gives the console back when the app dies, so a crash cannot keep it.
+>
+> **Amendment 2026-10-23 (drivers): an installed `driver` is given ONE DEVICE, by what the bus says it is, and the
+> authority that device carries - which on a machine with no IOMMU puts it inside the TCB (6.4).** Not recorded when
+> the first part shipped: v0.29.0 gave a driver package its device's register window and nothing else, v0.30.0
+> the same, and this section said nothing of it. What a driver package is given now (`docs/developer-services-design.md` 13.1,
+> `services/supervisor/src/installed.rs`), each named in its signed contract and approved by the operator:
+>
+> - **A PCI device, by class** (`hw_pci_class`): the kernel resolves which device from its own bus scan, exactly as
+>   for an in-tree driver named by class (12.3), and grants its register window - plus its interrupt when the
+>   contract asks (`hw_pci_irq`; the kernel allocates the vector, the caller names none) and a DMA arena of the size
+>   it asks (`hw_dma`, at most 2 MiB, never an address). Confinement is requested; whether it happens is the
+>   kernel's, per device (6.4).
+> - **A device an in-tree driver drives is TAKEN OVER, not shared:** the supervisor stops that driver and keeps it
+>   stopped while the package is installed, and starts it again when the package is uninstalled, ends, or is left
+>   down. One holder per device, which the kernel does not enforce for a PCI device and the supervisor does.
+> - **A USB device, by vendor and product** (`hw_usb`): no hardware authority of its own at all. Its host (`xhci`,
+>   `dwc2`, and `ehci` since the same day) binds it and serves its transfers to the one driver given that host as a send peer (`gs::driver::bus`),
+>   so the package is the host's client, as `wifi-usb` always was.
+>
+> **The TCB consequence, stated as 6.4 requires.** A driver package granted a DMA arena on a machine whose IOMMU
+> does not confine its device - every Pi, the VisionFive, and any x86 device the kernel leaves in passthrough - can
+> point the device at any address: kernel-equivalent reach, so it is trust-critical by necessity, exactly as an
+> unconfined in-tree driver is. That is why the arena is approved by a SECOND question at install, and why the
+> question is asked on every machine: nothing a service can ask says whether the kernel will confine this device,
+> so the warning is given rather than guessed (a confined machine asks needlessly; recorded, 26.7). A driver
+> package with registers only, or a USB driver, carries no such reach.
+>
+> **What does not change:** no privilege bit (the device is a hardware class in the spawn request, and the
+> supervisor already spawns by class), no kernel change and no new syscall, and `IMAGE_SPAWN` stays the
+> supervisor's alone. MISCIS is unchanged.
 
 ### 14.2 Restart and Cap Rebinding (Possibly Cross-Core)
 

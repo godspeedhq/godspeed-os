@@ -26,6 +26,7 @@ use godspeed_wifi::rxq::RxQueue;
 /// because `wifi-usb` holds both, and two of 32 left its stack about 220 KiB deep of 256 on the worst path.
 const LINK_SLOTS: usize = 8;
 use godspeed_wifi::serve::{Host, Notice};
+use godspeed::driver::bus::UsbError;
 use godspeed_wifi::{eapol, mgmt, usbfn, wire};
 
 use crate::rtl8188;
@@ -162,15 +163,18 @@ pub struct Heard<'l> {
 }
 
 /// Where a host says the dongle is (`usbfn::OP_INFO`'s optional part).
-#[derive(Clone, Copy)]
-pub struct Where {
-    pub root: u8,
-    pub hub: u8,
-    pub slot: u8,
-    pub in_addr: u8,
-    pub in_mps: u16,
-    pub outs: [u8; 4],
-    pub n_out: u8,
+pub type Where = godspeed::driver::bus::Place;
+
+/// One bulk IN transfer the host handed up: the bytes, and how many of them are the transfer.
+pub struct Transfer {
+    buf: [u8; usbfn::BULK_IN_MAX],
+    n: usize,
+}
+
+impl Transfer {
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf[..self.n]
+    }
 }
 
 impl<'l> Heard<'l> {
@@ -201,19 +205,16 @@ pub fn start(ctx: &ServiceContext) -> bool {
 }
 
 /// The host's answer to one `OP_BULK_IN`: `Ok(None)` when it held nothing.
-fn ask(ctx: &ServiceContext) -> Result<Option<godspeed_sdk::Message>, &'static str> {
-    let r = crate::host(ctx, &[usbfn::OP_BULK_IN])?;
-    let p = r.payload_bytes();
-    if p.len() < 2 || p[0] != usbfn::OP_BULK_IN {
-        return Err("the host answered something other than BULK_IN - not speaking usbfn");
-    }
-    match p[1] {
-        usbfn::ST_OK if p.len() > 2 => Ok(Some(r)),
-        usbfn::ST_OK => Ok(None),
-        usbfn::ST_NO_DEVICE => Err("the dongle is no longer bound"),
+fn ask(ctx: &ServiceContext) -> Result<Option<Transfer>, &'static str> {
+    let mut t = Transfer { buf: [0u8; usbfn::BULK_IN_MAX], n: 0 };
+    match crate::dev(ctx)?.bulk_in(&mut t.buf) {
+        Ok(0) => Ok(None),
+        Ok(n) => { t.n = n; Ok(Some(t)) }
+        Err(UsbError::NoDevice) => Err("the dongle is no longer bound"),
         // Two causes reach this one status: no bulk IN was found, or repairing it failed. The host's
         // log says which; this line used to name only the first (backlog/fixed/80 D11).
-        usbfn::ST_FAILED => Err("the host could not give this dongle a bulk IN (none found, or its repair failed - its log says which)"),
+        Err(UsbError::Failed) => Err("the host could not give this dongle a bulk IN (none found, or its repair failed - its log says which)"),
+        Err(UsbError::Host(e)) => Err(e.as_str()),
         _ => Err("the host refused BULK_IN as malformed"),
     }
 }
@@ -393,7 +394,7 @@ pub fn wait_frames(ctx: &ServiceContext, budget_ms: u64, f: &mut dyn FnMut(&rtl_
         match ask(ctx) {
             Ok(Some(m)) => {
                 let mut done = false;
-                rtl_rx::walk(&m.payload_bytes()[2..], &mut |pk| {
+                rtl_rx::walk(m.bytes(), &mut |pk| {
                     if !done && pk.desc.rpt_sel == 0 && !pk.desc.crc_err && !pk.desc.icv_err && !pk.truncated {
                         done = f(&pk);
                     }
@@ -426,7 +427,7 @@ fn collect(ctx: &ServiceContext, h: &mut Heard, mut sweep: Option<&mut Scan>) {
                 return;
             }
         };
-        let t = &m.payload_bytes()[2..];
+        let t = m.bytes();
         h.transfers = h.transfers.wrapping_add(1);
         let first = h.frames == 0;
         rtl_rx::walk(t, &mut |pk| heard(ctx, h, sweep.as_deref_mut(), &pk));

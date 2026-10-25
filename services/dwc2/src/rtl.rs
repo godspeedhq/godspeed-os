@@ -11,6 +11,10 @@
 //! than asking on a timer (U1b), and REPORTS it to the supervisor (`usbdev`), which starts and stops the
 //! driver with the dongle (`docs/usb-device-drivers.md`).
 //!
+//! **Not only the dongle, since 2026-10-23.** Any high-speed device whose first interface is vendor-specific is
+//! bound here the same way (`vendor_specific`), for an installed driver package that names it; the Realtek's two
+//! reads are sent to the Realtek alone. `configure` names the RTL8188CUS only when it is the Realtek.
+//!
 //! **Receive (R3b):** one bulk IN on `CH_RADIO_RX`, armed in the background once `wifi-usb` first asks
 //! `OP_BULK_IN`, taken on the USB interrupt (`service`), held until collected, with `usbfn::NOTE_BULK_IN`
 //! sent to say so. It stands aside for every other non-periodic transfer (`chan::program_ping`) and is put
@@ -82,6 +86,13 @@ pub struct Radio {
     /// A `NOTE_BULK_IN` the driver's queue refused, sent again on a later pass: nothing is armed until the
     /// held transfer is collected, so a notice lost for good would stop receive for good.
     note_owed: bool,
+    /// `wifi-usb` IS NOT RUNNING, at the last notice that could not be sent: an installed package drives the
+    /// device instead (`hw_usb`), or the driver has not started. Until its name resolves again a notice LOOKS
+    /// THE NAME UP and sends nothing (`tell_bulk`). It sent before: the owed notice went out on the dead
+    /// instance's cap on every pass, refused each time and logged by the kernel - a gen mismatch line every few
+    /// milliseconds for as long as a package held the dongle (VisionFive, 2026-10-24), found on the VisionFive's `xhci`
+    /// with the same code, and as `nic-driver`'s radio bridge did before its `gone` (`backlog/fixed/88`).
+    driver_gone: bool,
     /// Notices the driver took in place of an answer and named in an `OP_SYNC` (`usbfn::OP_SYNC`), sent
     /// again once it has been quiet for `DRIVER_QUIET_MS` - so they reach its serve loop, not its next call.
     sync_bulk: bool,
@@ -188,6 +199,7 @@ const RX_ERROR_TRIES: u32 = 3;
 
 /// The descriptor kinds and the bulk transfer type, as USB 2.0 chapter 9 numbers them.
 const DESC_CONFIG: u8 = 0x02;
+const DESC_INTERFACE: u8 = 0x04;
 const DESC_ENDPOINT: u8 = 0x05;
 const EP_TYPE_BULK: u8 = 0x02;
 /// A high-speed bulk endpoint's packet size, the only one USB 2.0 allows it. A smaller one means the dongle
@@ -201,11 +213,18 @@ const HS_BULK_MPS: u16 = 512;
 /// `wifi-usb` reaches its registers and says itself what failed.
 pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid: u16, pid: u16, gen: u32) -> Radio {
     stop(ctx, mmio);
-    let e = configure(ctx, mmio, dma, t)
+    let what = if vid == VID && pid == PID { "RTL8188CUS" } else { "the bound USB device" };
+    let e = configure(ctx, mmio, dma, t, what)
         .unwrap_or(Eps { ep_in: 0, in_mps: 0, outs: [0; MAX_OUT], n_out: 0, out_mps: 0 });
-    let _ = probe(ctx, mmio, dma, t);
+    // The Realtek's two register reads are vendor requests only that chip understands: another device bound for a
+    // driver of its own (`vendor_specific`) is not sent them.
+    if vid == VID && pid == PID {
+        let _ = probe(ctx, mmio, dma, t);
+    } else {
+        ctx.log_fmt(format_args!("dwc2-svc: USB device {:04x}:{:04x}, vendor-specific - configured, bound for a driver of its own", vid, pid));
+    }
     Radio {
-        t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false,
+        t: *t, vid, pid, gen, ep_in: e.ep_in, in_mps: e.in_mps, rx: Rx::Off, pid_in: chan::PID_DATA0, note_owed: false, driver_gone: false,
         sync_bulk: false, sync_radio: false, last_req: None, ring_len: [0; RX_SLOTS], ring_at: [None; RX_SLOTS], ring_head: 0, ring_n: 0, full_at: None,
         replug_asked: false, replug_allowed: true,
         errs_run: 0, stats: RxStats::default(),
@@ -214,9 +233,32 @@ pub fn bind(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, vid
     }
 }
 
+/// Is this device's first interface vendor-specific (class 0xFF)? Then this host binds it as it binds the dongle,
+/// for a driver of its own - an installed driver package that names it (`hw_usb`,
+/// `docs/developer-services-design.md` 13.1). Read from the start of its configuration descriptor; a device that
+/// does not answer is not one. One such device per host, as the dongle always was.
+pub fn vendor_specific(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> bool {
+    let mut buf = [0u8; 32];
+    if !chan::control(ctx, mmio, dma, t, &[0x80, 0x06, 0, DESC_CONFIG, 0, 0, 32, 0], &mut buf, true, 32) {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + 6 <= buf.len() {
+        let len = buf[i] as usize;
+        if len < 2 {
+            return false;
+        }
+        if buf[i + 1] == DESC_INTERFACE {
+            return buf[i + 5] == 0xFF;
+        }
+        i += len;
+    }
+    false
+}
+
 /// Read the configuration descriptor, find the bulk IN endpoint and the bulk OUTs, and SET_CONFIGURATION.
 /// `None`, said, on any failure; an `ep_in` of 0 when it configured but has no high-speed bulk IN.
-fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) -> Option<Eps> {
+fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, what: &str) -> Option<Eps> {
     const TRIES: u32 = 4;
     let ctl = |setup: &[u8; 8], buf: &mut [u8], data_in: bool, len: usize| -> bool {
         (0..TRIES).any(|i| {
@@ -228,19 +270,19 @@ fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) ->
     };
     let mut head = [0u8; 9];
     if !ctl(&[0x80, 0x06, 0, DESC_CONFIG, 0, 0, 9, 0], &mut head, true, 9) {
-        ctx.log("dwc2-svc: RTL8188CUS - the configuration descriptor did not come back; no receive");
+        ctx.log_fmt(format_args!("dwc2-svc: {} - the configuration descriptor did not come back; no receive", what));
         return None;
     }
     let want = (u16::from_le_bytes([head[2], head[3]]) as usize).min(chan::DATA_LEN);
     let cfg_val = head[5];
     let mut full = [0u8; chan::DATA_LEN];
     if !ctl(&[0x80, 0x06, 0, DESC_CONFIG, 0, 0, (want & 0xFF) as u8, (want >> 8) as u8], &mut full, true, want) {
-        ctx.log("dwc2-svc: RTL8188CUS - the configuration descriptor did not come back; no receive");
+        ctx.log_fmt(format_args!("dwc2-svc: {} - the configuration descriptor did not come back; no receive", what));
         return None;
     }
     let mut none: [u8; 0] = [];
     if !ctl(&[0x00, 0x09, cfg_val, 0, 0, 0, 0, 0], &mut none, false, 0) {
-        ctx.log_fmt(format_args!("dwc2-svc: RTL8188CUS - SET_CONFIGURATION {} FAILED; no receive", cfg_val));
+        ctx.log_fmt(format_args!("dwc2-svc: {} - SET_CONFIGURATION {} FAILED; no receive", what, cfg_val));
         return None;
     }
     let (ep, mps) = bulk_in(&full, want).unwrap_or((0, 0));
@@ -250,20 +292,20 @@ fn configure(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target) ->
     // does not run for bulk, exactly as for the IN below: none is kept, and transmit is off, said.
     if e.n_out > 0 && e.out_mps != HS_BULK_MPS {
         ctx.log_fmt(format_args!(
-            "dwc2-svc: RTL8188CUS bulk OUT is {} bytes, not high-speed - no transmit", e.out_mps));
+            "dwc2-svc: {} bulk OUT is {} bytes, not high-speed - no transmit", what, e.out_mps));
         e.n_out = 0;
     }
     if ep == 0 || mps != HS_BULK_MPS {
         ctx.log_fmt(format_args!(
-            "dwc2-svc: RTL8188CUS configured ({}) but no high-speed bulk IN (endpoint {}, {} bytes) - control only, no receive",
-            cfg_val, ep, mps));
+            "dwc2-svc: {} configured ({}) but no high-speed bulk IN (endpoint {}, {} bytes) - control only, no receive",
+            what, cfg_val, ep, mps));
         return Some(e);
     }
     e.ep_in = ep;
     e.in_mps = mps;
     ctx.log_fmt(format_args!(
-        "dwc2-svc: RTL8188CUS configured ({}) - bulk IN endpoint {}, {} bytes, received on channel {}; {} bulk OUT ({:?}), sent on channel {}",
-        cfg_val, ep, mps, CH_RADIO_RX, e.n_out, &e.outs[..e.n_out], chan::CH_BULK));
+        "dwc2-svc: {} configured ({}) - bulk IN endpoint {}, {} bytes, received on channel {}; {} bulk OUT ({:?}), sent on channel {}",
+        what, cfg_val, ep, mps, CH_RADIO_RX, e.n_out, &e.outs[..e.n_out], chan::CH_BULK));
     Some(e)
 }
 
@@ -356,7 +398,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
         }
     }
     if r.note_owed && r.ring_n > 0 {
-        r.note_owed = !tell_bulk(ctx);
+        r.note_owed = !tell_bulk(ctx, &mut r.driver_gone);
     }
     let at = match r.rx {
         Rx::Armed { at } => at,
@@ -391,7 +433,7 @@ pub fn service(ctx: &ServiceContext, mmio: &Registers, dma: &Parts, r: &mut Radi
         // Told when the ring stops being empty; once a transfer is collected and more wait, a notice is owed
         // again (`bulk_in_request`), so the driver - which, with the cable carrying the link, collects only
         // when told - empties the ring one notice at a time.
-        if r.ring_n == 1 && !tell_bulk(ctx) {
+        if r.ring_n == 1 && !tell_bulk(ctx, &mut r.driver_gone) {
             r.note_owed = true;
             r.stats.notes_late = r.stats.notes_late.wrapping_add(1);
         }
@@ -506,10 +548,25 @@ pub fn report(ctx: &ServiceContext, r: &Radio) {
         s.held_ms, s.held_max_ms, RX_SLOTS, s.full_ms));
 }
 
-fn tell_bulk(ctx: &ServiceContext) -> bool {
+/// `NOTE_BULK_IN` to the driver: `try_send`, and reacquired by name once if the cap is stale. A name that does not
+/// resolve marks the driver gone (`Radio::driver_gone`), and while it is gone the name is looked up and nothing sent.
+fn tell_bulk(ctx: &ServiceContext, gone: &mut bool) -> bool {
     let msg = Message::from_bytes(&[usbfn::NOTE_BULK_IN]);
-    gs::ipc::try_send(ctx, DRIVER, &msg).is_ok()
-        || (gs::cap::reacquire(ctx, DRIVER) && gs::ipc::try_send(ctx, DRIVER, &msg).is_ok())
+    if *gone {
+        if !gs::cap::reacquire(ctx, DRIVER) {
+            return false;
+        }
+        *gone = false;
+        return gs::ipc::try_send(ctx, DRIVER, &msg).is_ok();
+    }
+    if gs::ipc::try_send(ctx, DRIVER, &msg).is_ok() {
+        return true;
+    }
+    if gs::cap::reacquire(ctx, DRIVER) {
+        return gs::ipc::try_send(ctx, DRIVER, &msg).is_ok();
+    }
+    *gone = true;
+    false
 }
 
 /// The dongle on the Pi 2's hub, confirmed on hardware twice - `bugs/3` recorded it via this driver and
@@ -572,8 +629,8 @@ pub fn announce(ctx: &ServiceContext, radio: Option<&Radio>) {
 /// restartable (6.2) - and never waited on (8.9). (`report` above is the radio's statistics, not this.)
 pub fn report_device(ctx: &ServiceContext, radio: Option<&Radio>) {
     let r = match radio {
-        Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid, pid: r.pid },
-        None => usbdev::Report { present: false, gen: 0, vid: 0, pid: 0 },
+        Some(r) => usbdev::Report { present: true, gen: r.gen, vid: r.vid, pid: r.pid, host: usbdev::HOST_DWC2 },
+        None => usbdev::Report { present: false, gen: 0, vid: 0, pid: 0, host: usbdev::HOST_DWC2 },
     };
     let msg = Message::from_bytes(&usbdev::encode(&r));
     let sent = gs::ipc::try_send(ctx, SUPERVISOR, &msg).is_ok()

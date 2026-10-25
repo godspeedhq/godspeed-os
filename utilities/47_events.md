@@ -155,7 +155,7 @@ fs: disk capacity = 0 sectors (0 MiB)
 fs: serving file API
 nic-driver: dwc2 answered op 0x01 while we asked 0x10 - not our reply (3 mismatched...)
 block-driver: capacity 0 - the USB host service replied 1 byte(s), not a capacity
-events: 13 line(s) logged, none overwritten. Lines printed BEFORE `events` started are on serial only.
+events: 13 line(s) held (4 shown). This is a COPY - serial has the authoritative record, including everything printed before `events` started. Filter with `events log | where owner=<service>`.
 ```
 
 **This is a COPY, and never the authoritative record.** `ctx.log()` performs its syscall first and
@@ -167,9 +167,10 @@ AT the service would make observing a failure depend on a service that can fail,
 Three consequences, stated rather than left to be discovered:
 
 - **Nothing printed before `events` started is here.** Those lines are in the kernel ring, which no
-  syscall exposes to userspace. Boot output is serial's job and always was.
-- **The window is 8 KiB and wraps.** The footer says whether it has, so a truncated view never passes
-  for a complete one.
+  syscall exposes to userspace. Serial has them, and the kernel's fixed copy of the first 32 KiB is
+  `events log boot` (above).
+- **The window is 8 KiB and wraps.** The footer says how many lines are held and how many are shown;
+  it does not say whether older lines were overwritten, though the sink's reply carries that.
 - **A killed `events` loses the scrollback and no log output.** That is the design working: the tier
   beneath it survives anything, including a panic that halts every core.
 
@@ -337,9 +338,10 @@ trace: the ring lives in the `events` service - the kernel records nothing.
 #### Who is traced at all
 
 Only exchanges made through the SDK's request/reply calls, by services whose contract grants
-`ipc_send = ["events"]`. Today that is fourteen services - every internal one that talks to a peer:
-`block-driver`, `console`, `control`, `dwc2`, `ehci`, `events`, `fs`, `hw-enumerator`, `net-stack`,
-`nic-driver`, `recorder`, `shell`, `time`, `xhci`. It was `fs` and `shell` alone when the ring
+`ipc_send = ["events"]`. Today that is thirteen services:
+`block-driver`, `console`, `control`, `dwc2`, `ehci`, `fs`, `hw-enumerator`, `net-stack`,
+`nic-driver`, `recorder`, `shell`, `time`, `xhci`. (`events` writes its own metric rows into its own
+table, as described above.) It was `fs` and `shell` alone when the ring
 shipped, and the difference is the point of `trace_as`: a service that does not declare its name
 publishes under a BLANK owner, and since the key is `(owner, name)` every undeclared service collides
 into one row. Tracing is authority: visible in
@@ -572,7 +574,7 @@ The reader also **retries** a busy sink three times before reporting it, because
 congestion, not absence, and saying "unavailable" about a service that is alive and busy is a lie the
 same size as any other silent fallback.
 
-**`eseq` is the emitter's own counter**, not a global one, so a mixed dump interleaves several
+**`seq` is the emitter's own counter**, not a global one, so a mixed dump interleaves several
 sequences and looks unsorted. It is not - rows are in ring order, oldest first. The column earns its
 place by making one service's dropped events visible as a gap in its own numbering.
 
@@ -612,7 +614,7 @@ A service that never declares itself reads `?`, which is the honest answer rathe
 `events ipc` is a **record source**, like `status` or `dir` - one producer feeding three uses, rather
 than a printer plus a serialiser that drift apart:
 
-- **Console**: a grid, with a two-line legend above it.
+- **Console**: a grid, with a seven-line legend above it.
 - **Taller than the screen**: it pages, with the shared pager's keys (arrows, space, PgUp/PgDn,
   Home/End, `q`). `g`/`G` and `j`/`k` are gone, and so is `b` - `[b] background` claims that letter.
   The pager

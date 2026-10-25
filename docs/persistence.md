@@ -97,17 +97,19 @@ answer is that **capacity is just field width** and a poor way to compare:
 | ext4 | 16 TiB | 1 EiB |
 | APFS | 8 EiB | 8 EiB |
 | ZFS | 16 EiB | 256 ZiB (2¹²⁸-addressable) |
-| **GSFS (today)** | 4 GiB (u32 size) | 2 TiB (u32 blocks × 512 B) |
-| **GSFS (u64 fields)** | 16 EiB | ~8 ZiB |
+| **GSFS (Phase 1, u32 fields)** | 4 GiB (u32 size) | 2 TiB (u32 blocks × 512 B) |
+| **GSFS (today, u64 fields)** | 16 EiB | ~8 ZiB |
 
-GSFS is FAT32-class **today only because Phase-1 chose 32-bit fields**; widening
-`size` + `total_blocks` to `u64` is a one-line change that vaults it past ext4. So
+GSFS was FAT32-class **in Phase 1 only because Phase 1 chose 32-bit fields**; widening
+`size` + `total_blocks` to `u64` (done, §6.3) was a one-line change that vaults it past ext4. So
 capacity does not distinguish these filesystems. What ext4/NTFS/APFS/ZFS actually buy
 is **features** - journaling (crash-safety), checksums (bit-rot), snapshots,
 copy-on-write, B-tree metadata that stays fast at millions of files. **GSFS
-deliberately has none yet** - that, not size, is its real trade-off: §26.6/§20
-minimalism now, with journaling arriving as the Phase-3 transactional-recovery work
-(§6.3) only when a real need pulls it in.
+deliberately had none of these at Phase 1** - that, not size, was its real trade-off: §26.6/§20
+minimalism first, with journaling arriving as the Phase-3 transactional-recovery work
+(§6.3) only when a real need pulled it in. *(2026-10-25: it has since gained a metadata
+redo-journal (§6.8) and checksums on every block (§6.6, §6.10); it still has no snapshots,
+copy-on-write or B-tree metadata.)*
 
 ## 4. Layering and responsibilities
 
@@ -199,7 +201,7 @@ completion (a later optimization, not a correctness need).
 > describes a flat name-to-blob store with 4 KiB blocks and a fixed 256-entry table. GSFS has been
 > **GSFS0008** for a long time: **512-byte** blocks, real directories as a tree (§6.2), a free
 > **bitmap** rather than an entry table (§6.4), self-describing 64-byte records seven to a block with
-> a CRC trailer (§6.6), extent lists for fragmented files (§6.4), and a metadata redo-journal (§6.8).
+> a CRC trailer (§6.6), extent lists for fragmented files (§6.12), and a metadata redo-journal (§6.8).
 > Every one of those numbers below is superseded by the section named beside it.
 >
 > It is kept because §1's rule holds here as in the constitution - the history of how a format
@@ -406,8 +408,10 @@ remain the historical record.
 **Why it's deferred.** The three GSFS0003 structures already serve every *current*
 operation: mount (superblock + bitmap), path lookup (walk the path), `dir` (one directory),
 free space (the bitmap). The **only** thing `fs_index` accelerates is whole-FS enumeration -
-a `find`, a global search, an "every file" view - which GodspeedOS does not have yet. So by
-§26.2 it is built the day such a command pulls it into existence, not before.
+a `find`, a global search, an "every file" view - which GodspeedOS did not have when this was
+written. So by §26.2 it is built the day such a command pulls it into existence, not before.
+*(2026-10-25: the shell's `find` exists now, and it walks the tree directly; no walk has yet been
+measured too slow, so `fs_index` is still not built.)*
 
 **How it works when built** (the part worth recording now):
 
@@ -1244,6 +1248,8 @@ Test 14).
 > `OP_STAT_FILE` 12, directories, rename/move/delete, drives, streaming `OP_WRITE_NEW`/`OP_WRITE_AT`/
 > `OP_READ_AT` 24-26, check, scrub, `OP_OPEN` 30, `OP_SEAL` 31). The constants are the definition:
 > `services/fs/src/main.rs` and `services/block-driver/src/main.rs`.
+> *(2026-10-25: the client range now runs to 32, `OP_QUIESCE`, which `power` sends before a
+> shutdown, `docs/shutdown.md`.)*
 
 **Client ↔ fs** (Phase 1, name-addressed):
 

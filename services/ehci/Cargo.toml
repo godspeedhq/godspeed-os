@@ -12,3 +12,9 @@ path = "src/main.rs"
 godspeed-sdk = { path = "../../sdk/rust" }
 # `gs::driver` (docs/driver-library.md): the bounded waits and the parked hold.
 godspeed = { path = "../../stdlib/rust" }
+
+[features]
+# Bind a device of any class but a hub or a HID for a driver of its own, not only a vendor-specific one
+# (`bound::bindable`): for `osdev test driver-packages`, whose QEMU EHCI has no vendor-specific high-speed device.
+# Never built into an image.
+bind-any-class = []

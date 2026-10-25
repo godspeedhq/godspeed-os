@@ -31,10 +31,10 @@ no `>`"). `write` is both the inline primitive and that pipe sink.
 write 0.4.0 - create, overwrite, append, or prepend a file
 
 usage:
-  write <path>                     create an empty file at <path>
-  write <path> <content>           create/overwrite <path> with <content>
-  write append <path> <content>    add <content> to the END of <path> (create if missing)
-  write prepend <path> <content>   add <content> to the FRONT of <path> (create if missing)
+  write <path>                     create an empty file
+  write <path> <text>              create/overwrite with text
+  write append <path> <text>       add text to the end (create if missing)
+  write prepend <path> <text>      add text to the front (create if missing)
   <producer> | write [append|prepend] <path>   save piped output to a file
   write version                    print the version
   write help                       print this message

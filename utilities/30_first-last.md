@@ -22,8 +22,8 @@ first 0.4.0 - keep the first N lines (default 10)
 last  0.4.0 - keep the last N lines (default 10)
 
 usage:
-  <producer> | first [N]   first N lines of piped input
-  <producer> | last [N]    last N lines of piped input
+  <producer> | first [N]   first N piped lines
+  <producer> | last [N]    last N piped lines
   first [N] <path>         first N lines of a file
   last  [N] <path>         last N lines of a file
   <first|last> version     print the version

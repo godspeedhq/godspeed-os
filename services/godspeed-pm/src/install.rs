@@ -175,14 +175,15 @@ struct Plan {
     kept: u32,
 }
 
-/// What a checked release asks for, as the question shows it: `console` for an app, `device` for a driver, then
-/// its contract's send peers; `nothing` when there are none.
+/// What a checked release asks for, as the question shows it: `console` for an app, `device` for a driver (and
+/// `memory` when it asks for a DMA arena), then its contract's send peers; `nothing` when there are none.
 fn asks_of(c: &check::Checked) -> Cell {
     let mut a = Cell::new();
     let mut first = true;
     let mut add = |s: &str| { let _ = core::fmt::Write::write_fmt(&mut a, format_args!("{}{}", if first { "" } else { ", " }, s)); first = false; };
     if c.kind == Kind::App { add("console"); }
     if c.kind == Kind::Driver { add("device"); }
+    if c.kind == Kind::Driver && c.contract.dma_bytes > 0 { add("memory"); }
     for p in c.contract.peers() { add(p); }
     if first { a = cell(format_args!("nothing")); }
     a
@@ -312,8 +313,20 @@ pub fn requests(ctx: &ServiceContext, r: &mut Rows, which: &str) {
     }
     if checked.kind == godspeed_package::Kind::Driver {
         let class = checked.contract.pci_class.map_or(cell(format_args!("none named")), |c| cell(format_args!("{:06x}", c)));
-        r.entry(&[C::S("device"), C::S(cell(format_args!("the PCI device of class {}: its registers", class.as_str())).as_str()),
-                  C::S("where no IOMMU confines it, what the device itself can do, its driver can tell it to")]);
+        let gives = match checked.contract.usb {
+            Some((v, p)) => cell(format_args!("the USB device {:04x}:{:04x}, through its USB host: started while it is attached", v, p)),
+            None => cell(format_args!("the PCI device of class {}: its registers{}", class.as_str(),
+                if checked.contract.pci_irq { " and its interrupt" } else { "" })),
+        };
+        r.entry(&[C::S("device"), C::S(gives.as_str()),
+                  C::S("if a built-in driver drives that device, it is stopped while this one is installed, and started again when it is uninstalled")]);
+        // DMA memory is its own row, and the shell asks about it by a question of its own (13.1): whether an IOMMU
+        // confines the device is not something this machine can be asked, so the warning is always given.
+        if checked.contract.dma_bytes > 0 {
+            let gives = cell(format_args!("a DMA arena of {} KiB, memory its device reads and writes itself", checked.contract.dma_bytes.div_ceil(1024)));
+            r.entry(&[C::S("memory"), C::S(gives.as_str()),
+                      C::S("where no IOMMU confines the device (every Raspberry Pi and the VisionFive, an Intel PC, any device left unconfined), its driver can read and write all of memory")]);
+        }
     }
     for p in checked.contract.peers() {
         r.entry(&[C::S(p), C::S("a send capability to it"), C::S(if p == "supervisor" { "never granted to a package" } else { "" })]);
@@ -371,7 +384,7 @@ pub fn install(ctx: &ServiceContext, r: &mut Rows, which: &str, grant: &str) {
         for p in grant.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             if p == "supervisor" { return r.fail("grant", p, "`supervisor` is never granted to a package"); }
             let console = p == "console" && checked.kind == godspeed_package::Kind::App;
-            let device = p == "device" && checked.kind == godspeed_package::Kind::Driver;
+            let device = (p == "device" || (p == "memory" && checked.contract.dma_bytes > 0)) && checked.kind == godspeed_package::Kind::Driver;
             if !console && !device && !checked.contract.peers().any(|q| q == p) { return r.fail("grant", p, "its contract does not request it"); }
             if granted[..ng].contains(&p) { continue; }
             if ng == MAX_PEERS { return r.fail("grant", grant, "more peers than a package is given"); }

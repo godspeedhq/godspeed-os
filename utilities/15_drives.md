@@ -2,7 +2,7 @@
 
 **Status:** **Built + QEMU-verified** (step 3 = the data primitives: `flash` / `label` /
 list, as a shell built-in over `fs` - `osdev test drives` 7/7). The boot-layer
-(`godspeed install` / `update` / `default`) and the multi-drive selectors (`use` /
+(`drives godspeed install` / `update` / `default`) and the multi-drive selectors (`use` /
 `use default`) are reserved and specified here so the vocabulary is coherent from the
 start, but are later steps (see §8). This doc is the user-facing utility surface; the
 architecture/rationale lives in `docs/drives.md`

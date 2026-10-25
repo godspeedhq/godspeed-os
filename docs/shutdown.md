@@ -1,6 +1,6 @@
 # Shutdown: turning the machine off on purpose
 
-**Status:** built on branch `feat/shutdown`, 2026-10-14; QEMU-verified and **hardware-verified on all five boards**
+**Status:** built on branch `feat/shutdown`, 2026-10-14, and released in v0.28.0; QEMU-verified and **hardware-verified on all five boards**
 (S5, section 5). S1 to S4 are built: the kernel's `PowerOff` with its one deadline (S1), `fs`'s quiesce (S2),
 `power`'s warnings and tidy-up (S3) and the shell's `shutdown` (S4). `osdev test shutdown` passes 37 of 37 on x86;
 QEMU RISC-V powers off through SBI SRST; the refusal without the capability is `osdev test adv` A12. The Wyse powers

@@ -18,8 +18,8 @@ Two constraints, and they point the same way.
 
 **The fixtures must not be scanned by the checkers they provoke.** A file containing a dead symbol and
 a stale line number, sitting in the tree, is a violation - and would fail the very gates these cases
-exist to exercise. Exempting the directory in all seventeen checkers would mean seventeen edits and
-seventeen chances to widen an exemption by accident. Naming the file `.case` instead means almost no
+exist to exercise. Exempting the directory in every checker would mean an edit per checker and as
+many chances to widen an exemption by accident. Naming the file `.case` instead means almost no
 checker looks at it, because almost none of them scans that extension.
 
 The exception is `line_ending_check.py`, which scans every tracked text file whatever it is called -
@@ -37,8 +37,8 @@ the file, and diffs the render against `expected`.
 
 ## The safety rules, which are not optional
 
-`commandments_redteam.py` restores with `git checkout`, and that is how an hour of uncommitted work
-gets eaten. This does not do that:
+`commandments_redteam.py` used to restore with `git checkout`, and that is how an hour of uncommitted
+work got eaten (it restores from a snapshot now). This does not do that either:
 
 - **`--selftest` refuses to plant into a file you have uncommitted work in.** It compares the case
   TARGETS against `git status` and stops, naming them, if any overlap - and only then: everything else
@@ -69,6 +69,10 @@ loader now normalises the file's own endings, which are structure, and decodes w
 --- expect ---
 <the exact rendered diagnostic, or the single word NOTHING>
 ```
+
+`mode` may also be `create` (a new file, deleted after) or `replace` (the plant is `OLD`, a `--- with ---`
+line, then `NEW`; `OLD` must occur exactly once). A case that needs several files uses repeated
+`--- plant: <path> [append|write|create|replace] ---` blocks in place of `# target:` and `# mode:`.
 
 `expect: NOTHING` is a case that must produce **no** finding. Those matter as much as the others: half
 of what the 2026-09-26 comment sweep found was comments correctly RECORDING a removal, and a checker

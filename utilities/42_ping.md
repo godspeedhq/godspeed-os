@@ -57,9 +57,10 @@ the replies.)
 - **`time=`** - the measured round trip, in **microseconds** below 1 ms (`time=412us`, `time<1us`
   for zero) and whole milliseconds above. The summary uses one unit for all three figures, chosen
   by the average. `net-stack` times the round trip with the CPU's cycle counter, calibrated against
-  the wall clock, and reports microseconds as a u16 - so **a round trip over 65 ms reads as 65 ms**
-  (a silent cap, a code defect). On a host whose cycle counter is uncalibrated every reply reads
-  `time<1us` and the summary says the round-trip time is unavailable.
+  the wall clock, and reports microseconds as a u16, which saturates: a round trip of 65 ms or more
+  prints `time>=65ms`, and the summary adds a line saying such a reply counts as 65 ms. On a host
+  whose cycle counter is uncalibrated every reply reads `time<1us`, and the summary reports
+  `0us` for all three figures.
 - **`TTL=N`** - the time-to-live in the reply's IP header (the pinged host's, not ours).
 - **`Request timed out.`** - no matching echo reply arrived within the budget for that round.
   `No reply from <ip>: link not confirmed - ...` means `net-stack` could not confirm a link, and
@@ -92,7 +93,7 @@ This reuses the same `ping()` helper `net-stack` runs at boot to check the gatew
 - **A SEND cap to `net-stack`, acquired by name** (the shell holds `ACQUIRE_ANY`).
 
 `ping` holds no hardware capability itself - `net-stack` owns the ICMP construction and the frame
-path to `nic-driver`; the shell only asks (and reads the ungated TSC calibration for the timing).
+path to `nic-driver`; the shell only asks. `net-stack` calibrates the TSC itself for the timing.
 
 ## 7. Non-goals
 

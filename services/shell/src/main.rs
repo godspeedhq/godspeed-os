@@ -903,6 +903,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 line.reprint(&ctx);
                 notice_above = true;
             }
+            // A USB host printed a device notice over the prompt (`USB: WiFi dongle connected (xhci)`): end its
+            // line and draw the prompt again under it, with what was being typed. The hosts sent an Enter for
+            // this until 2026-10-24, which RAN a half-typed line here, and answered a `[y/N]` waiting elsewhere.
+            gs::io::keys::NOTICE_SIGNAL => {
+                gs::io::print(ctx, "\r\n");
+                line.reprint(&ctx);
+            }
             b'\r' | b'\n' => {
                 notice_above = false;
                 // We own echo now, so move to a fresh line ourselves (the kernel used
@@ -16011,10 +16018,27 @@ fn install_one(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &mu
         gs::io::println_fmt(ctx, format_args!("godspeed: {} not {}", spec, if from.is_some() { "upgraded" } else { "installed" }));
         return true;
     }
+    if peers.split(',').any(|p| p == "memory") && !confirm_dma(ctx, release, yes) {
+        gs::io::println_fmt(ctx, format_args!("godspeed: {} not {}", spec, if from.is_some() { "upgraded" } else { "installed" }));
+        return true;
+    }
     let grant = if peers.is_empty() { "none" } else { peers };
     let mut line = [0u8; 512];
     let cmd = fmt_into(&mut line, format_args!("install {} grant {}", spec, grant));
     godspeed_show(ctx, cmd).is_ok()
+}
+
+/// The second question a driver that asks for DMA memory is given (`docs/developer-services-design.md` 13.1). Asked
+/// on every machine, because none can tell the shell whether its IOMMU confines this device: the Pis and the
+/// VisionFive have no IOMMU at all, an Intel PC has none the kernel uses (it confines with AMD-Vi only,
+/// CLAUDE.md 6.4), and on an AMD PC the kernel confines a device only where it can.
+fn confirm_dma(ctx: &ShellCtx, who: &str, yes: bool) -> bool {
+    gs::io::println_fmt(ctx, format_args!("{} also asks for DMA memory: its device reads and writes memory by itself.", who));
+    gs::io::println(ctx, "Where no IOMMU confines the device - every Raspberry Pi and the VisionFive, an Intel PC, and");
+    gs::io::println(ctx, "any device the kernel leaves unconfined - its driver can then read and write all of this");
+    gs::io::print(ctx, "machine's memory. Grant it DMA memory? [y/N]: ");
+    if yes { gs::io::println(ctx, "yes (given on the command line)"); return true; }
+    read_confirm(ctx)
 }
 
 /// The most packages one plan installs, its own included (the package manager's `PLAN_MAX` and the package).
@@ -16122,6 +16146,12 @@ fn install_plan(ctx: &ShellCtx, spec: &str, from: Option<&str>, yes: bool, q: &m
     else if !read_confirm(ctx) {
         gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed, nor what it needs", spec));
         return Some(true);
+    }
+    for r in &rows[..n] {
+        if r.asks().split(", ").any(|p| p == "memory") && !confirm_dma(ctx, r.pkg(), yes) {
+            gs::io::println_fmt(ctx, format_args!("godspeed: {} not installed, nor what it needs", spec));
+            return Some(true);
+        }
     }
     for r in &rows[..n] {
         let mut grant = [0u8; 192];
@@ -26833,6 +26863,13 @@ fn read_confirm(ctx: &ShellCtx) -> bool {
         let b = ctx.console_read();
         match b {
             b'\r' | b'\n' => { gs::io::println(ctx, ""); break; }
+            // A USB host's notice printed over the question: not an answer. The question is still open, so
+            // the answer so far goes on a fresh line under the notice. A plug used to send an Enter here,
+            // which answered N (`godspeed install` on the VisionFive, 2026-10-24).
+            gs::io::keys::NOTICE_SIGNAL => {
+                gs::io::print(ctx, "\r\n[y/N]: ");
+                if let Ok(s) = core::str::from_utf8(&buf[..len]) { gs::io::print(ctx, s); }
+            }
             0x08 | 0x7f => { if len > 0 { len -= 1; gs::io::print(ctx, "\x08 \x08"); } }
             0x20..=0x7e => {
                 if len < buf.len() {

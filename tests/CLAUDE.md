@@ -10,7 +10,7 @@ tests/
     identity/    # CLAUDE.md only: maps each §22 Test to its entry (the tests live in osdev/src/validator.rs)
     harness/     # CLAUDE.md only: the harness itself is osdev/src/qemu.rs + validator.rs
     perf/        # baseline.json (written by `osdev test perf`) + CLAUDE.md
-    post_v1/     # verification-roadmap notes (coverage, unsafe audit, static analysis, mutation, ...)
+    post_v1/     # verification-roadmap notes (static analysis, mutation, property; coverage + unsafe audit are empty)
     1_IDENTITY/ ... 14_CHAOS_BRUTAL/   # committed serial logs from past suite runs - SNAPSHOTS, not
                  # tests, and not current: a run writes its logs to build/tests/<same name>/, and the
                  # committed copies predate later cases (no Test 11/15, no A11-A15, no C1B)

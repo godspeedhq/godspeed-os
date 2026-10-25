@@ -5,11 +5,12 @@
 > are **Apache-2.0** (`sdk/LICENSE`). Per-file `SPDX-License-Identifier` tags mark every
 > source file's zone. This document records the *strategy* and *rationale* behind that text.
 >
-> **Checked 2026-10-09, two gaps.** `sdk/LICENSE` names only `sdk/` in its own header; the standard
-> library (`stdlib/rust`) and `examples/` carry Apache-2.0 by their SPDX tags and have no `LICENSE`
-> file of their own. And "every source file" is not quite true: 13 `.rs` files carry no SPDX tag
-> (nine in `services/dwc2`, plus `net-stack/src/tcp.rs`, `probe/src/table.rs`,
-> `wifi-driver/src/main.rs` and `osdev/src/fs_model.rs`).
+> **Where the terms are written.** `sdk/LICENSE` carries the Apache-2.0 text for the SDK
+> (`sdk/rust`), the standard library (`stdlib/rust`) and `examples/`; the last two have no `LICENSE`
+> file of their own and are marked by their SPDX tags. The protocol crates beside the SDK - `sdk/wifi`,
+> `sdk/tls` and `sdk/audio` - are GPL-2.0-only, like the OS, and their tags say so.
+> `scripts/spdx_check.py` checks on every build that each tracked `.rs` file carries a tag, and that
+> the tag is its tree's licence.
 
 ## 1. The decision
 
@@ -20,6 +21,16 @@
 | **Examples** (`examples/`) | **Apache-2.0** | They are reference apps meant to be copied as the starting point for real services; permissive keeps that copy unencumbered. |
 | **Userspace services / apps** | **Any license** (their authors' choice) | They are separate programs over IPC - not derivative works of the kernel. A service built against the SDK carries **no copyleft**, so proprietary commercial services are fine. |
 | **Bundled bootloader** (Limine) | **BSD-2-Clause** (upstream; preserve its notice) | A separate program; GPL-compatible (§3). |
+
+### 1a. Two SDK files relicensed, 2026-10-25
+
+`sdk/rust/src/trace.rs` and `sdk/rust/src/churn.rs` carried GPL-2.0-only tags from their first commits,
+inside the Apache-2.0 SDK, and no commit or document gave a reason. It mattered most for `trace.rs`: the
+SDK's own `service_context.rs` calls it on every send and publish, so every program built on the SDK or
+on `gs` compiled GPL code in, which is the case this split exists to prevent. Both files have one
+author, the copyright holder, who relicensed them Apache-2.0 on 2026-10-25, so the SDK is wholly what
+the table above says it is. `scripts/spdx_check.py` had recorded the two as named exceptions; it records
+none now.
 
 The one-line summary: **copyleft OS, permissive ecosystem.** GodspeedOS-the-OS is
 GPL-2.0-only and open; what you build *on* it (against the Apache-2.0 SDK) is yours.
@@ -126,6 +137,10 @@ GPL code is mere aggregation, and Linux shipped them in-tree for years. Godspeed
 with a package manager, and fetch-at-setup was tried and failed three times on one file in an afternoon:
 the board name is a symlink, into a sibling directory, to a filename the packaging creates at build time.
 Absorbing that fragility once, here, beats pushing it onto every user.
+
+*(Note 2026-10-25: GodspeedOS has had a package manager since v0.29.0 - `godspeed fetch` then
+`godspeed install`, or a `.gsp` file. The firmware decision above was made before it and is unchanged:
+these blobs are still committed under `nonfree/`, not delivered as packages.)*
 
 The aggregation point matters and is worth stating plainly: the firmware is **data uploaded to a device**,
 not code linked into a GPL work. It does not make the OS a derivative of it, nor the reverse.

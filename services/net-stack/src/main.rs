@@ -244,6 +244,9 @@ fn nic_req(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i
 }
 
 fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, secs: i64) -> Option<Message> {
+    if pending.nic_absent(ctx) {
+        return None;
+    }
     // A plain bounded request (`request_with_reply_deadline_sifted`, in `sifted_req`), NOT the `Call`
     // primitive. Switching this to `Call`
     // during the x86 work is what stopped Pi 2 networking, and it was isolated by elimination on
@@ -309,6 +312,7 @@ fn nic_req_inner(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, s
                 }
                 ctx.log_fmt(format_args!(
                     "net-stack: op {} to nic-driver {} on the first attempt - and nic-driver could not be reacquired by name", op, what));
+                pending.nic_lost(ctx);
                 return None;
             }
         }
@@ -481,6 +485,15 @@ pub struct Displaced {
     ate_client_said: bool,
     /// Requests stashed over this service's life, for the throttled line in `note`.
     noted: u32,
+    /// `nic-driver` IS NOT RUNNING: its name did not resolve at the last reacquire - an installed driver
+    /// package holds the NIC (CLAUDE.md 14.1, drivers), or it is between a death and its respawn. Until the
+    /// name resolves again every request to it LOOKS THE NAME UP and sends nothing (`nic_absent`). It sent
+    /// before: each request went out on the dead instance's cap, the kernel refused it and logged a gen
+    /// mismatch, and with the polls asking every few milliseconds that was 218 lines while `kind-nic` held
+    /// the e1000 (`osdev test driver-packages`, 2026-10-24) - the flood `nic-driver`'s radio bridge had
+    /// (`backlog/fixed/88`) and `xhci` had for `wifi-usb`. Kept here because this is the state every
+    /// conversation with the driver is already threaded through.
+    nic_gone: bool,
 
     /// Client requests displaced by a conversation with `nic-driver`, kept in arrival order.
     ///
@@ -565,9 +578,32 @@ impl Displaced {
             n: 0,
             ate_client_said: false,
             noted: 0,
+            nic_gone: false,
             held: [const { None }; STASH_N],
             head: 0,
             live: 0,
+        }
+    }
+
+    /// Whether `nic-driver` is not running (`nic_gone`): looked up by name, and nothing sent while it is not.
+    /// Said once each way.
+    fn nic_absent(&mut self, ctx: &ServiceContext) -> bool {
+        if !self.nic_gone {
+            return false;
+        }
+        if !gs::cap::reacquire(ctx, "nic-driver") {
+            return true;
+        }
+        self.nic_gone = false;
+        ctx.log("net-stack: nic-driver is running again - its name resolves, asking it");
+        false
+    }
+
+    /// A request found `nic-driver`'s name not resolving: nothing is sent to it until it does (`nic_absent`).
+    fn nic_lost(&mut self, ctx: &ServiceContext) {
+        if !self.nic_gone {
+            self.nic_gone = true;
+            ctx.log("net-stack: nic-driver is not running - its name does not resolve; nothing is sent to it until it does");
         }
     }
 
@@ -2763,13 +2799,30 @@ fn link_notify(ctx: &ServiceContext, msg: &str) {
 /// five-second budget expired before it was answered: `serve: the echo was not accepted`, on a
 /// connection that was working perfectly. Bounded in work is not bounded in time (§26.6).
 fn nic_req_ms(ctx: &ServiceContext, pending: &mut Displaced, msg: &Message, ms: u64) -> Option<Message> {
-    ctx.request_with_reply_ms_sifted("nic-driver", msg, ms, |m| {
+    if pending.nic_absent(ctx) {
+        return None;
+    }
+    let r = ctx.request_with_reply_ms_sifted("nic-driver", msg, ms, |m| {
         let badge = gs::resource::last_badge(ctx);
         match gs::ipc::take_sent_cap(ctx) {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             None => true,
         }
-    })
+    });
+    reacquire_after(ctx, pending, r)
+}
+
+/// A fast path's answer, with the driver reacquired by name when there was none - for the NEXT call, never a
+/// retry of this one (a poll that is skipped is better than one that blocks, above). `nic_req` reacquires on a
+/// failure and these two did not, so a `nic-driver` that restarted - or was stood down while an installed driver
+/// package held the NIC and started again when it gave it back - left both polls sending on its dead capability
+/// for good: hundreds of refused sends, and no link afterwards (`osdev test driver-packages`, 2026-10-23). A name that
+/// does not resolve marks the driver not running (`Displaced::nic_lost`), so the next call sends nothing.
+fn reacquire_after(ctx: &ServiceContext, pending: &mut Displaced, r: Option<Message>) -> Option<Message> {
+    if r.is_none() && !gs::cap::reacquire(ctx, "nic-driver") {
+        pending.nic_lost(ctx);
+    }
+    r
 }
 
 /// Say where this service's time went while the connection just released was read (`tcp::Spent`), and start
@@ -2819,13 +2872,17 @@ fn nic_drain_ms(ctx: &ServiceContext, pending: &mut Displaced, ms: u64) -> Optio
     // SIFTED, like every other conversation with the driver. This was the last unsifted one, and it
     // is on the ping and TCP paths - the busiest moment in this service, and so the likeliest moment
     // for a client to speak into a wait that would have swallowed it.
-    ctx.request_with_reply_ms_sifted("nic-driver", &Message::from_bytes(&[9u8]), ms, |m| {
+    if pending.nic_absent(ctx) {
+        return None;
+    }
+    let r = ctx.request_with_reply_ms_sifted("nic-driver", &Message::from_bytes(&[9u8]), ms, |m| {
         let badge = gs::resource::last_badge(ctx);
         match gs::ipc::take_sent_cap(ctx) {
             Some(cap) => { pending.note(ctx, m, badge, cap); false }
             None => true,
         }
-    })
+    });
+    reacquire_after(ctx, pending, r)
 }
 
 /// Ask `nic-driver` for waiting frames (op 9). The PACING of an empty answer is the caller's.

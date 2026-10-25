@@ -57,8 +57,9 @@ the supervisor's commands, and there is one message carrying the state instead o
 
 **As built (Pi 2, `docs/wifi-usb.md` 26):** `sdk/rust/src/service_context.rs` `usbdev`. One message,
 `REPORT` - present or not, the binding count, VID:PID - instead of separate attached and detached
-messages: each report is the host's whole state for its device, so a duplicate is harmless. The host and
-port are not in it yet; two hosts report (`dwc2` and `xhci`), each with one such device. The binding
+messages: each report is the host's whole state for its device, so a duplicate is harmless. The host is in
+it since 2026-10-23 (byte 11, `HOST_DWC2`, `HOST_XHCI`, `HOST_EHCI`; section 4c); the port is not. Three hosts
+report (`dwc2`, `xhci`, `ehci`), each with one such device. The binding
 generation was a count restarting with each host instance until 2026-10-12; it is now the gen above, and
 `OP_INFO` carries it.
 
@@ -67,7 +68,7 @@ generation was a count restarting with each host instance until 2026-10-12; it i
 - **Not the kernel.** The supervisor already spawns and kills services; the hosts already send it
   nothing, and will send it this.
 - **New grants, pinned with their reasons:** `dwc2` and `xhci` each gain the supervisor as a peer, for
-  the reports.
+  the reports (`ehci` too, 2026-10-23).
 - **`wifi-usb`** is no longer started at boot. It is spawned with its dongle already bound, and the
   supervisor stops it on the report that the dongle is gone (decided in the first card: the driver does
   not exit by itself). On every board that embeds it, since `xhci` reports too (`docs/wifi-usb.md` 27),
@@ -83,7 +84,7 @@ generation was a count restarting with each host instance until 2026-10-12; it i
 |---|---|---|
 | `dwc2` (Pi 2) | binds the dongle, serves `usbfn` in full, tells `wifi-usb`, and REPORTS it (`usbdev`, 2026-10-06); the gen in `OP_INFO` (2026-10-12) | nothing |
 | `xhci` (PCs, Pi 4, VisionFive) | U2a: binds the dongle, serves control transfers; REPORTS it and watches its root or hub port (`docs/wifi-usb.md` 27). U2b and U2c, the bulk IN and OUTs, hardware-verified on the Pi 4: the dongle joins WPA2 through the VL805 (28-32); the gen in `OP_INFO` (2026-10-12) | nothing |
-| `ehci` (the T630's second controller) - **limitation, not planned** | one topology: the AMD hub on its root port, low-speed keyboards and mice behind it; **skips every high-speed device** on a hub port | everything `xhci` needed, and bulk transfers from scratch |
+| `ehci` (the T630's second controller) | the AMD hub on its root port with low-speed keyboards and mice behind it, as before; since 2026-10-23 also ONE vendor-specific device, behind that hub at any speed or straight on a root port, bound for a driver package and REPORTED as host `ehci` (section 4c) | the dongle: bound, but no notices are sent, so `wifi-usb` is not started for it |
 
 **`ehci` - A RECORDED LIMITATION, not planned work (operator, 2026-10-06).** A dongle in a socket that
 routes to `ehci` (on the T630, its second controller) is NOT driven: `ehci` logs it as a high-speed
@@ -97,6 +98,76 @@ behind a high-speed hub needs no split transactions, which is EHCI's simple case
 by VID:PID instead of skipping it; a runtime control transfer that leaves the rest of the arena
 alone; a bulk IN qTD kept armed, with its completion taken on the interrupt; a bulk OUT; and serving
 `usbfn`, as `xhci` and `dwc2` do.
+
+**Superseded in part, 2026-10-23 (section 4c):** `ehci` now binds a vendor-specific device, the dongle among them,
+and serves its transfers, for an installed driver PACKAGE. What stays true of the paragraph above: `wifi-usb` is not
+started for a dongle on `ehci` - it waits to be told of each held transfer (`NOTE_BULK_IN`), and `ehci` sends no
+notices - so `wifi` still reports no radio there, and the front sockets are still the answer for WiFi.
+
+## 4b. A device for an installed driver package (2026-10-23)
+
+The design above names "an interface class later" for the match table. What was built instead is narrower and
+needs no class: `xhci` and `dwc2` bind, beside the dongle, any device whose first interface is vendor-specific
+(class 0xFF) - the classes a host has no driver of its own for - and report it with the same `usbdev` report.
+The supervisor matches the report against `USB_MATCH` AND against the installed driver packages that name a
+device by `hw_usb`, and a package wins: it is started with the reporting host as its peer, and the built-in
+driver of that device (`wifi-usb`, for the dongle) is kept down while it is installed. The package speaks the
+function protocol through `gs::driver::bus`. One bound device per host still holds. Shown in QEMU with the FTDI
+serial adapter behind `xhci` (`osdev test driver-packages`); `dwc2`'s side is built and unseen, since it serves a
+high-speed device only and QEMU's `raspi2b` offers none. `docs/developer-services-design.md` 13.1 has the rest.
+
+## 4c. `ehci` binds one too (2026-10-23)
+
+Asked for by the operator the same day. `ehci` binds ONE device whose first interface is vendor-specific and that is
+not a boot keyboard or mouse (which it drives itself), wherever it finds one: behind the T630's rate-matching hub at
+high speed (straight through the hub) or at full speed (split through its translator), or straight on a root port.
+It addresses it at 100, clear of the hub and the keyboards, configures it, finds its first interface's bulk
+endpoints, and answers the function protocol for it: `OP_INFO` (with where it is), `OP_CONTROL`, `OP_CONTROL_ONCE`,
+`OP_BULK_OUT` and `OP_BULK_IN`. `OP_REPLUG` is refused, as `xhci` refuses it. Every transfer is the async schedule,
+one queue head at a time as its control transfer always was, in a part of the arena of its own; while keyboards are
+polled the schedule is pointed back at their ring after each one (`services/ehci/src/bound.rs`).
+
+**What differs from `xhci`, recorded rather than hidden (26.7).** No notices: a bulk IN waits up to 20 ms for the
+device and says what came, nothing included, so a driver asks again (`gs::driver::bus` callers already do; `wifi-usb`
+does not, which is why it is not started here). A device behind the hub is watched by asking the hub at most once a
+second, and a device on a root port by reading the port on every wake (at most 250 ms apart); a re-scan for keyboards
+leaves the bound device's port alone. Every root port is watched (2026-10-24; until then only the first one connected
+at boot was, Audit 25's finding 5): the first with a high-speed device on it is taken, a port whose device is not
+high-speed or not bound is passed over until it leaves, and when the bound device leaves every port is watched again.
+Once a hub is found it is enumerated for the driver's life and no other root port is watched; the T630's back sockets
+are all behind its one rate-matching hub, so there that costs nothing (a second hub on another root port would not be
+seen - not on any board here, recorded).
+
+**A device it does not bind is moved off address 0 (2026-10-25).** It used to be left where it was turned away, which
+for one refused at its descriptor is the default address 0. A high-speed device sees every high-speed transaction on
+the bus, so on the T630 the boot stick in one back socket - mass storage, never bound - answered for every high-speed
+device plugged in after it: the WiFi dongle in another socket was read as `1f75:0902`, the stick, and never bound.
+Keyboards were unaffected, since their transactions go through the hub's translator, which the stick does not see.
+`try_bind` now gives every device it does not bind address 101 (`PARK_ADDR`), and one that took address 100 and then
+refused its configuration is moved off 100 too. Shown in QEMU (`osdev test driver-packages`): a high-speed keyboard
+(`usb-kbd,usb_version=2`) on one root port and a stick plugged into another after it; before the change the stick
+was read as the keyboard, `0627:0001`, and now it is bound as itself.
+
+**The WiFi dongle on `ehci` is not verified, and is out of scope for now (operator, 2026-10-25).** The T630 card
+after that fix booted the image before it (`248246c2`), so it showed neither the fix nor its absence. The operator
+chose not to spend further cards on it: the dongle works through `xhci`'s sockets, and `wifi-usb` would still need
+notices `ehci` does not send. Recorded with it, from the same card: typing on a keyboard in a back socket lags
+slightly. `ehci` says why in its own log - `a HID report arrived with no interrupt - polling input at the 10ms
+tick` - so keystrokes are taken on the scheduler tick rather than when they arrive. Not changed by this branch, not
+investigated.
+
+**The report names its host.** `usbdev`'s report gained a byte, the host (`HOST_DWC2`, `HOST_XHCI`, `HOST_EHCI`),
+because a PC now has two hosts that report and "nothing attached" from one said nothing of the other. The supervisor
+keeps what each host last reported (`UsbState::by_host`, `Installed::usb_attached`): a package is started with the
+host that HAS its device as its peer, its device's leaving is taken from that host's report only, and a built-in
+driver is started for a device only on a host it is wired to - the dongle on `ehci` is said to be "attached on ehci,
+which wifi-usb is not wired to", never handed to `wifi-usb` with `xhci` as its peer.
+
+**Shown in QEMU** with QEMU's mass-storage device straight on a `usb-ehci` root port: `ehci` binds it (in a test build,
+`bind-any-class`, since a stick is not vendor-specific and QEMU's EHCI has no vendor-specific high-speed device), the
+supervisor starts `kind-stick` with `ehci` as its peer, and the package reads the stick's SCSI INQUIRY - a bulk OUT and
+two bulk INs (`osdev test driver-packages`). **Not seen:** anything behind the T630's hub, the full-speed split path
+above all, and the hub-port watch; those are a hardware card on the T630's back sockets.
 
 ## 5. Order of work
 

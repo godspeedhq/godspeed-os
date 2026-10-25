@@ -27,11 +27,11 @@ A pipeline is **one producer, zero or more filters, one sink**:
 
 - **PRODUCER** - emits text (or records), ignores input. Text built-ins
   (`is_producer_builtin`): `read`, `echo`, `tree`, `input`, and the system-info commands `about` /
-  `version` / `whatis` / `mem` / `cores` / `date` / `net` / `ping` / `sock` / `help`, plus `random`,
-  `tcp`, `churn`, and the report verbs of `wifi`, `audio` and `hardware` (their action verbs
-  refuse). Record
+  `version` / `whatis` / `mem` / `cores` / `date` / `net` / `ping` / `sock` / `help` / `pwd`, plus
+  `random`, `tcp`, `churn verify` (`churn`'s other verbs refuse), and the report verbs of `wifi`,
+  `audio` and `hardware` (their action verbs refuse). Record
   built-ins (`is_record_producer`): `status`, `dir`, `caps`, `drives`, `find`, `uptime`, `events`,
-  `trace`, `jobs`, and `observe now`. Services: `greet` (text), `roster` (records). *(There is no
+  `trace`, `jobs`, `ask`, the report verbs of `godspeed` (its action verbs refuse), and `observe now`. Services: `greet` (text), `roster` (records). *(There is no
   `cat`: `read` is the one file reader - `utilities/18_read.md`, the replacement for POSIX `cat`,
   whose name describes a different operation. This OS does not carry POSIX vocabulary for its own
   sake.)*
@@ -63,9 +63,9 @@ The governing idea is simple: **anything that displays information can be saved.
 pipe source iff its job is to *emit data*. That splits the command set three ways:
 
 - **Data / display commands → pipe sources.** Anything whose purpose is to show you something:
-  `about`, `version`, `whatis`, `mem`, `cores`, `date`, `net`, `ping`, `sock`, `help`, `random`,
-  `tcp`, `churn`, the reports of `wifi` / `audio` / `hardware`, `status`,
-  `dir`, `caps`, `drives`, `find`, `uptime`, `events`, `trace`, `jobs`, `tree`, `read`, `echo`,
+  `about`, `version`, `whatis`, `mem`, `cores`, `date`, `net`, `ping`, `sock`, `help`, `pwd`,
+  `random`, `tcp`, `churn verify`, the reports of `wifi` / `audio` / `hardware` / `godspeed`, `status`,
+  `dir`, `caps`, `drives`, `find`, `uptime`, `events`, `trace`, `jobs`, `ask`, `tree`, `read`, `echo`,
   `input`, `observe now`. Each renders through an `Out` target that is the console when run
   bare and a capture buffer when piped - so `about` prints, and `about | write /f` saves, the same
   bytes. No new authority: a built-in already held these capabilities; the pipe just redirects its
@@ -175,7 +175,8 @@ added - built-ins already had these capabilities; the pipe just redirects their 
 A service stage is wired with **no new syscall**:
 
 1. The shell asks the supervisor to spawn the service with `"shell"` as its peer
-   (`spawn_via_supervisor(service, 0xFFFF, &["shell"])` in `drain_service`). The delegated SEND cap
+   (`spawn_via_supervisor(svc, 0xFFFF, peers)` in `drain_stage`, with `&["shell"]` as the peers
+   `drain_service` passes). The delegated SEND cap
    to the shell's own endpoint is installed **first** (`gs::ipc::peer_at(ctx, 0)`) - that is the service's
    "downstream". The service's contracted peers (e.g. `fs`) follow, so a filter that must
    reach them to receive input still can.
@@ -203,9 +204,9 @@ knows when to stop. A zero-length message is **not** used: a byte says what it m
 - Each inter-stage buffer is 16 KiB; overflow is reported, never silent: the capture keeps what
   fits and the shell prints `pipe: producer output exceeded the pipe buffer (truncated)`.
 - A pipeline is capped at `MAX_STAGES` (8); more is refused.
-- **Stage 1 must be a producer.** A non-producer service in stage 1 would block the shell on a
-  `recv` that never comes (no non-blocking `recv` in v1), so producer services are an explicit
-  whitelist (`is_pipe_producer_service`, currently `greet`); anything else is refused loudly.
+- **Stage 1 must be a producer.** A non-producer service in stage 1 would send nothing, and the
+  shell would wait out its `FILTER_WAIT_SECS` deadline for output that never comes, so producer
+  services are an explicit whitelist (`is_pipe_producer_service`, currently `greet`); anything else is refused loudly.
 - A producer built-in mid-pipe or as a sink (it ignores input), or a service that never
   registers when used as a filter, is reported, not silently mishandled.
 - A buffer larger than a **service** stage can take (4 KiB, one message) is refused loudly with
@@ -235,8 +236,9 @@ no multi-block" limitation:
 (The `\| write` sink is no longer a ~3.5 KiB ceiling: it streams the buffer to a multi-block file
 via `WriteNew`/`WriteAt`. The remaining hard cap is the 4 KiB *service*-stage message.)
 
-So a *builtin-only* capture can fill 16 KiB, but it can only reach a sink that can take it -
-which today nothing beyond 4 KiB can. Lifting this is the streaming work, not a constant.
+So a *builtin-only* capture can fill 16 KiB and the `write` sink takes all of it; what cannot
+take more than 4 KiB is a *service* stage. Lifting that, and the 16 KiB total, is the streaming
+work, not a constant.
 
 ## Future: true streaming (design intent - not built)
 

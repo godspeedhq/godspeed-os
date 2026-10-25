@@ -926,7 +926,7 @@ const SPAWN_FLAG_PEERS_GRANT: u32 = 1 << 3;
 /// (the endpoint-id guard in `ipc::names`). The kernel learns nothing about what is handed over.
 const SPAWN_FLAG_HANDOVER: u32 = 1 << 5;
 /// Ceiling on a caller-requested DMA arena, in 4 KiB pages. 2048 = 8 MiB, comfortably above the
-/// largest real request (xHCI's, 1280 KiB) and far below anything that could starve the
+/// largest real request (xHCI's, 1344 KiB) and far below anything that could starve the
 /// frame allocator.
 const MAX_DMA_PAGES: u32 = 2048;
 /// A task of that name is already running, and one name is one task. Its own code because it is the one

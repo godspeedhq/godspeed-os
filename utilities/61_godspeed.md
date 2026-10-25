@@ -79,7 +79,8 @@ A registry is three things, kept together on one line of the file:
 - an **address** - `https://` only, because the transport is TLS;
 - a **signing root** - `sha256:` and 64 hex digits, the root its metadata must be signed by. Each registry
   has its own, so switching registries switches which root is checked and never trusts one registry with
-  another's root. **Nothing checks it yet**: it is for the metadata check, which is not built.
+  another's root. It is checked on first contact with the registry: root 1 must have this SHA-256
+  (section 4a, step 1).
 
 `godspeed registry add` shows the root and asks `[y/N]` before trusting it, because trusting a root is
 trusting whoever holds its key. `yes` as the last word answers in advance, as for `seal` and `chaos
@@ -87,11 +88,11 @@ max-carnage`; the line naming the root still prints. A registry is added known, 
 says `godspeed registry use <name>` to switch. `remove` refuses the one in use: switch first, so something
 is always in use.
 
-**An installed package will remember the registry it came from**, and an update will fetch from there,
-not from whichever registry is in use at the time. Otherwise switching registries would quietly change
-where installed packages update from, and a package with the same name on another registry, signed by
-another key, could replace one. If that registry has been removed, the update says so rather than trying
-another. This is the rule installing will follow; nothing installs yet.
+**A fetched package remembers the registry it came from** (in its `origin`), and `list updates` and
+`upgrade` ask there, not whichever registry is in use at the time. Otherwise switching registries would
+quietly change where installed packages update from, and a package with the same name on another registry,
+signed by another key, could replace one. If that registry has been removed, the command says so rather
+than trying another.
 
 `godspeed registry` is one row per registry: `item` its name, `value` its address, `note` the root it is
 signed by and, for the one in use, `in use`.
@@ -181,7 +182,7 @@ the shared crate's):
 | `info` | a CARD (`key value note`): `title` (the release, the latest or not, when and by whom), `about` (its description), `licence`, `built for` (the release, beside this machine's), `ships` (its architectures, and whether this machine's is one), `requests`, `signed` (the key, shortened, and its standing), `versions`; the chain, through the contract, in the status note. Checked as `fetch` checks it |
 | `fetch` | progress while it works (the chain's steps, then a bar as the binary downloads), then a CARD: `title` (fetched, or already fetched, and from where), `about` (the folder), `binary` (this machine's architecture and size), `built for`, `requests`, `signed`, `installed no`; the chain, through the binary, in the status note |
 | `list fetched` | a list, `package version from size state`, `size` in bytes (a pipe can compare it; the console shows KiB); the count and total in the status note |
-| `list installed` | none yet: the status note says why |
+| `list installed` | a list, `package version state` (section 4b); the count in the status note, or, with none, the command that installs one |
 | `list updates` | a list, `package have latest status`: newer (with the command that fetches it), up to date, or no longer listed. Each is asked of the registry it came from, not the one in use |
 | `verify` | a list, `package version status detail`, `status` `intact` or `DAMAGED`; the count in the status note. A damaged copy fails the command |
 | `trust` | a CARD per registry: `title` (its name, in use or not), `root` (and its expiry), `timestamp`, `namespaces`, `pin` (and whether it is the configuration's), then a `key <publisher>/` row per key, whole, with its standing |
@@ -257,6 +258,22 @@ way; a package that dies is restarted from the disk up to 5 times a boot and the
 
 **What it is given:** the approved peers, never `supervisor`, an endpoint if its contract declares `ipc_receive`, its
 contract's memory limit up to 64 MiB, and **no privilege**, which is not asked and cannot be granted.
+
+**A driver** is asked about its device as well (`device`): a PCI device by class - its registers, and its interrupt
+when the contract asks - or a USB device by vendor and product, reached through its host and started only while it
+is attached. One that asks for a DMA arena lists `memory` too and is then asked a SECOND question, because where no
+IOMMU confines the device its driver can read and write all of memory:
+
+```
+godspeed/kind-driver 0.1.0 asks for: device, memory (no privilege) and starts at every boot, driving that device. Install it and grant them? [y/N]: y
+godspeed/kind-driver 0.1.0 also asks for DMA memory: its device reads and writes memory by itself.
+Where no IOMMU confines the device - every Raspberry Pi and the VisionFive, an Intel PC, and
+any device the kernel leaves unconfined - its driver can then read and write all of this
+machine's memory. Grant it DMA memory? [y/N]:
+```
+
+A device a GodspeedOS driver already drives is taken over: that driver is stopped while the package is installed
+and started again when it is uninstalled (`docs/developer-services-design.md` 13.1).
 
 `godspeed upgrade <pkg>` (or `all`) looks up the newest release of each installed package on the registry it came
 from, fetches and verifies it, and installs it in the old one's place with the same question, now naming the
@@ -372,7 +389,7 @@ and the package asked for is last, `install`.
 
 ## 5. Pipes
 
-`godspeed search`, `info`, `list available | fetched | installed | updates`, `plan`, `resolve`, `verify`, `trust`, `registry`, `config` and `check` are reports, so they pipe as records
+`godspeed search`, `info`, `inspect`, `list available | fetched | installed | updates`, `plan`, `resolve`, `verify`, `trust`, `registry`, `config` and `check` are reports, so they pipe as records
 (`item`, `value`, `note`), with a last row whose item is `status` and whose value is `ok` or `failed`:
 
 ```
@@ -384,14 +401,17 @@ godspeed config | where note=file
 godspeed check | where item=tls
 ```
 
-`godspeed fetch`, `remove`, `install`, `uninstall` and `trust reset`, `godspeed config set` and `godspeed registry add`, `use` and
-`remove` are actions and refuse to start a pipe, with the sentence naming the reports.
+`godspeed fetch`, `remove`, `install`, `uninstall`, `upgrade`, `trust reset`, `trust add` and `trust remove`,
+`godspeed config set` and `godspeed registry add`, `use` and `remove` are actions and refuse to start a pipe,
+with the sentence naming the reports. `godspeed cleanup` piped is its listing alone: nothing is asked, so
+nothing is deleted. A package file given to `inspect` in a pipe is named by its full path.
 
 ## 6. What it holds
 
-Its supervisor row grants exactly four peers - the shell for its answer, `fs` for its settings, roots,
-trust record and fetched packages, `net-stack` for the registry's connection, `time` for the date - and no
-privilege of any kind. Packages added no peer and no privilege. Pinned in
+Its supervisor row grants exactly five peers - the shell for its answer, `fs` for its settings, roots,
+trust record and fetched packages, `net-stack` for the registry's connection, `time` for the date, and the
+supervisor, which starts and stops an installed package for it (`supcmd::INSTALL`, `UNINSTALL`,
+`INSTALLED`) - and no privilege of any kind. Pinned in
 `COMMANDMENTS.baseline.toml`. The TLS client is `sdk/tls`; the connection is `net-stack`'s op 23, a TCP
 connection held as a capability (`gs::net::Net::connect`). The `[y/N]` before a root is trusted is asked by
 the shell, which holds the console; the package manager is told only what to add.

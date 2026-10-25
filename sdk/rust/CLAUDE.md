@@ -33,6 +33,7 @@ Provide typed, safe wrappers around kernel syscalls so service code:
 | `dma.rs`              | `Dma`: accessors for a granted DMA arena (18.1) |
 | `memory.rs`           | `Region`: pages `AllocMem` mapped for this task, as a byte slice (18.1). Asked for once and reused - there is no free |
 | `hid.rs`              | USB HID boot-protocol decoding (keyboard and mouse), key repeat, and the Ctrl+Alt+Del and audio-shortcut signals (Ctrl+Alt+Up, Down, M), shared by `xhci`, `ehci` and `dwc2` - pure logic, host-tested |
+| `usbfn.rs`            | The USB function protocol's numbers (`OP_INFO`, `OP_CONTROL`, `OP_BULK_IN`, `OP_BULK_OUT`, ...): what a USB host service (`xhci`, `dwc2`, `ehci`) answers for the one device it binds for a driver, spoken through `gs::driver::bus` and re-exported by `godspeed_wifi::usbfn` |
 | `churn.rs`            | Pure helpers for the `churn` power-cut test's file content |
 | `adversarial.rs`      | The test-only fault and fuzz primitives (18.1): `fuzz_syscall` and the deliberate ring-3 faults; also the panic handler's way to die |
 
@@ -90,7 +91,7 @@ a number by hand instead of using `log_fmt`).
 | **IPC** | `recv()`; `try_recv() -> Option`; `recv_timeout(cycles)`; `send(peer, &msg)`; `try_send(peer, &msg)`; `send_by_handle(h, &msg)`; `request_with_reply(peer, &msg) -> Option<Message>` (sync, waits on truth); `reacquire_by_name(peer) -> bool` |
 | **Delegated resource caps (§7.10)** | `resource_mint(rights) -> Option<(id, cap)>`; `resource_invoke(cap, right, reply, &msg)`; `resource_revoke(id) -> bool`; `last_recv_badge() -> Option<(id, right)>`; `take_pending_cap() -> Option<CapHandle>`; `send_with_cap_by_handle(peer_h, cap, &msg)`; `acquire_send_cap(peer) -> Option<CapHandle>` |
 | **Hardware (drivers, §12)** | `mmio() -> Option<Mmio>`; `dma_region() -> Option<Dma>`; `irq_unmask(vector)`; `device_power(on) -> bool` (needs `DEVICE_POWER`, minted with a fixed device window the arch can power; §12.3); `cpu_clock(max) -> Option<u32>` (needs `CPU_CLOCK`, held by `power` alone); `power_off() -> i64`, `power_off_in(secs) -> i64`, `power_off_cancel() -> i64` (need `POWER_OFF`, held by the shell alone; `power_off` returns only when refused), `reboot_in(secs) -> i64` and `reboot_cancel() -> i64` (need `REBOOT`; the same one deadline), and `power_pending() -> Option<PowerPending>` with its two halves `power_off_pending()` and `reboot_pending()` (ungated, `docs/shutdown.md`) |
-| **CPU / lifecycle** | `yield_cpu()`; `park() -> !`; `spawn_on(name, core)` (by name: the kernel catalogue holds `supervisor` alone, so every other name fails) |
+| **CPU / lifecycle** | `yield_cpu()`; `park() -> !`; `exit(status) -> !` (syscall 57, CLAUDE.md 14.5; `gs::program::exit`); `spawn_on(name, core)` (by name: the kernel catalogue holds `supervisor` alone, so every other name fails) |
 
 ## Records and pipe-friendly services (`record.rs`)
 

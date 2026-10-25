@@ -15,6 +15,10 @@ do, who holds an authority, what to say, glossary terms, the Easter eggs, `ask e
 piped. QEMU-verified only; no board has run it yet. The vocabulary and every truthfulness rule are host
 tests (`services/ask/src/know.rs`, run by `scripts/host_test_check.py`).
 
+*(Note 2026-10-25: `feat/ask` merged to `main` for v0.26.0, and that merge records `chaos max-carnage`
+1000 and `selfcheck` 0 failed on all five boards - the Pi 4, Pi 2, VisionFive 2 Lite, Dell Wyse 5070 and HP
+T630 - with `ask` in the image. The paragraph above is the state on the day it was written.)*
+
 ## 1. The command
 
 ```
@@ -97,8 +101,9 @@ gsh> ask "is my system healthy?" | where label=verdict
 
 The kernel gives a task at most six send peers, and one row for every question would need seven. So the
 supervisor carries two rows for the one program, as it does for `observe`: `ask` (the supervisor, `fs`,
-`block-driver`, the board's USB host and radio) and `ask-net` (the supervisor, `net-stack`, the radio).
-The shell picks the row by reading the question with `ask`'s own `know.rs`, compiled into the shell from
+`block-driver`, the USB host the board's disk is behind where there is one, and the radio) and `ask-net`
+(the supervisor, `net-stack`, the radio - both radio drivers where a board carries two, the Pi 4 and the
+VisionFive). The shell picks the row by reading the question with `ask`'s own `know.rs`, compiled into the shell from
 the same file, so the two cannot disagree about which question it is. Each row's grants are pinned
 (Commandment VII).
 

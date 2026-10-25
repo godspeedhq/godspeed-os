@@ -55,7 +55,7 @@ USB keyboard → xhci driver → gs::driver::input::push (syscall 20)
 shell → ConsoleRead (syscall 17) → reads the ring
 ```
 
-**`events`** holds the bounded IPC trace ring (469 lines, `utilities/47_events.md`)
+**`events`** holds the bounded IPC trace ring (474 lines, `utilities/47_events.md`)
 - it was a stub that logged "ready" and parked when this was written. What has NOT
 changed is the half that matters here: all logging still short-circuits through the
 kernel ring buffer to serial and the framebuffer, and no log line goes *to* the
@@ -319,7 +319,7 @@ font renderer and is serial-blind") is answered below.
 
 ### 9.2 The split
 
-| | Kernel (`bootcon/`, 536 lines) | `console` service (1,763 lines) |
+| | Kernel (`bootcon/`, 539 lines) | `console` service (1,785 lines) |
 |---|---|---|
 | Serial | owns it, unchanged - **still the source of truth** | never touches it |
 | Framebuffer | a minimal boot/panic blit | the whole terminal |

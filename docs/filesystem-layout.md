@@ -310,6 +310,10 @@ folder (L2). It holds verified copies, not running programs: nothing starts a pr
 trust record is the package manager's own, under `/system/services/godspeed/trust/`. Versioned images and
 application data have not arrived.
 
+*(Note 2026-10-25: "nothing starts a program from disk yet" was true of `fetch` alone. Since `godspeed install`
+(the same day, v0.29.0) the supervisor starts an installed package from its copy under `/system/packages/`, after
+checking it again (`services/supervisor/src/installed.rs`, CLAUDE.md 14.1, 2026-10-17 amendment).)*
+
 ---
 
 ## 11. Layout rules

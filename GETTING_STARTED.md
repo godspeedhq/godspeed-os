@@ -71,6 +71,12 @@ also embed its image and spawn it (`services/supervisor/build.rs`, its `IMAGES` 
 `ensure_mapped` call; `hello` itself is embedded only for `osdev test examples`). Then
 `cargo run -p osdev -- build` and boot. (Copy `examples/00-hello` as your starting point - `osdev new` is not implemented yet.)
 
+**Or leave the OS untouched.** The developer CLI, [godspeed-cli](https://github.com/godspeedhq/godspeed-cli),
+makes the same kind of service outside this repository (`godspeed new service <name>`), builds it against a
+published GodspeedOS release, and packages and publishes it. A running Godspeed machine then takes it with
+`godspeed fetch` and `godspeed install` at its `gsh>` prompt: the supervisor checks its signature, the
+operator approves what its contract requests, and it starts, with no rebuild and no reflash.
+
 ## 3. The one gotcha that will bite you: `#[no_mangle]` on `service_main`
 
 A service's entry point is wired **by name**: `build.rs` passes `--entry=service_main` to the linker,
@@ -91,7 +97,11 @@ own "starting"/"ready" log.
   `ping`/`pong` (IPC + restart/reacquire) -> `reply-server` (request/reply) -> `cap-grant` ->
   `resource-server` -> the `greet`/`upper`/`roster` pipe trio -> `counter` (state across restart) ->
   `driver-skeleton`/`e1000` (hardware). Each folder's `CLAUDE.md` ties its pattern to a Commandment.
-- **[`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md)** - the `ServiceContext` API you call.
+- **[Writing a program for GodspeedOS](https://godspeedhq.github.io/godspeed-os/stdlib.html)** - the
+  standard library, `gs`, that a service is written against, and its
+  [API reference](https://godspeedhq.github.io/godspeed-os/api/godspeed/).
+- **[`sdk/rust/CLAUDE.md`](sdk/rust/CLAUDE.md)** - the layer underneath, `ServiceContext` and the SDK, for a
+  driver or for reading what `gs` is built on.
 - **[`CONTRIBUTING.md`](CONTRIBUTING.md)** - the "Where do I start?" task map and the instant-reject
   rules a pull request is held to.
 - **[`COMMANDMENTS.md`](COMMANDMENTS.md)** then **[`CLAUDE.md`](CLAUDE.md)** - the ten rules, then the

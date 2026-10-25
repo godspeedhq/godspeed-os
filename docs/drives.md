@@ -15,7 +15,8 @@
 > reachable on demand by `[index:]label/path` whenever it's plugged in; `15_drives.md`
 > §3.1), and **`drives use` / `drives use default`** (the current location is a single
 > drive+dir pointer moved by `cd`, not a second "current drive" verb; `15_drives.md`
-> §3.2). The boot layer is the `drives godspeed install|update|default` namespace. This
+> §3.2). The boot layer is reserved as the `drives godspeed install|update|default` namespace
+> (designed in `docs/prime.md`, not built). This
 > doc is retained for the **architecture/rationale** - addressing (§4.1/§4.2), the
 > default-flag (§3), the multi-drive model (§4), build scope (§7) - not the verb list.
 
@@ -51,8 +52,8 @@ With pluggable drives, the system needs to know *which* disk to mount on boot.
 
 ## 4. Multiple drives
 
-GodSpeed sees every attached disk (block-driver enumerates all SATA ports; today
-it only uses the first - multi-drive lifts that). Each drive is an independent GSFS
+Today GodSpeed uses one disk: block-driver stops at the first SATA port with a disk
+(on the USB boards, the one USB stick) - multi-drive lifts that. Each drive is an independent GSFS
 tree (its own root directory). A drive moves through states:
 
 ```
@@ -131,13 +132,13 @@ UUID. Identity (label) names it; location (index) disambiguates when identity re
 
 | Command | Effect | Persists? |
 |---------|--------|-----------|
-| `drives` | list every drive: index, label, status, size, current/default | - |
+| `drives` | list every drive: index, label, status, size, free | - |
 | `drives flash <drive> [label]` | format `<drive>` as a GSFS data drive (asks `[y/N]` - it ERASES); optional label; usable at once | data: yes |
 | `drives label <drive> <new>` | rename a drive's label; rewrites the superblock (duplicates allowed - index disambiguates) | data: yes |
-| `drives godspeed install <drive>` | install bootable GodspeedOS onto the drive (Prime) | **yes** |
-| `drives godspeed update <drive>` | A/B kernel update of an installed drive | **yes** |
-| `drives godspeed default <drive>` | which installed GodspeedOS the machine boots | **yes** |
-| `drives godspeed` | list installed GodspeedOS drives / help | - |
+| `drives godspeed install <drive>` | install bootable GodspeedOS onto the drive (Prime; not built) | **yes** |
+| `drives godspeed update <drive>` | A/B kernel update of an installed drive (not built) | **yes** |
+| `drives godspeed default <drive>` | which installed GodspeedOS the machine boots (not built) | **yes** |
+| `drives godspeed` | list installed GodspeedOS drives / help (not built) | - |
 | `cd <path>` · `mkdir <path>` | change current location / create a directory (`utilities/17`,`20`) | - |
 | `dir [path]` · `read <path>` · `write <path> …` · `copy`/`move`/`rename`/`delete` | navigate / read / write / manage files (`utilities/16`-`24`) | - |
 

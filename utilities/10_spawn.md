@@ -58,4 +58,4 @@ CLAUDE.md §13.6), places the task on a core (§14.1), and adds it to the run qu
 ## 6. Conformance
 
 Conforms: own `spawn help` / `spawn version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
-`help` under **Services** as `spawn <name>`. See `0_conventions.md` §3.
+`help` under **Services** as `spawn <svc>[,svc,...]`. See `0_conventions.md` §3.

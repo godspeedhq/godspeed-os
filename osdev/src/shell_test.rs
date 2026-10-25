@@ -6343,8 +6343,11 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
 }
 
 /// Boot bare-metal with a 10 MB `.gsh` baked in and `run` it - proving the run-from-file BOUND
-/// (SCRIPT_MAX): the streaming minifier reads ~7 KiB of CODE and truncates LOUDLY, the complex tour
-/// still runs, and the kernel never panics or OOMs on a 10 MB file (§26.6.1, docs/scripting.md §9).
+/// (SCRIPT_MAX): the streaming minifier reads the file in a fixed buffer, finds more CODE than fits,
+/// and REFUSES the script loudly with none of it run, and the kernel never panics or OOMs on a 10 MB
+/// file (§26.6.1, docs/scripting.md §9). Until `914b4329` (2026-10-10, `backlog/fixed/80` H11) the
+/// part that fitted ran; a script cut short can leave a half-done job, so that is what is pinned
+/// against now.
 pub fn run_big_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {
     println!("big-script: booting (smp={smp}) with a 10 MB GSFS-baked .gsh");
     let qemu      = crate::qemu::qemu_binary();
@@ -6397,23 +6400,24 @@ pub fn run_big_script(image_path: &Path, disk_path: &str, script_name: &str, smp
         child.kill().ok(); child.wait().ok(); std::process::exit(1);
     }
 
-    // Run the 10 MB script. It loads BOUNDED (~7 KiB), truncates loudly, runs the tour + some blocks.
+    // Run the 10 MB script. It is read BOUNDED (SCRIPT_MAX) and refused before any of it runs.
     send(&mut write_half, format!("run /{script_name}\r").as_bytes());
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
         Some(r) => {
             let _ = std::fs::write("build/big-script-transcript.txt", r.as_bytes()); // full transcript for inspection
             let tail: String = r.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
             println!("\n=== 10 MB run transcript (last 50 lines; full -> build/big-script-transcript.txt) ===\n{}\n=== end ===", tail.trim());
-            check!(r.contains("===TEN-MEG-STRESS-BEGIN==="), "the run started (10 MB script loaded, not rejected)");
-            check!(r.contains("===TEN-MEG-TOUR-DONE==="), "the complex feature-tour ran to completion (all features green)");
-            check!(r.contains("truncated") || r.contains("CODE exceeds"), "the 10 MB script truncated LOUDLY at SCRIPT_MAX");
-            check!(r.contains("blk-"), "dynamic blocks ran past the tour, up to the truncation point");
+            check!(r.contains("CODE exceeds") && r.contains("none of it was run"),
+                   "the 10 MB script is refused LOUDLY at SCRIPT_MAX, saying none of it ran");
+            check!(!r.contains("===TEN-MEG-STRESS-BEGIN==="), "its first line did not run");
+            check!(!r.contains("===TEN-MEG-TOUR-DONE===") && !r.contains("blk-"),
+                   "nothing past the first line ran either (no tour, no dynamic block)");
             check!(!r.contains("KERNEL PANIC"), "no kernel panic on a 10 MB file");
         }
         None => { println!("big-script: FAIL - `run /{script_name}` timed out (hang on 10 MB?)"); fail += 1; }
     }
 
-    // The shell SURVIVED - it still answers after loading + truncating a 10 MB file (no wedge/OOM).
+    // The shell SURVIVED - it still answers after reading and refusing a 10 MB file (no wedge/OOM).
     send(&mut write_half, b"echo STILL-ALIVE\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
         Some(r) => check!(r.contains("STILL-ALIVE"), "shell is responsive after the 10 MB run"),
@@ -8662,7 +8666,8 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let _ = run!(b"godspeed remove godspeed/hello-app\r", 60);
         let _ = run!(b"godspeed remove godspeed/hello-service\r", 60);
 
-        // A DRIVER: its device by PCI class, approved at install, found by the OS, registers only.
+        // A DRIVER: its device by PCI class, approved at install, found by the OS - registers only, as the published
+        // `hello-driver` 0.3.0 asks (`osdev test kinds` covers the interrupt and DMA, `driver-packages` a device taken over and a USB device).
         let df = run!(b"godspeed fetch godspeed/hello-driver\r", 240);
         check!(df.contains("a driver: `godspeed install` starts it with its device"), "`godspeed fetch` says what installing a driver does");
         let di = run!(b"godspeed install godspeed/hello-driver yes\r", 180);
@@ -12291,14 +12296,17 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
     let again = run!(b"version\r", 60);
     check!(!back.is_empty() && again.contains("GodspeedOS"), "a key gives the console back, and the shell answers");
 
-    // A DRIVER: the operator approves the device, the OS finds which it is, and the driver drives it.
+    // A DRIVER: the operator approves the device and, by a second question, its DMA memory; the OS finds which device
+    // it is and routes its interrupt; and the driver drives it by all three.
     let drv = run!(b"godspeed install /kind-driver-0.1.0.gsp yes\r", 240);
-    check!(drv.contains("asks for: device") && drv.contains("started (") && drv.contains("its device, checked from disk"),
-           "the driver installs, asking for its device, and the supervisor starts it with that device");
-    let _ = collect_until(&buf, &mut cursor, b"5! = 120", Duration::from_secs(30));
+    check!(drv.contains("asks for: device, memory") && drv.contains("Grant it DMA memory?"),
+           "the driver installs, asking for its device, and for its DMA memory by a question of its own");
+    check!(drv.contains("its device with its interrupt and DMA memory, checked from disk"),
+           "and the supervisor starts it with its device, its interrupt and its DMA arena");
+    let _ = collect_until(&buf, &mut cursor, b"through DMA and back", Duration::from_secs(30));
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
-    check!(log.contains("kind-driver: device id 0x010000ed, alive true, 5! = 120"),
-           "the driver reads `edu`'s identity, its liveness register and a factorial, through gs::driver");
+    check!(log.contains("kind-driver: device id 0x010000ed, alive true, 5! = 120 by interrupt, 64 bytes through DMA and back intact"),
+           "the driver reads `edu`'s registers, waits for its interrupt, and moves a buffer through DMA and back, all through gs::driver");
     let listed = run!(b"godspeed list installed\r", 60);
     check!(listed.contains("godspeed/kind-driver") && listed.contains("running"), "and it is listed as running");
 
@@ -12318,6 +12326,324 @@ pub fn run_kinds(image_path: &Path, persist_path: &str, smp: u32) {
     if fail > 0 { std::process::exit(1); }
 }
 
+/// `osdev test driver-packages`: what a driver package can be given beyond `osdev test kinds`' registers, interrupt
+/// and DMA arena - a device TAKEN OVER from a GodspeedOS driver (`kind-nic`, the e1000 from `nic-driver`), and a USB
+/// device reached through its host (`kind-usb`, QEMU's FTDI serial adapter behind `xhci`), through a supervisor restart
+/// and an unplug and a replug, with `net-stack` checked not to keep sending on `nic-driver`'s old capability; a USB
+/// device behind the USB 2.0 host (`kind-stick`, QEMU's stick on `ehci`, built with `bind-any-class`); and the RTL8168
+/// card's package refusing QEMU's e1000 (`kind-rtl`). Each made from the CLI's driver template
+/// (`osdev/fixtures/README.md`). Its own disk, because a test disk's root holds only so many files.
+pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
+    let qemu      = crate::qemu::qemu_binary();
+    let image_str = image_path.to_string_lossy().replace('\\', "/");
+    let mut pass = 0usize; let mut fail = 0usize;
+    macro_rules! check { ($ok:expr, $label:expr) => {
+        if $ok { println!("driver-packages: PASS - {}", $label); pass += 1; }
+        else { println!("driver-packages: FAIL - {}", $label); fail += 1; }
+    }; }
+    let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
+    let disk_str = disk.to_string_lossy().replace('\\', "/");
+    const KEY: &str = "ed25519:7721d3618c7946587c59ce0693e08876368b5cc371f06105953e68d1a1396b3d";
+    // The stick on the USB 2.0 controller: a blank megabyte, since only its INQUIRY answer is read.
+    let stick = "build/tests/ehci_stick.img";
+    let _ = std::fs::write(stick, vec![0u8; 1024 * 1024]);
+    let stick = std::fs::canonicalize(stick).unwrap_or_else(|_| std::path::PathBuf::from(stick));
+    let stick_str = stick.to_string_lossy().replace('\\', "/");
+
+    let port = pick_free_port();
+    // The FTDI adapter's serial port is a TCP socket this suite connects to: what the USB driver package writes to the
+    // adapter's bulk OUT arrives on it, and a line written to it is what the package reads back through the bulk IN.
+    // (A file chardev would do for output, but QEMU on Windows takes no input from one.)
+    let usb_port = pick_free_port();
+    // QEMU's monitor, to unplug the adapter and plug it back in - on loopback only, since it controls the machine.
+    let mon_port = pick_free_port();
+    let monitor = format!("tcp:127.0.0.1:{mon_port},server=on,wait=off");
+    let usb_chardev = format!("socket,id=fser,host=127.0.0.1,port={usb_port},server=on,wait=off");
+    let mut cmd = std::process::Command::new(&qemu);
+    cmd.args([
+        "-drive",   &format!("format=raw,file={image_str},if=ide"),
+        "-device",  "ich9-ahci,id=ahci",
+        "-drive",   &format!("id=data,format=raw,file={disk_str},if=none"),
+        "-device",  "ide-hd,drive=data,bus=ahci.0",
+        "-cpu",     "qemu64,+rdrand",
+        "-smp",     &smp.to_string(), "-m", "512M",
+        "-serial",  &format!("tcp::{port},server"),
+        "-serial",  "null",
+        "-display", "none", "-no-reboot", "-no-shutdown",
+        "-device", "e1000,netdev=n0", "-netdev", "user,id=n0",
+        // The driver template's device: QEMU's teaching device, which no GodspeedOS driver claims.
+        "-device", "edu",
+        // The USB driver package's device: an FTDI serial adapter (0403:6001) behind an xHCI, which no GodspeedOS
+        // driver claims - `xhci` binds it as vendor-specific and reports it.
+        "-device", "qemu-xhci,id=xhci",
+        "-chardev", &usb_chardev,
+        "-device", "usb-serial,bus=xhci.0,chardev=fser,id=fser_dev",
+        // A USB 2.0 controller with QEMU's mass-storage device straight on its root port: `ehci`, built for this
+        // suite with `bind-any-class`, binds it for a driver of its own - QEMU's EHCI takes no vendor-specific
+        // high-speed device, and a stick moves real bulk transfers - and reports it as host `ehci`.
+        "-device", "usb-ehci,id=ehci",
+        "-drive", &format!("id=stick,format=raw,if=none,file={stick_str}"),
+        "-device", "usb-storage,bus=ehci.0,drive=stick,id=stick_dev",
+        "-monitor", &monitor,
+    ]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = match cmd.spawn() { Ok(c) => c, Err(e) => { eprintln!("driver-packages: QEMU launch failed: {e}"); std::process::exit(1); } };
+    let stream = match retry_tcp_connect(port, Duration::from_secs(15)) {
+        Some(s) => s,
+        None => { child.kill().ok(); eprintln!("driver-packages: no shell serial"); std::process::exit(1); }
+    };
+    // The adapter's serial port: the line it will receive, and what it sends, collected as it comes.
+    let usb_wire: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut usb_line = None;
+    if let Some(port) = retry_tcp_connect(usb_port, Duration::from_secs(15)) {
+        usb_line = port.try_clone().ok();
+        let mut port = port;
+        let wire = Arc::clone(&usb_wire);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 512];
+            loop { match port.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => wire.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut read_half = stream.try_clone().expect("clone");
+    let mut write_half = stream;
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let buf2 = Arc::clone(&buf);
+        thread::spawn(move || {
+            let mut tmp = [0u8; 4096];
+            loop { match read_half.read(&mut tmp) { Ok(0) | Err(_) => break, Ok(n) => buf2.lock().unwrap().extend_from_slice(&tmp[..n]) } }
+        });
+    }
+    let mut cursor = 0usize;
+    if collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(60)).is_none() {
+        child.kill().ok(); eprintln!("driver-packages: never reached a prompt"); std::process::exit(1);
+    }
+    macro_rules! run { ($c:expr, $secs:expr) => {{
+        send(&mut write_half, $c);
+        collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs($secs)).unwrap_or_default()
+    }}; }
+
+    let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
+    let _ = run!(b"godspeed config\r", 60);
+    send(&mut write_half, format!("godspeed trust add godspeed {KEY}\r").as_bytes());
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(20));
+    let added = run!(b"y\r", 60);
+    check!(added.contains("trusted by this machine's operator"), "the fixtures' test key is trusted");
+
+    // A DRIVER THAT TAKES A DEVICE OVER: its class is ethernet, which `nic-driver` drives. Installing it stops
+    // `nic-driver` and keeps it stopped; uninstalling it gives the device back and `nic-driver` starts again.
+    let nic = run!(b"godspeed install /kind-nic-0.1.0.gsp yes\r", 240);
+    check!(nic.contains("asks for: device") && !nic.contains("Grant it DMA memory?"),
+           "a driver of a device GodspeedOS drives installs, and with no arena it is not asked about DMA memory");
+    let _ = collect_until(&buf, &mut cursor, b"took the ethernet device over", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("supervisor: nic-driver stood down - the installed godspeed/kind-nic drives its device until it is uninstalled"),
+           "the supervisor stops nic-driver for it, and says so");
+    check!(log.contains("kind-nic: took the ethernet device over - e1000 (8086:100e), status ") && log.contains("MAC 52:54:00:12:34:56"),
+           "and the package drives the e1000 nic-driver had: it reads its status and its MAC");
+    // Kept down: give the reconcile sweep time to run, then nic-driver must still not be running.
+    let _ = run!(b"sleep 3\r", 60);
+    let tasks = run!(b"status\r", 60);
+    let after = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(!after.contains("reconcile respawned nic-driver") && !tasks.lines().any(|l| l.split_whitespace().nth(1) == Some("nic-driver"))
+               && tasks.lines().any(|l| l.split_whitespace().nth(1) == Some("net-stack")),
+           "and nic-driver stays stopped while the package holds its device");
+    let out = run!(b"godspeed uninstall godspeed/kind-nic yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-nic uninstalls");
+    let _ = collect_until(&buf, &mut cursor, b"nic-driver started again", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("godspeed/kind-nic's device (class 020000) goes back to nic-driver")
+               && log.contains("supervisor: nic-driver started again - an installed package gave its device back"),
+           "uninstalled, it gives the device back, and the supervisor starts nic-driver again");
+    // WHILE THE PACKAGE HELD THE NIC, nothing sent on nic-driver's dead capability: net-stack looks the name up and
+    // sends nothing while it does not resolve (`Displaced::nic_gone`). It sent every few milliseconds before - 218
+    // refused sends, each a kernel log line, in one run (2026-10-24).
+    let held = log.find("supervisor: nic-driver stood down").map(|i| &log[i..]).unwrap_or("");
+    let held = &held[..held.find("nic-driver started again").unwrap_or(held.len())];
+    let refused = held.matches("gen mismatch").count();
+    check!(refused < 5, format!("while the package held the NIC, nothing kept sending to nic-driver ({refused} refused)"));
+
+    // A DRIVER OF A USB DEVICE: no registers of its own. `xhci` bound the adapter at boot and reported it, so the
+    // package starts when it is installed, with `xhci` as its peer, and drives the device through it.
+    let usb = run!(b"godspeed install /kind-usb-0.1.0.gsp yes\r", 240);
+    check!(usb.contains("asks for: device") && usb.contains("its USB device through its host, checked from disk"),
+           "a driver of a USB device installs, and the supervisor starts it with its host as its peer");
+    // The line goes to the adapter's serial port once the package listens, so the adapter has it when it is asked.
+    // The package can say so before the install's prompt returns, and the install's output has then been read past
+    // it - waiting for it again sat out 30 s while the package's 10 s window closed (3 failures in 6 runs,
+    // 2026-10-23). So it is looked for in what the install said first.
+    if !usb.contains("kind-usb: listening") {
+        let _ = collect_until(&buf, &mut cursor, b"kind-usb: listening", Duration::from_secs(30));
+    }
+    if let Some(p) = usb_line.as_mut() { let _ = p.write_all(b"hello from the serial port
+"); }
+    let _ = collect_until(&buf, &mut cursor, b"kind-usb: drove", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("xhci: USB device 0403:6001 on port") && log.contains("bound for a driver of its own"),
+           "xhci bound QEMU's FTDI adapter for a driver of its own, as vendor-specific");
+    check!(log.contains("kind-usb: drove 0403:6001 through xhci - device release ")
+               && log.contains("bytes sent by bulk OUT ok, bulk IN ") && log.contains("bytes: \"hello from the serial port\""),
+           "the package reads the device's identity and its descriptor, and moves data both ways, through gs::driver::bus");
+    let wrote = usb_wire.lock().unwrap().clone();
+    check!(String::from_utf8_lossy(&wrote).contains("hello from a Godspeed driver package"),
+           "and what it sent came out of the adapter's serial port");
+    // A SUPERVISOR RESTART, then an UNPLUG and a REPLUG. The respawned supervisor must read the running package's
+    // device again (`adopt_device`), or the unplug would not stop it; and the replug must start it again.
+    let storm = run!(b"chaos kill-storm supervisor 1\r", 60);
+    check!(storm.contains("recovered: 1/1"), "the supervisor is killed while kind-usb runs, and comes back");
+    let _ = run!(b"sleep 5\r", 60);
+    let monitor_cmd = |cmd: &str| {
+        if let Some(mut m) = retry_tcp_connect(mon_port, Duration::from_secs(5)) {
+            thread::sleep(Duration::from_millis(500));
+            let _ = m.write_all(cmd.as_bytes());
+            thread::sleep(Duration::from_millis(500));
+        }
+    };
+    // The unplug comes while a QUESTION is open, and its notice must not answer it: the hosts pushed an Enter
+    // after a notice until 2026-10-24, which answered `godspeed install` N on the VisionFive. The question is
+    // `uninstall`'s, answered `n` by this suite only after the notice, so the package stays installed.
+    send(&mut write_half, b"godspeed uninstall godspeed/kind-usb\r");
+    let _ = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(60));
+    let asked_at = buf.lock().unwrap().len();
+    monitor_cmd("device_del fser_dev\n");
+    let _ = collect_until(&buf, &mut cursor, b"its USB device is not attached", Duration::from_secs(30));
+    let _ = collect_until(&buf, &mut cursor, b"USB device removed (xhci)", Duration::from_secs(10));
+    thread::sleep(Duration::from_secs(2));
+    let while_asked = String::from_utf8_lossy(&buf.lock().unwrap()[asked_at..]).to_string();
+    check!(while_asked.contains("USB device removed (xhci)") && !while_asked.contains("gsh>"),
+           "a device's notice while a [y/N] question is open does not answer it: the question is still open");
+    let declined = run!(b"n\r", 60);
+    check!(!declined.contains("uninstalled godspeed"), "and the answer typed after it is the one taken");
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("supervisor: installed godspeed/kind-usb stopped - its USB device is not attached"),
+           "unplugged after the supervisor's restart, the package is stopped: the new supervisor knew its device");
+    let drove_before = log.matches("kind-usb: drove").count();
+    // The replug comes while a line is HALF TYPED at the prompt, and its notice must not run it: the prompt is
+    // drawn again under the notice with the line kept, and the rest of the line finishes it.
+    send(&mut write_half, b"echo half");
+    thread::sleep(Duration::from_millis(500));
+    let typed_at = buf.lock().unwrap().len();
+    monitor_cmd("device_add usb-serial,bus=xhci.0,chardev=fser,id=fser_dev\n");
+    let _ = collect_until(&buf, &mut cursor, b"USB device connected (xhci)", Duration::from_secs(30));
+    // The prompt drawn again under the notice, with the line - read past here, so the wait for the prompt below
+    // is the one after the command, not this one.
+    let _ = collect_until(&buf, &mut cursor, b"gsh> echo half", Duration::from_secs(10));
+    let finished = run!(b" done\r", 60);
+    let around = String::from_utf8_lossy(&buf.lock().unwrap()[typed_at..]).to_string();
+    check!(finished.contains("half done") && !around.contains("\nhalf\r") && !around.contains("\nhalf\n"),
+           "a device's notice while a line is half typed does not run it: the line is kept and finished");
+    let _ = collect_until(&buf, &mut cursor, b"kind-usb: listening", Duration::from_secs(30));
+    if let Some(p) = usb_line.as_mut() { let _ = p.write_all(b"hello from the serial port\n"); }
+    let _ = collect_until(&buf, &mut cursor, b"kind-usb: drove", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.matches("kind-usb: drove").count() > drove_before,
+           "plugged back in, it is started again and drives the adapter again");
+    // And the network came back with `nic-driver`: no send on a dead capability once it was given its NIC again.
+    let back = log.find("nic-driver started again").unwrap_or(log.len());
+    let after = &log[back..];
+    let stale = after.matches("gen mismatch").count();
+    check!(stale < 5, format!("after nic-driver is given its NIC back, nothing keeps sending on its old capability ({stale} refused)"));
+    let out = run!(b"godspeed uninstall godspeed/kind-usb yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-usb uninstalls");
+
+    // THE USB 2.0 HOST. `ehci` bound the stick on its root port and reported it as its own host, so a package that
+    // names it is started with `ehci` as its peer - not `xhci`, which reported a device of its own - and reaches it
+    // through `gs::driver::bus` exactly as `kind-usb` reached the adapter: a command out, an answer and a status in.
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("ehci: USB device 46f4:0001 on root port 1 bound for a driver of its own - high speed"),
+           "ehci bound QEMU's stick, straight on its root port, for a driver of its own");
+    check!(log.contains("supervisor: USB device 46f4:0001 attached on ehci - no driver for it here"),
+           "and reported it as host ehci, beside xhci's report of its own device");
+    let stick_out = run!(b"godspeed install /kind-stick-0.1.0.gsp yes\r", 240);
+    check!(stick_out.contains("asks for: device"), "a driver of the stick installs");
+    // As for `kind-usb` above: the line may already be in what the install said.
+    if !stick_out.contains("kind-stick: drove") {
+        let _ = collect_until(&buf, &mut cursor, b"kind-stick: drove", Duration::from_secs(60));
+    }
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    // `ehci` reported the stick at boot, so the package starts at install, with `ehci` - the host that has it - as its
+    // one peer (the drive line below names the host it reached).
+    check!(log.contains("supervisor: installed godspeed/kind-stick 0.1.0 started") && log.contains("1 peer(s), its USB device through its host"),
+           "the supervisor starts it at once, with the host that has the stick as its peer");
+    check!(log.contains("kind-stick: drove 46f4:0001 through ehci - INQUIRY 36 bytes: vendor \"QEMU\", product \"QEMU HARDDISK\"; status 0"),
+           "the package reads the stick's INQUIRY through ehci: a bulk OUT and two bulk INs, through gs::driver::bus");
+    let out = run!(b"godspeed uninstall godspeed/kind-stick yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-stick uninstalls");
+    // A DISK FROM ANOTHER MACHINE: the fetched copy stays after the uninstall, holding this machine's binary alone.
+    // Renamed to look like the VisionFive's, it is the USB stick moved to a Pi 4 (2026-10-24), where `install` took it
+    // as already fetched and stopped at "its aarch64 binary is missing". From the file again it must be replaced.
+    let _ = run!(b"rename /system/packages/godspeed/kind-stick/0.1.0/x86_64.elf riscv64.elf\r", 30);
+    let again = run!(b"godspeed install /kind-stick-0.1.0.gsp yes\r", 240);
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("held another machine's binary and not this one's") && again.contains("unpacked from")
+               && !again.contains("binary is missing"),
+           "a fetched copy holding another machine's binary is replaced from the file, and the install goes on");
+    let out = run!(b"godspeed uninstall godspeed/kind-stick yes\r", 120);
+    check!(out.contains("uninstalled"), "and it uninstalls again");
+    // EVERY ROOT PORT is watched, not only the one that had a device at boot (Audit 25's finding 5): the stick is
+    // unplugged from port 1 and plugged into port 3, and `ehci` must find and bind it there. A drive made with
+    // `-drive` goes with its device, so the second plug is given a drive of its own.
+    monitor_cmd("device_del stick_dev\n");
+    let _ = collect_until(&buf, &mut cursor, b"ehci: root port 1 is empty", Duration::from_secs(30));
+    monitor_cmd(&format!("drive_add 0 if=none,id=stick2,format=raw,file={stick_str}\n"));
+    monitor_cmd("device_add usb-storage,bus=ehci.0,port=3,drive=stick2,id=stick_dev2\n");
+    let _ = collect_until(&buf, &mut cursor, b"on root port 3 bound", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    let moved = log.rfind("ehci: root port 1 is empty").map(|i| &log[i..]).unwrap_or("");
+    check!(moved.contains("ehci: USB device 46f4:0001 on root port 3 bound for a driver of its own")
+               && moved.contains("supervisor: USB device 46f4:0001 attached on ehci"),
+           "unplugged and plugged into another root port, the stick is found there, bound and reported again");
+
+    // A DEVICE NOT BOUND MUST NOT SIT ON ADDRESS 0 (the T630 card, 2026-10-25): its boot stick, mass storage and never
+    // bound, was left at the default address, and the WiFi dongle plugged in beside it was read as the stick. Here a
+    // HIGH-SPEED keyboard (`usb_version=2`), a HID this host never binds, goes on root port 2, and then the stick on
+    // root port 4: the stick must be read as itself and bound, not answered for by the keyboard.
+    monitor_cmd("device_del stick_dev2
+");
+    let _ = collect_until(&buf, &mut cursor, b"ehci: root port 3 is empty", Duration::from_secs(30));
+    monitor_cmd("device_add usb-kbd,usb_version=2,bus=ehci.0,port=2,id=hskbd
+");
+    let _ = collect_until(&buf, &mut cursor, b"not one this host binds", Duration::from_secs(30));
+    monitor_cmd(&format!("drive_add 0 if=none,id=stick3,format=raw,file={stick_str}
+"));
+    monitor_cmd("device_add usb-storage,bus=ehci.0,port=4,drive=stick3,id=stick_dev3
+");
+    let _ = collect_until(&buf, &mut cursor, b"on root port 4 bound", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    let beside = log.rfind("ehci: root port 3 is empty").map(|i| &log[i..]).unwrap_or("");
+    check!(beside.contains("on root port 2 moved to address 101, off the default address"),
+           "a high-speed device this host does not bind is moved off address 0");
+    check!(beside.contains("ehci: USB device 46f4:0001 on root port 4 bound for a driver of its own"),
+           "and a device plugged in after it is read as itself and bound, not answered for by the one not bound");
+
+    // THE HARDWARE CARD'S PACKAGE, in QEMU: `kind-rtl` uses the RTL8168's interrupt and DMA, and QEMU has no RTL8168 -
+    // its e1000 has no MSI, so no interrupt is routed either. What QEMU can show is the path to it: a driver asking
+    // for an interrupt and DMA memory on a device without MSI is asked the DMA question, takes the NIC over, says it
+    // is not the chip it drives and touches nothing, and gives the NIC back.
+    let rtl = run!(b"godspeed install /kind-rtl-0.1.0.gsp yes\r", 240);
+    check!(rtl.contains("also asks for DMA memory"), "kind-rtl, which asks for DMA memory, is asked about it");
+    // The END of its line, not its start: a check that waits for `kind-rtl: took` reads the line before the rest of
+    // it has arrived when anything is printed just before it (2026-10-24, net-stack's "not running" line).
+    if !rtl.contains("so it touches nothing") && !rtl.contains("tally by DMA") {
+        let _ = collect_until(&buf, &mut cursor, b"touches nothing", Duration::from_secs(30));
+    }
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    check!(log.contains("kind-rtl: took the ethernet device over - 8086:100e, not the RTL8168 this package drives, so it touches nothing"),
+           "on QEMU's e1000 it takes the NIC over and touches nothing, saying why");
+    let out = run!(b"godspeed uninstall godspeed/kind-rtl yes\r", 120);
+    check!(out.contains("uninstalled"), "kind-rtl uninstalls");
+
+    let removed = run!(format!("godspeed trust remove godspeed {KEY}\r").as_bytes(), 60);
+    check!(removed.contains("no longer trusted"), "the test key is withdrawn");
+    check!(!String::from_utf8_lossy(&buf.lock().unwrap()).contains("KERNEL PANIC"), "and the kernel did not panic");
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::write("build/tests/driver_packages_serial.log", &*buf.lock().unwrap());
+    println!("\ndriver-packages: {pass} passed, {fail} failed (serial: build/tests/driver_packages_serial.log)");
+    if fail > 0 { std::process::exit(1); }
+}
+
 /// `osdev test download`: how fast this machine downloads over HTTPS, measured, at sizes a package can be.
 /// `godspeed check <url>` reads a page from a public speed-test server to its end and says how fast; the server's
 /// chain reaches GTS Root R4, which is put beside the registry's root for this (`osdev/fixtures/README.md`). It
@@ -12333,6 +12659,21 @@ pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
     let disk = std::fs::canonicalize(persist_path).unwrap_or_else(|_| std::path::PathBuf::from(persist_path));
     let disk_str = disk.to_string_lossy().replace('\\', "/");
     let port = pick_free_port();
+    // A plain web server on this host, on loopback only, reached from the guest at QEMU's host address (10.0.2.2):
+    // how a board fetches a package from a PC on its own network, by an address rather than a name.
+    let local = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind the local web server");
+    let local_port = local.local_addr().map(|a| a.port()).unwrap_or(0);
+    thread::spawn(move || {
+        for conn in local.incoming() {
+            let Ok(mut c) = conn else { continue };
+            let mut req = [0u8; 2048];
+            let _ = c.read(&mut req);
+            let body = b"hello from the PC, by its address\n";
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = c.write_all(head.as_bytes());
+            let _ = c.write_all(body);
+        }
+    });
     let mut cmd = std::process::Command::new(&qemu);
     cmd.args([
         "-drive",   &format!("format=raw,file={image_str},if=ide"),
@@ -12374,6 +12715,14 @@ pub fn run_download(image_path: &Path, persist_path: &str, smp: u32) {
     }}; }
     let _ = collect_until(&buf, &mut cursor, b"echo reply (ping OK)", Duration::from_secs(60));
     let _ = run!(b"godspeed config\r", 60);
+    // BY ADDRESS, first because it is quick: a link whose host is an IP address is that address, not a name to ask a
+    // resolver about (which answers "no such name", 2026-10-24, the VisionFive fetching a card's package from a PC).
+    let by_ip = run!(format!("download http://10.0.2.2:{local_port}/hello.txt\r").as_bytes(), 60);
+    let saved = run!(b"read /users/default/hello.txt\r", 30);
+    println!("download: by address it said:\n{}\n{}", by_ip.trim_end_matches("gsh>").trim(), saved.trim_end_matches("gsh>").trim());
+    check!(by_ip.contains("/users/default/hello.txt") && saved.contains("hello from the PC, by its address"),
+           "`download` of a plain http link by IP address saves the file, with no name to resolve");
+    let _ = run!(b"delete /users/default/hello.txt\r", 30);
     let copied = run!(b"copy /gts-root-r4.der /system/services/godspeed/roots/gts-root-r4.der\r", 30);
     check!(!copied.contains("error") && !copied.contains("not found"), "GTS Root R4 is beside the registry's root");
     let _ = run!(b"godspeed config set timeout-secs 20\r", 30);

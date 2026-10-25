@@ -8,7 +8,12 @@ unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 
 - Spawn the services in its `IMAGES` table per placement rules (§9.2); there is no manifest file.
 - Start a USB device's driver when its host reports the device attached, and stop it - without a restart -
-  when the host reports it gone (`USB_MATCH`, `UsbState`, `docs/usb-device-drivers.md`; both hosts, `dwc2` and `xhci`).
+  when the host reports it gone (`USB_MATCH`, `UsbState`, `docs/usb-device-drivers.md`; the hosts `dwc2`, `xhci` and
+  `ehci`, each report naming its host, and each host's report taken for what that host has bound only).
+  An installed driver package that names the device (`hw_usb`) comes first (`Installed::usb_report`).
+- Start installed packages from the disk (`installed.rs`, CLAUDE.md 14.1 amendments), a driver package with its one
+  device; a device an in-tree driver drives is taken over and that driver kept down while the package holds it
+  (`Installed::holds`, asked by the death notice, the reconcile sweep and `supcmd::MANAGED`).
 - Monitor services for death (via kernel death-notification endpoint).
 - Kill and restart failed services.
 - Expose `kill` and `restart` API (§14.4).
@@ -16,10 +21,11 @@ unkillable thing. Spawned directly by the kernel (init removed, Phase 5).
 - Keep a bounded record of what happens to the devices it drives - a driver's death and restart, a USB
   device attached or removed (`DevEvents`, the newest 32) - and answer it as `supcmd::EVENTS` for
   `hardware events`. Volatile: a respawned supervisor starts an empty record and says from when.
-- Keep how each watched service last ended, from the kernel's death notice (`name NUL 'K' killer` or
-  `name NUL 'F' kind addr`, CLAUDE.md 6.2 amendment 2026-10-11) - the newest per name, in `DevEvents`
-  beside the device record - and answer it as `supcmd::DEATH` for `ask`. Volatile, like that record.
-  The "died, restarting" line ends with the cause (` - killed by shell`, ` - memory fault at 0x0`).
+- Keep how each watched service last ended, from the kernel's death notice (`name NUL 'K' killer`,
+  `name NUL 'F' kind addr`, CLAUDE.md 6.2 amendment 2026-10-11, or `name NUL 'E' status`, 14.5) - the
+  newest per name, in `DevEvents` beside the device record - and answer it as `supcmd::DEATH` for `ask`. Volatile, like that record.
+  The "died, restarting" line ends with the cause (` - killed by shell`, ` - memory fault at 0x0`,
+  ` - exited with status N`).
 - Answer `supcmd::MANAGED` with the services it keeps running now (`managed_answer`), so `ask` calls a
   service down by the same rule the reconcile sweep would bring it back by.
 
@@ -29,7 +35,7 @@ The supervisor has mutually exclusive spawn-set features:
 
 | Feature            | Spawns                                  | Used by                          |
 |--------------------|-----------------------------------------|----------------------------------|
-| *(none)*           | pong + ping + all 183 probe services    | `osdev run` (full QEMU build)    |
+| *(none)*           | pong + ping + all 182 probe services    | `osdev run` (full QEMU build)    |
 | `identity-only`    | pong + ping + 16 identity probe services | `osdev test identity`            |
 | `perf-only`        | pong + ping + B1-B10 perf probes        | `osdev test perf`                |
 | `perf-brutal-only` | pong + ping + BP1-BP10 brutal probes    | `osdev test perf-brutal`         |
@@ -62,11 +68,11 @@ service_main():
   3. spawn("pong") on core 1      ← pong must precede ping (SEND cap wired at spawn)
   4. spawn("ping") on core 0      ← both skipped in a bare-metal build
   5. spawn the probe set, then the service set from the name→cap map (no kernel name resolution)
-  6. log("supervisor: ready")
+  6. log("supervisor: ready"), then start the installed packages from the disk (`Installed::boot`)
   7. loop: drain the queue (death notices, operator commands, USB device reports), then the reconcile sweep
 ```
 
-`"supervisor: ready"` appears after **all** spawns complete. Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its receive loop - no restart-mid-spawn conflict.
+`"supervisor: ready"` appears after **all** built-in spawns complete (installed packages are started just after it). Identity tests that trigger a service restart use this string as the `wait_for` gate to ensure the restart fires only when supervisor is safely in its receive loop - no restart-mid-spawn conflict.
 
 ## Who holds `service_control`
 

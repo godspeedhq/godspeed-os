@@ -2,8 +2,11 @@
 
 > **Status: COMPLETE.** The whole language is built, and it lives entirely on the stack (no heap
 > anywhere in the interpreter), with a fixed, readable bound on every buffer and a LOUD refusal on
-> every overflow: a 10 MB script truncates at ~7 KiB and still runs, never OOMs (`osdev test
-> big-script` 6/6). Scripts use the `.gsh` extension (GodspeedOS shell; `.gs` is reserved for a
+> every overflow: a 10 MB script is read through a bounded minifier, and when its code exceeds
+> `SCRIPT_MAX` (7112 bytes) it is refused loudly with none of it run, never OOMs. *(2026-10-25: it
+> used to truncate at ~7 KiB and run the part that fitted, which `osdev test big-script` (6/6)
+> pinned; the refusal replaced that in `914b4329`, `backlog/fixed/80` H10-H21, and the suite has
+> pinned the refusal since 2026-10-25: refused loudly, none of it run, no panic, 5/5.)* Scripts use the `.gsh` extension (GodspeedOS shell; `.gs` is reserved for a
 > future general-purpose Godspeed language). Built on the `run`/`run_lines` interpreter and the
 > command **Result** model (`execute` returns `Ok`/`Err`). Not POSIX - see CLAUDE.md Appendix B.3 / D.
 
@@ -585,7 +588,7 @@ tunable; hitting one is a clear error, never a silent truncation or a runaway. (
 | loop iterations  | hard cap (no runaway; configurable per loop later)|
 | function call depth | fixed frames (each = its params + locals)      |
 | deferred actions | fixed per scope                                   |
-| script size      | embedded: rodata; on-disk file: `MAX_FILE_BYTES`  |
+| script size      | embedded: rodata; on-disk file: `SCRIPT_MAX` (7112 B of minified code) |
 
 This is a **feature, not a limitation.** A finite ceiling forces good script hygiene - small,
 composable, readable scripts - and rules out the cryptic, sprawling, magic-laden scripts the POSIX
@@ -612,7 +615,9 @@ script ergonomics; the streaming path belongs to Godspeed lang + a v2 fs.
 For now:
 
 - **Capability delegation in script syntax** (pipes-as-caps, `spawn` with explicit grants) is
-  Appendix D.3 territory and waits on a service-initiated spawn API.
+  Appendix D.3 territory and is not built. *(2026-10-25: the service-initiated spawn it waited on
+  exists - the shell asks the supervisor to spawn a stage with named send peers - but no script
+  syntax names a grant.)*
 - A **string** toolkit (length, slice, split) - interpolation covers *building* strings; richer
   string ops wait. (Integer arithmetic is **in** - §3.)
 - **Cross-file include / `source`**, and **record values held in variables** (hold a whole table in

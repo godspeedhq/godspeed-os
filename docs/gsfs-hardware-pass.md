@@ -15,6 +15,10 @@ today, and `build/os-usb.img` is built and waiting for whenever that is worth do
 checklist for the five, written while the QEMU work was fresh so that the reasons behind each step
 are recorded rather than reconstructed later.
 
+*(Note 2026-10-25: the paragraph above is superseded. Both AHCI boards were re-cut on the 2026-09-23
+build the same day - the T630 hit the window again, the Wyse missed - so all five have been cut on one
+code state (`docs/gsfs-carnage.md` section 4, the physical-hardware row).)*
+
 **The board 6.1 named as the exception ANSWERED, on its third cut (2026-09-23).** `CLAUDE.md` 6.1 recorded `fs` on the
 Pi 2 as restartable but NOT crash-recoverable, because its USB stick was said to refuse
 `SYNCHRONIZE CACHE`. Seven sessions across three USB stacks showed the device accepting the flush,
@@ -134,10 +138,10 @@ Build fresh and verify the sweep is green on the machine you are flashing from, 
 is the trap this project has hit most:
 
 ```
-osdev build                 # 21 commandments, 75 redteam probes, 15 checkers
-osdev test fs-all           # 33 suites, roughly 55 minutes
-osdev test shell            # 174
-osdev test files            # 222
+osdev build                 # the commandment checks, redteam probes and checkers
+osdev test fs-all           # 33 suites, every storage suite
+osdev test shell
+osdev test files
 ```
 
 Check the build log says `build: <svc> OK` for every service. An image built before the services it
@@ -218,6 +222,11 @@ has no timestamp, and must read `unknown` rather than being given an invented da
 5. Bring the stick back to an x86 board: both original files intact, the new file present, the seal
    still refusing writes.
 
+*(Note 2026-10-25: superseded for riscv64. `py scripts/cross_isa.py` runs this handoff in QEMU, x86-64 ->
+riscv64 over USB -> x86-64, and is in `osdev test fs-all` (`docs/gsfs-carnage.md` 3.11); it builds its own
+x86 volume, and `build/xisa-x86-written.img` no longer exists. The Pi 2 and Pi 4 legs are still
+hardware-only.)*
+
 **What this is really testing.** Not endianness - every field is little-endian by construction. It is
 the BLOCK TRANSPORT: AHCI hands `fs` a sector, USB mass storage hands it one through BOT/SCSI over a
 split transaction. The filesystem should not care, and "should not" is the phrase this exercise
@@ -286,7 +295,9 @@ Stated so nobody reads a green pass as more than it is:
 - **The torn-write work is QEMU-only and stays that way.** Record-and-replay needs a tap on the write
   path and a way to rebuild the disk between boots; on hardware the equivalent is a real power cut,
   which is 2.2 and is a much blunter instrument.
-- **Metadata exhaustion, the block-layer attack and the reference model** are NOT RUN anywhere.
+- **Metadata exhaustion, the block-layer attack and the reference model** run in QEMU only
+  (`fs-metafull`, `fs-blockchaos`, `fs-blockdeath`, `fs-unplug`, `fs-model`; `docs/gsfs-carnage.md` 3.2,
+  3.4, 3.7), not on a board.
 
 ## To actually exercise journal RECOVERY on hardware
 

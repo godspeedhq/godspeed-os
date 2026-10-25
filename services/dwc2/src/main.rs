@@ -137,9 +137,10 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // events and once from the console, which shares the same line.
     gs::io::print(ctx, "\r\n");
     gs::io::println_fmt(ctx, args);
-    // GIVE THE PROMPT BACK. The shell reads byte 10 as Enter, so this makes it redraw `gsh>`
-    // under the notice - otherwise the cursor is left below a line the user did not type and
-    // the machine looks like it is waiting for something.
+    // GIVE THE PROMPT BACK, so the cursor is not left below a line the user did not type and the
+    // machine does not look like it is waiting for something. A signal the shell redraws `gsh>` on
+    // (`NOTICE_SIGNAL`); it was byte 10, Enter, until 2026-10-24, and an Enter answers a `[y/N]`
+    // question waiting on the console or runs a half-typed line (`xhci`'s `notify`, the VisionFive card).
     //
     // This exact call was reverted once ("the cure was worse than the complaint"): it fired on
     // every keyboard RE-BIND, and re-binds were happening constantly during the wedge storms,
@@ -147,7 +148,7 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
     // mechanism but its trigger - this is reachable only from a hot-plug event, which is a
     // person physically plugging something in. That cannot storm, and it is bounded by the
     // one thing no software defect can accelerate.
-    gs::driver::input::push(&ctx, 10);
+    gs::driver::input::notice_shown(&ctx);
 }
 
 /// Answer a request `dispatch` could not route (an empty payload) with `STATUS_ERR`, instead of consuming
@@ -509,6 +510,12 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 radio_port = p;
                                                 radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                                 radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
+                                            } else if radio.is_none() && rtl::vendor_specific(&ctx, &m, &d, &dt) {
+                                                // Any other vendor-specific device, for a driver package that names it:
+                                                // bound as the dongle is, and reported; the supervisor decides its driver.
+                                                radio_port = p;
+                                                radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                                radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver did:
                                                 // ask the device its size, then read block 0. Capacity
@@ -824,6 +831,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                     radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
                                     radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
                                     notify(&ctx, format_args!("usb: WiFi dongle connected (port {})", port));
+                                    radio_port = port;
+                                    rtl::announce(&ctx, radio.as_ref());
+                                } else if radio.is_none() && rtl::vendor_specific(&ctx, &m, &d, &dt) {
+                                    // Another vendor-specific device, plugged in after boot: bound for a driver of its own.
+                                    radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                    radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
+                                    notify(&ctx, format_args!("usb: USB device {:04x}:{:04x} connected (port {})", hvid, hpid, port));
                                     radio_port = port;
                                     rtl::announce(&ctx, radio.as_ref());
                                 } else if let Some(k) = hid::bind(&ctx, &m, &d, &dt, dsplt) {

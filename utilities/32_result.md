@@ -69,9 +69,11 @@ there is no `Ok`-wrapping that could hide a failure:
   error is `Err`).
 - **An unknown command is `Err`** (so `assert fails typo` holds; a typo in a script counts).
 - **The info commands** (`echo`/`about`/`mem`/`cores`/`date`/`status`/`clear`/`help`) genuinely
-  can't fail, so they return `Ok` - uniformly on the model, not specially wrapped. (`reboot`
-  never returns.) **Exception, a code defect:** `date sync` reports `no time from the network`,
-  `the clock service did not answer` and the other sync failures and still returns `Ok`.
+  can't fail, so they return `Ok` - uniformly on the model, not specially wrapped. (A reboot that
+  happens never returns; `reboot cancel`, `reboot 10m` and the other deadline forms return `Ok` or
+  `Err` like any command.) The exception is `date sync`, which returns `Err(Unknown)` for every way the
+  sync did not happen (`no time from the network`, `the clock service did not answer`, and the
+  others).
 
 `ShellError` variants in use: `FileNotFound`, `Denied`, `AssertFailed`, `Unknown`. New ones are
 added as a failure earns its own name (`StorageUnavailable`, `EndpointDead`, … reusing kernel

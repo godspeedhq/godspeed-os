@@ -18,7 +18,7 @@
 copy 0.4.0 - copy a file or a whole subtree
 
 usage:
-  copy <src> <dst>              copy the file <src> to <dst>
+  copy <src> <dst>              copy file <src> to <dst>
   copy <src> <dst> recursive    copy directory <src> and everything under it
   copy version                  print the version
   copy help                     print this message

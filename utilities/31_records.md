@@ -47,7 +47,7 @@ usage:
       e.g. status | where mem>0
   <records> | select <col> [col…]    project the named columns, in order
       e.g. status | select name core state
-  <records> | to <json|yaml>         render to JSON / YAML at the edge
+  <records> | to <json|yaml|grid>    render to JSON / YAML / the plain table at the edge
       e.g. status | where mem>0 | to yaml
   <text>    | from <json>            parse text → records (the bridge)
       e.g. read /svc.json | from json | where core=1
@@ -62,15 +62,18 @@ The predicate is **one token, operator attached** (no spaces, no quotes unless t
 space): `where mem>0`, `where state=BlockRecv`, `where name!=shell`, `where core>=1`. The parser
 finds the operator inside the token by **longest match** (`!=` `>=` `<=` before `=` `>` `<`):
 before it is the column, after is the value. Ops: `=` `!=` `>` `<` `>=` `<=` ` contains ` (the spaced word; `~` is NOT accepted - rule 3 rejects synonyms). The
-comparison is **numeric** when both sides parse as numbers, else **textual**. An unknown column is
-a loud error naming the available columns (§3.12).
+comparison is **numeric** when both sides parse as numbers, else **textual**. An unknown column
+prints `where: no such column '<col>'`, and the rows pass on unfiltered.
 
 ### `select <col> [col…]` - projection
 Keep only the named columns, in the order given (`select name core state` reorders too). An
-unknown column is a loud error.
+unknown column is a loud error (`select: no such column (check the column names)`) and stops the
+pipeline.
 
-### `to <json|yaml>` - edge renderers
-`to json` emits a JSON array of objects; `to yaml` emits a YAML list of mappings. These live at
+### `to <json|yaml|grid>` - edge renderers
+`to json` emits a JSON array of objects; `to yaml` emits a YAML list of mappings; `to grid` emits
+the plain aligned table, for a producer that draws something else on the console (`trace deps fs |
+to grid`). These live at
 the **edge** of the pipeline - terminal output or, piped to `write`, export. A record never *is*
 JSON; JSON is one way to *print* it. With no `to`, the default rendering is the aligned table grid.
 

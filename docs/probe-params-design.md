@@ -33,8 +33,8 @@ test parameters** - which is policy, and policy belongs to the supervisor (§26.
 The supervisor already names every probe: it spawns them explicitly, in build-feature-gated groups.
 What it does not supply is the parameters. It will.
 
-**No new syscall, and no change in arity.** `handle_spawn` today packs `(cap_slot, core)` into the low
-32 bits of `arg0` and leaves the upper 32 unused. The parameters ride there:
+**No new syscall, and no change in arity.** `handle_spawn` packed `(cap_slot, core)` into the low
+32 bits of `arg0` and left the upper 32 unused. The parameters ride there:
 
 ```text
 arg0:  [63..56] reserved  [55..48] flags  [47..32] probe_mode  [31..16] core  [15..0] spawn cap slot
@@ -48,6 +48,10 @@ payload is well under; a payload that will not fit is REFUSED rather than trunca
 silently shortened peer name would wire a probe to the wrong service and read as a passing test.
 
 The kernel kept **one** `probe` entry: the ELF and the defaults. (Step C moved that one too.)
+
+*(2026-10-25: this packing is history. Step C replaced it with `SpawnImage` (syscall 52), whose
+request is a fixed, versioned struct (`handle_spawn_image`, `kernel/src/syscall/dispatch.rs`), and
+the spawn-by-name syscalls `handle_spawn` served were retired on 2026-10-10, CLAUDE.md 18.5.)*
 
 ### The prerequisite: task names had to be owned
 

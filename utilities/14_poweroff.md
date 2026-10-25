@@ -78,4 +78,7 @@ Two project principles, both decisive:
 
 It needs a real (if minimal) AML interpreter able to evaluate `\_S5` and execute
 `\_PTS`/`\_GTS` - a deliberate, separate undertaking, not a shell built-in. Until
-then, the **Power** category has exactly one honest member: `reboot`.
+then, the **Power** category holds `reboot` and `shutdown`, and `shutdown` says it
+halted where the firmware gates S5 on `\_PTS` (the T630). Typed at the prompt,
+`poweroff` is not a command: the shell answers `unknown: poweroff` and names
+`shutdown` (`FOREIGN_HINTS`).

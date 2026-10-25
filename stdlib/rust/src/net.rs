@@ -346,7 +346,9 @@ impl<'a> Net<'a> {
         })
     }
 
-    /// Resolve a hostname to an address.
+    /// Resolve a hostname to an address. A host that is already an address, in dotted-quad
+    /// (`192.168.4.40`), is that address, and no name server is asked: a resolver answers "no such
+    /// name" for it, which made a link to a machine on the local network fail before it connected.
     ///
     /// **Blocks** up to [`NET_SECS`]: this leaves the machine and a name server may be slow or
     /// absent. **Read-only**, so a retry is always safe.
@@ -355,6 +357,9 @@ impl<'a> Net<'a> {
     /// [`Error::NotFound`] if the name does not resolve. [`Error::OutcomeUnknown`] if no answer
     /// arrives in time - harmless here, since resolving twice costs only time.
     pub fn resolve(&mut self, host: &str) -> Result<Ipv4, Error> {
+        if let Some(ip) = Ipv4::parse(host) {
+            return Ok(ip);
+        }
         let mut req = [0u8; 256];
         let n = host.len().min(req.len() - 1);
         if n != host.len() {

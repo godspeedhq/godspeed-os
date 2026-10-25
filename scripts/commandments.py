@@ -1005,6 +1005,26 @@ def check_stdlib_delegates_reacquire(pins):
                 "`gs::cap::reacquire` is listed in `reacquire_api`, so a service calling it is credited "
                 "with a recovery path - and its body no longer reaches a reacquisition API. Restore it, "
                 "or remove it from `reacquire_api`."))
+    # `UsbDevice::granted` IS credited too (2026-10-23): a USB device's driver reaches its host through
+    # `gs::driver::bus`, whose every request is `call::request_within` (verified just above to reacquire on
+    # a failed send) and whose `granted` falls back to `cap::reacquire` by name. `wifi-usb` moved onto it and
+    # its own reacquire went with its hand-written request loop. Same rule: the credit stands only while
+    # `bus.rs` still routes its requests through `call::request_within` and still reacquires in `granted`.
+    bus_path = os.path.join(ROOT, "stdlib", "rust", "src", "driver", "bus.rs")
+    if "UsbDevice::granted" in (pins.get("reacquire_api", []) or []) and os.path.exists(bus_path):
+        with open(bus_path, encoding="utf-8", errors="replace") as fh:
+            bus_text = fh.read()
+        at = bus_text.find("pub fn granted(")
+        granted = bus_text[at:bus_text.find("\n    }\n", at)] if at != -1 else ""
+        at = bus_text.find("fn ask(")
+        ask = bus_text[at:bus_text.find("\n    }\n", at)] if at != -1 else ""
+        if "call::request_within" not in ask or "cap::reacquire" not in granted:
+            out.append(Violation(
+                "stdlib/rust/src/driver/bus.rs", 0,
+                "`UsbDevice::granted` is listed in `reacquire_api`, so a driver reaching its USB host "
+                "through `gs::driver::bus` is credited with a recovery path - and `bus.rs` no longer sends "
+                "its requests through `call::request_within`, or `granted` no longer reacquires by name. "
+                "Restore it, or remove it from `reacquire_api`."))
     # WHICH ARM IS THE REACQUIRE IN? This used to be `"DeadlineOutcome::SendFailed" in text`, which
     # is a weaker question than it looks: it passes on a file that names the variant in a COMMENT and
     # reacquires on the deadline, and it fails a file that is entirely correct in a different shape.

@@ -402,6 +402,9 @@ else, which is why adding it did not touch a single arm."*
 - **The nic-driver hop.** A different channel with a different problem; `net_query` takes the tag as
   an `Option` and its nic-driver callers pass `None`.
 
+*(Note 2026-10-25: the op-11 nudge no longer exists - the clock left `net-stack` on 2026-10-01, §7.4 -
+so a capless request now has no special meaning there: it is logged and dropped as unanswerable.)*
+
 ### Why the type, not the byte
 
 Thirteen places in net-stack answer a client. Hand-writing the tag at each is the "plausible-looking
@@ -528,6 +531,7 @@ Three properties are deliberately preserved from the tag:
 - **Badged invocations carry no header** - a capability invocation names its resource and needs no
   correlation - so those keep `HOLD_MS` as the default.
 - **`time`'s one-way `[11]` nudge is untouched**: it is capless and handled before the strip.
+  *(Note 2026-10-25: the nudge has since gone, §7.4.)*
 
 The latches went with it. Both drop reports were "said once", which is exactly what hid this for three
 debugging sessions: the first drop was reported at boot and every later one - each costing a client

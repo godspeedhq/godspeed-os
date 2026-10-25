@@ -80,7 +80,11 @@ reading only your own state, or a hardware clock, does not.*
 | `InspectKernel` 13 | whether the CALLER owns the console foreground - caller-specific, like 0 |
 | `InspectKernel` 10, 11, 12, 16, 17 | board-neutral timing: input-ready, the RTC now/boot reads, TSC-per-quantum, deglitched monotonic seconds |
 | `InspectKernel` 14, 15, 18, 19, 20, 21, 23 | board facts and transport: NIC identity and BAR, driver-presence bits, a hardware random word, the EMMC base clock, one byte off the COM2 operator channel, the board's own MAC |
-| `InspectKernel` 9, 22 | deleted queries (console geometry moved to the `console` service, clock provenance to `time`); still in the ungated list, so they answer `-1` rather than `CapNotHeld` |
+| `InspectKernel` 28 | the pending power-off or reboot - system-wide, but ungated deliberately so a pending shutdown can never be hidden (`docs/shutdown.md` 6) |
+
+Queries 9 and 22 were deleted (console geometry moved to the `console` service, clock provenance to
+`time`) and are no longer in the ungated list, so like any unknown query they answer `CapNotHeld` to
+a task without the cap and `-1` to a holder.
 
 The gate is a single `matches!` on the ungated set in `handle_inspect_kernel`, so a
 query added without thought lands on the gated side - the right default. The line is
@@ -184,8 +188,9 @@ The services that legitimately read cross-task/system state:
 | `observe` | `task_stat` + aggregates | the metrics utility itself |
 | `probe` | `inspect_endpoint_generation` (query 2) | test harness; query 0 + TSC stay ambient so most probe paths are unaffected |
 
-Since written, `chaos` and `control` hold it too (their rows in the supervisor's spawn table,
-`services/supervisor/src/main.rs`), so the table above is the original three, not the full list.
+Since written, `chaos`, `control`, `power`, `ask` and `ask-net` hold it too (their rows in the
+supervisor's spawn table, `services/supervisor/src/main.rs`), so the table above is the original
+three, not the full list.
 
 The kernel mints `INTROSPECT_RESOURCE` (READ) into the cap table of each task whose
 spawn request carries `privbits::INTROSPECT`, at spawn (§14.1). The grant lands on exactly the probes that need query 2 and on no

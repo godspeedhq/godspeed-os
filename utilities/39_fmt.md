@@ -129,8 +129,7 @@ original - so a failed write leaves the original intact. `fmt check` formats to 
 two files *sequentially* (never two concurrent reads of the same file). Pinned by `osdev test fmt-idem`
 (the format-twice boundary diff) and `osdev test fmt-demo` (the 10 MB).
 
-Has its own `help_block` and is listed under **Console** in the top-level `help`, but does **NOT
-currently conform** to `0_conventions.md` rules 1 and 5 (found 2026-10-09): `fmt` is missing from the
-shell's `UTILS` list, so `fmt help` and `fmt version` are not intercepted and reach `cmd_fmt`, which
-takes `help` / `version` as a PATH to format. The `help_block` is reachable through `help fmt`.
-A code defect; the fix is adding `"fmt"` to `UTILS`.
+Has its own `help_block` and is listed under **Console** in the top-level `help`, and conforms to
+`0_conventions.md` rules 1 and 5: `fmt` is in the shell's `UTILS` list, so `fmt help` and
+`fmt version` are intercepted before `cmd_fmt`. (Found 2026-10-09 missing from `UTILS`, so `fmt help`
+took `help` as a PATH to format; fixed in `backlog/fixed/80` H8.)

@@ -34,7 +34,7 @@ resources only (gen 0 forever) - see `docs/introspection-capability.md`,
 `docs/service-control-cap.md`, and the note on its definition in
 `capability/table.rs`.
 
-## Syscall table (v1, partial - `SyscallNumber` in `dispatch.rs` is the full list, 1-56 with 9 removed)
+## Syscall table (v1, partial - `SyscallNumber` in `dispatch.rs` is the full list, 1-57 with 7, 9, 19, 38 and 39 removed)
 
 | Number | Name        | Required cap right             |
 |--------|-------------|--------------------------------|
@@ -44,8 +44,8 @@ resources only (gen 0 forever) - see `docs/introspection-capability.md`,
 | 4      | `yield`     | none                           |
 | 5      | `log`       | log_write cap                  |
 | 6      | `alloc_mem` | implicit (own task memory)     |
-| 7      | `spawn`     | SPAWN (WRITE)                  |
-| 8      | `kill`      | SERVICE_CONTROL (WRITE) - held by shell/supervisor/probes; validated by holdings (no slot - both args carry the name). See `docs/service-control-cap.md` |
+| 7      | (removed)   | was `spawn`, by name from the kernel catalogue; retired with 19, 38 and 39 (`backlog/fixed/80` K14). A service starts through the supervisor, whose `SpawnImage` (52) needs SPAWN (WRITE) plus IMAGE_SPAWN |
+| 8      | `kill`      | SERVICE_CONTROL (WRITE) - held by the supervisor, `shell`, `chaos`, `control` and the probes; validated by holdings (no slot - both args carry the name). See `docs/service-control-cap.md` |
 | 13     | `inspect_kernel` | INTROSPECT (READ) for the system queries (1, 2, 4-8); **none** for the ungated task-neutral reads: 0 (own alloc), 3 (TSC), 10 (input-ready), 11 (RTC), 12 (boot datetime), 13 (console-foreground-allows for the calling task), the board/transport reads 14-21 and 23, and 28 (the pending power-off or reboot, `secs * 2 + kind`, ungated so neither can ever be hidden). Queries 24-27 (owned endpoint, CALL-awaited endpoint, unlocked-serial count, boot record) are INTROSPECT-gated. **Query 9 (framebuffer console geometry) is DELETED** - terminal geometry belongs to the `console` service and is read over IPC via `ctx.console_dims()` (`docs/console-service.md` 9.7) |
 | 16     | `task_stat` | INTROSPECT (READ) - discloses any task's state |
 | 18     | `reboot`    | REBOOT (WRITE) - held by `shell` alone (its `reboot` cmd, and the Ctrl+Alt+Del chord the USB drivers only SIGNAL to it - SEC-2); validated by holdings (no args). Closes the ambient-reboot gap |
@@ -69,6 +69,6 @@ flowchart TD
     N -->|Recv| R[handle_recv: validate RECV cap → dequeue or block]
     N -->|Yield| Y[scheduler::yield_current]
     N -->|Log| L[handle_log: validate log_write cap → append to ring buffer]
-    N -->|AllocMem| A[handle_alloc: track_alloc → map page]
+    N -->|AllocMem| A[handle_alloc_mem: current_task_claim_alloc → map page]
     N -->|Unknown| E[Return -1]
 ```

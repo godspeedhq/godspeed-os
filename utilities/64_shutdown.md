@@ -32,8 +32,8 @@ shutdown cancel       stop a pending shutdown
 - **The deadline is the kernel's.** `shutdown` sets the machine's one pending power-off in the kernel (`PowerOff`,
   syscall 56), so it survives the death of this shell, of `power`, of every service; and it is gone at a reboot. The
   kernel logs every set and cancel with who asked, and anyone can read how long is left.
-- **Earliest wins.** A second `shutdown` for LATER than the pending one is refused and names it - nothing can
-  postpone a shutdown already set. One for sooner moves it forward.
+- **Earliest wins.** A second `shutdown` for LATER than the pending one changes nothing and says so: the pending
+  one is kept, and its time named - nothing can postpone a shutdown already set. One for sooner moves it forward.
 - **One deadline, one action.** A pending `reboot <delay>` (`13_reboot.md`) rides the same deadline, so while one
   is pending `shutdown <delay>` is refused and names it, and `shutdown status` and `shutdown cancel` say a reboot is
   pending rather than that nothing is.

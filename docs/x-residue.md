@@ -73,6 +73,8 @@ above do. They are a tripwire on the consequences, not a judge of the decision.
 ## Why this file exists rather than a tenth check
 
 Inventing a check so the scoreboard reads 10 of 10 would be a number optimised instead of a property
-secured, which is the failure §26.3 and `commandments_redteam.py` exist to prevent. The count is now
-10 of 10 because a real gap was closed - the user-facing vocabulary was reconciled against nothing
-before - and this file records precisely how much of X that does and does not buy.
+secured, which is the failure §26.3 and `commandments_redteam.py` exist to prevent. X counts as having
+a check because a real gap was closed - the user-facing vocabulary was reconciled against nothing
+before - and this file records precisely how much of X that does and does not buy. (This said "the
+count is now 10 of 10"; the checker reports 9 of 10 commandments with a check, none covered whole,
+since 2026-10-10 - see the status line above.)

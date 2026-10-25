@@ -18,7 +18,7 @@ cases are **data-driven `TestSpec` entries in `osdev/src/validator.rs`** (each n
 | `4A` / `4B`                         | §22 Test 4 | Restartability            | 30s / 60s    |
 | `5A` / `5B`                         | §22 Test 5 | Authority is explicit     | 30s          |
 | `6A` / `6B`                         | §22 Test 6 | Restartability            | 60s / 60s    |
-| `7A` / `7B`                         | §22 Test 7 | Isolation                 | 30s / 60s    |
+| `7A` / `7B`                         | §22 Test 7 | Isolation                 | 60s          |
 | `8A` / `8B`                         | §22 Test 8 | No service monopoly       | 120s / 120s  |
 | `9A` / `9B`                         | §22 Test 9 | Identity over location    | 60s          |
 | `10A` / `10B`                       | §22 Test 10| Identity over location    | 60s / 60s    |
@@ -40,10 +40,10 @@ Timeout column: positive case / negative case. Single value = both cases share t
 ## How tests work (§22.3)
 
 Each test:
-1. Builds a kernel + probe service image via `osdev build`.
+1. Builds a kernel + probe service image once for the whole suite, with the `identity-only` supervisor (`cmd_build_identity`); 1B builds its own corrupt-supervisor kernel.
 2. Boots QEMU with `-smp 4` (and `-enable-kvm` when `/dev/kvm` is accessible; without it every timeout is multiplied by 4, `qemu::timeout_scale`).
-3. Streams serial output line by line.
-4. Passes when all `expect` strings appear in order within the timeout.
+3. Re-reads the serial log file every 200 ms (`poll_serial`).
+4. Passes when all `expect` strings appear, in any order, within the timeout.
 5. Fails if any `fail_on` string appears, or the timeout fires, or `KERNEL PANIC` appears unexpectedly.
 
 ## TestKind variants
@@ -60,12 +60,12 @@ The identity cases use three of the harness kinds defined in `osdev/src/validato
 
 ## Timeout rationale
 
-`osdev test identity` builds supervisor with `--features supervisor/identity-only`, which compiles out the 160+ non-identity probe spawns and leaves only the 16 identity probe services. This cuts `"supervisor: ready"` time from 30-200 s (full build) to ~3 s on Windows TCG. KVM (CI) completes every test well inside 30 s.
+`osdev test identity` builds supervisor with `--features supervisor/identity-only`, which compiles out the 160+ non-identity probe spawns and leaves only the 16 identity probe services. This cuts `"supervisor: ready"` time from 30-200 s (full build) to ~3 s on Windows TCG. KVM completes every test well inside 30 s.
 
 | Test    | Timeout | Reason |
 |---------|---------|--------|
-| 1A      | 120s    | Full supervisor build (1B test shares the image); 178 probes before "supervisor: ready" in that path |
-| 7A/7B   | 60s     | 15 identity probes still compete; 30s was marginal on loaded TCG |
+| 1A      | 120s    | Set when 1A ran on the full build, with 178 probes before "supervisor: ready"; it now boots the `identity-only` image like every case but 1B, so 120 s is margin |
+| 7A/7B   | 60s     | 16 identity probes still compete; 30s was marginal on loaded TCG |
 | 8A      | 120s    | Yielder competes with concurrent probe services for scheduler quanta |
 | 8B      | 120s    | Pong/ping spawn first; no queue-full stall; 120s is conservative |
 | 9A      | 60s     | "pong: received" at t≈5-10s with identity-only; 60s is 6× margin |
@@ -74,7 +74,7 @@ The identity cases use three of the harness kinds defined in `osdev/src/validato
 
 ## Spawn order (affects timing)
 
-The supervisor spawns pong and ping **first** (before all probe services). In the `identity-only` build this is followed by 15 identity probe services; in the full build it is followed by 160+ probes. Cross-core IPC between ping and pong is established within ~5 s of boot on any build variant. Tests that previously timed out waiting for `"pong: received"` at t≈175 s (full build under load) now see it at t≈5 s.
+The supervisor spawns pong and ping **first** (before all probe services). In the `identity-only` build this is followed by 16 identity probe services; in the full build it is followed by 160+ probes. Cross-core IPC between ping and pong is established within ~5 s of boot on any build variant. Tests that previously timed out waiting for `"pong: received"` at t≈175 s (full build under load) now see it at t≈5 s.
 
 ## Pass record
 

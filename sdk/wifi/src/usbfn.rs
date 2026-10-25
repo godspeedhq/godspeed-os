@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! THE USB RADIO'S FUNCTION PROTOCOL: what a USB host service (`dwc2`, and `xhci` since U2a) answers for the one
-//! device it has bound as a WiFi radio, and what `wifi-usb` asks. ONE definition, read by both sides.
+//! device it has bound as a WiFi radio, and what `wifi-usb` asks. ONE definition, read by both sides. Since
+//! 2026-10-23 a host binds any vendor-specific device the same way, for an installed driver package, which asks the
+//! same ops through `gs::driver::bus`; where this file says "the radio", read "the bound device" for that case.
 //!
 //! **Narrow on purpose.** A host binds a radio by its VID:PID - a vendor-class device, so there is no class
 //! to match on - and then serves exactly that device: who it is, and its control transfers. It is not a
@@ -11,6 +13,10 @@
 //!
 //! Every reply starts `[op, status]`; the status is one of the `ST_` values, so a reply to the wrong op, or a
 //! host that does not speak this protocol, is told apart from an answer.
+//!
+//! **The numbers are the SDK's** (`godspeed_sdk::usbfn`, 2026-10-23), re-exported here one by one, so a driver
+//! PACKAGE can speak the protocol through `gs::driver::bus` without this crate: each is defined once, there. This
+//! file keeps what it says about them, and the two helpers only the hosts and `wifi-usb` use.
 
 /// `[op]` -> `[op, status, vid lo, vid hi, pid lo, pid hi, gen (4 bytes LE)]`: which device is bound as the
 /// radio, if any, and which BINDING of it this is (`INFO_GEN_AT`, the host's `next_gen`). The same dongle
@@ -21,13 +27,13 @@
 ///
 /// A host that knows where the radio is may go on, for `wifi hardware <radio>` (`utilities/56_wifi.md` 11a):
 /// `[root port, hub port (0 = on the root port itself), slot, bulk IN address, bulk IN max packet lo, hi,
-/// bulk OUT count, bulk OUT address...]` (`INFO_WHERE_AT` onwards). `xhci` does; `dwc2` does not yet, and a
+/// bulk OUT count, bulk OUT address...]` (`INFO_WHERE_AT` onwards). `xhci` and `ehci` do; `dwc2` does not yet, and a
 /// driver reads only what the reply carries.
-pub const OP_INFO: u8 = 0x20;
+pub use godspeed_sdk::usbfn::OP_INFO;
 /// Where an `OP_INFO` answer's gen starts.
-pub const INFO_GEN_AT: usize = 6;
+pub use godspeed_sdk::usbfn::INFO_GEN_AT;
 /// Where the optional part of an `OP_INFO` answer starts.
-pub const INFO_WHERE_AT: usize = 10;
+pub use godspeed_sdk::usbfn::INFO_WHERE_AT;
 
 /// The gen for a new binding, given the host's `gs::driver::wait::counter_ms` now and the gen it gave last:
 /// the counter, so a restarted host does not repeat a gen its previous instance gave (a count from 1 did, on
@@ -42,13 +48,13 @@ pub fn next_gen(now_ms: u64, last: u32) -> u32 {
 /// `[op, setup(8), data out...]` -> `[op, status, data in...]`. One control transfer to the bound radio: the
 /// 8-byte setup packet as USB defines it; for an OUT transfer the data follows it, `wLength` bytes; for an
 /// IN transfer the reply carries what the device returned.
-pub const OP_CONTROL: u8 = 0x21;
+pub use godspeed_sdk::usbfn::OP_CONTROL;
 /// `OP_CONTROL`, attempted EXACTLY ONCE: the host does not retry it, and a failure is `ST_FAILED`. For a
 /// transfer that must not reach the device twice. A firmware block is one: the host retrying a block whose
 /// data arrived and whose status stage failed sends it again, and the chip's checksum is then never
 /// reported (seen on a Pi 2 replug, R2). Linux sends each block once and restarts the whole download on a
 /// failure (`rtl8xxxu_download_firmware`'s `-EAGAIN`), which needs the failure to be seen.
-pub const OP_CONTROL_ONCE: u8 = 0x22;
+pub use godspeed_sdk::usbfn::OP_CONTROL_ONCE;
 /// `[op]` -> `[op, status, transfer...]`: the bulk IN transfer the host has taken from the radio, if it holds
 /// one, and the host's IN armed again; `ST_OK` with no bytes when it holds none, which also arms the IN if it
 /// was not armed - so the driver's first ask, once the chip's receive is set up, is what starts receiving.
@@ -57,14 +63,14 @@ pub const OP_CONTROL_ONCE: u8 = 0x22;
 /// meanwhile; `dwc2` arms again at once into a ring of eight (`rtl::RX_SLOTS`), and holds the chip only when
 /// all eight wait. Either way nothing is dropped between the host and the driver. `ST_FAILED` when the radio has no bulk IN endpoint, or the host could not repair it
 /// after a failed transfer.
-pub const OP_BULK_IN: u8 = 0x23;
+pub use godspeed_sdk::usbfn::OP_BULK_IN;
 /// `[op, out, transfer...]` -> `[op, status]`: one bulk OUT transfer to the radio - a frame with the chip's
 /// transmit descriptor in front of it. `out` is the endpoint's POSITION among the radio's bulk OUT endpoints
 /// in its configuration descriptor, 0 first: the order Linux's `rtl8xxxu_parse_usb` fills `out_ep[]` in, so
 /// the driver maps its queues to endpoints as `rtl8xxxu_init_queue_priority` does without knowing any
 /// endpoint's number. `ST_BAD_REQUEST` for an `out` the radio does not have or an empty transfer;
 /// `ST_FAILED` when the device or the bus did not take it.
-pub const OP_BULK_OUT: u8 = 0x24;
+pub use godspeed_sdk::usbfn::OP_BULK_OUT;
 
 /// `[OP_SYNC, notice]`: **never answered.** A driver spawned without a reply mailbox (past the routing table's
 /// reserve with no mailbox credit left - `spawn[ipc]: ... gets no reply mailbox`, `docs/wifi-usb.md` 19, 20) awaits its replies on the
@@ -76,13 +82,13 @@ pub const OP_BULK_OUT: u8 = 0x24;
 /// again once the driver has been quiet (`docs/wifi-usb.md` 19) - except `xhci` with no dongle bound,
 /// which gives the capability back and does not re-send a named `NOTE_RADIO` (`answer_absent`); recorded
 /// in `audits/documentation-audit.md` Audit 12.
-pub const OP_SYNC: u8 = 0x25;
+pub use godspeed_sdk::usbfn::OP_SYNC;
 
 /// `[NOTE_BULK_IN]`, sent BY the host TO the driver, no reply expected: a bulk IN transfer is held, ask
 /// `OP_BULK_IN`. Sent with `try_send`; one the driver's full queue refused is sent again on the host's next
 /// pass, because a lost notice would stop receive: `xhci` arms nothing until the transfer is collected, and
 /// `dwc2`'s ring is emptied only as the driver is told it holds something.
-pub const NOTE_BULK_IN: u8 = 0x2E;
+pub use godspeed_sdk::usbfn::NOTE_BULK_IN;
 
 /// `[op]` -> `[op, status]`: REPLUG the radio - reset its port and bind it afresh, what unplugging and plugging
 /// it back does short of cutting its power. For a chip that has stopped answering its driver: on the Pi 2 the
@@ -90,11 +96,11 @@ pub const NOTE_BULK_IN: u8 = 0x2E;
 /// until the dongle is replugged (2026-10-22). `ST_OK`: the host will, after answering - it reports the radio
 /// gone and then bound again, so the supervisor stops this driver and starts a fresh one, as for a real
 /// replug. `ST_FAILED`: it has already done so as often as its bound allows, and says so. `ST_BAD_REQUEST`:
-/// a host that cannot (`xhci`, which does not take it yet).
-pub const OP_REPLUG: u8 = 0x27;
+/// a host that cannot (`xhci` and `ehci`, which do not take it).
+pub use godspeed_sdk::usbfn::OP_REPLUG;
 
-/// Is `op` a request a driver sends its host - `OP_INFO` to `OP_SYNC`, and `OP_REPLUG`? Every host routes by
-/// this and by nothing else, so a new op cannot fall into another protocol's range. `OP_REPLUG` did: `dwc2`
+/// Is `op` a request a driver sends its host - `OP_INFO` to `OP_SYNC`, and `OP_REPLUG`? Every host that links this
+/// crate routes by this and by nothing else (`ehci`, which does not, writes the same range out), so a new op cannot fall into another protocol's range. `OP_REPLUG` did: `dwc2`
 /// routed `OP_INFO..=OP_SYNC` here and everything above 0x10 to the network, whose answer to an op it does not
 /// know is `[op, 0]` - and 0 is `ST_OK`, so a driver was told its dongle was being reset and nothing was
 /// (Pi 2, 2026-10-22).
@@ -111,30 +117,30 @@ pub fn is_request(op: u8) -> bool {
 /// on a driver that is behind; a notice lost to a full queue costs only that change, and the driver asks
 /// `OP_INFO` once when it starts, so a respawn on either side begins from the truth. This is what lets the
 /// driver block in `recv` instead of asking on a timer (`docs/wifi-usb.md`, U1b).
-pub const NOTE_RADIO: u8 = 0x2F;
+pub use godspeed_sdk::usbfn::NOTE_RADIO;
 
 /// The transfer was done (or the device is bound, for `OP_INFO`).
-pub const ST_OK: u8 = 0;
+pub use godspeed_sdk::usbfn::ST_OK;
 /// No radio is bound on this host - none plugged in, or this host has not enumerated it yet.
-pub const ST_NO_DEVICE: u8 = 1;
+pub use godspeed_sdk::usbfn::ST_NO_DEVICE;
 /// The host tried the transfer and the device or the bus did not complete it.
-pub const ST_FAILED: u8 = 2;
+pub use godspeed_sdk::usbfn::ST_FAILED;
 /// The request was malformed: too short, or a `wLength` over `CONTROL_MAX`.
-pub const ST_BAD_REQUEST: u8 = 3;
+pub use godspeed_sdk::usbfn::ST_BAD_REQUEST;
 
 /// The most data one control transfer may carry either way. The hosts' control buffers are this size or
 /// larger, and the Realtek's register file is reached a word at a time, its firmware 128 bytes at a time.
-pub const CONTROL_MAX: usize = 256;
+pub use godspeed_sdk::usbfn::CONTROL_MAX;
 
 /// The most one bulk IN transfer carries: seven 512-byte high-speed packets, the most whole packets that fit
 /// one IPC message beside the reply's two bytes. It holds one unaggregated receive transfer, which Linux
 /// sizes as `IEEE80211_MAX_FRAME_LEN` (2352, `include/linux/ieee80211.h`) plus the receive descriptor
 /// (`rtl8xxxu_submit_rx_urb`); a driver that turns the chip's receive aggregation on must keep its batches
 /// under it. A whole number of packets, because a device that sends more than the host asked for is babble.
-pub const BULK_IN_MAX: usize = 3584;
+pub use godspeed_sdk::usbfn::BULK_IN_MAX;
 const _: () = assert!(BULK_IN_MAX + 2 <= godspeed_sdk::ipc::MAX_PAYLOAD);
 const _: () = assert!(BULK_IN_MAX % 512 == 0);
 
 /// The most one bulk OUT transfer carries: the rest of an IPC message after the op and the endpoint byte. A
 /// full-length frame with its 32-byte descriptor is about 2,400 bytes, so this is room, not a squeeze.
-pub const BULK_OUT_MAX: usize = godspeed_sdk::ipc::MAX_PAYLOAD - 2;
+pub use godspeed_sdk::usbfn::BULK_OUT_MAX;

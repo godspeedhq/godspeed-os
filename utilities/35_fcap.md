@@ -32,9 +32,8 @@ time as a "does the file-cap model still hold end-to-end?" probe.
 
 `fcap` takes **no path** - passing one is refused (`fcap: takes no argument …`). It uses its own
 files in the shell's scratch folder (`/system/scratch/shell/fcap-selftest`, then `fcap_append` and `fcap-gs`) and removes them, so it is
-leak-free and re-runnable. (`reuse` and `gsreuse` are NOT in `fcap help` and do not tab-complete,
-which `0_conventions.md` rules 2 and 9 require - a code defect, recorded here so the words are not
-discoverable only from the source.)
+leak-free and re-runnable. `reuse` and `gsreuse` are listed in `fcap help` and tab-complete;
+both kill `fs`, and `reuse` uses `/ru_old.txt` and `/ru_new.txt` at the root.
 
 ## 3. Output
 
@@ -54,6 +53,7 @@ fcap: rewriting earlier bytes through an append-only cap DENIED
 fcap: a later forward write still accepted after the refusal
 fcap: gs::cap wrote and read the file THROUGH the capability
 fcap: gs::cap non-escalation holds - a READ cap cannot write
+fcap: gs::cap an append-only file carries WRITE alone, and closes
 fcap: all file-capability checks passed
 ```
 
@@ -91,8 +91,8 @@ cannot fake a file-cap operation over its ordinary `fs` send cap.
 
 - **Not a file editor or viewer.** `fcap` never reads, writes, or deletes a file of yours -
   use `read` / `write` / `delete` for that. It only touches its own throwaway file.
-- **No options or paths.** One behaviour, no flags (§ `0_conventions.md`); it is a self-check,
-  not a configurable tool.
+- **No options or paths.** No flags (§ `0_conventions.md`); the self-check takes no argument, and
+  `reuse` / `gsreuse` are its only words. It is a self-check, not a configurable tool.
 
 ## 7. Conformance
 

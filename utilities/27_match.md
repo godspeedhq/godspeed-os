@@ -25,9 +25,10 @@ If a line matches, it is kept; if it doesn't, it is dropped. One honest verb cov
 match 0.4.0 - keep the lines that match a pattern
 
 usage:
-  <producer> | match <pattern>   keep piped lines that match <pattern>
-  match <pattern> <path>         keep lines of <path> that match (the path is required)
-  match except <pattern> [path]  keep the lines that do NOT match (the inverse)
+  <producer> | match <pattern>   keep piped lines matching <pattern>
+  match <pattern> <path>         keep lines of <path> that match
+  match except <pattern> [path]  keep the lines that do NOT match
+  match "<two words>" …          quote a multi-word pattern
   match version                  print the version
   match help                     print this message
 

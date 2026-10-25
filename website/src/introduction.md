@@ -41,9 +41,9 @@ directory, reacquire a fresh capability, and resume - possibly against a new ins
 core, which is invisible to them. Identity is stable; location is not.
 
 The **[Design Notes](design/persistence.md)** trace how that model plays out in real subsystems -
-the filesystem, the block driver, DMA confinement, naming, the scripting language - and the
-**[Forward-Looking](design/networking.md)** notes sketch where it goes next: across a network, and
-across a cluster.
+the filesystem, the block driver, DMA confinement, naming, the scripting language, the network
+stack - and the **[Forward-Looking](design/cluster.md)** note sketches where it goes next: across a
+cluster.
 
 ## Seeing it run
 

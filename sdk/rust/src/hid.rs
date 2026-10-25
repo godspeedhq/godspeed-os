@@ -272,6 +272,15 @@ pub const VOLUME_UP_SIGNAL: u8 = 0x81;
 pub const VOLUME_DOWN_SIGNAL: u8 = 0x82;
 pub const MUTE_TOGGLE_SIGNAL: u8 = 0x83;
 
+/// Console-stream signal from a USB host: it has just printed a device notice (`USB: WiFi dongle connected
+/// (xhci)`) over whatever the console showed, and the program reading the console may want to put its own
+/// line back. The shell redraws its prompt with the half-typed line under the notice; anything else ignores
+/// it, because it is not a key. The hosts pushed a real Enter (`\n`) for this until 2026-10-24, and an Enter
+/// is an ANSWER: a plug while `godspeed install` asked `[y/N]` answered it N, and at the prompt it ran the
+/// half-typed line (the VisionFive card). Outside ASCII, so no typed key produces it, and read from here by
+/// both ends.
+pub const NOTICE_SIGNAL: u8 = 0x84;
+
 /// HID usages of the keys the audio shortcuts use.
 const KEY_UP: u8 = 0x52;
 const KEY_DOWN: u8 = 0x51;
@@ -570,7 +579,7 @@ mod tests {
         assert_eq!(emit_mods(0x01, 0x52, &mut rep), b"\x1b[A");
         assert_eq!(emit_mods(0x04, 0x10, &mut rep), b"m");
         // Outside ASCII, so no typed key can produce one.
-        for s in [VOLUME_UP_SIGNAL, VOLUME_DOWN_SIGNAL, MUTE_TOGGLE_SIGNAL, CTRL_ALT_DEL_SIGNAL] {
+        for s in [VOLUME_UP_SIGNAL, VOLUME_DOWN_SIGNAL, MUTE_TOGGLE_SIGNAL, CTRL_ALT_DEL_SIGNAL, NOTICE_SIGNAL] {
             assert!(s >= 0x80);
         }
     }

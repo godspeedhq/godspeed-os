@@ -31,6 +31,23 @@ fi
 echo "==> [3/3] assemble the site (book + /api)"
 if [ -n "$doc" ] && [ -d "$doc" ]; then
   mkdir -p website/book/api && cp -r "$doc"/* website/book/api/
+  # rustdoc writes a page per crate and none above them, so /api/ itself was a 404. A page that
+  # names both, unless a later rustdoc writes its own.
+  if [ ! -e website/book/api/index.html ]; then
+    cat > website/book/api/index.html <<'HTML'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GodspeedOS API reference</title></head>
+<body style="font-family: sans-serif; max-width: 40em; margin: 2em auto; padding: 0 1em; line-height: 1.5">
+<h1>GodspeedOS API reference</h1>
+<ul>
+<li><a href="godspeed/index.html"><code>godspeed</code></a>, the standard library: what a program is written against.</li>
+<li><a href="godspeed_sdk/index.html"><code>godspeed_sdk</code></a>, the SDK underneath it: what the kernel can do.</li>
+</ul>
+<p><a href="../stdlib.html">The standard library, explained</a></p>
+</body></html>
+HTML
+  fi
   echo "    ready: website/book/  (with /api)"
 else
   echo "    rustdoc not produced - shipping the book WITHOUT /api (same best-effort as the workflow)"

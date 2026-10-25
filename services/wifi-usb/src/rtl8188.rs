@@ -13,7 +13,8 @@ use godspeed::driver::wait::{self, Budget};
 use godspeed_sdk::ServiceContext;
 use godspeed_wifi::usbfn;
 
-use crate::host;
+use crate::{dev, said};
+use godspeed::driver::bus::UsbError;
 use crate::rtl_power::{self, TxPower};
 use crate::rtl_queues::{self, TxQueues};
 use crate::rtl_tables;
@@ -26,21 +27,13 @@ const DIR_OUT: u8 = 0x40;
 /// One register read of `width` bytes (1, 2 or 4), or why not.
 pub fn read(ctx: &ServiceContext, reg: u16, width: u8) -> Result<u32, &'static str> {
     let [lo, hi] = reg.to_le_bytes();
-    let r = host(ctx, &[usbfn::OP_CONTROL, DIR_IN, VENDOR_REQ, lo, hi, 0, 0, width, 0])?;
-    let p = r.payload_bytes();
-    if p.len() < 2 || p[0] != usbfn::OP_CONTROL {
-        return Err("the host answered something other than CONTROL");
+    let mut v = [0u8; 4];
+    let w = (width as usize).min(4);
+    let n = dev(ctx)?.control_in([DIR_IN, VENDOR_REQ, lo, hi, 0, 0, width, 0], &mut v[..w]).map_err(said)?;
+    if n < w {
+        return Err("the host refused the request as malformed");
     }
-    match p[1] {
-        usbfn::ST_OK if p.len() >= 2 + width as usize => {
-            let mut v = [0u8; 4];
-            v[..width as usize].copy_from_slice(&p[2..2 + width as usize]);
-            Ok(u32::from_le_bytes(v))
-        }
-        usbfn::ST_NO_DEVICE => Err("the dongle is no longer bound"),
-        usbfn::ST_FAILED => Err("the transfer did not complete"),
-        _ => Err("the host refused the request as malformed"),
-    }
+    Ok(u32::from_le_bytes(v))
 }
 
 /// One register write of `width` bytes.
@@ -51,7 +44,7 @@ pub fn write(ctx: &ServiceContext, reg: u16, width: u8, val: u32) -> Result<(), 
 /// `bytes` written from register `reg` in ONE control transfer - a register's 1, 2 or 4 - which the host
 /// may retry, since a register written twice holds the same value.
 pub fn write_bytes(ctx: &ServiceContext, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
-    write_op(ctx, usbfn::OP_CONTROL, reg, bytes)
+    write_op(ctx, false, reg, bytes)
 }
 
 /// One block of the firmware download (`rtl8xxxu_writeN`, 128 at a time for this family), sent EXACTLY
@@ -59,29 +52,21 @@ pub fn write_bytes(ctx: &ServiceContext, reg: u16, bytes: &[u8]) -> Result<(), &
 /// download's checksum (a Pi 2 replug, R2); Linux sends each block once and restarts the whole download
 /// when one fails, which `download_firmware`'s caller does.
 pub fn write_block(ctx: &ServiceContext, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
-    write_op(ctx, usbfn::OP_CONTROL_ONCE, reg, bytes)
+    write_op(ctx, true, reg, bytes)
 }
 
-fn write_op(ctx: &ServiceContext, op: u8, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
+fn write_op(ctx: &ServiceContext, once: bool, reg: u16, bytes: &[u8]) -> Result<(), &'static str> {
     let [lo, hi] = reg.to_le_bytes();
     let [nlo, nhi] = (bytes.len() as u16).to_le_bytes();
-    let mut req = [0u8; 9 + crate::rtl_fw::BLOCK];
     if bytes.len() > crate::rtl_fw::BLOCK {
         return Err("a write longer than one 128-byte block");
     }
-    req[..9].copy_from_slice(&[op, DIR_OUT, VENDOR_REQ, lo, hi, 0, 0, nlo, nhi]);
-    req[9..9 + bytes.len()].copy_from_slice(bytes);
-    let r = host(ctx, &req[..9 + bytes.len()])?;
-    let p = r.payload_bytes();
-    if p.first().copied() != Some(op) {
-        return Err("the host answered something other than this write");
-    }
-    match p.get(1).copied() {
-        Some(usbfn::ST_OK) => Ok(()),
-        Some(usbfn::ST_NO_DEVICE) => Err("the dongle is no longer bound"),
-        Some(usbfn::ST_FAILED) => Err("the transfer did not complete"),
-        _ => Err("the host refused the write as malformed"),
-    }
+    let setup = [DIR_OUT, VENDOR_REQ, lo, hi, 0, 0, nlo, nhi];
+    let d = dev(ctx)?;
+    if once { d.control_out_once(setup, bytes) } else { d.control_out(setup, bytes) }.map_err(|e| match e {
+        UsbError::BadRequest => "the host refused the write as malformed",
+        e => said(e),
+    })
 }
 
 pub fn read8(ctx: &ServiceContext, reg: u16) -> Result<u8, &'static str> { read(ctx, reg, 1).map(|v| v as u8) }
@@ -300,19 +285,10 @@ fn config_descriptor(ctx: &ServiceContext) -> Result<[u8; usbfn::CONTROL_MAX], &
 
 /// One control transfer IN with the given setup packet; the bytes returned are copied into `out`.
 fn control_in(ctx: &ServiceContext, setup: [u8; 8], out: &mut [u8]) -> Result<usize, &'static str> {
-    let mut req = [0u8; 9];
-    req[0] = usbfn::OP_CONTROL;
-    req[1..9].copy_from_slice(&setup);
-    let r = host(ctx, &req)?;
-    let p = r.payload_bytes();
-    match (p.first().copied(), p.get(1).copied()) {
-        (Some(usbfn::OP_CONTROL), Some(usbfn::ST_OK)) => {
-            let n = (p.len() - 2).min(out.len());
-            out[..n].copy_from_slice(&p[2..2 + n]);
-            Ok(n)
-        }
-        _ => Err("a standard request to the dongle did not complete"),
-    }
+    dev(ctx)?.control_in(setup, out).map_err(|e| match e {
+        UsbError::Host(e) => e.as_str(),
+        _ => "a standard request to the dongle did not complete",
+    })
 }
 
 /// The transmit queues set up, after the power-on and BEFORE the firmware download, as both Linux drivers

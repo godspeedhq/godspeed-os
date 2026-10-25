@@ -38,5 +38,5 @@ Pong is stateless - it logs each received message. No state to reconstruct on re
 | String                         | Test           |
 |--------------------------------|----------------|
 | `"pong: ready on core"`        | 9A, 10A        |
-| `"pong: ready on core 2"`      | 10A, 10B       |
-| `"pong: received"`             | 6A, 6B, 9A, 10A, 10B (indirect) |
+| `"pong: ready on core 2"`      | 10A            |
+| `"pong: received"`             | 9A             |

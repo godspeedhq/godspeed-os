@@ -5,7 +5,9 @@
 converted to the first three across all four ports; and since 2026-10-19 every compiled driver on the grants
 (step 3), the one-way ratchet holding a new driver to them, and since 2026-10-20 every compiled driver's
 arena laid out by name - no driver reaches its arena at an offset from the arena's start any more; the
-offsets that remain are within a named, bounds-checked part. "Current state" below says what exists; the
+offsets that remain are within a named, bounds-checked part. Since 2026-10-22 every driver that takes an
+interrupt waits for it through `irq` (step 4) and a driver's remaining SDK calls are wrapped (`input`,
+`power`, `device`, step 5); since 2026-10-23 `bus` reaches a USB device through its host. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -50,7 +52,22 @@ test for `gs` is whether a contributor must NAME a thing and rely on it. A drive
 window and its DMA arena, so those types come through `gs::driver` too, over the SDK's `Mmio` and `Dma`;
 the end state is no service or driver crate depending on the SDK directly (`backlog/71`).
 
-## Current state (2026-10-22)
+### A contributor's driver (operator, 2026-10-23)
+
+**`gs::driver` is the documented way to write a driver, and the one the compatibility promise covers.** A driver
+package may also call the SDK directly - it may copy what an in-tree driver does, or reach a mechanism `gs::driver`
+does not have yet - and nothing refuses it: a package's authority comes from its signed contract and the operator's
+answers at install, never from which library it calls, so the SDK confers nothing the contract did not grant. What
+it costs is the PROMISE: the SDK is what the kernel can do, and it may change between releases where `gs::driver`
+does not (grow-only, above). A package written on raw SDK calls can stop building, or stop working, on a later
+release, and nothing warns its author; `scripts/one_way_check.py` reads this tree, never a contributor's package.
+
+So the rule stands where it was for THIS tree - in-tree drivers are written on `gs::driver`, held there by the one-way
+check, and are left as they are - and for a contributor it is advice with its reason, not a gate. A mechanism a
+contributor had to take from the SDK is a gap in `gs::driver`, closed here when it is found in a real driver, as
+every mechanism above was.
+
+## Current state (2026-10-23)
 
 What exists now. The dated steps after the method sections are the record of how each piece got here,
 and why; read them for the reasoning, not to find out what the library contains.
@@ -102,9 +119,24 @@ and why; read them for the reasoning, not to find out what the library contains.
   knows about a device that the driver cannot read for itself. `gs::program::mode` beside them is the mode
   a program was started in. All counted by `one_way_check.py`, every caller at zero.
 
+- **`bus`** (2026-10-23) - a device reached through the host of the bus it is on, for a device with no registers
+  of its own: `UsbDevice::granted` finds the USB host a driver was given as its peer (`xhci`, `dwc2` or `ehci`) (or, for a host spawned after
+  it, one it may reacquire by name - a package may not, so that widens nothing), and `info`, `place`,
+  `control_in`, `control_out`, `control_out_once`, `bulk_out`, `bulk_in` and `replug` ask it for the bound
+  device's transfers over the function protocol (`godspeed_sdk::usbfn`), each bounded, with a host's notice named
+  back by `OP_SYNC`. A BUS, not a class: it moves transfers and knows nothing of what the device is, so the rule
+  against a `driver::usb` class API stands. Its first user was a driver package (`hw_usb`,
+  `docs/developer-services-design.md` 13.1); `wifi-usb` was converted to it the same day (2026-10-23) and is the
+  library's proof on a real driver - **built, and not run anywhere yet**: it is started only when a host reports the
+  dongle, which QEMU has none of, so every transfer it makes through `bus` is owed a hardware card. What it needed
+  that a package had not: `place` (for `wifi hardware usb`), `control_out_once` (a firmware block must reach the
+  chip once, section 6 of `docs/wifi-usb.md`) and `replug` (a chip that took no firmware).
+
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
-(1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet
-verified on hardware**). `audio-driver` and `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
+(1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l's own card was never run**;
+`ehci` ran on it in step 4's T630 card), `wifi-usb` (`bus`, 2026-10-23; on hardware 2026-10-24: joined on the VisionFive and the Pi 2, and on the
+Pi 4 stood down for a package and took the dongle back, `docs/developer-services-design.md` 13.1). `audio-driver` and
+`pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
 
 **What a driver still takes from the SDK, and why it is not here.** Two things, neither a hardware call:
 
@@ -727,7 +759,7 @@ test audio` 69/0, the WAV read back. Owed: a card on the Wyse and the T630.
 
 **`xhci` fifth, its grants only.** Its register window and arena come through `gs::driver` (`Registers`,
 `Arena`) on every port, and the arena is still reached at its offset constants: its layout - shared controller
-structures, six per-device slices, the scratchpad and the disk's region, with the hub probe deliberately
+structures, its per-device slices, the scratchpad and the disk's region, with the hub probe deliberately
 inside the ERST page - is the next step, and the largest of any driver. QEMU: `osdev test iommu` 1/1 (the
 keyboard bound through the confined domain) and, on RISC-V `virt` with a USB disk behind `qemu-xhci`, `drives
 flash data`, a write read back and `drives check` with 0 bad. Built for the Pi 4 and the VisionFive. Owed:

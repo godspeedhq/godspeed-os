@@ -148,9 +148,14 @@ and **continue from there**" - layers on top: after Prime boots, the supervisor
 services reconstruct their state from GSFS (§15). Half of that is already in place: the
 supervisor holds every service's image and spawns it from a pointer it supplies
 (`SpawnImage`, `docs/service-ownership.md`), so the kernel no longer has to know a
-service exists. What is missing is only where the bytes come from - they are still
-embedded in the supervisor rather than read from a drive, and reading them from `fs` is
-the one capability that unlocks the portable *world* on top of portable *Prime*.
+service exists. Where the bytes come from was the missing half when this was written - they
+were embedded in the supervisor rather than read from a drive, and reading them from `fs` is
+the one capability that unlocks the portable *world* on top of portable *Prime*. *(2026-10-25:
+that half now exists for installed packages: since v0.29.0 the supervisor reads a package's
+image from `/system/packages/` on the disk, checks its signature, and starts it at install, at
+every boot and on every restart - `services/supervisor/src/installed.rs`, CLAUDE.md 14.1. The
+built-in services are still embedded in the supervisor, and nothing loads a whole world off a
+plugged-in drive.)*
 
 This is the **update model (§16) generalized**: §16 is "restart a service with a new
 binary"; this is "load a service's binary from a drive." Same principle - the binary

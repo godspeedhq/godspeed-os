@@ -19,7 +19,7 @@ Hardware test suite for GodspeedOS on real x86_64 silicon. Mirrors the QEMU test
 | `bare-metal` | `bare-metal` | the daily-driver set, settling at `gsh>` (no ping/pong; `spawn pong` / `spawn ping` start them) | Stability, smoke test, S6/S8 24h soak |
 | `perf` | `perf-only` | B1-B10 probes | Regular perf benchmarks |
 | `perf-brutal` | `perf-brutal-only` | BP1-BP10 probes | Brutal perf benchmarks |
-| `identity` | `identity-only` | 15 identity probes | Identity WatchSerial tests |
+| `identity` | `identity-only` | 16 identity probes | Identity WatchSerial tests |
 | `stress` | `stress-only` | S1-S10 probes | Stress benchmarks |
 | `adv` | `adv-only` | adversarial probes | Adversarial tests |
 | `chaos` | `chaos-only` | C2-C7 probes | Chaos tests |

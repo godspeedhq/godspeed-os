@@ -134,8 +134,9 @@ open in `edit`. It is deliberately NOT what the everyday view depends on - that 
 what just scrolled past require storage to be present and healthy.
 
 Unlike the view, it needs `fs`, and says so rather than half-writing: a failed create reports
-`could not create the file`, and a failure part-way through reports that the file is incomplete
-(§26.7 - a recovery that fails is still a failure).
+`scrollback: could not create <path> - <reason>`, and a failure part-way through reports
+`scrollback: the write failed part-way - <path> is INCOMPLETE (<reason>)` (§26.7 - a recovery that
+fails is still a failure).
 
 ## 5. In a script it prints
 

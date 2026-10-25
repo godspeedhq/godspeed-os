@@ -9,7 +9,9 @@ Ten Commandments** (`../COMMANDMENTS.md`) through real code.
 Each example is one concept in its own folder. All but one carry a `CLAUDE.md` written to be
 **pointed at an AI**: a contributor adapting an example for their own service can hand its `CLAUDE.md`
 to their assistant as the pattern primer. The exception is `stdlib-hello`, whose explanation is the
-header of its own `src/main.rs`. Every `CLAUDE.md` follows the same shape:
+header of its own `src/main.rs`. Every `CLAUDE.md` but `ping`'s and `pong`'s (short notes on their
+milestone role, spawn order and the log lines the identity tests match) follows the same shape, some
+adding a section or leaving out the annotated contract:
 
 > Purpose - What it demonstrates - **Why it is built this way (the Commandments)** - The contract,
 > annotated - **What you must NOT do** (each anti-pattern tagged with the Commandment it breaks) -
@@ -66,7 +68,7 @@ reach. Each port builds them with `--examples`, which adds the same `examples-te
 
 | ISA | Build | Boot |
 |---|---|---|
-| x86-64 | (built by the test) | `osdev test examples` - 11 assertions |
+| x86-64 | (built by the test) | `osdev test examples` - 12 assertions |
 | ARMv7 | `py scripts/arm_build.py --release --examples` | `py scripts/arm_run.py --release` |
 | AArch64 | `py scripts/pi4_build.py --release --examples` | `py scripts/pi4_run.py` |
 | RISC-V 64 | `py scripts/riscv_build.py --release --examples` | `py scripts/riscv_run.py --release` |

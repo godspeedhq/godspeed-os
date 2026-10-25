@@ -69,8 +69,9 @@ words, not a guess made at the prompt:
 
 | what happened | what you see |
 |---|---|
-| the source does not exist | `move: failed - path not found` |
+| the source does not exist | `move: failed - source not found` |
 | the destination already exists | `move: failed - dest exists` |
+| the destination's parent does not exist | `move: failed - dest path not found` |
 | the destination's parent is a file | `move: failed - dest not a directory` |
 | moving a directory into itself or its subtree | `move: cannot move into itself` (the shell's own check, before the round trip) |
 | storage is not available | `storage unavailable - do NOT run 'drives flash' (data may be intact; awaiting storage recovery)` |

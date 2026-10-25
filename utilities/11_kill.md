@@ -30,8 +30,8 @@ graceful-shutdown mechanism.
 - **`service_control` capability required.** `kill` (syscall 8) validates the
   `SERVICE_CONTROL` resource before doing anything; without it the call returns
   `CapNotHeld`. This closes the §3.1/§14.4 ambient-authority hole - before it,
-  any service could kill any other. Held only by the shell, supervisor, and test
-  probes. See `docs/service-control-cap.md`.
+  any service could kill any other. Held only by the supervisor and the services
+  it delegates it to: the shell, `chaos`, `control` and the test probes. See `docs/service-control-cap.md`.
 - **Results are one line each:** `killed: <name>`, `not running: <name>` (an `Err`),
   or `kill failed: <name>` (an `Err`). The `observe` variants are refused with a
   pointer to the `observe` command.
@@ -68,4 +68,4 @@ graceful-shutdown mechanism.
 ## 6. Conformance
 
 Conforms: own `kill help` / `kill version` (with a real example, per `0_conventions.md`); listed by the shell's top-level
-`help` under **Services** as `kill <name>`. See `0_conventions.md` §3.
+`help` under **Services** as `kill <svc>[,svc,...] | all-services`. See `0_conventions.md` §3.

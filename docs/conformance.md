@@ -142,9 +142,10 @@ def f():
 runs clean. Every one of those four sites is inside a function body. Had any been at module or class
 level the annotation WOULD be evaluated and the floor would be 3.9.
 
-**CI does not pin a version** - the only `python-version` in the workflows is `'3.x'` in
+**CI did not pin a version** - the only `python-version` in the workflows was `'3.x'` in
 `pages.yml`. That should become the declared minimum too, so "it works on my machine" and "it works
-in CI" cannot diverge silently.
+in CI" cannot diverge silently. (It has, for the build: `build.yml` pins `'3.8'`; `pages.yml` still
+takes `'3.x'`.)
 
 ### Decision: Python stays
 
@@ -191,8 +192,7 @@ was the optional half, and it is now declined.
 
 **And the seam turned out not to need Rust at all.** `scripts/conform.py` is the whole thing: it reads
 `EXTRA_CHECKS` out of `osdev/src/main.rs`, runs each checker, frames the failures, fixes the decidable
-class, and answers `--explain` and `--list`. `osdev conform` will be a shim that shells out to it -
-three lines - which means the front door exists and works today, and the Rust is a convenience rather
+class, and answers `--explain` and `--list`. `osdev conform` is a shim that shells out to it - which means the front door exists and works today, and the Rust is a convenience rather
 than the feature.
 
 ## As built, and the five defects that only appeared when it was RUN
@@ -491,7 +491,8 @@ Two more defects, again found only by running it:
 
 ### And the floor is now held mechanically
 
-`README.md` declares Python 3.8, and a hand-measured number is right on the day it is taken.
+A hand-measured floor is right on the day it is taken. `README.md` quoted it (3.8) until 2026-10-24; it now
+sends a contributor to `FLOOR` in `scripts/python_floor_check.py` instead, so there is one copy.
 `scripts/python_floor_check.py` fails if any tracked script uses a feature newer than `FLOOR`, and it
 makes the same function-local-annotation distinction the measurement did: at module or class level
 `list[str]` genuinely needs 3.9, inside a function body it never evaluates. Proved by planting a

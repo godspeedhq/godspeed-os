@@ -22,7 +22,7 @@ assert: ok
 gsh> assert fails read /nope            # must FAIL (a negative test)
 read: not found: /nope
 assert: ok
-gsh> roster | where role=core | assert contains vesta
+gsh> roster | where role=core | assert contains Matthew
 assert: ok
 ```
 
@@ -52,13 +52,13 @@ to its grid) and checks it. Because it's the last stage, *its* verdict is the pi
 | `empty`           | the output is blank - for records, there are no rows (a table's header line does not count) |
 
 ```
-roster | where role=core | assert contains vesta
+roster | where role=core | assert contains Matthew
 dir / | assert lacks secret
 find *.tmp | assert empty
 ```
 
 This is what verifies *correctness*, not just absence of errors: `roster | where role=core`
-returns `Ok` whether or not it found `vesta`; `| assert contains vesta` is what actually checks it.
+returns `Ok` whether or not it found `Matthew`; `| assert contains Matthew` is what actually checks it.
 
 ## 4. In a script - the self-checking suite
 
@@ -93,7 +93,7 @@ run: ran 2, failed 0, skipped 0
 
 ## 5. Bounds & safety (§26.6 / §3.12)
 
-- A failed assert is **loud** (`assert: FAILED (contains 'vesta')`) and returns `Err(AssertFailed)`
+- A failed assert is **loud** (`assert: FAILED (contains 'Matthew')`) and returns `Err(AssertFailed)`
   - never a silent miss.
 - The content sink materialises the stream into one bounded `Cap` (held off `pipe_run`'s frame -
   `assert_stream` is `#[inline(never)]`, the same user-stack discipline pipes/`run` need).

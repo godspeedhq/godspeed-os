@@ -60,9 +60,11 @@ queue pressure, which is what the `QueueFull` retry in `fs::block_rpc` exists to
 ### 2. Treat co-location as a rule, not luck
 
 Cross-core IPC measured ~14x same-core on the T630 (1,433,087 vs ~102,600 cycles) - an IPI plus
-cache-line bouncing on the queue's head/tail. Already true of the chatty pairs by round-robin accident:
-`fs` + `block-driver` on core 1, `net-stack` + `nic-driver` on core 1. `shell` (core 0) reaching `fs`
-(core 1) is the remaining cross-core hop, and it matters during scripts rather than at human pace.
+cache-line bouncing on the queue's head/tail. Already true of the chatty pairs, by the preferred core in
+each one's spawn row (`services/supervisor/src/main.rs`): `fs` + `block-driver` on core 1, `net-stack` +
+`nic-driver` on core 1. `shell` (core 0) reaching `fs` (core 1) is the remaining cross-core hop, and it
+matters during scripts rather than at human pace. (On the Pi 2 the rows differ: `shell` and `fs` share
+core 1 and `block-driver` is on core 2, so there the cross-core hop is `fs` to `block-driver`.)
 
 §9.2 placement is contract-declared and re-evaluated from scratch on every restart, so this is a
 statement a contract can make - but note §3.11: contracted placement is deployment-coupled by design,

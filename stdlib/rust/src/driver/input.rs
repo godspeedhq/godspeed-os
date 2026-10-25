@@ -31,6 +31,16 @@ pub fn push(ctx: &ServiceContext, byte: u8) {
     ctx.console_push(byte)
 }
 
+/// Say that this driver has just printed a notice over the console (a device plugged in or out), so the
+/// program reading it can put its line back: pushes `NOTICE_SIGNAL` (`godspeed_sdk::hid`), which no key
+/// produces. Not an Enter, which would answer a question or run a half-typed line. Does nothing without
+/// `CONSOLE_PUSH`.
+#[cfg(not(test))]
+#[inline(always)]
+pub fn notice_shown(ctx: &ServiceContext) {
+    ctx.console_push(godspeed_sdk::hid::NOTICE_SIGNAL)
+}
+
 /// Say that input setup is finished - the end-of-boot signal the shell watches to clear the boot screen.
 /// Called in every terminal path of a keyboard driver's setup, found or not. Does nothing without
 /// `CONSOLE_PUSH`.

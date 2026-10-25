@@ -1750,6 +1750,7 @@ fn cmd_test(suite: &str) {
         "gsp"            => run_gsp_test(),
         "deps"           => run_deps_test(),
         "kinds"          => run_kinds_test(),
+        "driver-packages" => run_driver_packages_test(),
         "download"       => run_download_test(),
         "fs-metafull"    => run_fs_metafull_test(),
         "fs-unplug"      => run_python_suite("fs: pull the DISK out mid-write (§3.7)", "fs_unplug.py"),
@@ -1914,6 +1915,13 @@ fn cmd_build_blockdev() { build_blockdev_fs("selftest", ""); }
 /// compiled with `bd_features` (e.g. `io-error-test` to exercise the I/O retry path; `""` for
 /// none).
 fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
+    build_blockdev_fs_with(fs_features, bd_features, "");
+}
+
+/// `build_blockdev_fs`, with `ehci` built with `ehci_features` - before the supervisor that embeds it and the kernel
+/// that embeds the supervisor, so the image carries it. `osdev test driver-packages` builds it with `bind-any-class`;
+/// every other suite builds it plain, so the next build after this one carries the feature no more.
+fn build_blockdev_fs_with(fs_features: &str, bd_features: &str, ehci_features: &str) {
     clean_supervisor();
     // Force a fresh `fs` (and `block-driver` if it gets a feature) so the test features are
     // compiled in even if a prior plain build cached them.
@@ -1939,6 +1947,10 @@ fn build_blockdev_fs(fs_features: &str, bd_features: &str) {
         if *crate_name == "block-driver" && !bd_features.is_empty() {
             args.push("--features");
             args.push(bd_features);
+        }
+        if *crate_name == "ehci" && !ehci_features.is_empty() {
+            args.push("--features");
+            args.push(ehci_features);
         }
         let status = std::process::Command::new("cargo")
             .args(&args)
@@ -4017,6 +4029,33 @@ fn run_kinds_test() {
     }
     gsfs_layout(persist);
     crate::shell_test::run_kinds(&image_path, persist, 2);
+}
+
+/// `osdev test driver-packages`: a driver package that takes a device over from a GodspeedOS driver (`kind-nic`), one
+/// that drives a USB device through `xhci` (`kind-usb`), one through `ehci` (`kind-stick`), and the RTL8168 card's
+/// package refusing QEMU's e1000 (`kind-rtl`) (`shell_test::run_driver_packages`). Four fixtures, on a disk of their own.
+fn run_driver_packages_test() {
+    println!("
+=== driver-packages: a device taken over, and a USB device through its host ===");
+    // `ehci` with `bind-any-class`, for this suite only: it binds QEMU's stick for `kind-stick` (`services/ehci`,
+    // `bound::bindable`).
+    build_blockdev_fs_with("selftest", "", "ehci/bind-any-class");
+    let kernel_elf = std::path::Path::new("target/x86_64-unknown-none/release/kernel");
+    if !kernel_elf.exists() { eprintln!("kernel ELF not found"); std::process::exit(1); }
+    let limine_dir = std::path::Path::new("tools/limine");
+    let image_path = disk_image::create(kernel_elf, limine_dir);
+    disk_image::install_bootloader(limine_dir, &image_path);
+    let _ = std::fs::create_dir_all("build/tests");
+    let persist = "build/tests/persist_driver_packages.img";
+    std::fs::write(persist, vec![0u8; 16 * 1024 * 1024]).expect("create disk");
+    format_superblock(persist);
+    for f in ["kind-nic-0.1.0.gsp", "kind-usb-0.1.0.gsp", "kind-stick-0.1.0.gsp", "kind-rtl-0.1.0.gsp"] {
+        let path = format!("osdev/fixtures/{f}");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        gsfs_add_file(persist, f, &bytes);
+    }
+    gsfs_layout(persist);
+    crate::shell_test::run_driver_packages(&image_path, persist, 2);
 }
 
 /// `osdev test gsp`: a package carried as one `.gsp` file, made on the machine and installed with no network.
