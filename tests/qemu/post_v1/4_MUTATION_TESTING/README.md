@@ -1,13 +1,14 @@
 # Mutation Testing Evidence
 
-This directory collects artefacts from the `mutation` workflow job.
+Where to keep artefacts from the `mutation` workflow (`.github/workflows/mutation.yml`, `workflow_dispatch`-only,
+paused). None is in this directory today.
 
 | File | Contents |
 |------|----------|
 | `mutation-report.txt` | Full stdout/stderr from `cargo mutants` |
 | `mutants.out/` | cargo-mutants output directory: `missed.txt`, `caught.txt`, `timeout.txt`, `outcomes.json` |
 
-CI uploads these as a named artefact (`mutation-report-<sha>`) on every run.
+Each run of that workflow uploads these as a named artefact (`mutation-report-<sha>`).
 Download from the GitHub Actions "Artifacts" tab.
 
 ## Interpreting outcomes.json
@@ -25,9 +26,11 @@ Kill rate = `caught / (caught + missed)` × 100. Target: ≥ 80%.
 
 ## Running locally (Linux / WSL)
 
+The workflow's own command, from the repository root (`kernel/mutants.toml` scopes the mutations; without
+`--config` it is not found and every mutant runs):
+
 ```sh
-cd kernel
-cargo mutants -- --lib
+cargo mutants --package kernel --config kernel/mutants.toml -- --lib
 ```
 
-Results appear in `kernel/mutants.out/`.
+Results appear in `mutants.out/`.

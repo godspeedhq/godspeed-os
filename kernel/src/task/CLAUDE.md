@@ -27,7 +27,7 @@ The 10 ms quantum is enforced by each core's local timer (the local APIC on x86-
 
 ## Kernel stack pool
 
-224 slots × 64 KiB = 14 MiB of static BSS (`TASK_KSTACK_MAX`, `KSTACK_SIZE`). Liveness is tracked by `KSTACK_USED: SpinLock<[bool; TASK_KSTACK_MAX]>` - a boolean flag per slot, locked for the duration of alloc/free. `alloc_kstack()` returns the top pointer; `free_kstack(kstack_top)` reverse-computes the slot index from the pointer and clears the flag. The pool uses two unavoidable unsafe lines: one pointer-arithmetic `as_mut_ptr().add(...)` to locate the slot top, and one `as_ptr() as u64` to compute the base address for reverse-index in `free_kstack`.
+224 slots × 68 KiB (64 KiB of stack above a 4 KiB unmapped guard page, `KSTACK_STRIDE`) = about 14.9 MiB of static storage (`TASK_KSTACK_MAX`, `KSTACK_SIZE`, `KSTACK_GUARD`). Liveness is tracked by `KSTACK_USED: SpinLock<[bool; TASK_KSTACK_MAX]>` - a boolean flag per slot, locked for the duration of alloc/free. `alloc_kstack()` returns the top pointer; `free_kstack(kstack_top)` reverse-computes the slot index from the pointer and clears the flag. The pool uses two unavoidable unsafe lines: one `addr_of_mut!(...).add(...)` in `alloc_kstack` to locate the slot top, and one `addr_of!(...) as u64` in `kstack_pool_base`, which `free_kstack` uses to reverse-compute the index.
 
 ## Spawn flow (§14.1)
 
@@ -39,7 +39,7 @@ The 10 ms quantum is enforced by each core's local timer (the local APIC on x86-
 
 ## Kill flow (§14.4)
 
-`kill_current(kind, addr)` (a fault) and the `kill` syscall both reach `scheduler::kill_task_by_slot`, with a `Cause` - the fault's kind and address, or the slot of the task that called `kill` - which:
+`kill_current(kind, addr)` (a fault), the `kill` syscall and `Exit` (57) all reach `scheduler::kill_task_by_slot`, with a `Cause` - the fault's kind and address, the slot of the task that called `kill`, or the status the task exited with - which:
 1. Sets the task's state to Dead.
 2. Kills its endpoints (`ipc::routing::kill_endpoint`), wakes blocked senders/receivers with `EndpointDead` and blocked `Call`ers with `ReplyDead`, and marks the resources dead in the capability table.
 3. Waits until no other core is still running the task, then reclaims its user frames (`arch::imp::page_tables::reclaim_user_frames`) - **skipping the PML4 frame** on the self-kill path (see below).

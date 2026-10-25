@@ -9,7 +9,7 @@ Shared test infrastructure (§22.3). There is no code in this directory: the har
 | QEMU launcher       | Spawns `qemu-system-x86_64` with configurable `-smp N`; adds `-enable-kvm` when `/dev/kvm` exists |
 | Serial reader       | Re-reads the serial file QEMU writes (`build/tests/<suite>/<id>-<name>.log`) every 200 ms and searches the whole content |
 | Test runner         | Drives `TestKind` variants; manages deadline; reports PASS/FAIL |
-| COM2 control channel| Opens a TCP socket to QEMU's COM2 to inject `RESTART`/`KILL` commands for `WithRestart` tests |
+| COM2 control channel| Opens a TCP socket to QEMU's COM2 to inject `RESTART`/`KILL`/`FIRE_IRQ` commands for `WithRestart` tests |
 | Serial logs         | Every run's serial log is left under `build/tests/`, pass or fail |
 
 ## TestKind variants
@@ -46,7 +46,7 @@ sequenceDiagram
     Note over H: 500ms settle
     H->>C: TCP connect to COM2 port
     H->>C: write restart_cmd bytes
-    C-->>H: close connection
+    Note over H,C: connection held open until the post-restart poll ends
     H->>Q: poll for expect_after strings
     Q-->>H: all expect_after seen → PASS
 ```
@@ -66,7 +66,7 @@ Timeouts are per-test `timeout_secs`, calibrated for KVM. Without KVM (TCG, e.g.
 `qemu::spawn_for_test` (and the other launchers) call `kvm_available()`, which checks for `/dev/kvm`:
 
 ```rust
-fn kvm_available() -> bool {
+pub fn kvm_available() -> bool {
     std::fs::metadata("/dev/kvm").is_ok()
 }
 ```

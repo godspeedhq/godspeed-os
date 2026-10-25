@@ -1,7 +1,8 @@
 # kernel/src/arch/riscv64/ (RV64GC, S-mode - QEMU `virt` and StarFive VisionFive 2 Lite / JH7110)
 
-The fourth complete port, and the first with **zero mentions of the ISA in architecture-neutral
-kernel code**. Everything below the `arch::imp` seam is here; nothing above it names RISC-V.
+The fourth complete port, and the first with **no architecture-neutral kernel CODE naming the ISA**.
+Everything below the `arch::imp` seam is here; above it RISC-V is named only in comments, as
+explanation.
 
 **Hardware-verified** on a StarFive VisionFive 2 Lite (JH7110, 4 usable harts): first boot 2026-09-07,
 and a 22,872-round `chaos max-carnage` soak absorbing 136,906 service kills with zero kernel panics

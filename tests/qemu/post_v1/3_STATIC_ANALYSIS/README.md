@@ -1,6 +1,8 @@
 # Static Analysis Evidence
 
-This directory collects CI artefacts from the `static-analysis` workflow job.
+Where to keep captures of the three tools the `static-analysis` job in `.github/workflows/build.yml` runs.
+That workflow is `workflow_dispatch`-only (paused), and the job writes no files: its output is in the
+GitHub Actions log. None of the files below is in this directory today.
 
 | File | Contents |
 |------|----------|
@@ -8,8 +10,7 @@ This directory collects CI artefacts from the `static-analysis` workflow job.
 | `miri.txt` | Output of `cargo miri test -p kernel --lib` |
 | `cargo-geiger.txt` | Output of `cargo geiger --package kernel` |
 
-All three are written by CI on each run. The files here are the most-recent local
-captures if you ran the tools manually. CI results live in the GitHub Actions log.
+Save a local capture here under these names if you run the tools by hand.
 
 To reproduce locally (Linux / WSL):
 

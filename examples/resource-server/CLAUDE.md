@@ -124,7 +124,7 @@ calling `gs::resource::revoke` when the resource goes away. `services/fs` is thi
 - `services/fs` - the real resource server: a file is a delegated resource cap, minted on `Open`,
   served via the badge, revoked on delete/close.
 - The shell `fcap <file>` command + **CLAUDE.md §22 Test 14** (file-is-a-capability) - proves every
-  property above end to end (`osdev test file-cap`, 15 assertions today; hardware-validated on the T630).
+  property above end to end (`osdev test file-cap`, 16 assertions today; hardware-validated on the T630).
 - `examples/cap-grant` - capability **transfer** (the operation before this one).
 - `examples/e1000` - the same spawn-request grant route, for a device class instead of a privilege
   (there is no by-name kernel grant any more); `examples/driver-skeleton` - the compilable-template

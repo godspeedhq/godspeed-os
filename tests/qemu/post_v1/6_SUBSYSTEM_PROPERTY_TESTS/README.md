@@ -24,7 +24,9 @@ PROPTEST_CASES=10000 cargo test -p kernel --lib
 
 ## Test count
 
-50 tests from items 1-5, plus 14 new property tests from item 6 = **64 tests total**.
+When item 6 landed: 50 tests from items 1-5, plus 14 new property tests from item 6 = 64 tests. The
+library target has grown since: its modules (`kernel/src/lib.rs`) carry 98 `#[test]` functions, counted
+from the source on 2026-10-25.
 
 ## Notes
 

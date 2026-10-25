@@ -97,7 +97,8 @@ hard links. Bad magic **or** bad CRC is a loud mount refusal, never an auto-refo
 
 Not in the table, and served all the same (the `OP_*` constants in `src/main.rs` are the full list):
 `Rename` 15, `Delete` 16, `Move` 17, `MkdirP` 18, `DeleteTree` 19, the drives ops `DrivesInfo` 20,
-`Flash` 21, `Label` 22 and `Reset` 23, and `Seal` 31.
+`Flash` 21, `Label` 22 and `Reset` 23, `Seal` 31, and `Quiesce` 32 (flush, then refuse writes for a
+bounded `QUIESCE_SECS` before a shutdown, `docs/shutdown.md` 4.3).
 
 **Large files (streaming).** `WriteFile`/`ReadFile` carry a whole *small* file in one ≤4 KiB
 IPC message. Files larger than one message use the offset-addressed ops: `WriteNew` allocates

@@ -42,7 +42,9 @@ handed the producer at composition time.
 `log_write` and - the lesson - no send peers** (no `ipc_send`). A producer that declared a fixed
 peer would hold standing authority to reach it (a small violation of VII). Instead the shell
 delegates the SEND cap dynamically at spawn, installed as `send_peers[0]` (reached via
-`gs::ipc::peer_at(&ctx, 0)`); authority is granted at composition time, never held. `log_write` is itself
+`gs::ipc::peer_at(&ctx, 0)`); authority is granted at composition time, never held. (Its row in the
+supervisor's spawn table does name `pong`, for one other spawn mode only: the shell's `spawnwired`
+self-check, which proves an installed peer cap. `contract_check.py` records that exemption.) `log_write` is itself
 a v1 default minted to every service - the contract lists it for clarity and consistency. Every
 service should have a contract (CLAUDE.md §13), so a minimal contract is the conformant, clearer way
 to teach "no standing send authority": the contract is *present*, and it pointedly grants nothing to

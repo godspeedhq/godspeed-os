@@ -43,7 +43,9 @@ and a job that faults is a service that faults rather than a shell that faults.
 
 ## What it holds, and what it does not
 
-`fs` and its log. **No `console_push`**, so it cannot inject keystrokes into the shell's input
+`fs`, its log, and a send peer to the board's audio driver (`audio-driver` on the PCs, `pwm-audio` on
+the Pis, none on the VisionFive) for the "done" sound a finished job makes (`sound_done`; the
+supervisor's `board::COPIER_PEERS`). **No `console_push`**, so it cannot inject keystrokes into the shell's input
 (SEC-2). No spawn, no reboot, no network. It CAN write to the console, as every task can through
 `log_write` (ConsoleWrite checks nothing else). A detached job stays off a prompt somebody is typing
 at by convention - this service never calls `gs::io` - not because a capability stops it.

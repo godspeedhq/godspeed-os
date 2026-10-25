@@ -42,6 +42,7 @@ through their own boot path (§11.1, 2026-09-12 amendment).
 | `invariants/`    | §22         | No  |
 | `bootcon/`       | §11.4       | No - see below |
 | `log.rs`         | §11.4       | No  |
+| `clock.rs`, `elf_flags.rs` | §14.1 (`elf_flags`: W^X page permissions) | No - pure logic, shared with the host-test `lib.rs` (`clock`: the RTC deglitch decision) |
 | `main.rs`, `loader.rs` | §11, §14.1 | grandfathered: `main.rs` 2, `loader.rs` 1 - see audit |
 
 ## Unsafe policy (§18)
@@ -91,4 +92,4 @@ its spawn request rather than receiving by name.
 
 ## Panic behaviour
 
-The panic handler prints `KERNEL PANIC: {info}` to the serial console (and the log ring buffer), then calls `halt_all_cores()` - which broadcasts an NMI so **every** core halts, not just the panicking one (SEC-18). There is no recovery. A reserved crash-page that persists the panic reason across reboot was once described here but was **never implemented**, and `init` (which would have re-read it) is removed (Phase 5); the panic reason lives on the serial console only (SEC-20 doc-drift correction).
+The panic handler prints `KERNEL PANIC: {info}` to the serial console (and the log ring buffer), then calls `halt_all_cores()`, which halts **every** core, not just the panicking one (SEC-18): x86-64 broadcasts an NMI; the ARM and RISC-V ports publish a flag that every other core checks on its next timer tick (`panic_halt_check`). There is no recovery. A reserved crash-page that persists the panic reason across reboot was once described here but was **never implemented**, and `init` (which would have re-read it) is removed (Phase 5); the panic reason lives on the serial console only (SEC-20 doc-drift correction).

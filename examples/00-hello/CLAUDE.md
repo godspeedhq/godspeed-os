@@ -54,7 +54,7 @@ version = "0.1.0"
 
 [resources.memory]
 request = "32MiB"   # minimum the service needs to start
-limit   = "64MiB"   # maximum it may ever allocate (AllocDenied past this)
+limit   = "32MiB"   # maximum it may ever allocate (AllocDenied past this)
 
 [capabilities]
 log_write = true    # the ONLY authority hello holds: write the kernel log ring + serial

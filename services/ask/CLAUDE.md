@@ -8,8 +8,9 @@ do yet, is `docs/ask-design.md`.
 **A foreground program for one question, not a service.** The shell starts it wired to send to the shell
 (`drain_service_with`), hands it the question and an end-of-stream byte, reads the answer back as one
 record table, and ends it before the prompt returns. It is in no boot set and no `MANAGED` list, so
-nothing restarts it, and nothing of it stays running. v1 has no way for a task to end itself, and this
-one must not hold `kill`, so the shell - which started it and holds `kill` - ends it.
+nothing restarts it, and nothing of it stays running. It does not end itself (it parks once its answer
+is sent; `Exit`, syscall 57, CLAUDE.md 14.5, now exists but `ask` does not call it), and it must not hold
+`kill`, so the shell - which started it and holds `kill` - ends it.
 
 The supervisor carries TWO rows for this one program, because the kernel gives a task at most six send
 peers: `ask` (storage and the radio) and `ask-net` (`net-stack` and the radio). The shell picks the row by
@@ -36,5 +37,6 @@ Read only. Defined requests only - no log line is parsed as if it were a contrac
 an INFERENCE (by a named rule) or an UNKNOWN. A source that did not answer is a hole the answer names,
 never a pass and never a fault. A service is named from what the machine knows, not from a word list, so
 a new service needs no new vocabulary. HOW a service ended is a fact - the kernel's death notice says
-killed (by whom) or a CPU fault (kind, address), and the supervisor keeps the newest per name
-(`supcmd::DEATH`); WHY is usually UNKNOWN, and the answer says so (`docs/ask-design.md` 6).
+killed (by whom), a CPU fault (kind, address) or an exit (its status, CLAUDE.md 14.5), and the supervisor
+keeps the newest per name (`supcmd::DEATH`); `know.rs` reads the first two and not yet an exit. WHY is
+usually UNKNOWN, and the answer says so (`docs/ask-design.md` 6).

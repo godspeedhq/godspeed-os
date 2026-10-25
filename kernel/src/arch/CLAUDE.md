@@ -102,7 +102,7 @@ is something a new port edits.
 
 3. **`kernel/kernel-<isa>.ld` + `kernel/build.rs`** - a linker script for your load address and
    PHDRS, plus a target-matching block in `build.rs` that passes `-T` for it and adds `is_<isa>` to
-   `use_placeholder` (real cross-arch service ELFs do not exist yet, so the kernel embeds an empty
+   `use_placeholder` (a new port has no service ELFs of its own yet, so the kernel embeds an empty
    placeholder - the point of the milestone is that the *neutral kernel* compiles and boots).
 
 4. **`.cargo/config.toml`** - a `[target.<triple>]` block with the rustflags your target needs (for
@@ -173,8 +173,7 @@ guarantees x86 gives for free but a weaker arch (AArch64, RISC-V) does **not**. 
 is correct and generates identical-or-no-op instructions; on a weak-ordered SMP port each becomes a real
 race unless the port meets the obligation below. These are the security audit's **SEC-25..28**
 (`audits/security-audit.md`) - **port blockers**, gathered here so a porter meets them by construction
-instead of rediscovering them as heisenbugs. (They do not affect x86, so they are not "fixed" in code on
-`feat/hardening`; they are specified here for whoever brings up SMP on a weak arch.)
+instead of rediscovering them as heisenbugs. (They do not affect x86; each item below says where the weak-ordered ports stand.)
 
 **1. Task-slot publication ordering (SEC-25) - DONE (ARM port, kernel-audit Audit 5).** The scheduler
 publishes a slot with a flag store and reads it with a flag load, then touches plain data fields
@@ -224,8 +223,9 @@ writes TTBR0, then `isb`, then `tlbi`, on every switch: `backlog/fixed/72`). So 
 `write_page_table_base` as a flush; today none calls it at all. Matching the x86 *signature* is
 necessary but not sufficient - the seam pins names, and this section pins the semantics behind them.
 
-**3. DMA cache coherence (SEC-28).** The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) maps the arena
-cacheable and does **no** cache maintenance, because "x86 DMA is cache-coherent". AArch64 (and most
+**3. DMA cache coherence (SEC-28).** The SDK's `Dma` wrapper (`sdk/rust/src/dma.rs`) does **no** cache
+maintenance; the arena's MAPPING is the arch's answer (`DMA_ARENA_UNCACHED`): x86-64, whose DMA is
+cache-coherent, and riscv64 map it cacheable, while arm32 and aarch64 map it uncached. AArch64 (and most
 non-x86) DMA is **not** coherent - CPU and device can see stale copies. A port reusing a driver there
 MUST add cache maintenance (clean before a device read of a CPU-written buffer; invalidate before a CPU
 read of a device-written buffer), either by mapping the arena non-cacheable or via a `dma_sync`-style
@@ -291,10 +291,12 @@ DEAD service's text out of a recycled frame.
 > not the bytes in the file. Boot spawns are fine and only RESPAWNS fail, because a boot spawn gets
 > fresh frames.
 
-> **THE RULE. `finalize_service_address_space` is where a port pays this**, and it must reach every
-> hart that could run the task, not just the one that built the page table. arm32 has the same
-> obligation (`publish_user_pages_to_other_cores`); x86-64 does not, because its caches are coherent
-> with respect to instruction fetch. Matching the x86 no-op is the mistake.
+> **THE RULE. Every hart that could run the task must see the new text before it executes it**, not
+> just the one that built the page table. arm32 pays it in `finalize_service_address_space`
+> (`publish_user_pages_to_other_cores`); riscv64 pays it with a LOCAL `fence.i` in
+> `context_switch::user_entry_trampoline`, on the hart about to run the task, because a cross-hart
+> broadcast from inside a spawn (interrupts off) hung the machine. x86-64 owes nothing, because its
+> caches are coherent with respect to instruction fetch. Matching the x86 no-op is the mistake.
 
 ### 4. A liveness watchdog that is armed with a stubbed number - NO WEDGE DETECTION AT ALL
 
@@ -315,8 +317,9 @@ instead of a loud panic naming the core and its last task.
 §19). A port whose `halt_all_cores` only halts the caller leaves the other cores executing against
 whatever state the panic was about.
 
-> **THE RULE. If the port cannot signal the other cores yet, SAY SO IN THE STUB.** The loongarch64
-> stub does: *"a no-op on this port until its `halt_all_cores` actually signals the other cores"*.
+> **THE RULE. If the port cannot signal the other cores yet, SAY SO IN THE STUB.** The loongarch64,
+> riscv32 and s390x stubs do: *"STUB: a no-op here means the panic on another core never reaches this
+> one"*.
 > That is the right shape - an unimplemented thing that names its own consequence.
 
 ### What to do with this when you write `arch/<isa>/`

@@ -16,7 +16,7 @@ the supervisor's spawn request (CLAUDE.md §13.6). `scripts/contract_check.py` r
 contract's memory limit, placement core, `ipc_send`, `hw_device`/`hw_pci_*` and `resource_mint`
 against that spawn row, and requires `log_write` of a crate that prints through `godspeed::io`;
 `IV-contract-authority` in `scripts/commandments.py` reconciles `service_control`, `resource_mint`,
-`pci_cfg` and `cpu_clock` against what is actually granted.
+`pci_cfg`, `cpu_clock` and `power_off` against what is actually granted.
 
 ## Contract format (§13.1)
 
