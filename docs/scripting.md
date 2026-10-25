@@ -5,7 +5,8 @@
 > every overflow: a 10 MB script is read through a bounded minifier, and when its code exceeds
 > `SCRIPT_MAX` (7112 bytes) it is refused loudly with none of it run, never OOMs. *(2026-10-25: it
 > used to truncate at ~7 KiB and run the part that fitted, which `osdev test big-script` (6/6)
-> pinned; the refusal replaced that in `914b4329`, `backlog/fixed/80` H10-H21.)* Scripts use the `.gsh` extension (GodspeedOS shell; `.gs` is reserved for a
+> pinned; the refusal replaced that in `914b4329`, `backlog/fixed/80` H10-H21, and the suite has
+> pinned the refusal since 2026-10-25: refused loudly, none of it run, no panic, 5/5.)* Scripts use the `.gsh` extension (GodspeedOS shell; `.gs` is reserved for a
 > future general-purpose Godspeed language). Built on the `run`/`run_lines` interpreter and the
 > command **Result** model (`execute` returns `Ok`/`Err`). Not POSIX - see CLAUDE.md Appendix B.3 / D.
 

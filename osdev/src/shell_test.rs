@@ -6343,8 +6343,11 @@ pub fn run_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u3
 }
 
 /// Boot bare-metal with a 10 MB `.gsh` baked in and `run` it - proving the run-from-file BOUND
-/// (SCRIPT_MAX): the streaming minifier reads ~7 KiB of CODE and truncates LOUDLY, the complex tour
-/// still runs, and the kernel never panics or OOMs on a 10 MB file (§26.6.1, docs/scripting.md §9).
+/// (SCRIPT_MAX): the streaming minifier reads the file in a fixed buffer, finds more CODE than fits,
+/// and REFUSES the script loudly with none of it run, and the kernel never panics or OOMs on a 10 MB
+/// file (§26.6.1, docs/scripting.md §9). Until `914b4329` (2026-10-10, `backlog/fixed/80` H11) the
+/// part that fitted ran; a script cut short can leave a half-done job, so that is what is pinned
+/// against now.
 pub fn run_big_script(image_path: &Path, disk_path: &str, script_name: &str, smp: u32) {
     println!("big-script: booting (smp={smp}) with a 10 MB GSFS-baked .gsh");
     let qemu      = crate::qemu::qemu_binary();
@@ -6397,23 +6400,24 @@ pub fn run_big_script(image_path: &Path, disk_path: &str, script_name: &str, smp
         child.kill().ok(); child.wait().ok(); std::process::exit(1);
     }
 
-    // Run the 10 MB script. It loads BOUNDED (~7 KiB), truncates loudly, runs the tour + some blocks.
+    // Run the 10 MB script. It is read BOUNDED (SCRIPT_MAX) and refused before any of it runs.
     send(&mut write_half, format!("run /{script_name}\r").as_bytes());
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(120)) {
         Some(r) => {
             let _ = std::fs::write("build/big-script-transcript.txt", r.as_bytes()); // full transcript for inspection
             let tail: String = r.lines().rev().take(50).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
             println!("\n=== 10 MB run transcript (last 50 lines; full -> build/big-script-transcript.txt) ===\n{}\n=== end ===", tail.trim());
-            check!(r.contains("===TEN-MEG-STRESS-BEGIN==="), "the run started (10 MB script loaded, not rejected)");
-            check!(r.contains("===TEN-MEG-TOUR-DONE==="), "the complex feature-tour ran to completion (all features green)");
-            check!(r.contains("truncated") || r.contains("CODE exceeds"), "the 10 MB script truncated LOUDLY at SCRIPT_MAX");
-            check!(r.contains("blk-"), "dynamic blocks ran past the tour, up to the truncation point");
+            check!(r.contains("CODE exceeds") && r.contains("none of it was run"),
+                   "the 10 MB script is refused LOUDLY at SCRIPT_MAX, saying none of it ran");
+            check!(!r.contains("===TEN-MEG-STRESS-BEGIN==="), "its first line did not run");
+            check!(!r.contains("===TEN-MEG-TOUR-DONE===") && !r.contains("blk-"),
+                   "nothing past the first line ran either (no tour, no dynamic block)");
             check!(!r.contains("KERNEL PANIC"), "no kernel panic on a 10 MB file");
         }
         None => { println!("big-script: FAIL - `run /{script_name}` timed out (hang on 10 MB?)"); fail += 1; }
     }
 
-    // The shell SURVIVED - it still answers after loading + truncating a 10 MB file (no wedge/OOM).
+    // The shell SURVIVED - it still answers after reading and refusing a 10 MB file (no wedge/OOM).
     send(&mut write_half, b"echo STILL-ALIVE\r");
     match collect_until(&buf, &mut cursor, b"gsh>", Duration::from_secs(15)) {
         Some(r) => check!(r.contains("STILL-ALIVE"), "shell is responsive after the 10 MB run"),
