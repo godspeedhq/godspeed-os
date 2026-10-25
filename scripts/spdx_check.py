@@ -13,9 +13,11 @@ is the case the split exists to prevent.
 WHAT IT CHECKS. In every `.rs` file git tracks: an `SPDX-License-Identifier:` in the first five lines,
 naming a licence this project uses; and, under a tree `docs/licensing.md` gives a licence, that licence.
 
-THE EXCEPTIONS ARE NAMED, with the reason, and may only shrink. Two `sdk/rust` files are tagged
-GPL-2.0-only inside the Apache-2.0 SDK. Changing a file's licence is the copyright holder's decision,
-not a checker's, so they are recorded here rather than retagged - and a new mismatch fails.
+THE EXCEPTIONS ARE NAMED, with the reason, and may only shrink. There are none now. Two `sdk/rust`
+files, `churn.rs` and `trace.rs`, were tagged GPL-2.0-only inside the Apache-2.0 SDK and recorded here
+until their copyright holder relicensed them Apache-2.0 on 2026-10-25 (`docs/licensing.md` 1a).
+Changing a file's licence is the copyright holder's decision, not a checker's, so a mismatch is ended
+by that decision or recorded here with its reason - and a new one fails.
 
 Exit 0 when every file passes, 1 otherwise.
 """
@@ -34,10 +36,7 @@ KNOWN = {"GPL-2.0-only", "Apache-2.0"}
 # docs/licensing.md, "Licensing intent": the permissive trees. Everything else in the repository is the OS.
 TREE_LICENCE = [("sdk/rust/", "Apache-2.0"), ("stdlib/rust/", "Apache-2.0"), ("examples/", "Apache-2.0")]
 
-MISMATCH_RECORDED = {
-    "sdk/rust/src/churn.rs": "GPL-2.0-only in the Apache-2.0 SDK; relicensing is the copyright holder's call",
-    "sdk/rust/src/trace.rs": "GPL-2.0-only in the Apache-2.0 SDK; relicensing is the copyright holder's call",
-}
+MISMATCH_RECORDED: dict = {}
 
 
 def tracked_rust():

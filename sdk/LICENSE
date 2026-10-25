@@ -1,6 +1,8 @@
                                GodspeedOS SDK
 
-      The Rust SDK for building GodspeedOS services (this directory, sdk/).
+  The Rust SDK for building GodspeedOS services (sdk/rust), the standard
+  library (stdlib/rust) and the examples (examples/). The protocol crates
+  sdk/wifi, sdk/tls and sdk/audio are GPL-2.0-only, like the OS.
      Copyright (C) 2026 Bankole Ogundero and the GodspeedOS contributors.
 
 SPDX-License-Identifier: Apache-2.0

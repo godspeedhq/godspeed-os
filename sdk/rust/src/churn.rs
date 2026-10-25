@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! The self-describing content pattern that makes a TORN FILE detectable.
 //!
 //! **Why this is in the SDK and not in whichever crate happens to write it.** This is a contract

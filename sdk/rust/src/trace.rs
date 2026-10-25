@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: Apache-2.0
 //! IPC trace emission - the client half of the trace ring that `events` holds (`utilities/47_events.md`).
 //!
 //! # Why the instrumentation is HERE and not in the kernel
