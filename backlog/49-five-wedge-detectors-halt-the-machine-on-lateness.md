@@ -145,6 +145,45 @@ passed). The rerun on the same build: 11 passed, 0 failed, no panic. So it is no
 supervisor respawn on this host, whichever test asks for one. The serial log was overwritten by the rerun; the
 panic line is quoted here as it was read.
 
+## On hardware: the T630, twice in one day, each right after a supervisor respawn (2026-10-25)
+
+Both on `feat/driver-packages`, in `chaos max-carnage all-services 1000`, with the WiFi dongle on `xhci`.
+
+**A wedge, 11:38.** As the kernel respawned the supervisor (`respawning (#132)`), three seconds later:
+
+```text
+KERNEL PANIC: panicked at kernel\src\task\scheduler.rs:1993:21:
+LIVENESS WEDGE: core 0 made NO progress for 6660716855 counter ticks (1x the 5988743100 allowed); it was
+running task slot 16 'chaos'; since its last stamp it has taken 0 timer interrupts and halted 0 times in idle
+```
+
+1.11x the allowance, not 1.002x, and on real hardware, where no host deschedules the core. Zero timer
+interrupts in that window means core 0 was not taking its tick at all, so this one may be a real stall rather
+than lateness. Not investigated. The report that followed was interleaved with another core's output on serial.
+
+**A silent reset, 16:12, on `ec7c0e17`.** Round 328 of 1000. Chaos killed the supervisor, the kernel respawned it
+(`respawning (#186)`), it adopted the running services and restarted `console`, `control`, `power` and
+`audio-driver`, and a fresh `gsh>` was drawn. The last line is `audio-driver` reading its controller's
+capabilities (16:11:59.974), just after the kernel confined 00:09.2 and enabled its bus mastering. Then
+nothing until the firmware's own output at 16:12:13. No `KERNEL PANIC`, no wedge, no `reboot:` line. The
+operator was away and did not reset it. The rerun on the same image ran all 1000 rounds clean, and
+`selfcheck` passed 666 of 666 after it.
+
+What can reset this machine without a line, read from the code and not observed:
+
+- **A triple fault.** The x86 TSS sets no Interrupt Stack Table entry (`boot.rs`, `ist: [0; 7]`), so a fault taken
+  with a bad kernel stack - an overflow into the guard page - has no stack to report on, the double fault
+  fails the same way, and the CPU resets. This is the only silent path in the kernel.
+- **`Reboot` (syscall 18) does not flush serial** before `hardware_reset`, unlike `reboot_now`, so its
+  `reboot: hardware reset` line can be lost with the reset. Only the shell holds `REBOOT`, and nothing asked it.
+- **The platform.** An AMD chipset can reset itself on a fatal device error. The audio controller had DMA
+  refused at `0x46a9400` in both runs, 6 and 116 times - an address inside its own arena (its RIRB), so probably
+  while its confinement was being taken down or set up, not checked - but it was also restarted 172 and 495 times
+  without a reset, so the timing is the only thing pointing there.
+
+Two changes would make the next one say why, and both are kernel changes for their own branch: an IST stack for
+the double fault (a triple fault becomes a printed panic), and a serial flush in `Reboot`.
+
 ## Next step
 
 The operator's call on scope. `backlog/fixed/48`'s instance is the one with a measurement behind it and the
