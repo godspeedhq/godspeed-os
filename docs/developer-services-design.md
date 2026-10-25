@@ -1223,23 +1223,23 @@ rest is `feat/driver-packages` (2026-10-23):
 **How it was shown.** In QEMU on x86, `osdev test kinds` (the template's driver: registers, the interrupt and a DMA
 arena on `edu`) and `osdev test driver-packages` (a package taking the e1000 over from `nic-driver` and giving it
 back; a package driving QEMU's FTDI serial adapter behind `xhci`, a line each way; a package reading QEMU's stick's
-INQUIRY through `ehci`, which binds it in that test build only). On hardware: three of the five boards, below. Three
+INQUIRY through `ehci`, which binds it in that test build only). On hardware: all five boards, below. Three
 packages are made for the cards, signed by the test key (`osdev/fixtures/README.md`): `kind-dongle`, which names the
 RTL8188CUS and so takes it from `wifi-usb` on every board with the dongle; `kind-nic`, which reads the RTL8168 of the
 T630 and the Wyse as well as QEMU's e1000; and `kind-rtl`, which uses the RTL8168's interrupt and DMA - the only
 package that shows those two grants on hardware, since `edu` is QEMU's. A board fetches each with `download` from a
 machine that serves the file, after `godspeed trust add` for the test key.
 
-**The cards** (run 2026-10-24; the T630 and the Wyse are still owed):
+**The cards** (run 2026-10-24 and 2026-10-25):
 
 | Board | What it shows | Result |
 |---|---|---|
 | VisionFive | `wifi-usb` on `gs::driver::bus`; `kind-dongle` through `xhci` | **passed**: `kind-dongle` downloaded and installed, `wifi-usb stood down`, `took 0bda:8176 over through xhci`, unplugged, replugged and given back; `wifi-usb` joined; `selfcheck` 600 run, 0 failed, 1 skipped |
 | Pi 4 | `wifi-usb` on `gs::driver::bus`; `kind-dongle` through `xhci` | **passed**: the same takeover, unplug, replug and give-back, `chaos max-carnage` with the package installed, `selfcheck` 600 run, 0 failed, 1 skipped. The dongle needs several replugs to enumerate on this board, which is the chip's and not pursued (`docs/wifi-usb.md`) |
 | Pi 2 | `wifi-usb` on `gs::driver::bus`: bring-up, scan, join; then `kind-dongle` through `dwc2`, the network over the cable | **`wifi-usb` passed**: `selfcheck` 659 run, 0 failed, 1 skipped, on the dongle and on the cable, on `fe9be63f`. `kind-dongle` through `dwc2` was installed but not shown working; the card found the multi-block WRITE(10) disk stall instead, fixed in `fe9be63f` |
-| T630 | `kind-nic`, then `kind-rtl`: the RTL8168 taken from `nic-driver` and given back, its interrupt and its DMA, the arena IOMMU-confined; `kind-dongle` in a front socket (`xhci`) and in a back one (`ehci`, behind the rate-matching hub) | owed |
-| Wyse | `kind-nic` and `kind-rtl` as on the T630, unconfined; `kind-dongle` through `xhci` | owed |
-| All five | chaos and `selfcheck`, since the supervisor and all three USB hosts changed | three of five, above |
+| T630 | `kind-nic`, then `kind-rtl`: the RTL8168 taken from `nic-driver` and given back, its interrupt and its DMA, the arena IOMMU-confined; `kind-dongle` in a front socket (`xhci`) and in a back one (`ehci`, behind the rate-matching hub) | **passed but for the back socket**: `kind-nic` taken over and given back, ping answered; `kind-dongle` through `xhci` taken over, unplugged, replugged and given back. `kind-rtl`: the rings are written in its confined arena and read back, and the tally was written by DMA on one card; the software interrupt was never raised in three cards, and one out-of-arena read the IOMMU refused (`0x99300`) was seen on the cards that wrote the tally and not on the one that did not - placed, not explained (`osdev/fixtures/README.md`). The back socket was dropped by the operator: the dongle does not come up on `ehci`, and typing there lags (`docs/usb-device-drivers.md` 4c). `chaos max-carnage 1000` ran clean on its second attempt; the first reset the machine silently at round 328 (`backlog/49`). `selfcheck` 666 run, 0 failed, on `ec7c0e17` |
+| Wyse | `kind-nic` and `kind-rtl` as on the T630, unconfined; `kind-dongle` through `xhci` | **passed**: `kind-nic` and `kind-rtl` taken over and given back, ping answered after each; `kind-rtl`'s rings in its arena and the tally written by DMA (60 of 64 bytes, the guard untouched), the software interrupt not raised, as on the T630; `kind-dongle` in a back socket taken over, unplugged (`WiFi dongle removed (xhci)`), replugged and given back. The first boot found `xhci` resetting every 3.5 s with the dongle, a keyboard and the boot stick behind the Wyse's two USB3 hubs - seven devices for six slices - fixed in `48f0b967`, on which the card ran. `chaos max-carnage 1000` clean, `selfcheck` 666 run, 0 failed |
+| All five | chaos and `selfcheck`, since the supervisor and all three USB hosts changed | five of five, above |
 
 ### 13.2 `app`: a program with a screen of its own, while it has focus
 
