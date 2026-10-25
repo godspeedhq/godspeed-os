@@ -801,7 +801,7 @@ dependencies = [
 
 [[package]]
 name = "godspeed"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "godspeed-sdk",
 ]
@@ -835,7 +835,7 @@ dependencies = [
 
 [[package]]
 name = "godspeed-sdk"
-version = "0.30.0"
+version = "0.31.0"
 
 [[package]]
 name = "godspeed-tls"
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "bitflags 2.11.1",
  "limine",
@@ -1454,7 +1454,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "osdev"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "clap",
  "fatfs",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "shell"
-version = "0.30.0"
+version = "0.31.0"
 dependencies = [
  "godspeed",
  "godspeed-audio",
