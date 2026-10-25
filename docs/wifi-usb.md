@@ -3161,7 +3161,7 @@ after `kill all-services` the dongle's download failed, and for over three minut
 Address Device on hub ports 1 and 2 (the disk's port among them), so the run ended with no disk. Recorded
 as `backlog/fixed/83`, with what the gen change does and does not have to do with it.
 
-## 53. `wifi-usb` on `gs::driver::bus` (2026-10-23) - built, NOT SEEN on hardware
+## 53. `wifi-usb` on `gs::driver::bus` (2026-10-23) - built; hardware-verified 2026-10-24 on the VisionFive, the Pi 4 and the Pi 2 (note at the end)
 
 `wifi-usb` spoke the function protocol (section 2) by hand: its own request loop, its own `OP_SYNC` handling
 (section 19), and a decoder for each answer. A driver PACKAGE for a USB device reaches its device through
@@ -3182,3 +3182,8 @@ place.
 **Seen:** it builds for every board. Nothing of it RUNS in QEMU: the supervisor starts `wifi-usb` only when a host
 reports the dongle, and QEMU has none. **Not seen:** anything at all at runtime. The card is the dongle on each board: bring-up to `R3a done`, a scan, a join, and `kill xhci`
 for the afresh binding (section 52).
+
+*(Note 2026-10-25: seen since. On the driver-package cards of 2026-10-24 (`docs/developer-services-design.md`
+13.1) `wifi-usb` on `gs::driver::bus` joined on the VisionFive and the Pi 2 - on the Pi 2 with `selfcheck` 659 run,
+0 failed, on the dongle and on the cable - and on the Pi 4 it stood down for a driver package and was given the
+dongle back. The T630 and the Wyse cards are still owed.)*

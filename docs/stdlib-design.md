@@ -4,7 +4,9 @@
 **Status: Phase 1 report, REVIEWED AND APPROVED 2026-09-23. The first slice is implemented** on
 `feat/stdlib` - `stdlib/rust` with `error`, `call`, `fs`, `io`; `examples/stdlib-hello`;
 `services/recorder` migrated. Option A was taken (services only, no kernel change); the terminating
-task of §1 remains open and unimplemented, which is the point of recording it here.
+task of §1 was left open and unimplemented, which is the point of recording it here. *(2026-10-25:
+since closed by option B - `Exit`, syscall 57, added 2026-10-17 (CLAUDE.md 14.5) - and a program that
+ends itself is written on `gs::program`.)*
 
 What follows is the report as written before any code, kept as it was argued. §7 onwards records
 what building it changed, section by dated section; §25 (2026-10-09) is the latest, every service
@@ -1852,7 +1854,8 @@ Recorded as evidence, not as a plan (26.2):
    while it must keep client requests that arrive mid-wait, and the `_into` forms `fs` and the supervisor
    use to keep a second 4 KiB frame off their stacks. Section 20's gap, from the other side.
 5. **Two drivers' wait loops** (`xhci`, `dwc2`): call sites moved, structure did not. `Irq::wait` is the
-   destination, one hardware card per board.
+   destination, one hardware card per board. *(Note 2026-10-25: reached. Since 2026-10-22 the wait of
+   `xhci`, `dwc2` and `ehci` is `Irq::wait`, `docs/driver-library.md` step 4.)*
 
 ### Small differences, all deliberate
 
@@ -1876,4 +1879,6 @@ checks that does not need storage passed. Pi 2 (`raspi2b`): `chaos max-carnage a
 same branch (the test now syncs on a prompt it asked for).
 
 **Hardware: not yet.** Owed on each of the five boards: boot, `selfcheck`, and a chaos soak, because
-four drivers' waits and replies changed call shape even though their timing did not.
+four drivers' waits and replies changed call shape even though their timing did not. *(Note
+2026-10-25: this work merged in v0.23.0, and every board has since booted and run hardware cards on
+builds that contain it - for one, `backlog/fixed/80`'s cards of 2026-10-10 and 11.)*

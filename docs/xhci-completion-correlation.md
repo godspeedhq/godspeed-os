@@ -1,6 +1,7 @@
 # Design Spec: Completion Correlation in the xhci Driver
 
-> **Status:** Root cause **proven by measurement** (2026-08-11), fix **not built**. This is the
+> **Status:** Root cause **proven by measurement** (2026-08-11), fix **built and hardware-verified the
+> same day** (the OUTCOME below; this line said "not built" until 2026-10-25). This is the
 > driver-layer twin of `docs/net-tags-design.md`: several consumers, one queue, no correlation.
 >
 > **OUTCOME (2026-08-11, hardware): fixed.** Hub probes went from **151/328 (46%) to 312/313 (99.7%)**

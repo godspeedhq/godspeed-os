@@ -60,6 +60,8 @@ and determining what abstractions naturally fit Godspeed.
 >   2026-10-09; this said 52 when written) the only one that ends a task is `Kill` - gated behind `service_control`, which no application should hold. **This is the
 >   STOP condition the brief names below**, and it is open: `stdlib-design.md` §1 sets out three
 >   options and recommends adding an `Exit(status)` syscall as its own reviewed change.
+  *(2026-10-25: closed. `Exit` (syscall 57) was added on 2026-10-17, CLAUDE.md 14.5, and a program
+  that ends itself is written on `gs::program`.)*
 > - `read_to_string` cannot return an allocated `String`: there is no heap, deliberately (§26.6.1).
 >   The shipped shape is `read_into(path, &mut buf)` - the caller owns the buffer and the bound is
 >   readable in the source.
@@ -109,7 +111,9 @@ speculative framework.
 > growing since (`call::request_once`, `task::sleep_quantum`/`sleep_us`/`sleep_ticks`, `ipc::reply`,
 > `recv_within_ms`, the `ipc::exact` module and two error-type re-exports). The 13 EXCLUDES a 14th
 > public module, `driver`: the `gs::driver` tier (`wait`, `delay`, `irq`, 33 items) is counted
-> separately because `backlog/71` puts it outside the first covered surface. `cap` was recorded as "not built" for a day and then built: the blocker was
+> separately because `backlog/71` puts it outside the first covered surface. *(2026-10-25: four
+> more public modules have since arrived, `memory`, `program`, `app` and `handover` - 17 beside
+> `driver`; the item counts above are the 2026-10-09 ones and were not recounted.)* `cap` was recorded as "not built" for a day and then built: the blocker was
 > that the file-capability protocol carried no correlation tag, which is a protocol property and was
 > fixed in userspace. `task` SHIPPED, and carries the clock surface that answers "time":
 > `uptime_secs`, `epoch_secs_monotonic`, `datetime`, `clock_source`, `clock_is_set`. This said both
@@ -169,6 +173,7 @@ appears necessary before making any kernel change.
 > `stdlib-design.md` §1 argues it is probably not a seventh MISCIS responsibility (the reclaim,
 > generation bump and death notification all exist; what is missing is a task saying "I am finished,
 > here is my status") but it is a kernel change either way, so it waits for review.
+> *(2026-10-25: reviewed and built - `Exit`, syscall 57, 2026-10-17, CLAUDE.md 14.5.)*
 
 ## Unsafe rule
 

@@ -1,8 +1,11 @@
 # Who owns a service: images, authority, discovery, trust
 
-**Status:** steps A, C, D1, D1b and D2 are BUILT, hardware-verified and merged; D3 is built except for
-the second half of slice 3 (below). Step 2 - images from `fs`, as signed packages - is design, not
-built.
+**Status:** steps A, C, D1, D1b and D2 are BUILT, hardware-verified and merged; D3 is built, slice 3's
+second half included since 2026-10-09 (`39746569`: a supplied BDF selects the whole grant), though the
+kernel still holds its own bus scan to look that BDF up in and to fall back on when none is supplied.
+Step 2 - images from `fs`, as signed packages - is BUILT for INSTALLED packages, in a different shape
+from section 7's design (v0.29.0; see the note at the head of section 7): the built-in services are
+still embedded in the supervisor.
 **Merge bar (stated by the project owner):** this branch did not merge to `main` until the supervisor
 actually owned the ELF images and the catalogue was out of the kernel. That bar is met: the
 `service_configs` pin is at its target of **1**, `supervisor` alone.
@@ -166,13 +169,14 @@ Number 3 is the one that matters. The other two are bugs; that one is why they s
    step C  DONE      supervisor owns the IMAGES + authority  pin 29 -> 1
       |              => adding a SERVICE touches no kernel file
       v
-   step D  DONE      bus DISCOVERY out of the kernel - bar the second half of
-      |              slice 3, where the kernel still resolves MMIO and IRQ from its
-      |              own scan rather than from the supplied BDF
+   step D  DONE      bus DISCOVERY out of the kernel; a supplied BDF selects the
+      |              device (2026-10-09), looked up in the kernel's own scan, which
+      |              is still the fallback when none is supplied
       |              => adding a DRIVER touches no kernel file
       v
-   step 2  NOT BUILT images come from `fs`, packages are SIGNED
-                     => update without reflash; authority enforceable again
+   step 2  PARTLY    INSTALLED packages come from `fs`, SIGNED, checked by the
+                     supervisor (v0.29.0); built-ins still embedded
+                     => update without reflash, for an installed package
 ```
 
 ---
@@ -863,6 +867,10 @@ responsibility: config reads, MSI programming and interrupt routing are all alre
 **Slice 3 (HALF BUILT): the supervisor passes the BDF in the spawn request.** It does - `req.bdf`,
 from `ask_bdf_for_class` - and a supplied BDF WINS over the class when the kernel picks the device.
 What is not built is the other half: MMIO and IRQ still come from `find_by_class`, not from that BDF.
+*(2026-10-25: built since 2026-10-09, `39746569`. `HwClass::pci_dev` in `kernel/src/task/mod.rs` is the
+one place that picks the device, and a supplied BDF selects the window, the arena, the vector, the
+confinement and the bus mastering together; a BDF whose device is not of the requested class is
+refused. `find_by_class` remains the fallback when no BDF is supplied, and says so.)*
 
 **Slice 4 (BUILT): the assignment / re-enumeration split - and half of it needed no code.**
 
@@ -1406,6 +1414,18 @@ after it started hashes identically. Worth stating so it is never oversold as "w
 
 ## 7. Step 2: images from `fs`, as signed packages
 
+> **As built (2026-10-25): for INSTALLED packages, and checked by the supervisor, not the kernel.**
+> Since v0.29.0 `godspeed fetch` / `godspeed install` (or a `.gsp` file) put a package on the disk
+> under `/system/packages/`, and the supervisor reads its image from there, checks the publisher's
+> signature over its manifest, the signing key against this machine's trust record and the contract
+> and binary against the manifest's digests, and hands the kernel the bytes it hashed through
+> `SpawnImage` - at install, at every boot and at every restart (`services/supervisor/src/installed.rs`,
+> CLAUDE.md 14.1 amendment 2026-10-17). What differs from the design below: the verify is in the
+> supervisor, so there is no crypto in the kernel; the trust record is on `/system`, not inside
+> `kernel.bin`, and every `fs` holder can write it (recorded in 14.1); the built-in services stay
+> embedded; and an installed package runs under its own `publisher/name`, so it can never replace a
+> built-in under that built-in's name. The design below is kept as written.
+
 Today, changing one service means reflashing the machine. Step 2 puts the service binaries on the
 GSFS disk as files; the supervisor reads them through `fs` and spawns them. Update a service = write
 a file and restart it.
@@ -1575,7 +1595,7 @@ four machines** in the step A validation without a single kernel panic.
 | **D1 (done)** | 1 | no kernel change | **no kernel change** (polled drivers) | no |
 | **D1b (done)** | 1 | no kernel change | **no kernel change** (+ interrupts) | no |
 | **D2 (done)** | 1 | no kernel change | no kernel change; the bus WALK is a service, the kernel keeps the generic table | no |
-| 2 (not built) | 1 | no kernel change | no kernel change | **yes** |
+| 2 (installed packages, v0.29.0) | 1 | no kernel change | no kernel change | **yes**, for an installed package |
 
 **Step C is built, and the pin is at its target: 1.** `supervisor` alone, because the kernel must
 bootstrap it - nothing is beneath it. Every other service's image, memory limit, placement, peers,
@@ -1679,7 +1699,9 @@ does the service still call the syscall?
 
 - **Step D's arch shape** is x86 + Pi 4: arm32 has no PCI at all, so `dwc2` keeps its SoC-presence
   path. The two walks agree device-for-device on QEMU q35, the Wyse and the Pi 4.
-- **Step 2's key management** has no design yet, and it is process as much as code.
+- **Step 2's key management** has no design yet, and it is process as much as code. *(2026-10-25:
+  for installed packages there is now a per-machine trust record of publisher keys, managed with
+  `godspeed trust` - `utilities/61_godspeed.md`; rotation and a leaked key are still not designed.)*
 - **A9-4, the BSP idle wedge**, is unrelated to this work and remains open and deferred. It did not
   recur on any of the four hardware runs. *(2026-10-09: since diagnosed and fixed - the idle path
   restarted a periodic LAPIC countdown before it could fire, `bdc7adaa`; `audits/kernel-audit.md`

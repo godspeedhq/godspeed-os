@@ -211,6 +211,12 @@ two controllers are different problems:
   schedule (frame-driven, always live) rather than the async schedule before concluding it is
   impossible - but until that is re-verified on hardware, **EHCI stays busy-poll**.
 
+*(2026-10-25: superseded as a description of the drivers today. `xhci` blocks on its interrupt
+(Phase 1a, §12), `ehci` stopped spinning in Phase 1b, and since 2026-10-22 both wait in `Irq::wait`
+(`docs/driver-library.md`, step 4). `ehci` still falls back to a short poll deadline when it sees a
+keyboard report arrive with no interrupt (`hid_needs_poll`, `services/ehci/src/main.rs`), because
+the keyboard is still on the async schedule.)*
+
 ## 12. Phasing (revised for the prior art)
 
 1. **Phase 1a - xHCI interrupt-driven, with IRQ-core co-location. DONE + HW-VERIFIED (Wyse 5070,

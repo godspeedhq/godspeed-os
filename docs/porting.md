@@ -142,7 +142,7 @@ godspeed/
 │   ├── src/
 │   │   ├── arch/
 │   │   │   ├── <isa>/                              ★ YOU WRITE THIS, and essentially only this.
-│   │   │   │                                         135 `arch::imp` members; the compiler and
+│   │   │   │                                         134 `arch::imp` members; the compiler and
 │   │   │   │                                         arch_seam_check.py name every one you owe.
 │   │   │   └── mod.rs                              + 2 lines: `pub mod <isa>;`
 │   │   │                                                      `pub use <isa> as imp;`
