@@ -759,7 +759,7 @@ test audio` 69/0, the WAV read back. Owed: a card on the Wyse and the T630.
 
 **`xhci` fifth, its grants only.** Its register window and arena come through `gs::driver` (`Registers`,
 `Arena`) on every port, and the arena is still reached at its offset constants: its layout - shared controller
-structures, six per-device slices, the scratchpad and the disk's region, with the hub probe deliberately
+structures, its per-device slices, the scratchpad and the disk's region, with the hub probe deliberately
 inside the ERST page - is the next step, and the largest of any driver. QEMU: `osdev test iommu` 1/1 (the
 keyboard bound through the confined domain) and, on RISC-V `virt` with a USB disk behind `qemu-xhci`, `drives
 flash data`, a write read back and `drives check` with 0 bad. Built for the Pi 4 and the VisionFive. Owed:

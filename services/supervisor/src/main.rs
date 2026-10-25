@@ -1005,13 +1005,14 @@ fn spawn_by_image(ctx: &ServiceContext, name: &str, core: u32, peers: &[&str],
     req.dma_pages    = match name {
         // 64 KiB - the size `HwClass::Ahci` implied before the class had a name in the kernel.
         "block-driver" => 16,
-        // 32 pages of control structures (command and event rings, DCBAA, ERST, six per-device slices so a
-        // hub and what is behind it can be addressed at once), 256 scratchpad buffers (the T630's AMD xHCI
+        // 48 pages of control structures (command and event rings, DCBAA, ERST, ten per-device slices so a
+        // hub and what is behind it can be addressed at once - six until 2026-10-25, which the Wyse's two
+        // USB3 hubs, a keyboard, the WiFi dongle and the boot stick outnumbered), 256 scratchpad buffers (the T630's AMD xHCI
         // asks for 256 and malfunctions without them), and the disk's 32 pages (its rings, its command
         // page, its data page and two 56 KiB gather buffers, `services/xhci/src/msc.rs`), kept apart ON
         // PURPOSE: the Pi 4 lost days to one page shared by a keyboard report, a hub's port status and the
         // disk's CBW. The kernel held these sizes as a constant of its own until 2026-10-21.
-        "xhci" => 32 + 256 + 32,
+        "xhci" => 48 + 256 + 32,
         // 64 KiB: the control transfer and the poll slots (`services/ehci`), as main had it. Not more: the
         // driver zeroes both parts on every control transfer, and the xHCI-sized 1 MiB it once shared a
         // constant with regressed back-port enumeration.

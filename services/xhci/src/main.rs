@@ -279,11 +279,16 @@ impl EvMail {
 // and the buffers are parts after the device slices (`Parts`), sized in the arena's
 // size: the supervisor's `dma_pages` for `xhci`, which is the only statement of it.
 // Hub enumeration needs several slices live at once - the hub's own slice plus each downstream
-// device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). The arena is 320 pages:
-// the controller's 7 + 6 slices of 4 (24) + the SBA (1) = 32, then 256 of scratchpad, then the
+// device's - so MAX_SLICES is larger than MAX_HID (docs/usb-hub.md). The arena is 336 pages:
+// the controller's 7 + 10 slices of 4 (40) + the SBA (1) = 48, then 256 of scratchpad, then the
 // disk's 32 (`msc::DISK_REGION_BYTES`); `lay_out` refuses, naming the part, an arena that is short.
-const MAX_SLICES: usize = 6; // per-device DMA slices (bound HIDs + transient hub/enum)
-const MAX_SCRATCHPAD: usize = 256; // arena room = 320 pages - 32 - the disk's 32
+//
+// Ten, not six, since 2026-10-25: a USB3 hub is TWO hubs to this driver, its USB2 half and its
+// SuperSpeed half, each holding a slice. The Wyse has two such hubs, which is four slices before
+// anything is plugged in, and a keyboard, the WiFi dongle and the boot stick made seven. The seventh
+// had no slice. Ten leaves room for a mouse and a hub more.
+const MAX_SLICES: usize = 10; // per-device DMA slices (bound HIDs + transient hub/enum)
+const MAX_SCRATCHPAD: usize = 256; // arena room = 336 pages - 48 - the disk's 32
 
 /// Counter ticks in `ms` milliseconds, exactly as the SDK's `duration_cycles` computes them: never 0,
 /// and 1 on a machine whose counter the kernel could not calibrate. For the tick-domain instruments
@@ -705,8 +710,32 @@ struct KeptHub {
     slot: u32,
     dev: usize,
     nports: u32,
+    /// The ports this pass's walk did NOT reach because this driver ran out of room - its device slices,
+    /// its HID table or the hub's ring - by port number, bit `n` for port `n`. Something connected there
+    /// is not an arrival: a re-enumeration would run out of room at the same place, and on the Wyse it
+    /// did, resetting the controller every 3.5 s under the keyboard (2026-10-25). A port that reads
+    /// disconnected loses its bit (`unstarve`), so a device plugged in there later is still seen.
+    starved: u64,
 }
-const KEPT_HUB_NONE: KeptHub = KeptHub { slot: 0, dev: 0, nports: 0 };
+const KEPT_HUB_NONE: KeptHub = KeptHub { slot: 0, dev: 0, nports: 0, starved: 0 };
+
+/// Whether port `port` of the hub on `slot` was left unwalked for want of room (`KeptHub::starved`).
+fn starved(hubs: &[KeptHub], slot: u32, port: u32) -> bool {
+    port < 64 && hubs.iter().any(|h| h.slot == slot && h.starved & (1u64 << port) != 0)
+}
+
+/// The port reads disconnected: what was left unwalked there is gone, so its next connection is an arrival.
+fn unstarve(hubs: &mut [KeptHub], slot: u32, port: u32) {
+    if port >= 64 { return; }
+    for h in hubs.iter_mut().filter(|h| h.slot == slot) {
+        h.starved &= !(1u64 << port);
+    }
+}
+
+/// Bits `from..=to` of a port mask (ports past 63 are not recorded, as everywhere else here).
+fn ports_from(from: u32, to: u32) -> u64 {
+    (from..=to.min(63)).fold(0u64, |m, p| m | (1u64 << p))
+}
 /// Hubs recorded per pass: one per slice at most, since every hub holds one.
 const MAX_HUBS: usize = MAX_SLICES;
 
@@ -3358,16 +3387,20 @@ fn enumerate_one(
     // enabling it, the ring or the slices run out, a port past 31. Such a walk does not end a wedge: a port
     // that was never asked has not answered.
     let mut inconclusive = false;
+    // The ports this walk could not reach for want of room (`KeptHub::starved`), recorded on the hub.
+    let mut starved_ports = 0u64;
     // Whether a disk was already bound BEFORE walking this hub. A disk found behind it counts as
     // "something usable is down there" exactly as a HID does - see the release check below.
     let disk_before = disk.is_some();
     for dp in 1..=nports {
         if *ndev >= MAX_HID {
             inconclusive = true;
+            starved_ports |= ports_from(dp as u32, nports as u32);
             break;
         }
         if hoff + 48 > 0xD00 {
             inconclusive = true;
+            starved_ports |= ports_from(dp as u32, nports as u32);
             break;
         }
         let ok = control(
@@ -3516,8 +3549,11 @@ fn enumerate_one(
         let d_idx = match sa.alloc() {
             Some(i) => i,
             None => {
-                ctx.log("xhci: out of DMA slices for a downstream device - stopping hub walk");
+                ctx.log_fmt(format_args!(
+                    "xhci: out of DMA slices ({} in use) for the device on hub port {} of the hub on port {} - it and the ports after it are not enumerated, and are not taken for arrivals",
+                    MAX_SLICES, dp, port));
                 inconclusive = true;
+                starved_ports |= ports_from(dp as u32, nports as u32);
                 break;
             }
         };
@@ -3784,7 +3820,7 @@ fn enumerate_one(
     // and goes, and the pool exists to bound growth rather than to reclaim the machine's own wiring.
     // Recorded, whatever is behind it: the poll loop watches each kept hub's empty ports (`KeptHub`).
     if *nhubs < MAX_HUBS {
-        hubs[*nhubs] = KeptHub { slot, dev: dev_idx, nports: nports as u32 };
+        hubs[*nhubs] = KeptHub { slot, dev: dev_idx, nports: nports as u32, starved: starved_ports };
         *nhubs += 1;
     }
     if *ndev == ndev_before && disk.is_some() == disk_before {
@@ -5851,6 +5887,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hub_slot && r.hub_port == hp as u32) => {
                                 radio_absent_seen = 0;
                             }
+                            // A port the walk had no room to reach (`KeptHub::starved`): connected, and not an arrival.
+                            Some(true) if starved(&hubs[..nhubs], hub_slot, hp as u32) => {}
                             // The bind guard lives HERE now (see the scan gate above): only a free
                             // HID slice makes an arrival actionable. A full table still watches.
                             // CONFIRM the arrival: one connected read is a reading, two is an event.
@@ -5884,6 +5922,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // accumulates its way to a phantom arrival, just more slowly.
                                 hub_seen[hp as usize] = 0;
                                 hub_tried &= !(1u64 << hp);
+                                unstarve(&mut hubs[..nhubs], hub_slot, hp as u32);
                             }
                             // A FAILED probe resets the confirmation run.
                             //
@@ -5974,6 +6013,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             Some(true) if radio.as_ref().is_some_and(|r| r.hub_slot == hs && r.hub_port == hp as u32) => {
                                 radio_absent_seen = 0;
                             }
+                            // A port the walk had no room to reach (`KeptHub::starved`): connected, and not an arrival.
+                            Some(true) if starved(&hubs[..nhubs], hs, hp as u32) => {}
                             // Connected AND not already tried, on two consecutive reads: a real arrival.
                             // The same confirmation the HID-driven scan has (`hub_seen`) - one connected
                             // read is a reading, two is an event. This took ONE until 2026-10-10, the
@@ -6010,6 +6051,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 // accumulates its way to a phantom arrival, just more slowly.
                                 hub_seen[hp as usize] = 0;
                                 hub_tried &= !(1u64 << hp);
+                                unstarve(&mut hubs[..nhubs], hs, hp as u32);
                             }
                             // A failed probe resets the confirmation run, for the HID-driven scan's
                             // reason: the next reading on this hub may be a late answer.
@@ -6055,6 +6097,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                 hs, hp, if abandoned { " (the probe was abandoned)" } else { "" }));
                         }
                         match st {
+                            // A port the walk had no room to reach (`KeptHub::starved`): connected, and not an arrival.
+                            Some(true) if starved(&hubs[..nhubs], hs, hp as u32) => {}
                             Some(true) if hp < 64 && kh_tried[h] & (1u64 << hp) == 0
                                 && { kh_seen[h][hp as usize] = kh_seen[h][hp as usize].saturating_add(1);
                                      kh_seen[h][hp as usize] >= 2 } => {
@@ -6070,6 +6114,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             Some(false) if hp < 64 => {
                                 kh_seen[h][hp as usize] = 0;
                                 kh_tried[h] &= !(1u64 << hp);
+                                unstarve(&mut hubs[..nhubs], hs, hp as u32);
                             }
                             None if hp < 64 => {
                                 kh_seen[h][hp as usize] = 0;
