@@ -112,7 +112,7 @@ QEMU, and hardware is checked by hand-run "cards" (section 4.2).
 | Recovery | What happens when a component dies? | Tests 11, 13 and 15; `chaos` (kill, flood, memory and spawn storms, max-carnage) in QEMU and on all five boards | Recovery is observed, not proved; storms are bounded runs |
 | Filesystem | What durability and consistency hold? | Journal and replay suites; an independent model (`osdev test fs-model`); unassisted power cuts recovered on all five boards (`docs/gsfs-carnage.md`) | Section 3.6 of that document: stale identity is partly covered |
 | Drivers | Can a driver failure harm others? | Drivers are restartable services; IOMMU confinement on x86 (Test 12, `docs/iommu.md`) | No IOMMU on the ARM and RISC-V boards: a compromised DMA driver is kernel-equivalent there |
-| Executable loading | Are images and permissions validated? | `kernel/src/loader.rs`; fuzz F3 (bit-flipped ELFs); W^X (`CLAUDE.md` 18.5); the spawn request checks (`CLAUDE.md` 14.1) | No signature over service images (section 8, C) |
+| Executable loading | Are images and permissions validated? | `kernel/src/loader.rs`; fuzz F3 (bit-flipped ELFs); W^X (`CLAUDE.md` 18.5); the spawn request checks (`CLAUDE.md` 14.1) | No signature over built-in service images; installed packages are signed (section 8, C) |
 | Unsafe Rust | Where and why? | Every block listed in `audits/unsafe-audit.md` and checked against source on every build (`scripts/unsafe_check.py`); services forbid `unsafe` at the compiler | The SDK's wrapper layer has 80-odd call-site blocks a safe wrapper would remove (`CLAUDE.md` 18.5) |
 | Portability | Which board showed what? | Release notes and `docs/` tables per board | Hardware serial logs are not published (section 4.2) |
 | Release quality | Can a result be reproduced? | Every suite is an `osdev test` command; artefacts and `SHA256SUMS` are built by CI from the tag | QEMU suites are run locally, not in CI |
@@ -258,10 +258,13 @@ scheduler and interrupt invariants; the `unsafe` boundaries.
 **B. Recovery and persistence.** Supervisor restart; service recovery against revocation; `fs` crash consistency;
 interrupted operations; the backend-conditional durability guarantee.
 
-**C. Executable trust.** What exists: ELF validation in the kernel loader, and a versioned spawn request the
-kernel checks field by field. **What does not:** any signature over a service image, and any package, manifest,
-update or rollback system. A compromised supervisor can start arbitrary code under any name, and nothing prevents
-that until image signing is built (`CLAUDE.md` 14.1, 2026-09-26 amendment).
+**C. Executable trust.** What exists: ELF validation in the kernel loader, a versioned spawn request the
+kernel checks field by field, and, for an INSTALLED package (`godspeed install`), a signed manifest the supervisor
+checks against this machine's trust record before every start (`CLAUDE.md` 14.1, 2026-10-17 amendment). **What
+does not:** any signature over a built-in service image, which the supervisor carries inside `kernel.bin`. A
+compromised supervisor can start arbitrary code under any name (`CLAUDE.md` 14.1, 2026-09-26 amendment), and the
+trust record an installed package is checked against is on `/system`, which every `fs` holder can write (the
+2026-10-17 amendment records it).
 
 **D. Cross-platform behaviour.** The arch seam; differences between boards and their firmware; driver isolation
 where there is no IOMMU; the repeatability of release cards.
@@ -280,7 +283,7 @@ GodspeedOS is experimental software (`CLAUDE.md` 2.2). These stay explicit until
 - Boards, firmware and emulators behave differently; QEMU hides timing and device behaviour that real boards
   show.
 - Four ports compiling and booting does not establish identical behaviour on each.
-- No service image is signed (section 8, C).
+- No built-in service image is signed; only installed packages are (section 8, C).
 - The test suites run in QEMU only, and the hardware logs are not published (section 4.2).
 - AI-assisted code needs the same review and verification as any other.
 - No independent security review or formal verification has been performed. Neither will be claimed until it has.

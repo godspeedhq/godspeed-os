@@ -15,7 +15,7 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **The real OS bootstrap:** the kernel makes its one direct spawn (the **supervisor**), which spawns
   services from its manifest through the neutral spawn path (per-task address spaces, PL0 user mode,
   banked-register trap frames, fault-survival: a PL0 fault kills just that task and the kernel continues).
-- **Services:** `supervisor`, `events`, `recorder`, `copier`, `console`, `shell`, `ping`, `pong`, the driver services
+- **Services:** `supervisor`, `events`, `recorder`, `copier`, `ask`, `godspeed-pm`, `console`, `shell`, `ping`, `pong`, the driver services
   (`dwc2`, `block-driver` + `fs`, `nic-driver` + `net-stack`, `time`, `control`, `pwm-audio`, `power`,
   `wifi-usb`) and the example services
   (`observe`, `chaos`, `mem-pressure`, `counter`, `greet`, `upper`, `roster`, `reply-server`, `asker`,
@@ -122,7 +122,7 @@ python scripts/arm_run.py --release --usb          # boot in QEMU with an emulat
 kernel (which embeds them via `kernel/build.rs`'s `arm_built` allowlist), and objcopies to a flat
 `build/kernel7.img`. The supervisor is built with its `bare-metal` feature (the "usable OS, quiet gsh>"
 set: events, `console` (the terminal), the driver services - `dwc2`, `block-driver` + `fs`,
-`nic-driver` + `net-stack`, `time` - and the shell; no harness probes, `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
+`nic-driver` + `net-stack`, `time`, `control`, `power`, `pwm-audio` - and the shell; no harness probes, `ping`/`pong` spawnable on demand). Deploy to a Pi by copying
 `build/kernel7.img` **and `build/config-pi2.txt` (as `config.txt`)** to the SD card's FAT boot partition (a file copy, not a
 flash - `docs/multi-arch.md`); the **full procedure** (preparing the boot card *and* the storage USB
 stick, with the disk-identification safety and the durability caveat) is **`docs/pi2-deploy.md`**.
@@ -268,7 +268,8 @@ GodspeedOS way.
 - **Hardware RNG (BCM2835) - DONE + QEMU-verified** (2026-07-23). An entropy source: `hw_random()` reads
   the SoC RNG, exposed ungated as InspectKernel query 19 (entropy confers no authority) with a `random [n]`
   shell command. QEMU's `raspi2b` emulates it (`random 3` -> three distinct u32s). x86 RDRAND is a trivial
-  follow-up (stubbed `None` today).
+  follow-up (stubbed `None` today). *(Note 2026-10-25: x86 has since followed - its `hw_random` reads
+  RDRAND, `kernel/src/arch/x86_64/mod.rs`.)*
 - **GPIO (BCM2835) - DONE + QEMU-verified** (2026-07-23). Drive the SoC pins: a **capability-gated** `Gpio`
   syscall (GPIO carries the UART/SD lines, so only the `shell` holds `GPIO_DEVICE`) with a `gpio
   <input|output|high|low|read> <pin>` command. QEMU verifies the readback (pin high -> reads 1, low -> 0);

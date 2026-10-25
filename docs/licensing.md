@@ -138,6 +138,10 @@ with a package manager, and fetch-at-setup was tried and failed three times on o
 the board name is a symlink, into a sibling directory, to a filename the packaging creates at build time.
 Absorbing that fragility once, here, beats pushing it onto every user.
 
+*(Note 2026-10-25: GodspeedOS has had a package manager since v0.29.0 - `godspeed fetch` then
+`godspeed install`, or a `.gsp` file. The firmware decision above was made before it and is unchanged:
+these blobs are still committed under `nonfree/`, not delivered as packages.)*
+
 The aggregation point matters and is worth stating plainly: the firmware is **data uploaded to a device**,
 not code linked into a GPL work. It does not make the OS a derivative of it, nor the reverse.
 

@@ -90,7 +90,7 @@ not "feature-complete."
   │   - routes datagrams <-> sockets             │
   ├─────────────────────────────────────────────┤
   │  nic-driver  (service, NOT IOMMU-confined)   │   per-board: e1000, RTL8168, GENET, dwmac;
-  │                                              │   Pi 4: + the radio via wifi-driver (cable wins)
+  │                                              │   + a radio bridge to wifi-driver or wifi-usb (cable wins)
   │   - raw Ethernet frames in/out via DMA rings │   MMIO + DMA + IRQ caps (§12.3, §6.4)
   ├─────────────────────────────────────────────┤
   │  Kernel  (routes opaque socket caps only)    │   NO networking - delegated-resource-cap routing
@@ -118,9 +118,11 @@ A userspace driver service, structurally identical to `block-driver` (AHCI) and 
   **DMA arena** for the TX/RX descriptor rings + packet buffers.
 - **NOT IOMMU-confined (§6.4).** This said the opposite, and the correction matters because it is a
   trust claim. `nic-driver` is spawned `hwclass::pci(0x02_00_00, BAR_AUTO, false)` - the third argument
-  is `confine`, and it is `false` (`services/supervisor/src/main.rs`, the `nic-driver` spawn row). **`xhci` (and, in QEMU only,
-  `audio-driver`) are the only confined drivers in the system**; `ehci` and `block-driver` are deliberately left in passthrough because they
-  keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs, the `confine` flag on `HwClass::Pci``). So the
+  is `confine`, and it is `false` (`services/supervisor/src/main.rs`, the `nic-driver` spawn row; on the
+  boards whose NIC is not on PCI it is `hwclass::NIC`, with no confinement either). **`xhci` and
+  `audio-driver` are the only in-tree drivers spawned confined** (an installed driver package's PCI
+  device is asked for confinement too, CLAUDE.md 14.1); `ehci` and `block-driver` are deliberately left in passthrough because they
+  keep a stale firmware DMA pointer that confinement would fault (`kernel/src/task/mod.rs`, the `confine` flag on `HwClass::Pci`). So the
   NIC driver's DMA is unconfined: a *buggy* one is bounded by the arena it was granted, but a
   *compromised* one can point the controller anywhere in RAM, which is kernel-equivalent reach by
   §6.4's own rule. It is restartable, and it is **in the TCB on every machine today**. All `unsafe`

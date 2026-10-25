@@ -5,7 +5,9 @@
 converted to the first three across all four ports; and since 2026-10-19 every compiled driver on the grants
 (step 3), the one-way ratchet holding a new driver to them, and since 2026-10-20 every compiled driver's
 arena laid out by name - no driver reaches its arena at an offset from the arena's start any more; the
-offsets that remain are within a named, bounds-checked part. "Current state" below says what exists; the
+offsets that remain are within a named, bounds-checked part. Since 2026-10-22 every driver that takes an
+interrupt waits for it through `irq` (step 4) and a driver's remaining SDK calls are wrapped (`input`,
+`power`, `device`, step 5); since 2026-10-23 `bus` reaches a USB device through its host. "Current state" below says what exists; the
 method sections say how anything gets in; the dated steps are the record.**
 
 ## The principle
@@ -131,8 +133,9 @@ and why; read them for the reasoning, not to find out what the library contains.
   chip once, section 6 of `docs/wifi-usb.md`) and `replug` (a chip that took no firmware).
 
 **Converted** (step in brackets): `wifi-driver` (1), `genet` (1b, 1f), `xhci` (1c, 1e, 1f, 4), `sdk/wifi`
-(1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l not yet
-verified on hardware**), `wifi-usb` (`bus`, 2026-10-23 - built, not yet run on hardware). `audio-driver` and
+(1d), `dwc2` (1g, 1h, 4), `dwmac` (1i), the x86 `nic-driver` (1j), `ahci` (1k), `ehci` (1l, 4 - **1l's own card was never run**;
+`ehci` ran on it in step 4's T630 card), `wifi-usb` (`bus`, 2026-10-23; hardware-verified 2026-10-24 on the VisionFive, the Pi 4 and the Pi 2,
+`docs/developer-services-design.md` 13.1). `audio-driver` and
 `pwm-audio` were written on the library from the start (`wait`, `delay`, `irq`).
 
 **What a driver still takes from the SDK, and why it is not here.** Two things, neither a hardware call:

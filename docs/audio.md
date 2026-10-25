@@ -967,6 +967,11 @@ Recorded here because they were found on the way and do not belong to audio alon
    each shown to refuse by putting the mismatch back (2026-10-03). The Pi 4 one matters most: it builds
    the images the Wi-Fi work flashes.
 
+*(Note 2026-10-25: items 1 and 2 are fixed on x86 - see "K1: the window is the BAR" and "K2: the
+controller the driver is granted" below. On x86 a PCI driver's window is its BAR (`pci::bar_len`) and a
+supplied BDF selects the device for every grant; the other ports still answer 0 from `bar_len` and keep
+the fixed 64 KiB window.)*
+
 ## Step A4: `audio outputs` and `audio output` (2026-10-09, `feat/audio-finish`)
 
 **The survey keeps every output, not the first.** It used to return the first pin with a path to a

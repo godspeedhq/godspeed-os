@@ -352,6 +352,7 @@ A hardware pass on the five boards confirms at the end. It is not needed along t
 is deliberately arranged so that it is not.
 
 **The checklist for it is `docs/gsfs-hardware-pass.md`**, written while this work was fresh. Two of
-its items are NOT confirmations: the cross-ISA handoff and the Pi 2's durability warning cannot be
-answered in QEMU at all (`backlog/34`), so for those the boards are the only instrument rather than a
-second opinion.
+its items are NOT confirmations: the Pi 2's durability warning cannot be answered in QEMU at all, and
+neither can the cross-ISA handoff to the two ARM ports (`backlog/34`), so for those the boards are the
+only instrument rather than a second opinion. The x86-64 to riscv64 handoff does run in QEMU, as
+`py scripts/cross_isa.py` (`docs/gsfs-carnage.md` 3.11).

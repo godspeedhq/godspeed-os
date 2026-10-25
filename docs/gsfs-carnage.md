@@ -532,7 +532,7 @@ weakness:
 
 The core of this is already enforced by the capability model rather than by convention: a file
 capability is a delegated resource cap (7.10), revoked by a generation bump on delete, close and
-rename, and `file-cap` (13 checks) pins unforgeable, non-escalating and revocable end to end. The
+rename, and `file-cap` (16 checks) pins unforgeable, non-escalating and revocable end to end. The
 `move` doc records that open capabilities to a moved path are revoked including for every descendant.
 
 What is NOT covered is the reuse case the checklist names: open A, restart `fs`, delete A, let B take

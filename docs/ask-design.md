@@ -1,6 +1,7 @@
 # ask - Assisted System Knowledge (design; v0.1 built)
 
-> **Status: v0.1 BUILT on `feat/ask`, 2026-10-11, QEMU-verified only.** Since then: how a service ended
+> **Status: v0.1 BUILT on `feat/ask`, 2026-10-11, QEMU-verified then; shipped in v0.26.0, whose
+> `selfcheck` (with an `ask` part) ran clean after 1000 rounds of chaos on all five boards.** Since then: how a service ended
 > (the kernel's death notice, 6), the storage chain below `fs` when it has no disk (3.4), "is the network
 > up?" (3.5), "what is <service>?" from each crate's own `description`, "what can <service> do?" / "who can
 > reboot?" from the capabilities the kernel holds for each task, "what to say?", glossary terms and the
@@ -28,8 +29,9 @@ it is gone before the next prompt. Nothing of it stays running. It is NOT like `
 which this section first named as its model: they are started on demand too, but they stay up afterwards
 and serve later requests, which is a background service, and `ask` is not one.
 
-How it ends, stated because v1 has no way for a task to end itself: the only call that ends a task is
-`kill`, and `ask` must not hold the authority to kill. So the SHELL, which does, ends it as soon as the
+How it ends, stated because when this was designed there was no way for a task to end itself: the only
+call that ended a task was `kill` (a task may end itself with `Exit`, syscall 57, since 2026-10-17, CLAUDE.md
+14.5; `ask` does not use it), and `ask` must not hold the authority to kill. So the SHELL, which does, ends it as soon as the
 answer is in, and on a bounded deadline if the answer never comes - which a dead or wedged source cannot
 cause, since each request inside `ask` is bounded too (section 7). `observe now` is the nearest existing
 shape, and also the difference: it parks after its frame and lingers until the next `observe now`;

@@ -2,7 +2,7 @@
 # Developer services: building a service from outside the tree into an image
 
 **Status: PROPOSAL, 2026-10-15, for sections 1-8: nothing in them is built and nothing in them is approved. The
-later sections are dated, and 11, 12, 14, 15 and 16 have since been built (each says so).** Written for the
+later sections are dated, and 11 to 16 have since been built, each as far as it says.** Written for the
 `godspeed` developer CLI (the separate `godspeed-cli` repository), whose contract says its first half -
 create, build, test, run in QEMU - "can be built now". Measured against this tree it cannot, without
 the CLI editing supervisor source, and that is the boundary the CLI's own contract forbids. This
@@ -13,7 +13,9 @@ verification (`audits/2026-10-16-kernel-verification.md`). Section 11 (2026-10-1
 OS release publish the facts the CLI builds against as one file, so the CLI stops reading this
 repository's build files.
 
-No kernel change. No MISCIS change. No new syscall. No image loaded from disk.
+Sections 1-8: no kernel change, no MISCIS change, no new syscall, no image loaded from disk. (The later
+sections differ, each saying so: 12 starts a signed image read from the disk, and 12.4 added `Exit`,
+syscall 57.)
 
 ---
 
@@ -185,7 +187,7 @@ empty today**, and each obvious candidate shows why:
 | peer | what any client may ask it today | so |
 |---|---|---|
 | `events` | to record a trace event or a metric under any name, and to read back the whole IPC trace ring (`TRACE_OP_DUMP`), every metric (`TRACE_OP_METRICS`) and the recent log lines of every service (`TRACE_OP_LOGS`) | not at the floor: a developer service could read what every other service did and logged, and write events that look like theirs |
-| `time` | to raise the clock floor (`OP_FLOOR_SET`), which only ever rises and is persisted to disk, and to start a network fetch (`OP_SYNC`) | not at the floor: one message could push the machine's clock years ahead for good |
+| `time` | to start a network fetch (`OP_SYNC`); it used to raise the clock floor too (`OP_FLOOR_SET`, which only ever rises and is persisted), retired 2026-10-16 | not at the floor yet: joining is an amendment that weighs `OP_SYNC` |
 | `fs` | read and write over the whole disk | not at the floor until folder capabilities exist |
 | `net-stack` | sockets to anywhere | not at the floor until there is a design for what an untrusted program may reach |
 
@@ -198,9 +200,9 @@ server answers an arbitrary client safely:
 - **`events`** when its read ops are gated or scoped to the asker, and its write ops attribute
   by the kernel's badge rather than the name a client supplies;
 - **`time`** when the floor is set by a holder of storage alone, the way it is written and read on the way
-  down and up (its own comment calls it "persisted by whoever holds storage"). Being done (2026-10-16,
-  branch `fix/time-floor`): `OP_FLOOR_SET` is retired and the floor is `time`'s alone. Once that merges,
-  `time` answers only `OP_NOW`, `OP_FLOOR_GET` and `OP_SYNC`, and joining the set is an amendment that
+  down and up (its own comment calls it "persisted by whoever holds storage"). Done (2026-10-16,
+  branch `fix/time-floor`, merged): `OP_FLOOR_SET` is retired and the floor is `time`'s alone, so
+  `time` serves only `OP_NOW`, `OP_FLOOR_GET` and `OP_SYNC`, and joining the set is an amendment that
   weighs `OP_SYNC` (a client can make it send an NTP query);
 - **`fs`** with folder capabilities, as a grant of the service's own `/system/services/<name>/` and
   nothing wider;
@@ -216,8 +218,8 @@ A request for any peer outside the set is refused with the reason:
       Remove fs from ipc_send, or build the service in the OS tree, where its spawn row is reviewed.
 
 **Two findings this check turned up in the OS itself, recorded here rather than in `backlog/`** (5 in
-section 7): any service holding a send cap to `time` can raise the persisted clock floor without bound,
-and any service holding a send cap to `events` can read every service's traces and log lines. Neither is
+section 7): any service holding a send cap to `time` could raise the persisted clock floor without bound
+(closed since: `OP_FLOOR_SET` is retired), and any service holding a send cap to `events` can read every service's traces and log lines. Neither is
 reachable by a developer service under this floor. Who holds those caps today, and whether either is a
 defect for them, is for the operator to decide.
 
@@ -234,7 +236,9 @@ peers_grant` (4.2; 2.1 says why these two matter most). The refusal names the ke
       Remove the request, or build the service in the OS tree, where its spawn row is reviewed.
 
 This is also why the CLI's `driver` template stays unavailable: a driver needs a device grant, and
-this floor has none. That is the honest answer until the local grant policy exists.
+this floor has none. That is the honest answer until the local grant policy exists. *(2026-10-25: the
+CLI's `driver` template exists now, for a driver PACKAGE granted its device at install (13.1); this
+`--with` floor, which is not built, still grants none.)*
 
 ### 3.4 The supervisor
 
@@ -327,6 +331,9 @@ identity suite, made available to one crate.
 | hw class | `hw_device`, `hw_pci_class`, `hw_pci_bar`, `hw_pci_irq` | covered, reconciled |
 | DMA pages | - | **missing**: a `match` on the service's name inside `spawn_by_image` |
 | restarted by the supervisor | - | **missing**: membership of `MANAGED` |
+
+*(2026-10-25: the schema has since gained `hw_dma`, `hw_usb` and `handover`, read for an installed
+package (13.1, 14); an in-tree row's DMA pages are still the `match` in `spawn_by_image`.)*
 
 ### 4.2 The additions
 
@@ -438,7 +445,8 @@ the usual hardware cards, since the supervisor is on every board.
    because that floor reaches no disk, network or device (3.5). Reopened if the floor widens.
 4. ~~`ipc_send` to any service, or a named public set?~~ **Proposed answer: a public set, and today it is
    empty.** Read against their code, `fs` is the whole disk, `net-stack` the network, `events` every
-   service's traces and logs, and `time` a clock floor any client can push forward for good (3.3). Each
+   service's traces and logs, and `time` a clock floor any client could push forward for good (3.3; since
+   retired). Each
    joins when its server answers an arbitrary client safely.
 5. ~~Backlog items or this document?~~ **Proposed answer: this document stays the single record until
    approved**; nothing is opened in `backlog/` for it.
@@ -477,6 +485,10 @@ its own constitution. The CLI follows; it never works around one.
 | `godspeed new app` | public application interfaces | nowhere yet |
 | anything but Rust | a stable, documented ABI below `gs` | CLAUDE.md Appendix B (non-normative) |
 
+*(2026-10-25: since built - installing (12), utilities (12.4), drivers (13.1, the interrupt, DMA arena,
+takeover and USB parts on `feat/driver-packages` and not yet released) and apps (13.2). Changes 1 to 3
+(`godspeed run`) and other languages are not.)*
+
 ### 9.1 What the floor (3.3) runs, measured against the CLI's own examples
 
 `godspeed-cli/examples/` holds three services, built for all four ISAs in that repository's CI. Against
@@ -510,7 +522,7 @@ already built.
   how that decision is shown. It is not designed (2, last point but one). The developer grant policy
   (3.3) is the build-time answer for one case. An installed package needs the runtime one.
 
-Then: `godspeed install`, `update` and `uninstall` on a Godspeed machine, and the Stranger Test's second
+Then: `godspeed install`, `upgrade` and `uninstall` on a Godspeed machine, and the Stranger Test's second
 half.
 
 ### 9.3 `utility`: a terminating task
@@ -597,13 +609,17 @@ Native Package Manager"): the host CLI creates, builds, packages and publishes o
 **native package manager** runs on a Godspeed machine and owns
 
     godspeed search <query>     godspeed info <package>     godspeed list
-    godspeed install <package>  godspeed update <package>   godspeed uninstall <package>
+    godspeed install <package>  godspeed upgrade <package>  godspeed uninstall <package>
 
 It is "an ordinary Godspeed program on public interfaces: no privileged kernel knowledge, no private
 supervisor protocol", and installing "never grants a requested capability by itself". The CLI side of
 the format is done: `godspeed-package` (`no_std`, no allocator, built for all four targets) defines the
 package, the manifest, the registry index and the trust metadata, and verifies all of them. This section
 is what the OS has to settle before the native side can be built, and what it can do before 9.2 exists.
+
+*(2026-10-25: since built - `services/godspeed-pm` is that program, and install, `upgrade` and `uninstall`
+run packages (12). The machine's verb is `upgrade`; there is no `update`. 10.1's "today" column and 10.2's
+"every utility today is a function inside `services/shell`" are as of 2026-10-16.)*
 
 ### 10.1 What it can do on today's OS, and what it cannot
 
@@ -612,7 +628,7 @@ is what the OS has to settle before the native side can be built, and what it ca
 | `search`, `info` | to read the registry's index and trust metadata, and verify them | transport (10.3) and the clock (10.4) are built; what remains is reading and verifying the metadata (10.6); no kernel change |
 | download and verify a package | the above, plus a place to keep it (10.5) | the same; no kernel change |
 | `list`, `uninstall` | a record of what is kept, and deleting it | possible once something is kept |
-| `install`, `update` (running the package) | a loader and a local grant policy (9.2) | blocked: nothing reads an image from disk |
+| `install`, `upgrade` (running the package) | a loader and a local grant policy (9.2) | blocked: nothing reads an image from disk |
 
 So a first version can be **fetch, verify, keep, list and remove**, and it must say plainly that a kept
 package is not installed: the machine cannot run it until 9.2 exists. The CLI's contract already forbids
@@ -781,7 +797,8 @@ wall clock to be right. Three facts from this tree bear on that:
   then look expired. That fails closed (no install, no forgery), but it is a lasting denial of the whole
   package manager. **Being fixed (the operator agreed, 2026-10-16) on the branch `fix/time-floor`:**
   `OP_FLOOR_SET` is retired, the floor is set by `time` alone from its own file and its own readings, and
-  `date sync` has `time` re-read that file when it never loaded. Not merged yet;
+  `date sync` has `time` re-read that file when it never loaded. Merged since (`OP_FLOOR_SET` now
+  answers `[0]`, `services/time/src/main.rs`);
 - on x86 the RTC read behind `time` races across cores and can return a date years ahead
   (`audits/2026-10-16-kernel-verification.md`, D23), which a lock around the CMOS pair would fix.
 
@@ -832,7 +849,9 @@ is decided when the native package manager is, and that is now.
 
 **As built, 2026-10-17: option 1**, the smallest, taken to build the first version and easy to change: a
 git dependency on the CLI repository at tag `cli-v0.2.0` (`services/godspeed-pm/Cargo.toml`). The choice
-between the three is still the operator's; moving to option 2 or 3 changes one line of that file. Two
+between the three is still the operator's; moving to option 2 or 3 changes one line of that file.
+*(2026-10-25: the dependency is now pinned to a commit of the CLI repository (`rev = "6bc893ac..."`),
+not a tag, in `services/godspeed-pm/Cargo.toml` and `services/supervisor/Cargo.toml`.)* Two
 things found doing it:
 
 - **Cargo reads every `Cargo.toml` in a git dependency's repository**, and the CLI's two templates hold
@@ -1014,7 +1033,8 @@ the CLI's own change, behind its src/kit.rs, and needs nothing further here.
    *Recommended: yes, with the entry symbol (11.1) and the `--check` mode in `EXTRA_CHECKS` (11.4). It
    needs no kernel change, grants nothing, and is the one item here the CLI is already waiting on.*
 
-   **Decided 2026-10-17 by the operator: yes, as recommended.** Built the same day.
+   **Decided 2026-10-17 by the operator: yes, as recommended.** Built the same day. *(2026-10-25: the
+   first release to carry it was v0.30.0; v0.29.0 and earlier have none, 11.3.)*
 
 ### 11.6 As built
 
@@ -1203,22 +1223,23 @@ rest is `feat/driver-packages` (2026-10-23):
 **How it was shown.** In QEMU on x86, `osdev test kinds` (the template's driver: registers, the interrupt and a DMA
 arena on `edu`) and `osdev test driver-packages` (a package taking the e1000 over from `nic-driver` and giving it
 back; a package driving QEMU's FTDI serial adapter behind `xhci`, a line each way; a package reading QEMU's stick's
-INQUIRY through `ehci`, which binds it in that test build only). On hardware: not yet. Three
+INQUIRY through `ehci`, which binds it in that test build only). On hardware: three of the five boards, below. Three
 packages are made for the cards, signed by the test key (`osdev/fixtures/README.md`): `kind-dongle`, which names the
 RTL8188CUS and so takes it from `wifi-usb` on every board with the dongle; `kind-nic`, which reads the RTL8168 of the
 T630 and the Wyse as well as QEMU's e1000; and `kind-rtl`, which uses the RTL8168's interrupt and DMA - the only
 package that shows those two grants on hardware, since `edu` is QEMU's. A board fetches each with `download` from a
 machine that serves the file, after `godspeed trust add` for the test key.
 
-**The cards owed** (none run yet):
+**The cards** (run 2026-10-24; the T630 and the Wyse are still owed):
 
-| Board | What it shows |
-|---|---|
-| T630 | `kind-nic`, then `kind-rtl`: the RTL8168 taken from `nic-driver` and given back, its interrupt and its DMA, the arena IOMMU-confined; `kind-dongle` in a front socket (`xhci`) and in a back one (`ehci`, behind the rate-matching hub) |
-| Wyse | `kind-nic` and `kind-rtl` as on the T630, unconfined; `kind-dongle` through `xhci` |
-| Pi 2 | `wifi-usb` on `gs::driver::bus`: bring-up, scan, join; then `kind-dongle` through `dwc2`, the network over the cable |
-| Pi 4, VisionFive | `wifi-usb` on `gs::driver::bus`; `kind-dongle` through `xhci` |
-| All five | chaos and `selfcheck`, since the supervisor and all three USB hosts changed |
+| Board | What it shows | Result |
+|---|---|---|
+| VisionFive | `wifi-usb` on `gs::driver::bus`; `kind-dongle` through `xhci` | **passed**: `kind-dongle` downloaded and installed, `wifi-usb stood down`, `took 0bda:8176 over through xhci`, unplugged, replugged and given back; `wifi-usb` joined; `selfcheck` 600 run, 0 failed, 1 skipped |
+| Pi 4 | `wifi-usb` on `gs::driver::bus`; `kind-dongle` through `xhci` | **passed**: the same takeover, unplug, replug and give-back, `chaos max-carnage` with the package installed, `selfcheck` 600 run, 0 failed, 1 skipped. The dongle needs several replugs to enumerate on this board, which is the chip's and not pursued (`docs/wifi-usb.md`) |
+| Pi 2 | `wifi-usb` on `gs::driver::bus`: bring-up, scan, join; then `kind-dongle` through `dwc2`, the network over the cable | **`wifi-usb` passed**: `selfcheck` 659 run, 0 failed, 1 skipped, on the dongle and on the cable, on `fe9be63f`. `kind-dongle` through `dwc2` was installed but not shown working; the card found the multi-block WRITE(10) disk stall instead, fixed in `fe9be63f` |
+| T630 | `kind-nic`, then `kind-rtl`: the RTL8168 taken from `nic-driver` and given back, its interrupt and its DMA, the arena IOMMU-confined; `kind-dongle` in a front socket (`xhci`) and in a back one (`ehci`, behind the rate-matching hub) | owed |
+| Wyse | `kind-nic` and `kind-rtl` as on the T630, unconfined; `kind-dongle` through `xhci` | owed |
+| All five | chaos and `selfcheck`, since the supervisor and all three USB hosts changed | three of five, above |
 
 ### 13.2 `app`: a program with a screen of its own, while it has focus
 
@@ -1230,7 +1251,9 @@ shell gets them back when it releases or dies. So an app is the utility mechanis
 **The one new grant.** `console` (contract key `[capabilities] console = true`): a send cap to the `console`
 service for output, and the right to claim the foreground. Asked at install like a peer, with the reason:
 "it will read the keyboard while it runs". A keyboard is a command channel (6.4, SEC-2), so this is the grant
-that matters, and it is never given silently.
+that matters, and it is never given silently. *(2026-10-25, as built: there is no contract key. An app is
+asked for `console` at install by its kind (`services/godspeed-pm/src/install.rs`), and the supervisor
+starts it with `SPAWN_FLAG_REQ_CONSOLE` when its grant names it (CLAUDE.md 14.1 amendment).)*
 
 **Lifecycle.** Started by typing its name, as a utility, and in the foreground until it ends. The shell's
 `[q]` cannot reach a program that owns the keyboard, so the way out is the app's own (its quit key) or from

@@ -127,7 +127,7 @@ services --(send cap)--> events  (stateless router, unforgeable attribution)
 
 ## What runs now
 
-`services/events/src/main.rs` is **469 lines** and serves four query protocols:
+`services/events/src/main.rs` is **474 lines** and serves four query protocols:
 
 1. Logs `events: ready` at startup.
 2. Holds a **192-event IPC trace ring** (`RING = 192`), a **64-slot metrics table** (`METRICS = 64`)

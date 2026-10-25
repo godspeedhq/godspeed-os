@@ -64,9 +64,12 @@ arm32  :  GodspeedOS arm32: _start reached SVC, PL011 alive - 32-bit ARM BOOTS. 
 - **Linker scripts:** `kernel/kernel.ld` (x86, higher-half), `kernel-arm.ld` (flat at `0x8000`),
   `kernel-aarch64.ld` (virt `0x4008_0000`) with `kernel-aarch64-pi4.ld` for the board,
   `kernel-riscv64.ld` (virt `0x8020_0000`) with `kernel-riscv64-visionfive.ld` for that board, and
-  `kernel-loongarch64.ld` (virt `0x20_0000`). `kernel/build.rs` selects by target and embeds an empty
-  service-ELF placeholder for any service not yet built for that target - so riscv32, LoongArch and
-  s390x are all placeholder, while x86-64, ARMv7, AArch64 and RISC-V 64 embed real ones.
+  `kernel-loongarch64.ld` (virt `0x20_0000`), and `kernel-riscv32.ld` (virt `0x8040_0000`).
+  `kernel/build.rs` selects by target and embeds an empty service-ELF placeholder for any service not
+  yet built for that target - so riscv32, LoongArch and s390x are all placeholder, while x86-64,
+  ARMv7, AArch64 and RISC-V 64 embed real ones. Since step C the kernel embeds only four images (the
+  supervisor, plus `events`, `ping` and `pong` for the arm32 bring-up scaffolding); every other
+  service image is embedded by the supervisor (`services/supervisor/build.rs`).
 
 ## Word size: 32-bit as well as 64-bit (proof, recorded for the future)
 
