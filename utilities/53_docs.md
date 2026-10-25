@@ -61,7 +61,8 @@ first line look identical, because both leave you at the top.
 
 The **section you are in is pinned** at the top. That is the thing a scrollback buffer structurally
 cannot give you: scrolled into the middle of a document you would otherwise have no idea which part
-you were reading. It is the same reason `trace` keeps its own pager, which pins a column header.
+you were reading. It is the same reason `trace` still pages its own views, with a column header
+pinned.
 
 ## 4. `[a] about` is drawn from live state, deliberately
 

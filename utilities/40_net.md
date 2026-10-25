@@ -92,8 +92,10 @@ and when there is no drivable NIC, `nic-driver` serves empty replies and `net-st
 
 ```
 gsh> net dns example.com
+net: resolving ...
 example.com is 104.20.23.154
 gsh> net dns nope.invalid
+net: resolving ...
 nope.invalid: no reply from the DNS server (0 frames, 0 UDP, 6 timeouts)
 ```
 
@@ -125,16 +127,19 @@ NIC registers (RTL8168):
 ```
 
 `OWN=1` means the NIC owns that descriptor (armed, waiting for a frame); `OWN=0` means a frame has
-landed and the driver has not consumed it yet. (On QEMU the e1000 path prints CTRL/STATUS/RCTL/etc.)
+landed and the driver has not consumed it yet. The capture above is from when the RX ring held four
+descriptors; it holds `RX_RING_COUNT` (256) now, and `net stats` prints one line for each descriptor the
+driver sends. (On QEMU the e1000 path prints CTRL/STATUS/RCTL/etc.)
 
 `net arp <ip>` resolves one host's MAC by ARP, and `net scan` sweeps the whole /24 - both live queries
 (like `net dns`), for "who else is on this LAN?":
 
 ```
 gsh> net arp 192.168.4.1
+resolving 192.168.4.1
 192.168.4.1 is at xx:xx:xx:xx:xx:xx
 gsh> net scan
-Scanning 192.168.4.0/24 for live hosts [q] quit
+Scanning 192.168.4.0/24 for live hosts:
   192.168.4.1
   192.168.4.80
   192.168.4.107

@@ -103,7 +103,7 @@ Refused by name, leading with the reason, and naming what to type instead:
 ```
 gsh> background selfcheck
 background: `selfcheck` not supported for it runs inside the shell - a job runs as a detachable separate service.
-  detachable services: copy <src> <dst>, delete <path> recursive, drives check, drives scrub
+  detachable services: copy <src> <dst>, delete <path> recursive, drives check, drives scrub, churn <seconds>
 ```
 
 **That list is built from the table the dispatch reads**, not written into the sentence. An earlier
@@ -236,7 +236,8 @@ that finishes while nobody looks keeps `copier` until then.
 
 ## 4. What a job can reach
 
-The `copier` service holds `fs` and its log. **It has no `console_push`**, so a detached job cannot
+The `copier` service holds `fs`, the board's audio driver (`audio-driver` on the PCs, `pwm-audio` on
+the Pis, for the sound a finished job makes) and its log. **It has no `console_push`**, so a detached job cannot
 inject keystrokes into the shell's input. It CAN write to the console - every task can, through
 `log_write` - and stays off the prompt by convention: it never calls `gs::io`. (This said a
 capability stopped it; printing needs only `log_write`, so none does. Corrected 2026-10-09, with the
@@ -246,7 +247,8 @@ contract's own comment.) It cannot spawn, reboot, or reach the network.
 source and a WRITE capability for the destination and handing over exactly those, so a job could
 reach nothing else for its whole life. That is not what this does: the shell's `spawn` takes a name
 and nothing else, and per-invocation capability delegation is listed as future work in
-`10_spawn.md` §5. So the bound is the **contract's** (`fs`, entire) rather than the two paths'. It
+`10_spawn.md` §5. So the bound is the **contract's** (`fs`, entire, plus the audio driver) rather than the two
+paths'. It
 is a real reduction from the alternative - a job running inside the shell's loop would hold the
 SHELL's authority, which includes `spawn` and `reboot` - and it is not the bound the design claimed.
 Recorded here rather than left to be discovered (§26.7).
@@ -258,7 +260,7 @@ Four words from the service, and one the shell adds:
 | state | means |
 |---|---|
 | `running` | in progress |
-| `done` | the whole file was copied |
+| `done` | the job finished - for a copy, the whole file was copied |
 | `failed` | it stopped on an error; the reason is printed with the row |
 | `stopped` | `q` cancelled it |
 | `lost` | **the shell's own verdict**: `copier` is gone, so the job did not finish and how far it got is unknown |

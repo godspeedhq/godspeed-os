@@ -19,10 +19,10 @@ Reading **one** file is the whole job. Joining multiple streams is a pipe concer
 ## 2. Usage
 
 ```
-read 0.4.0 - print a file's contents
+read 0.4.0 - print a file
 
 usage:
-  read <path>         print the file at <path>
+  read <path>         print the contents of <path>
   read version        print the version
   read help           print this message
 
@@ -36,8 +36,8 @@ with `READ_AT` (op 26) in `IO_CHUNK` pieces (3556 bytes) and writes the bytes ou
 travels in message-bounded chunks (§8.5: 4 KiB max IPC message; §2.5: no shared memory), so
 a large file is a sequence of copied reads - the honest, bounded data path
 (`docs/persistence.md` §6.1). A missing trailing newline is supplied. Reading a directory is
-a loud error, not a silent dump - though it is reported as `read: not found: <path>`, the
-same words as a missing file. A read that fails part way prints `read: storage error`.
+a loud error, not a silent dump: `read: <path> is a directory - `dir <path>` lists it`. A
+missing file is `read: not found: <path>`. A read that fails part way prints `read: storage error`.
 
 ## 4. Implementation
 

@@ -18,7 +18,7 @@ its own sake. Its natural use is a pipe (`find *.txt | sort`, `read /names | sor
 sort 0.4.0 - order the lines (ascending, or reverse)
 
 usage:
-  <producer> | sort         sort piped input
+  <producer> | sort         sort piped lines
   sort <path>               sort a file's lines
   sort reverse [path]       sort descending
   sort version              print the version

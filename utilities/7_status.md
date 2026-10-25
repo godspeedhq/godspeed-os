@@ -12,11 +12,9 @@
 every live scheduler slot. It reports raw facts and renders no health verdict
 (`0_conventions.md` §1 rule 7).
 
-> **Naming note.** The `observe` spec (`1_observe.md` §9) reserves the *name*
-> `status` for a future **health-verdict** utility ("is everything OK?"). The
-> current `status` command is a raw task list, closer to a one-shot task table. If
-> the health utility is built, expect this command's name/role to be revisited so
-> the two stay distinct (raw facts vs verdict).
+> **Naming note.** `status` is a raw task list, not a health verdict. "Is everything
+> OK?" is answered by `ask` (`60_ask.md`) and the `health` library script, so the two
+> stay distinct (raw facts vs verdict).
 
 ## 2. Invocation
 
@@ -71,7 +69,7 @@ console and the pipe show the same columns; `select` projects whichever are want
 
 ## 6. Non-goals
 
-- **No health verdict** (reserved for a future `status`-the-health-utility).
+- **No health verdict** (that is `ask`'s, `60_ask.md`).
 - **No full metrics.** CPU% and the live view belong to `observe`.
 
 ## 7. Conformance

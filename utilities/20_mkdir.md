@@ -18,14 +18,17 @@ verb - a universal contraction, one of the two short ones we keep (`cd` / `mkdir
 mkdir 0.4.0 - create a directory
 
 usage:
-  mkdir <path>        create the directory at <path>
-  mkdir <path> parents   create <path> and any missing parents
-  mkdir <a>,<b>,...   create each (comma list, no spaces, at most 16)
+  mkdir <path>        create the directory <path>
+  mkdir <path> parents   create missing parent dirs too
+  mkdir <a>,<b>,...   create several directories (comma-separated)
   mkdir version       print the version
   mkdir help          print this message
 
 <path> = [index:]label/path | /abs | rel   (see docs/drives.md §4.1)
 ```
+
+A comma list has no spaces and at most 16 items (`LIST_MAX`); a longer one is refused before
+anything is created.
 
 ## 3. Behaviour & bounds
 

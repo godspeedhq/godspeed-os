@@ -22,9 +22,11 @@ conversation (phase 2), keeps a displaced client request in a bounded stash rath
 (phase 3, §9), carries a correlation tag on the client hop so a late reply is discarded instead of
 misread (§8), and runs a bounded poll step when no client is asking.
 
-What remains is the API. A long-lived connection needs to be a thing a client can HOLD - a TCP
-connection as a delegated resource capability, the way a file and a UDP socket already are - plus
-`listen`/`accept` so the machine can serve rather than only fetch. Both are ordinary work now.
+Both halves of the API that this needed now exist. A long-lived connection is a thing a client can
+HOLD - a TCP connection as a delegated resource capability, the way a file and a UDP socket are
+(`gs::net::Net::connect`, which `godspeed` uses for its TLS connection to the registry) - and
+`listen`/`accept` let the machine serve rather than only fetch (`serve`, `utilities/49_serve.md`).
+`tcp` itself stays one transaction.
 
 ## What the protocol actually implements
 

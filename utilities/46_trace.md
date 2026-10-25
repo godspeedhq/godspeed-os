@@ -267,7 +267,7 @@ endpoint. Three shapes of answer:
 | first line | means |
 |---|---|
 | `owned by task N "name" (state)` | a live service's endpoint |
-| `console_push (id 4) - a kernel resource, not an endpoint` | ids 1-5 are stable kernel resources (`log_write`, `spawn`, `console_read`, `console_push`, `introspect`). They have no owning task by design |
+| `console_push (id 4) - a kernel resource, not an endpoint: it has no owning task` | ids 1-18 are the kernel's fixed resources (`log_write`, `spawn`, `console_read`, `console_push`, `introspect`, ... - `AUTHORITIES` in the SDK names them all). They have no owning task by design |
 | `NO LIVE OWNER` | either the owning task died, or it is a REPLY-only endpoint. A task's reply mailbox is not its primary one, and only primaries are named here |
 
 | column | what it holds |
@@ -400,20 +400,20 @@ exists for. `reply-dead` still passes 5/5, so reading a stuck chain changes noth
 ### What `trace deps` reads, and what it cannot
 
 ```text
-   contract (fs.toml)          kernel service_config          fs's LIVE cap table
-   ipc_send = [...]     --->   send_peers = [...]      --->   [ SEND -> ep 42 ]
+   contract (fs.toml)          supervisor spawn request       fs's LIVE cap table
+   ipc_send = [...]     --->   send peers (IMAGES row) --->   [ SEND -> ep 42 ]
         |                            |                        [ SEND -> ep 51 ]
         |                            |                               |
-   host-only:                  inside the kernel:               task_caps(slot)
-   reconciled at build         not readable from a                    |
-   time, never ships           service                                v
+   host-only:                  inside the supervisor:           task_caps(slot)
+   reconciled at build         no query answers it                    |
+   time, never ships                                                  v
                                                               trace deps  <-- reads THIS
 ```
 
 `trace deps` walks the right-hand column: capabilities a service is holding right now, each endpoint
 resolved back to its owning task. The left-hand columns are what "declared" would mean, and neither is
-reachable without new kernel surface - which is why that view waits for the supervisor to own service
-policy.
+reachable today: the contract never ships, and the supervisor, which holds each service's send peers
+in its spawn table (CLAUDE.md 14.1), has no query that answers with them.
 
 ### `trace deps` and `trace endpoint`: authority, in both directions
 
@@ -430,6 +430,10 @@ net-stack                            endpoint 4 - NO LIVE OWNER.
         `-- events  (trace sink - its own traffic is never recorded)
 (3 reply address(es) not shown: reply#119 reply#107 - `trace endpoint <id>` resolves one)
 ```
+
+(An early capture. Today id 4 answers `console_push (id 4) - a kernel resource, not an endpoint`, and
+the closing line is a count and the pipe that lists them, `(3 reply address(es) hidden - ...)`, as in
+the reference section above.)
 
 Both are built from the LIVE capability table (`task_caps`), not from a contract: a row is not "the
 toml says it may call block-driver", it is "this service is holding, right now, a SEND capability
@@ -459,12 +463,11 @@ Four bugs surfaced only because the tree draws structure a table hides, and each
    dropping them hides real dependencies, including them silently shows return addresses as
    dependencies, and an honest ambiguity beats a confident wrong answer in either direction.
 
-**What it deliberately does NOT show: DECLARED dependencies.** A contract's `ipc_send` list lives in
-`service_config` inside the kernel (the `.toml` never ships - `contract_check.py` reconciles it at
-build time), so `trace deps <svc> declared` would need a new `InspectKernel` query: kernel-surface
-growth for a diagnostic, which this project does not do. It is deferred to the work that moves the
-service catalogue into the supervisor, after which the supervisor owns that policy and the query is
-service-to-service with the kernel uninvolved.
+**What it deliberately does NOT show: DECLARED dependencies.** A service's send peers live in the
+supervisor's spawn table, the row it sends the kernel in each spawn request (CLAUDE.md 13.6; the
+`.toml` never ships - `contract_check.py` reconciles it at build time). The service catalogue has moved
+into the supervisor, so a `trace deps <svc> declared` would be a supervisor query, service-to-service
+with the kernel uninvolved - and no such query exists yet, so the view is not built.
 
 ## 9. Open questions for review
 
@@ -489,8 +492,8 @@ service-to-service with the kernel uninvolved.
 ## The instrument must not hang on what it measures
 
 Every ask to `events` is bounded at 5 seconds and escapable with `q`, advertising `[q] quit` once
-the wait lingers past 2 s (`trace_ask`, through `gs::call::request_within_notice`; a timeout is
-retried twice, reacquiring `events` by name between attempts). That matters more here than for an ordinary command: `events failures` is what you
+the wait lingers past 2 s (`trace_ask`, through the command's watch, `gs::call::request_watched`, or
+`gs::call::request_within_notice` between commands; a timeout is retried twice, reacquiring `events` by name between attempts). That matters more here than for an ordinary command: `events failures` is what you
 reach for WHEN something is wedged, so an instrument that can itself wedge takes the prompt with it
 and leaves you with a power button. It used to use a bare `request_with_reply`, which parks the shell
 inside the syscall where it cannot read the keyboard (`backlog/fixed/29`, conventions rule 10).

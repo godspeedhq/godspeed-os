@@ -84,7 +84,7 @@ usage:
   dir                       list the current directory
   dir <path>                list the directory at <path>
   dir bytes                 sizes as an exact byte count, not KiB/MiB/GiB
-  dir [path] | <verb>       piped: emits records (name/type/size)
+  dir [path] | <verb>       piped: emits records name/type/size
   dir | select … / sort …   project / order the listing
   dir version               print the version
   dir help                  print this message

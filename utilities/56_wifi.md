@@ -110,10 +110,9 @@ What every verb does, and what was seen:
   point drops goes on reading as joined, and is not rejoined; `wifi join` brings it back. The onboard
   radios (the Pi 4's and the VisionFive's) report the drop. Recorded 2026-10-08.
 
-One limitation of the record format, recorded rather than left for a pipe to find: SSIDs may contain
-spaces, and `ssid` is the first field, so a positional filter on the second field will misread such a row.
-This file puts `ssid` first; the fix, if wanted, is a design decision about field order and not a bug in
-the scan.
+SSIDs may contain spaces. In a pipe that costs nothing - the name is its own record column, `network`
+(section 3) - and on the screen it is padded to a fixed column, so a name with a space in it does not
+shift the columns after it.
 
 **Why this file moved here, which is a small lesson about the gates.** It was written as
 `utilities/56_wifi.md` and Commandment X refused it: a spec under `utilities/` asserts the shell
@@ -214,8 +213,9 @@ once for both. `match`, `first` and `last` are text stages and refuse a record s
 `where` - the same rule as `dir` and `observe now`. (It was text in a pipe for one morning, 2026-10-02,
 and `wifi list | match WPA2` worked then; `where security=WPA2` is its record form. `docs/wifi.md` 58.)
 
-**The reports pipe; the actions do not.** `list`, `stored`, `status`, `info`, `debug` and `version` can start
-a pipe. `scan`, `join`, `leave`, `forget` and `radio ...` are actions, and refuse with a sentence that names
+**The reports pipe; the actions do not.** `list`, `stored`, `status`, `info`, `debug`, `hardware` (and
+`hardware <radio>`) and `version` can start a pipe. `scan`, `join`, `leave`, `forget`, `radio ...` and
+`hardware use` are actions, and refuse with a sentence that names
 the reports: their output is a conversation, not data - `join` reads a passphrase from the console, and in
 a pipe its prompt would disappear while it waited. A report that fails (no scan yet, a scan running, the
 radio down) says why on the CONSOLE and stops the pipe, and an empty scan gives a pipe no rows at all, so
@@ -273,7 +273,7 @@ derived view is never served as current when it is not. An empty list would say 
 radio nobody asked; the old cache during a sweep would hand a pipe stale rows with nothing marking them
 stale. An error goes to nobody's pipe.
 
-`wifi stored` is a producer of one field, `ssid`. It exists so that "which networks do I have a
+`wifi stored` is a producer of one network name per line. It exists so that "which networks do I have a
 password for" is answerable without a way to ask "what is the password", which is not a supported
 question at any privilege level.
 
@@ -327,13 +327,13 @@ join: 1
  1  Maple-House                       5GHz    excellent  -41  WPA2      joined
 passphrase (not shown):
 joining Maple-House
-joined Maple-House on 5GHz, bssid 02:1a:7e:c4:09:51 - the link is up and the handshake completed
+joined Maple-House
   (for the address, type net)
 ```
 
-The BSSID and band in the last line come from the association event, not from the row - the row said
-which network was asked for, the event says which access point answered, and where they differ the
-event is the truth. `wifi info` shows it.
+The `joined` line names the network only. Which access point answered - its BSSID and band - is `wifi
+info`, read from the firmware: the row said which network was asked for, the firmware says which access
+point answered, and where they differ the firmware is the truth.
 
 An `open` network skips the passphrase prompt. A `WEP` network is refused at the pick with `WEP is
 not supported` (section 9) rather than asked for a key it will not use. A `(hidden)` row **cannot be
@@ -388,7 +388,7 @@ The driver owns the cache: it already holds the scan result, and it is the one p
 between shell commands. It is bounded at 32 networks, replaced only by a completed `wifi scan`, and
 lost with the driver - a respawned driver starts with no cache and `wifi list` says `no scan yet`.
 
-Its age is always available. `wifi scan` ends with `11 networks in 2.8 s`; `wifi status` carries
+Its age is always available. `wifi scan` ends with `11 networks in 3 s` (whole seconds); `wifi status` carries
 `last scan: 42 s ago, 11 networks`. `wifi list` itself stays records-only so pipes stay clean - the
 age is one command away, never mixed into the data.
 
@@ -857,7 +857,8 @@ what the machine tells its owner.
 
 **Refused, with a sentence:** a name that is not in the report: `no radio called 'usb-9999' - wifi
 hardware lists them`; and plain `usb` when there are two dongles: `there are two USB radios - usb-1a0d or
-usb-77e2`. These are section 11's sentences, shared.
+usb-77e2` - designed with the two-dongle names and, like them, not built. These are section 11's
+sentences, shared.
 
 **More than one dongle is named now and built later.** Today each USB host binds one radio, and one
 `wifi-usb` drives one dongle. Two need either a `wifi-usb` per dongle or one serving several, plus a host

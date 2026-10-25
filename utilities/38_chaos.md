@@ -42,7 +42,8 @@ console-only (§5b).
 
 Only **recoverable** services are valid `kill-storm` targets - the kernel itself **cannot be killed**,
 and killing a non-recoverable thing would just wedge. The list is `CHAOS_RESTARTABLE` in the shell
-(the same list `kill all-services` expands to); anything else is refused:
+(not the set `kill all-services` kills, which is asked of the supervisor, its `MANAGED` set); anything
+else is refused:
 
 | Target | Recovered by |
 |---|---|

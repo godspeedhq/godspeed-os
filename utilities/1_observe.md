@@ -18,8 +18,9 @@ queue depth, restarts, CPU time, uptime) plus a system summary (uptime, per-core
 CPU%, RAM).
 
 `observe` reports raw metrics. It does **not** render a verdict - "is everything
-OK?" is the future job of a separate `status` utility (see §9). Keeping the two
-apart is deliberate: `observe` = *what is happening*; `status` = *is it healthy*.
+OK?" is answered elsewhere: by `ask` (`60_ask.md`) and the `health` library script
+(see §9). Keeping the two apart is deliberate: `observe` = *what is happening*; the
+verdict is a separate utility's.
 
 ---
 
@@ -30,7 +31,7 @@ apart is deliberate: `observe` = *what is happening*; `status` = *is it healthy*
 | `observe` | **Continuous** live-refreshing view. Repaints in place until you press `q`. |
 | `observe now` | **Static** one-shot frame. Prints once, returns to `gsh>`. |
 | `observe help` | Usage for the utility (modes, subcommands, version header). |
-| `observe now help` | Usage for the static subcommand (what the columns mean). |
+| `observe now help` | Usage for the static subcommand (one row: `print a single metrics frame and return`). |
 | `observe version` | Prints `observe 0.4.0`. |
 
 `observe` (bare verb) means *ongoing observation* - that is why the live view is
@@ -84,13 +85,14 @@ them; what remains below is `observe`'s own normative help output.
 observe 0.4.0 - live system metrics view (records when piped)
 
 usage:
-  observe          watch live metrics (refreshes until you press q)
-  observe now      print a single metrics frame and return
-  observe version  print the version
-  observe help     print this message
-
-subcommand help:
-  observe now help
+  observe                       full-screen live view; q quits
+      e.g. observe
+  observe now                   one-shot metrics frame
+      e.g. observe now
+  observe now | <verb>          piped: records + a 'ticks' (cpu-time) column
+      e.g. observe now | sort reverse ticks
+  observe version
+  observe help
 ```
 
 ---
@@ -272,7 +274,7 @@ supervisor's spawn request, not from the contract (CLAUDE.md §13.6, §14.1).
 
 ## 9. Out of scope / non-goals
 
-- **Health verdicts.** Reserved for a future `status` utility (is-everything-OK).
+- **Health verdicts.** `ask` (`60_ask.md`) and the `health` library script answer is-everything-OK; `status` is the task list (`7_status.md`).
 - **Filtering/sorting/search** (top-style `P`/`M` sort keys). Not v1.
 - **Per-task drill-down** (cap list, held resources). A later `observe <name>`
   subcommand could add this; not now.

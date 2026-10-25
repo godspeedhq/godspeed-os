@@ -53,9 +53,9 @@ banana: unknown
   confusion this line dissolves. The dual commands (`sort`, `match`, `count`, `first`, `last`)
   run bare on files too, so bare they are built-ins.
 - **`unknown` returns `Err`** (`assert fails whatis banana` holds).
-- **"Shell built-in" means the shell's `UTILS` list**, and a few built-ins are not on it
-  (`fmt`, `tcp`, `serve`, `random`, `gpio`), so `whatis` calls them `unknown` - a code defect.
-  A service that is not running is recognised only if it is in the shell's `KNOWN_SERVICES`
+- **"Shell built-in" means the shell's `UTILS` list**, which holds every command the shell
+  dispatches (`fmt`, `tcp`, `serve`, `random` and `gpio` were missing from it, and called
+  `unknown`, until `backlog/fixed/80` H8). A service that is not running is recognised only if it is in the shell's `KNOWN_SERVICES`
   list, which is shorter than the supervisor's roster.
 
 ## 4. The lens (one deliberate ambiguity)

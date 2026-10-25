@@ -39,8 +39,9 @@ write, send, recv, grant, revoke). The kernel's fixed resources, ids 1-18, are n
 (1=log_write, 2=spawn, 3=console_read, 4=console_push, 5=introspect,
 6=service_control, 7=resource_mint, 8=reboot, 9=acquire_any, 10=net_device,
 11=gpio_device, 12=usb_disk, 13=set_clock, 14=fire_irq, 15=image_spawn, 16=pci_cfg,
-17=device_power, 18=cpu_clock); any larger id is an IPC endpoint and prints as
-`endpoint#N`. A task holding nothing prints `(none)`; a name with no live task is
+17=device_power, 18=cpu_clock, from `AUTHORITIES` in the SDK); any other id prints
+as `endpoint#N`. That includes 19, the kernel's `POWER_OFF` resource, which the table
+does not name, so the shell's own `caps` shows it as `endpoint#19`. A task holding nothing prints `(none)`; a name with no live task is
 `caps: no such live service` and an `Err`.
 
 ## 3a. As a record producer (typed pipes)

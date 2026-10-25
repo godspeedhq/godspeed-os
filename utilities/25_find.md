@@ -22,12 +22,13 @@ It is whole-filesystem **enumeration**: the one operation that reads across the 
 rather than a single path or directory.
 
 ```
-find 0.4.0 - search the tree by name (substring, or glob with */?)
+find 0.4.0 - search the tree by name (substring/glob; records when piped)
 
 usage:
-  find <name>            search from / for entries whose name contains <name>
-  find <glob>            glob match: * = any run, ? = one char (e.g. find *.txt)
-  find <pattern> <path>  search only the subtree under <path>
+  find <name>            matches names containing <name>
+  find <glob>            glob match: * = any run, ? = one char
+  find <pattern> <path>  search only under <path>
+  find … | <verb>        piped: records name/type/path
   find version           print the version
   find help              print this message
 
@@ -72,9 +73,11 @@ there is no chunked-reply problem - the shell just keeps asking `fs` to list dir
 
 The walk holds a **bounded stack** of pending directories (`FIND_QCAP`, currently 32). A
 tree wide/deep enough to exceed it does not silently drop results - `find` prints
-`find: search truncated …` so the user knows the answer is partial. A directory that could
-not be read to the end (past `DIR_PAGE_MAX` pages, or any failed listing) prints `find:
-INCOMPLETE - ...`. The glob matcher is itself bounded: iterative backtracking (`glob_match`),
+`find: search truncated …` so the user knows the answer is partial. A directory too large
+to read to the end (past `DIR_PAGE_MAX` pages) prints `find: INCOMPLETE - ...`; one whose listing
+failed prints `find: could not read <dir> - <reason>`, the search goes on, and the summary adds
+`find: N director(y/ies) could not be read - the answer is incomplete`. Either way the command
+ends `Err`. A start path that is not a directory is refused: `find: not a directory: <path>`. The glob matcher is itself bounded: iterative backtracking (`glob_match`),
 no recursion and no allocation.
 
 ## 4. Why no `fs_index` yet

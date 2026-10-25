@@ -16,23 +16,27 @@ cryptic; `delete` says it plainly. It is destructive, so it is **loud** about wh
 ## 2. Usage
 
 ```
-delete 0.4.0 - remove a file or directory
+delete 0.4.0 - remove a file, empty directory, or whole subtree
 
 usage:
-  delete <path>             remove the file or empty directory at <path>
-  delete <path> recursive   remove the directory <path> and everything under it
-  delete <a>,<b>,...        remove each (comma list, no spaces, at most 16)
+  delete <path>             remove the file/empty dir <path>
+  delete <path> recursive   remove directory <path> and everything under it
+  delete <a>,<b>,...        remove several (comma-separated; recursive applies to all)
   delete version            print the version
   delete help               print this message
 
 <path> = [index:]label/path | /abs | rel   (see docs/drives.md §4.1)
 ```
 
+A comma list has no spaces and at most 16 items (`LIST_MAX`); a longer one is refused before
+anything is removed.
+
 ## 3. Behaviour
 
 `delete <path>` removes the directory entry **and frees the data blocks** in the bitmap
 (GSFS0003 reclamation is intrinsic). A non-empty directory is a **loud error** by default -
-no accidental tree wipes - and the error names the opt-in (`use 'delete <path> recursive'`).
+no accidental tree wipes - and the error names the opt-in (`delete: failed - directory not empty
+(a non-empty directory needs 'delete <path> recursive')`).
 
 `delete <path> recursive` removes a non-empty directory and its whole subtree. The safe
 default is deliberate (mirrors `mkdir … parents`, `copy … recursive`): the destructive

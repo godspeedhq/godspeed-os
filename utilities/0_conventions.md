@@ -53,8 +53,8 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
 6. **`help` output carries the version header.** Line 1 of any help/usage output is
    `<util> <version>`, so the version is always one keystroke away.
 7. **Utilities report raw facts; they do not editorialize.** Health verdicts,
-   policy, and recommendations belong to purpose-built utilities (e.g. a future
-   `status` health view), not bolted onto a metrics or info command.
+   policy, and recommendations belong to purpose-built utilities (e.g. `ask`,
+   `60_ask.md`), not bolted onto a metrics or info command.
 8. **Vocabulary is not POSIX.** GodspeedOS has no fork/exec/errno/signals, so the
    user-facing words do not borrow POSIX names that would imply that heritage.
    Concretely: the clock's epoch subcommand is `date epoch` ("seconds since 1970"),
@@ -86,7 +86,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    `<util> version` and `<util> help` (rules 5-6), so `complete_keyword` appends them to every
    command's first-argument completion automatically. Do **not** add `version`/`help` to a
    `SUBCMD_FIRST` entry (they are deduped in). A utility that takes **no positional first
-   argument** (an info command: `about`, `version`, `mem`, `cores`, `uptime`, `status`, ...) has
+   argument** (an info command: `about`, `version`, `mem`, `uptime`, `status`, ...) has
    the universal `version`/`help` as its *only* first-arg subcommands - add it to **`INFO_CMDS`**
    (beside `NO_PATH_CMDS`) so those two complete and Tab never falls through to a filesystem
    listing. So a new utility is exactly one of: a **path** command (in neither list), a **keyword**
@@ -247,6 +247,11 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     *(Note 2026-10-09: the count above is dated. `audio` and `hardware` have since joined `UTILS` and
     both are in `is_producer_builtin`, so `UTILS` now holds 68 names and 29 of them start a pipe; the
     17 stages and the 22 non-sources are unchanged.)*
+
+    *(Note 2026-10-25: recounted. `UTILS` holds 82 names and 34 of them start a pipe - `ask`,
+    `godspeed` (its reports only), `audio` (its reports only) and `hardware` joined, and `random` and
+    `tcp` are in `UTILS` now, as are `serve`, `gpio`, `spawncap` and `spawnwired`. The 17 stages are
+    unchanged; the other 31 are not sources, `shutdown` and `download` among the actions.)*
 13. **If it does not fit the common pipes, `write` still captures it.** Any producer's output
     snapshots to a file with `| write <path>` (redirection is `| write`; there is no `>`, see
     `19_write.md`). So even a utility that is not a record source is never trapped on screen -
@@ -255,8 +260,9 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     `spawn ping,pong`, `restart fs,events`, `delete /a,/b`, `mkdir docs,tmp`, `fmt a.gsh,b.gsh`,
     `chaos max-carnage nic-driver,net-stack` - one argument, comma-delimited. NOT spaced
     (`kill ehci xhci fs`): the shell tokenizes a line to a small fixed arg count (`MAX_ARGS = 8`), so a
-    spaced list silently caps at ~3 targets, while a comma-list is a SINGLE token and is therefore
-    unbounded. Comma is also the one uniform rule - the same separator on every command - so the user
+    spaced list silently caps at ~3 targets, while a comma-list is a SINGLE token and is not
+    capped by it (a list takes at most 16 items, `LIST_MAX`; a longer one is refused before anything
+    runs). Comma is also the one uniform rule - the same separator on every command - so the user
     never has to guess which verb wants which shape. Each target runs the command's normal
     single-target path (same guards, same per-target report); a failure on one does not abort the
     rest; the set is bounded. A single target with no comma behaves exactly as before. The keyword
@@ -272,16 +278,16 @@ everyone knows what `<path>` should be filled with):
 <util> <version> - <one-line description>
 
 usage:
-  <util>                      <default behaviour>
+  <util>                        <default behaviour>
       e.g. <real example>
-  <util> <subcmd>             <what the subcommand does>
+  <util> <subcmd>               <what the subcommand does>
       e.g. <real example>
-  <util> version              print the version
-  <util> help                 print this message
-
-subcommand help:
-  <util> <subcmd> help        (same shape, focused on the subcommand)
+  <util> version
+  <util> help
 ```
+
+`<util> <subcmd> help` prints the same shape for that subcommand, without the
+`version` / `help` footer (`help_block` in `services/shell/src/main.rs`).
 
 `version` output is the name + version number, then the creator credit:
 

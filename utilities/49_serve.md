@@ -85,8 +85,8 @@ Bytes outside printable ASCII render as `.`, so a peer cannot spray control code
 
 Waits for as long as you asked - by default until `q`, `Q` or ESC - and at most 10 seconds for an
 accepted peer to send something. A duration whose NUMBER is over a year of seconds is refused as a
-typo rather than honoured; the check is made before the unit is applied, so `400d` is accepted (a
-code defect in `parse_duration`).
+typo rather than honoured. The check is made on the seconds, after the unit is applied, so `400d` is
+refused too.
 
 While it waits it says so every ten seconds, because two minutes of a mute prompt is
 indistinguishable from a wedged one.
@@ -109,8 +109,9 @@ finished and revokes it, so the holder's next call gets `CapRevoked` from the ke
 
 **It does not always land, and that is recorded rather than hidden** (`backlog/28`). The release is a
 round trip, and measured over a dozen QEMU runs it failed a couple of times - leaving the port
-registered and the next `serve` on it refused. `serve` retries three times and says
-`the port was NOT released` if it still fails, so the condition is visible; the underlying asymmetry
+registered and the next `serve` on it refused. `serve` asks once and says
+`serve: the port was NOT released (...) - the next `serve` on it will be refused` if that fails, so
+the condition is visible; the underlying asymmetry
 is that the kernel does not tell a service when a capability is dropped, so a port cannot release
 itself and a client that dies will always leak one.
 
@@ -137,7 +138,8 @@ all: the segment reached us from that address, which is the one fact that never 
 | the stack has no address yet | `net-stack would not listen on that port`, and net-stack's log says which of the three reasons it was |
 | the port is already listened on, or every listener slot is in use | the same line; net-stack's log distinguishes them |
 | nobody connected in time | `serve: <n>s elapsed, 0 connection(s) served`, when a duration was given |
-| you pressed `q` | `serve: aborted`, and the port is released |
+| you pressed `q` while it waited | `serve: stopped after N connection(s)`, and the port is released |
+| you pressed `q` while the port was still being opened | `serve: aborted`; nothing was granted, so nothing is released |
 | the peer connected and sent nothing | `the peer connected but sent nothing` |
 
 ## Conventions
