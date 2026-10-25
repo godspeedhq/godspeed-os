@@ -116,15 +116,19 @@ registers, its interrupt and a DMA arena - without sending or receiving a frame.
 configuration registers unlocked (`9346CR`), points its receive ring and both transmit rings at rings of one
 descriptor the host owns in its arena, raises the chip's forced software interrupt (`TxPoll.FSWInt`, `SWInt`) with
 the transmitter on and waits for it, then has the chip dump its tally counters into the arena by DMA (`DTCCR`), with
-a guard after them that must stay untouched, logging `kind-rtl: took the RTL8168 over - reset done, rings in this
-arena (TNPDS ... THPDS ... RDSAR ..., arena ...), MAC ..., link ...; software interrupt raised and taken (ISR ...); tally by DMA written (N of 64 bytes changed): TxOk ... RxOk ... missed ..., the 64 bytes
-after it untouched`. When no interrupt comes it says whether the chip latched `SWInt` (the interrupt was not
+a guard after them that must stay untouched, logging one line per step: `kind-rtl: step 1 of 4 - stopped and
+reset done; MAC ..., link ...`, `step 2 of 4 - rings in this arena: TNPDS ... THPDS ... RDSAR ..., arena ..., tally at
+...`, `step 3 of 4 - software interrupt raised and taken (ISR ...)` and `step 4 of 4 - tally by DMA written (N of 64
+bytes changed): TxOk ... RxOk ... missed ..., the 64 bytes after it untouched`. When no interrupt comes it says whether the chip latched `SWInt` (the interrupt was not
 delivered) or did not. Rebuilt 2026-10-25 after the first T630 card: that one wrote `TxPoll` with the transmit rings
 still pointing at the stood-down `nic-driver`'s memory, and the confined chip read outside its arena (refused by the
 IOMMU), and its interrupt did not come. Rebuilt again the same day after the second: with the rings in its arena
 the tally was written (TxOk 27790), but the chip still read outside the arena once, at another address, and `ISR`
 never showed `SWInt` - so it now resets the chip and writes the ring addresses unlocked, and reads them back and
-prints `ISR`, so the next card shows whether they took. On the T630 the arena is the IOMMU-confined one. On anything but an
+prints `ISR`, so the next card shows whether they took. They took, and the chip read `0x99300` again, so it was
+rebuilt a third time: one line per step (0 given the chip, 1 stopped and reset, 2 rings, 3 the interrupt, 4 the
+tally, then done), each followed by a two-second pause, so the IOMMU's fault report, which comes a few hundred
+milliseconds late, falls after the step that caused it. On the T630 the arena is the IOMMU-confined one. On anything but an
 RTL8168 it says so and touches nothing, which is all `osdev test driver-packages` sees of it on QEMU's e1000 (no MSI,
 so no interrupt is routed there either). Packaged as the files above.
 
