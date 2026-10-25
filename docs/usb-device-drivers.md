@@ -148,6 +148,14 @@ refused its configuration is moved off 100 too. Shown in QEMU (`osdev test drive
 (`usb-kbd,usb_version=2`) on one root port and a stick plugged into another after it; before the change the stick
 was read as the keyboard, `0627:0001`, and now it is bound as itself.
 
+**The WiFi dongle on `ehci` is not verified, and is out of scope for now (operator, 2026-10-25).** The T630 card
+after that fix booted the image before it (`248246c2`), so it showed neither the fix nor its absence. The operator
+chose not to spend further cards on it: the dongle works through `xhci`'s sockets, and `wifi-usb` would still need
+notices `ehci` does not send. Recorded with it, from the same card: typing on a keyboard in a back socket lags
+slightly. `ehci` says why in its own log - `a HID report arrived with no interrupt - polling input at the 10ms
+tick` - so keystrokes are taken on the scheduler tick rather than when they arrive. Not changed by this branch, not
+investigated.
+
 **The report names its host.** `usbdev`'s report gained a byte, the host (`HOST_DWC2`, `HOST_XHCI`, `HOST_EHCI`),
 because a PC now has two hosts that report and "nothing attached" from one said nothing of the other. The supervisor
 keeps what each host last reported (`UsbState::by_host`, `Installed::usb_attached`): a package is started with the
