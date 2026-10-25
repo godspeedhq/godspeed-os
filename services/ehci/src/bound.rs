@@ -36,6 +36,9 @@ use crate::{await_hw, control_data, wait as wait_reg, Ep, Parts, CMD_ASE, CMD_IA
 /// The address a bound device is given. Clear of the hub (1) and the keyboard and mouse (2 and 3, `scan_devices`),
 /// so binding never moves a device the HID path addressed.
 pub const BOUND_ADDR: u8 = 100;
+/// Where a device this host does not bind is moved: off the default address 0, which every later device is first
+/// read at, and off `BOUND_ADDR`. Nothing is ever sent here, so several devices parked together do not matter.
+const PARK_ADDR: u8 = 101;
 
 /// How long a bulk IN waits for the device before it says nothing came. A device with nothing to send NAKs; this
 /// host has no notice to send when it has something, so the driver's next ask is how it learns.
@@ -214,8 +217,42 @@ pub fn bindable(class: u8) -> bool {
 
 /// Read the device at address 0 on `ep0` (its speed and packet size known), and if its first interface is one this
 /// host binds, address it at `BOUND_ADDR`, configure it, and find its bulk endpoints. `None`, said, when it is not
-/// bindable or a step fails - a device not bound is left where it was.
+/// bindable or a step fails - and then the device is moved to `PARK_ADDR`.
+///
+/// **Why a device not bound is moved (found on the T630 card, 2026-10-25).** It used to be left where it was, which
+/// for one turned away at its descriptor is address 0. A high-speed device sees every high-speed transaction on the
+/// bus, so the boot stick on one back socket - mass storage, never bound - answered for every high-speed device
+/// plugged in after it: the WiFi dongle on another socket was read as `1f75:0902`, the stick, and never bound. A
+/// low-speed keyboard did not show it, because its transactions go through the hub's translator, which the stick
+/// does not see.
 pub fn try_bind(ctx: &ServiceContext, hw: &Hw, ep0: Ep, root: u8, hub_port: u8, gen: u32) -> Option<Bound> {
+    match bind(ctx, hw, ep0, root, hub_port, gen) {
+        Ok(b) => Some(b),
+        Err(at) => {
+            park(ctx, hw, Ep { addr: at, ..ep0 }, Where(root, hub_port));
+            None
+        }
+    }
+}
+
+/// Move a device not bound from `ep0`'s address to `PARK_ADDR`. Best effort, and said when it fails: a device that
+/// did not answer its descriptor will not answer this either, and then nothing else is answering at address 0.
+fn park(ctx: &ServiceContext, hw: &Hw, ep0: Ep, at: Where) {
+    let setup = [0x00, 0x05, PARK_ADDR, 0, 0, 0, 0, 0]; // Set_Address(PARK_ADDR)
+    for _ in 0..3 {
+        if control_data(ctx, hw.mmio, hw.dma, hw.op, hw.said, &ep0, &setup, 0, false, &[]).is_some() {
+            delay::hold_parked(ctx, RECOVERY); // SetAddress recovery (>= 2 ms)
+            ctx.log_fmt(format_args!("ehci: the device not bound on {} moved to address {}, off the default address", at, PARK_ADDR));
+            return;
+        }
+        delay::hold_parked(ctx, RECOVERY);
+    }
+    ctx.log_fmt(format_args!("ehci: the device not bound on {} did not take Set_Address({}) - it may still answer at address {}", at, PARK_ADDR, ep0.addr));
+}
+
+/// `try_bind`'s steps. `Err` carries the address the device is at when it is not bound: 0, or `BOUND_ADDR` when it
+/// took its address and then refused its configuration.
+fn bind(ctx: &ServiceContext, hw: &Hw, ep0: Ep, root: u8, hub_port: u8, gen: u32) -> Result<Bound, u8> {
     let (mmio, dma, op, said) = (hw.mmio, hw.dma, hw.op, hw.said);
     let ctl = |ep: &Ep, setup: [u8; 8], len: usize, in_dir: bool, tries: u32| -> Option<usize> {
         for _ in 0..tries {
@@ -227,14 +264,14 @@ pub fn try_bind(ctx: &ServiceContext, hw: &Hw, ep0: Ep, root: u8, hub_port: u8, 
         None
     };
     let at = Where(root, hub_port);
-    ctl(&ep0, [0x80, 0x06, 0x00, 0x01, 0, 0, 18, 0], 18, true, 5)?;
+    ctl(&ep0, [0x80, 0x06, 0x00, 0x01, 0, 0, 18, 0], 18, true, 5).ok_or(0)?;
     let vid = dma.ctl.read16(DATA_BUF + 8);
     let pid = dma.ctl.read16(DATA_BUF + 10);
     // The configuration descriptor: nine bytes for its length, then all of it that fits.
-    ctl(&ep0, [0x80, 0x06, 0x00, 0x02, 0, 0, 9, 0], 9, true, 5)?;
+    ctl(&ep0, [0x80, 0x06, 0x00, 0x02, 0, 0, 9, 0], 9, true, 5).ok_or(0)?;
     let total = (dma.ctl.read16(DATA_BUF + 2) as usize).clamp(9, CONFIG_MAX);
     let [tlo, thi] = (total as u16).to_le_bytes();
-    let got = ctl(&ep0, [0x80, 0x06, 0x00, 0x02, 0, 0, tlo, thi], total, true, 5)?;
+    let got = ctl(&ep0, [0x80, 0x06, 0x00, 0x02, 0, 0, tlo, thi], total, true, 5).ok_or(0)?;
     let cfg = dma.ctl.read8(DATA_BUF + 5);
     let mut b = Bound {
         vid, pid, gen, ep0: Ep { addr: BOUND_ADDR, ..ep0 }, root, hub_port,
@@ -280,21 +317,21 @@ pub fn try_bind(ctx: &ServiceContext, hw: &Hw, ep0: Ep, root: u8, hub_port: u8, 
         ctx.log_fmt(format_args!(
             "ehci: USB device {:04x}:{:04x} on {} - interface class {:#04x}, not one this host binds for a driver of its own",
             vid, pid, at, class));
-        return None;
+        return Err(0);
     }
     if ctl(&ep0, [0x00, 0x05, BOUND_ADDR, 0, 0, 0, 0, 0], 0, false, 5).is_none() {
         ctx.log_fmt(format_args!("ehci: USB device {:04x}:{:04x} on {} did not take Set_Address - not bound", vid, pid, at));
-        return None;
+        return Err(0);
     }
     delay::hold_parked(ctx, RECOVERY); // SetAddress recovery (>= 2 ms)
     if ctl(&b.ep0, [0x00, 0x09, cfg, 0, 0, 0, 0, 0], 0, false, 5).is_none() {
         ctx.log_fmt(format_args!("ehci: USB device {:04x}:{:04x} on {} did not take Set_Configuration - not bound", vid, pid, at));
-        return None;
+        return Err(BOUND_ADDR);
     }
     ctx.log_fmt(format_args!(
         "ehci: USB device {:04x}:{:04x} on {} bound for a driver of its own - {} speed, address {}, interface class {:#04x}, bulk IN {:#04x}, {} bulk OUT",
         vid, pid, at, match ep0.speed { 2 => "high", 1 => "low", _ => "full" }, BOUND_ADDR, class, b.in_addr, b.n_out));
-    Some(b)
+    Ok(b)
 }
 
 /// Where a device is, for a log line: `root port 1`, or `root port 1 > hub port 3`.

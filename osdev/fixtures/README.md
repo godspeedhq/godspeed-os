@@ -112,11 +112,15 @@ An UNPUBLISHED driver package for a HARDWARE card on the T630 and the Wyse, sign
 `x86_64` only: a driver that takes the Realtek RTL8168 over from `nic-driver` and uses all three grants on it - its
 registers, its interrupt and a DMA arena - without sending or receiving a frame. Made 2026-10-23 from a copy of
 `kind-nic` whose contract adds `hw_pci_irq = true` and `hw_dma = "8KiB"`, and whose `src/main.rs` stops the chip
-(interrupts masked, receive and transmit off), raises the chip's forced software interrupt (`TxPoll.FSWInt`, `SWInt`)
-and waits for it, then points the receiver at a ring of one descriptor the host owns in its arena and has the chip
-dump its tally counters there by DMA (`DTCCR`), with a guard after them that must stay untouched, logging `kind-rtl:
-took the RTL8168 over - MAC ..., link ...; software interrupt raised and taken; tally by DMA written: TxOk ... RxOk ...
-missed ..., the 64 bytes after it untouched`. On the T630 the arena is the IOMMU-confined one. On anything but an
+(interrupts masked, receive and transmit off), points its receive ring and both transmit rings at rings of one
+descriptor the host owns in its arena, raises the chip's forced software interrupt (`TxPoll.FSWInt`, `SWInt`) with
+the transmitter on and waits for it, then has the chip dump its tally counters into the arena by DMA (`DTCCR`), with
+a guard after them that must stay untouched, logging `kind-rtl: took the RTL8168 over - MAC ..., link ...; software
+interrupt raised and taken; tally by DMA written (N of 64 bytes changed): TxOk ... RxOk ... missed ..., the 64 bytes
+after it untouched`. When no interrupt comes it says whether the chip latched `SWInt` (the interrupt was not
+delivered) or did not. Rebuilt 2026-10-25 after the first T630 card: that one wrote `TxPoll` with the transmit rings
+still pointing at the stood-down `nic-driver`'s memory, and the confined chip read outside its arena (refused by the
+IOMMU), and its interrupt did not come. On the T630 the arena is the IOMMU-confined one. On anything but an
 RTL8168 it says so and touches nothing, which is all `osdev test driver-packages` sees of it on QEMU's e1000 (no MSI,
 so no interrupt is routed there either). Packaged as the files above.
 

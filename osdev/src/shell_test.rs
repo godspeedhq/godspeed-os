@@ -12594,6 +12594,28 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
                && moved.contains("supervisor: USB device 46f4:0001 attached on ehci"),
            "unplugged and plugged into another root port, the stick is found there, bound and reported again");
 
+    // A DEVICE NOT BOUND MUST NOT SIT ON ADDRESS 0 (the T630 card, 2026-10-25): its boot stick, mass storage and never
+    // bound, was left at the default address, and the WiFi dongle plugged in beside it was read as the stick. Here a
+    // HIGH-SPEED keyboard (`usb_version=2`), a HID this host never binds, goes on root port 2, and then the stick on
+    // root port 4: the stick must be read as itself and bound, not answered for by the keyboard.
+    monitor_cmd("device_del stick_dev2
+");
+    let _ = collect_until(&buf, &mut cursor, b"ehci: root port 3 is empty", Duration::from_secs(30));
+    monitor_cmd("device_add usb-kbd,usb_version=2,bus=ehci.0,port=2,id=hskbd
+");
+    let _ = collect_until(&buf, &mut cursor, b"not one this host binds", Duration::from_secs(30));
+    monitor_cmd(&format!("drive_add 0 if=none,id=stick3,format=raw,file={stick_str}
+"));
+    monitor_cmd("device_add usb-storage,bus=ehci.0,port=4,drive=stick3,id=stick_dev3
+");
+    let _ = collect_until(&buf, &mut cursor, b"on root port 4 bound", Duration::from_secs(30));
+    let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+    let beside = log.rfind("ehci: root port 3 is empty").map(|i| &log[i..]).unwrap_or("");
+    check!(beside.contains("on root port 2 moved to address 101, off the default address"),
+           "a high-speed device this host does not bind is moved off address 0");
+    check!(beside.contains("ehci: USB device 46f4:0001 on root port 4 bound for a driver of its own"),
+           "and a device plugged in after it is read as itself and bound, not answered for by the one not bound");
+
     // THE HARDWARE CARD'S PACKAGE, in QEMU: `kind-rtl` uses the RTL8168's interrupt and DMA, and QEMU has no RTL8168 -
     // its e1000 has no MSI, so no interrupt is routed either. What QEMU can show is the path to it: a driver asking
     // for an interrupt and DMA memory on a device without MSI is asked the DMA question, takes the NIC over, says it

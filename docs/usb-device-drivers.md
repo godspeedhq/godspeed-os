@@ -138,6 +138,16 @@ Once a hub is found it is enumerated for the driver's life and no other root por
 are all behind its one rate-matching hub, so there that costs nothing (a second hub on another root port would not be
 seen - not on any board here, recorded).
 
+**A device it does not bind is moved off address 0 (2026-10-25).** It used to be left where it was turned away, which
+for one refused at its descriptor is the default address 0. A high-speed device sees every high-speed transaction on
+the bus, so on the T630 the boot stick in one back socket - mass storage, never bound - answered for every high-speed
+device plugged in after it: the WiFi dongle in another socket was read as `1f75:0902`, the stick, and never bound.
+Keyboards were unaffected, since their transactions go through the hub's translator, which the stick does not see.
+`try_bind` now gives every device it does not bind address 101 (`PARK_ADDR`), and one that took address 100 and then
+refused its configuration is moved off 100 too. Shown in QEMU (`osdev test driver-packages`): a high-speed keyboard
+(`usb-kbd,usb_version=2`) on one root port and a stick plugged into another after it; before the change the stick
+was read as the keyboard, `0627:0001`, and now it is bound as itself.
+
 **The report names its host.** `usbdev`'s report gained a byte, the host (`HOST_DWC2`, `HOST_XHCI`, `HOST_EHCI`),
 because a PC now has two hosts that report and "nothing attached" from one said nothing of the other. The supervisor
 keeps what each host last reported (`UsbState::by_host`, `Installed::usb_attached`): a package is started with the
