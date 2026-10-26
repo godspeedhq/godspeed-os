@@ -5,8 +5,9 @@
 //! It began as the third architecture's stub scaffold (the docs/aarch64.md pattern): the SAME
 //! `arch::imp` surface as the other ports, so the arch-NEUTRAL kernel compiled for riscv64 with only
 //! this directory written. The bodies are real now - Sv39 (`sv39.rs`), the S-mode trap vector
-//! (`trap.rs`), SBI timer, IPI and HSM hart start (`sbi.rs`). There is still NO PLIC: no device
-//! interrupt reaches the kernel, so the UART is polled from the tick and drivers poll.
+//! (`trap.rs`), SBI timer, IPI and HSM hart start (`sbi.rs`), and the PLIC (`plic.rs`), which routes
+//! a PCI device's INTx to the driver that holds the device and nothing else: the UART is still polled
+//! from the tick, and the SoC drivers poll.
 
 #![allow(unused_variables, dead_code)]
 
@@ -248,8 +249,8 @@ fn rx_push(b: u8) -> bool {
 /// arrived.
 ///
 /// **The wake is the half that matters.** A task blocked in `ConsoleRead` is parked, and the neutral
-/// code that parked it says it expects to be woken "by the RX IRQ". This port has no PLIC yet, so
-/// there is no RX IRQ - the drain runs from the timer tick instead, and if it did not wake the waiter
+/// code that parked it says it expects to be woken "by the RX IRQ". This port's PLIC routes PCI INTx
+/// only, so there is no RX IRQ - the drain runs from the timer tick instead, and if it did not wake the waiter
 /// the shell would sit blocked forever with its keystroke sitting in the ring.
 ///
 /// The loop is BOUNDED by the ring rather than by the FIFO: a UART wedged with `DR` permanently set
@@ -1137,7 +1138,7 @@ pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // whether it is busy (bit 30 generating, bit 31 seeding), `MODE` +0x08 bit 3 selects 256-bit output,
 // `IE` +0x10 and `ISTAT` +0x14 hold the ready, seed-done and LFSR-lockup bits (write 1 to clear), the
 // words are at `RAND0` +0x20, and the auto-reseed counters `AUTO_RQSTS` +0x60 / `AUTO_AGE` +0x64 are left
-// at 0 as Linux leaves them. Linux waits for the INTERRUPT; this port has no interrupt controller driver,
+// at 0 as Linux leaves them. Linux waits for the INTERRUPT; this port's PLIC routes PCI INTx only,
 // so the same status bits are polled, each wait bounded on the timebase. `IE` is still written as Linux
 // writes it, so the status latches exactly as it does there; nothing routes the line, so nothing fires.
 
@@ -1770,7 +1771,8 @@ pub mod boot {
     /// Re-arm an idle core - at the QUANTUM on this port, not at the usual ~1 s idle rate.
     ///
     /// **Because here the idle tick IS the keystroke latency.** A task blocked in `ConsoleRead` is
-    /// parked waiting to be woken "by the RX IRQ", and this port has no PLIC, so there is no RX IRQ:
+    /// parked waiting to be woken "by the RX IRQ", and this port's PLIC routes PCI INTx only, so there is
+    /// no RX IRQ:
     /// the timer tick is the only thing that drains the UART and wakes that task. Slowing the tick to
     /// a second while a core idles - which is exactly when a shell is waiting at a prompt - would put
     /// up to a second between a key being pressed and the shell seeing it, and typing would be
