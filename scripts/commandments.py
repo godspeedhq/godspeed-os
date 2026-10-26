@@ -1387,6 +1387,20 @@ def check_chaos_exclusions(check, pins):
         return [Violation("services/chaos/src/main.rs", 0,
                           "cannot find `is_transient`: who is excluded from Maximum Carnage cannot be "
                           "verified, and an unverifiable exclusion set is a failure, never a pass")]
+    # ONLY A DISJUNCTION OF NAME LITERALS (backlog/90 E2). The exclusions below are read off `name == "x"` and
+    # `name.starts_with("x")`; an escape written any other way - `matches!(name, "fs" | "time")`, a table
+    # lookup, a condition - excluded a service while this read nothing from it, and passed. So the body must
+    # be exactly those terms joined by `||`, and anything else fails: what is excluded is then always what
+    # this reads.
+    inner = re.search(r"\{(.*)\}", body.group(0), re.S)
+    inner = re.sub(r"//[^\n]*|\s+", "", inner.group(1)) if inner else ""
+    term = r'(?:name=="[a-z0-9-]+"|name\.starts_with\("[a-z0-9-]+"\))'
+    if not re.fullmatch(rf"{term}(?:\|\|{term})*", inner):
+        return [Violation("services/chaos/src/main.rs", 0,
+                          "`is_transient` is not a plain `||` of `name == \"x\"` and `name.starts_with(\"x\")` "
+                          "terms, so who it excludes cannot be read off it - an exclusion written as a "
+                          "`matches!`, a lookup or a condition would escape the storm unseen. Write it as "
+                          "that disjunction.")]
     excluded = set(re.findall(r'name == "([a-z0-9-]+)"', body.group(0)))
     excluded |= {m + "*" for m in re.findall(r'starts_with\("([a-z0-9-]+)"\)', body.group(0))}
 

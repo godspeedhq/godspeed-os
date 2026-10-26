@@ -267,6 +267,13 @@ CASES_II = [
      lambda: edit(CH, 'ctx.spawn("mem-pressure")', 'ctx.spawn("something-else")'),
      [CH], [], True),
 
+    # backlog/90 E2: the exclusions were read off `name == ".."` terms only, so an escape written as a
+    # `matches!` excluded a service while the check read nothing from it.
+    ("II matches! escape", "a service excluded through matches!, not ==",
+     lambda: edit(CH, 'name == "chaos" || name == "mem-pressure"',
+                      'name == "chaos" || name == "mem-pressure" || matches!(name, "fs" | "shell")'),
+     [CH], [], True),
+
     ("II unfindable", "is_transient renamed - the exclusion set cannot be read",
      lambda: edit(CH, "fn is_transient(", "fn is_transient_renamed("),
      [CH], [], True),
