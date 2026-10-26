@@ -14,7 +14,8 @@ nothing for the other checkers to account for - one file, one compiler invocatio
 THE LIST IS EXPLICIT for the reason `EXTRA_CHECKS` is: adding a file is a decision, not a side effect of
 a directory listing. A listed file that is missing is a failure, not a skip.
 
-Exit: 0 if every listed file compiles and every test in it passes, 1 otherwise.
+Exit: 0 if every listed file compiles and every test in it passes, and `cargo test -p kernel --lib`
+passes, 1 otherwise.
 """
 import os
 import subprocess
@@ -77,6 +78,20 @@ def main() -> int:
                 failed += 1
             else:
                 print(f"host tests: {rel} - {summary[0] if summary else 'ok'}")
+    # THE KERNEL'S OWN HOST TESTS (backlog/90 E3). `kernel/src/lib.rs` compiles the hardware-free half of
+    # the kernel for the host - the capability table, the rights, the routing and naming models, the clock
+    # deglitch - and its unit and property tests ran on no automatic path at all: written, green, and run
+    # only when someone remembered. A test nobody runs is not evidence. About 35 s cold, a few warm.
+    r = subprocess.run(["cargo", "test", "-q", "-p", "kernel", "--lib"], cwd=root,
+                       capture_output=True, text=True)
+    summary = [l for l in r.stdout.splitlines() if l.startswith("test result:")]
+    if r.returncode != 0 or not summary:
+        print("host tests: cargo test -p kernel --lib FAILED")
+        print(r.stdout[-4000:])
+        print(r.stderr[-4000:])
+        failed += 1
+    else:
+        print(f"host tests: kernel --lib - {summary[-1]}")
     return 1 if failed else 0
 
 

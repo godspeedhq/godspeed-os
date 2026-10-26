@@ -145,8 +145,9 @@ jobs:
           # filesystem isolation so it can resolve the path without aborting.
           MIRIFLAGS: -Zmiri-disable-isolation
           # Miri is ~100-1000x slower than native. Set cases to 1 per
-          # property - enough for UB detection. Full 256 cases run in the
-          # regular cargo test step.
+          # property - enough for UB detection. The full 256 cases run in
+          # `cargo test -p kernel --lib`, which this workflow does not run:
+          # scripts/host_test_check.py runs it on every osdev build (backlog/90 E3).
           PROPTEST_CASES: 1
         run: cargo miri test -p kernel --lib
 
