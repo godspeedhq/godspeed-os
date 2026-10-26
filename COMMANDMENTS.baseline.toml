@@ -335,6 +335,21 @@ reacquire_api = [
 # `supervisor` (the report of the device it binds for a driver of its own). Its `events` emission is the same
 # unpaid half.
 peer_reacquire_debt = ["console", "hw-enumerator"]
+# Commandment VI - mutable statics in services, as of 2026-10-26. Read by `VI-static-mut` (`relpath:NAME`). SHRINK
+# ONLY: an entry that matches nothing is itself a violation.
+#
+# Found when the check was widened to path-qualified types (backlog/90 E2): `fs` wrote these four as
+# `core::sync::atomic::AtomicBool`/`AtomicU32`, which the old pattern did not see. They are `fs`'s own latches -
+# the one-shot stack-depth report in `block_rpc`, and the outage latch and counters that keep an unreachable
+# `block-driver` from flooding the serial line - and live in statics because `block_rpc` is a free function with
+# a dozen callers (their own comment says so). Owning them means threading state through those callers, a
+# refactor of the filesystem service; recorded rather than done inside the checker fix.
+static_state_debt = [
+  "services/fs/src/main.rs:STACK_DEPTH_REPORTED",
+  "services/fs/src/main.rs:PEER_UNREACHABLE",
+  "services/fs/src/main.rs:PEER_UNREACHABLE_SUPPRESSED",
+  "services/fs/src/main.rs:PEER_OUTAGES",
+]
 # Commandment III - constants declared in two files of one crate, as of 2026-09-14. Read by
 # `III-duplicate-constants`. SHRINK ONLY; a stale entry is itself a violation.
 #

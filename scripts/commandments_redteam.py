@@ -185,6 +185,19 @@ CASES = [
      lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
                   "\nstatic mut SNEAK: u32 = 0;\n#[no_mangle]\npub extern"),
      ["services/events/src/main.rs"], []),
+
+    # backlog/90 E2: the pattern missed a path-qualified type, which is how `fs` wrote its four.
+    ("VI-static-mut (path)", "a path-qualified atomic static in a service",
+     lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
+                  "\nstatic SNEAK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);\n"
+                  "#[no_mangle]\npub extern"),
+     ["services/events/src/main.rs"], []),
+
+    # ...and the debt list may only shrink: an entry that matches nothing is a violation.
+    ("VI-static-mut (stale debt)", "a debt entry for a static that does not exist",
+     lambda: edit("COMMANDMENTS.baseline.toml", '  "services/fs/src/main.rs:PEER_OUTAGES",\n',
+                  '  "services/fs/src/main.rs:PEER_OUTAGES",\n  "services/fs/src/main.rs:NO_SUCH_STATIC",\n'),
+     ["COMMANDMENTS.baseline.toml"], []),
 ]
 
 base = run()

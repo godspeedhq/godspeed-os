@@ -116,7 +116,7 @@ def scope_entries_empty(check):
     return empty
 
 
-def scan_source(check, _pins):
+def scan_source(check, pins):
     """Report each line matching the check's pattern, ignoring comments.
 
     Comment-skipping is deliberate: these Commandments govern what the code DOES. A doc comment
@@ -129,11 +129,27 @@ def scan_source(check, _pins):
     for d in scope_entries_empty(check):
         out.append(Violation(d, 0, "this scope entry contributes no file to the check - the path is missing, "
                              "or names nothing it reads. Fix the path, or remove the entry and say why."))
+    # Named DEBT, for a check that has some (`debt_pin`): a match whose `relpath:KEY` is listed in that pin
+    # is recorded rather than reported, KEY being what `debt_key` captures from the line. SHRINK ONLY: an
+    # entry that matches nothing any more is itself a violation, as `peer_reacquire_debt` has always been.
+    debt = set((pins or {}).get(check["debt_pin"], []) or []) if check.get("debt_pin") else set()
+    dk = re.compile(check["debt_key"]) if check.get("debt_key") else None
+    seen = set()
     inc, _ = files_in_scope(check)
     for f in inc:
+        rel = os.path.relpath(f, ROOT).replace(os.sep, "/")
         for i, ln in enumerate(read(f).split("\n"), 1):
             if matches_line(ln, rx, sk):
+                m = dk.search(ln) if dk else None
+                key = f"{rel}:{m.group(1)}" if m else None
+                if key and key in debt:
+                    seen.add(key)
+                    continue
                 out.append(Violation(os.path.relpath(f, ROOT), i, check["fix"]))
+    for stale in sorted(debt - seen):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"{check['debt_pin']} lists '{stale}', which matches nothing now. Delete the entry - "
+                             f"a debt list not tightened when the debt is paid rots into a permanent exemption."))
     return out
 
 
@@ -1805,8 +1821,13 @@ CHECKS = [
          # Invariant 9 forbids UNOWNED GLOBAL MUTABLE STATE, not a keyword. Matching only `static mut`
          # caught the form nobody writes any more and missed the one everybody does: a check
          # satisfiable without the property being true, which is the failure the honesty rule names.
-         pattern=r"\bstatic\s+mut\b|^\s*(?:pub\s+)?static\s+[A-Z_][A-Z0-9_]*\s*:\s*"
-                 r"(?:Atomic|SpinLock|Mutex|RwLock|UnsafeCell|Cell|RefCell|OnceCell)",
+         # WIDENED 2026-10-26 (backlog/90 E2): the type may be PATH-QUALIFIED
+         # (`core::sync::atomic::AtomicBool`, which is how `fs` wrote four of them and how this missed
+         # them), an ARRAY of one (`[AtomicU8; N]`), and the item `pub(crate)`.
+         pattern=r"\bstatic\s+mut\b|^\s*(?:pub(?:\([a-z]+\))?\s+)?static\s+[A-Z_][A-Z0-9_]*\s*:\s*\[?\s*"
+                 r"(?:[A-Za-z_][A-Za-z0-9_]*::)*(?:Atomic|SpinLock|Mutex|RwLock|UnsafeCell|Cell|RefCell|OnceCell)",
+         debt_pin="static_state_debt",
+         debt_key=r"static\s+(?:mut\s+)?([A-Z_][A-Z0-9_]*)",
          fix="unowned global mutable state: give it an owner, or pass it explicitly",
          proves="no service holds unowned global mutable state in any of its spellings - "
                 "`static mut`, an atomic static, a static lock, a static cell",
@@ -1820,6 +1841,13 @@ CHECKS = [
                   code="static T: SpinLock<u32> = SpinLock::new(0);", expect=True),
              dict(why="a static UnsafeCell likewise",
                   code="static C: UnsafeCell<u32> = UnsafeCell::new(0);", expect=True),
+             dict(why="a PATH-QUALIFIED atomic is the same state (how `fs` wrote four; backlog/90 E2)",
+                  code="static LATCH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);",
+                  expect=True),
+             dict(why="an ARRAY of atomics likewise",
+                  code="static SLOTS: [AtomicU8; 8] = [const { AtomicU8::new(0) }; 8];", expect=True),
+             dict(why="`pub(crate)` does not make it owned",
+                  code="pub(crate) static N: AtomicU32 = AtomicU32::new(0);", expect=True),
              dict(why="an immutable static is fine", code="static COUNT: u32 = 0;", expect=False),
              dict(why="a const is fine", code="const COUNT: u32 = 0;", expect=False),
          ]),
