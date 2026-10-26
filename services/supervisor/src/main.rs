@@ -1077,10 +1077,16 @@ fn usb_host() -> Option<&'static str> {
 
 /// The in-tree driver whose spawn row names PCI class `class`, if one does: the driver a package that names that class
 /// takes the device over from (`installed.rs`, `Installed::holds`).
-fn in_tree_driver_of(class: u32) -> Option<&'static str> {
+///
+/// `nic_on_bus`: the kernel's `NIC` kind is a PCI ethernet controller on this machine. On riscv64 the kind resolves
+/// to the bus's controller when the scan finds one (QEMU `virt`'s e1000) and to the SoC MAC otherwise, so there a
+/// `NIC`-kind row drives class 0x020000 too, and a package that takes that class over must stand it down. Without
+/// this the two would share the device. Asked of the kernel once (`Installed::new`), never assumed from the ISA.
+fn in_tree_driver_of(class: u32, nic_on_bus: bool) -> Option<&'static str> {
     use godspeed_sdk::service_context::hwclass;
     IMAGES.iter().chain(USB_IMAGES.iter())
-        .find(|row| row.8 & hwclass::PCI != 0 && row.8 & 0x00FF_FFFF == class)
+        .find(|row| (row.8 & hwclass::PCI != 0 && row.8 & 0x00FF_FFFF == class)
+            || (nic_on_bus && class == 0x02_00_00 && row.8 == hwclass::NIC))
         .map(|row| row.0)
 }
 
@@ -2611,7 +2617,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     usb.ready = true;
     // The packages installed on this machine, started from the disk once everything they could name is up. A
     // respawned supervisor adopts the ones still running rather than starting a second (`installed.rs`).
-    let mut inst = installed::Installed::new();
+    let mut inst = installed::Installed::new(&ctx);
     inst.boot(&ctx);
 
     // Death-notification restart loop (H11 ph6; extended for fs + block-driver in Phase D).

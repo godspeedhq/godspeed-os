@@ -129,8 +129,8 @@ def main():
            "-serial", "mon:stdio"]
     if a.net:
         # `virt` has a real PCIe host bridge (ECAM at 0x3000_0000, in the FDT), so this is an ordinary
-        # PCI device the arch's own enumeration finds - not a special case wired in for the test. It
-        # stops there: nic-driver's riscv64 backend is the dwmac (see the --net help).
+        # PCI device the arch's own enumeration finds - not a special case wired in for the test, and
+        # nic-driver drives it by its identity, as on x86 (see the --net help).
         cmd += ["-device", "e1000,netdev=n0", "-netdev", "user,id=n0"]
         if a.pcap:
             cmd += ["-object", "filter-dump,id=nicdump,netdev=n0,file=%s" % a.pcap]
