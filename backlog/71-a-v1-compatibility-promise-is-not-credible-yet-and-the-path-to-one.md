@@ -160,6 +160,11 @@ breaking change; then v1.
    promise there would be broken. **Amended 2026-10-11: `gs::driver` is IN, grow-only** (the decision
    above): hardware support grows by adding mechanisms, which the promise allows, and a contributor
    writing a driver needs the mechanisms it has to hold still.
+   **Decided 2026-10-26 (operator), written in [`docs/compatibility.md`](../docs/compatibility.md):** covered
+   are `gs` and `gs::driver` (grow-only), the `gsh` language and the record fields utilities emit (not their
+   human-readable text), the on-disk formats (GSFS0008, the WiFi key store, the `/system` and `/users/default`
+   layout), the contract schema, and - not in the proposal above - the package format and the platform file.
+   The SDK, syscall numbers, service-to-service protocols and the kernel stay out.
 2. **Reshape first** (the section above), so the surface frozen is the one meant to be kept.
 3. **Make the promise a gate**, as this project enforces everything else: a checked-in snapshot of the public
    `gs` surface and the utility vocabulary, and a checker that fails the build when something is REMOVED or
