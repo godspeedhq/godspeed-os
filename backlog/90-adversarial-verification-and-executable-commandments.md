@@ -1,6 +1,6 @@
 # 90. Adversarial verification of the kernel, and the commandments made more executable
 
-**Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19; under way since 2026-10-26 on `feat/v1-groundwork`, with Kani and Creusot as layer C's tools (Next step).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
+**Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19; under way since 2026-10-26 on `feat/v1-groundwork`, with Kani, Creusot and Verus as layer C's tools, run in CI (Next step).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
 the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
 enforcement-layer defects are listed below, NOT fixed; four executable prototypes exist outside the tree
 and are NOT landed. Both wait on the operator. The brief, as recorded on 2026-10-15, follows; only its list of checker
@@ -257,28 +257,43 @@ kernel service, never a runtime dependency, nothing added to an image to check i
   that cross responsibilities rather than single functions: spawn and kill, grant, attenuate, transfer and revoke,
   send, receive, block and cancel, queue saturation and exhaustion, task-identity reuse, ownership and
   reclamation, supervisor and service death. Deterministic seeds; a failing sequence kept and replayable.
-- **C. Machine-checked proofs: Kani for bounded proofs, Creusot for unbounded ones (the operator's choice,
-  2026-10-26).** New here. Start with the capability table, task identity and lifecycle transitions, the IPC queue
-  and blocked-task records, and ownership and reclamation. Every harness or proof documents the property, the
-  PRODUCTION functions it exercises, the bounds or the specification, the assumptions, what it does not support,
-  and the result. **A bounded proof is never described as unrestricted, and a simplified model is never presented
-  as the implementation.** The two tools, and what each result may claim:
-  - **Kani** (bounded model checking, through CBMC): a harness checks every input within its stated bounds, so a
-    result is PROVED WITHIN STATED BOUNDS, for exactly those bounds. Suited to the table and queue operations,
-    where the state is small and a bound covers it: rights narrowing, generation checks, `0 <= len <= capacity`,
-    a blocked-sender record kept or withdrawn.
-  - **Creusot** (deductive verification, through Why3 and its SMT solvers): a function is proved against a
-    contract written beside it (`#[requires]`, `#[ensures]`, loop invariants), for every input. A result is
-    PROVED, but only against that contract, so the contract is what a reviewer checks: a proof of the wrong
-    specification proves nothing useful. Suited to small pure functions whose property is the whole point -
-    `Rights::without`, `narrow_embedded_for_receiver` (SEC-7's GRANT strip, which no test checks today, E5),
-    `next_generation`, the queue index arithmetic.
-  - **Where they run.** Both are Linux and macOS tools; neither runs natively on Windows. On a Windows machine
-    they run under WSL. Each pins its own nightly Rust, and neither runs on the kernel's `no_std` targets, so
-    both prove the HOST build of the files they cover: the same files the kernel compiles (`capability/*.rs`, and
-    `routing.rs` and `endpoint.rs`, which E4 found host-compile with one constant stubbed), through the
-    `kernel/src/lib.rs` seam C2 already needs. A result is about that code as host-compiled; that the kernel's
-    target build is the same code is an assumption every proof states.
+- **C. Machine-checked verification: Kani, Creusot, and Verus where a mechanism needs it (the operator's
+  choice, 2026-10-26).** New here. Start with the capability table, task identity and lifecycle transitions, the
+  IPC queue and blocked-task records, and ownership and reclamation. Every harness or proof documents the property,
+  the PRODUCTION functions it exercises, the bounds or the specification, the assumptions, what it does not
+  support, and the result. **A bounded proof is never described as unrestricted, and a simplified model is never
+  presented as the implementation.** Each tool has one job:
+  - **Kani: bounded counterexample discovery** (model checking through CBMC). A harness explores every input
+    within its stated bounds and either produces a concrete failing input or finds none. A result is
+    COUNTEREXAMPLE FOUND, or PROVED WITHIN STATED BOUNDS for exactly those bounds. It reasons about `unsafe` and
+    raw pointers, which Creusot cannot, so it covers the `arch/`, `memory/` and `smp/` obligations as well as the
+    table and queue operations: rights narrowing, generation checks, `0 <= len <= capacity`, a blocked-sender
+    record kept or withdrawn.
+  - **Creusot: invariants of safe Rust** (deductive verification through Why3 and its SMT solvers). A function is
+    proved against a contract written beside it (`#[requires]`, `#[ensures]`, loop invariants), for every input. A
+    result is PROVED, but only against that contract, so the contract is what review checks: a proof of the wrong
+    specification proves nothing useful. It cannot reason about `unsafe` and handles statics and interior mutability
+    poorly, so it is for small pure functions whose property is the whole point: `Rights::without`,
+    `narrow_embedded_for_receiver` (SEC-7's GRANT strip, which no test checks today, E5), `next_generation`, the
+    queue index arithmetic.
+  - **Verus: selected low-level mechanisms, decided one mechanism at a time.** The one of the three that proves
+    properties of raw memory and concurrency primitives, through ghost permissions: candidates are the spinlocks,
+    the frame allocator's bitmap and a page-table walk. Adopted for a mechanism only when Kani's bounds are not
+    enough for it, and with one decision taken explicitly each time: Verus verifies code written inside its
+    `verus!` macro against its own library, so proving PRODUCTION code makes its crates kernel dependencies - what
+    `I-kernel-deps` (Commandment I) exists to refuse without a recorded reason - while proving a COPY proves the
+    algorithm, not the implementation, and is labelled so.
+  - **Where they run: in CI, reproducibly, never on one workstation.** Kani and Creusot are Linux and macOS tools,
+    so they run on Linux CI runners, in jobs that run on every pull request touching `kernel/` and are a required
+    check for merging - the first automatic check on the OS repository's pull requests, which today have none,
+    where the test workflows are `workflow_dispatch` and paused. The tool versions are pinned (Kani's release,
+    Creusot's commit, Why3's and each solver's version, and the solver timeouts, the usual cause of a flaky proof),
+    and the same environment ships as a container image, so a contributor reruns a failing proof exactly: on Linux
+    or macOS directly, on Windows under WSL. The fast checks stay in `osdev build`, where every build runs them; the
+    proofs and the long property runs are CI's. Each tool proves the HOST build of the files it covers - the same
+    files the kernel compiles (`capability/*.rs`, and `routing.rs` and `endpoint.rs`, which E4 found host-compile
+    with one constant stubbed), through the `kernel/src/lib.rs` seam C2 already needs - so that the kernel's target
+    build is the same code is an assumption every result states.
 - **D. Runtime chaos with invariant assertions.** The section 22 suites (property, fuzz, stress, adversarial, chaos) and
   `chaos max-carnage`. What changes: each run checks EXPLICIT invariants, not that the machine stayed up. **A
   surviving kernel is not necessarily a correct kernel.** Termination and recreation, IPC floods, memory
@@ -387,8 +402,9 @@ easier to review, and incorrect ones easier to reject.
    state transition.
 
 No TLA+ or theorem-proving programme unless a concrete gap justifies one. *(Amended 2026-10-26 by the operator:
-Creusot, a deductive verifier, joins Kani in layer C. The rule still bounds it: a Creusot proof is for a function
-whose property a test or a bounded proof cannot cover, never a programme to prove the kernel.)*
+Creusot, a deductive verifier, joins Kani in layer C, and Verus may for a selected low-level mechanism. The rule
+still bounds them: a deductive proof is for a function or mechanism whose property a test or a bounded search
+cannot cover, never a programme to prove the kernel.)*
 
 ### Done when
 
@@ -416,9 +432,10 @@ then `cargo test -p kernel --lib` into the `osdev` gate and C4 (the syscall gate
 change.
 
 Then, as before: the fixes in section 13's order (D8, D7, D2, D1, D12, D10), each one change per flash, QEMU
-first; and layer C with **Kani and Creusot** (above), first on the capability files C1 already drives, then
-`routing.rs` once the `kernel/src/lib.rs` seam exists. Neither tool is installed yet; both run under WSL on a
-Windows machine.
+first; and layer C (above): **Kani** first on the capability files C1 already drives, then `routing.rs` once the
+`kernel/src/lib.rs` seam exists, then **Creusot** on the pure functions; **Verus** only when a mechanism needs it.
+All of it in a pinned CI job on Linux runners, required on pull requests touching `kernel/`, with a container
+image for running it locally (WSL on Windows). Neither the job nor the image exists yet.
 
 **What the scheduler fixes need first.** D7, D8, D10 and D11 change the task-switch path, and on 2026-10-26
 `osdev test shell` could not judge a change there: in QEMU a supervisor respawn sits at the liveness watchdog's
