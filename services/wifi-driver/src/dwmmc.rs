@@ -19,7 +19,7 @@ use core::cell::Cell;
 
 use godspeed::driver::wait::{self, Budget};
 use godspeed::driver::Registers;
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed_wifi::sdio::{Cmd, Resp, SdioHost, Xfer};
 
 // Registers (`dw_mmc.h`).

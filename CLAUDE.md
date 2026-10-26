@@ -402,6 +402,10 @@ os/
                          #   SDK calls the standard library already covers - may fall, may not rise, and
                          #   a NEW crate starts at zero. Counts only methods with a `gs` replacement, which
                          #   it names; a gap in `gs` is closed in `gs` (backlog/71, 2026-10-05)
+    sdk_dependency_check.py # ...and whether a crate may depend on the SDK at ALL: only the named
+                         #   exceptions in SDK-DEPENDENCY.baseline.txt, each with its reason (the
+                         #   supervisor's spawn ABI, the USB hosts, the test-only `adversarial`, ...).
+                         #   Every other crate is on `gs` alone; the list only shrinks (backlog/71 step 2)
     quit_wait_check.py   #   NO SILENT WAIT in the shell, which observes every command: each wait reads
                          #   the command's watch or says on the line above why it cannot trap anyone
                          #   (`// quit-ok:`), and those exceptions may fall, not rise (backlog/fixed/89)

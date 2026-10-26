@@ -34,7 +34,7 @@
 //! means ROTATE to the next of `PIECES` files (see there and `CLAUDE.md`), never grow.
 
 use godspeed as gs;
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 /// Control opcodes on this service's endpoint.
 pub const REC_OP_START: u8 = 1; // [1][capacity:u64][plen][path][flen][filter]

@@ -5,7 +5,7 @@
 //! and the decision a respawn makes about a card an earlier instance left behind - which turns on the
 //! Broadcom firmware asserting function 2 ready.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 pub use godspeed_wifi::sdio::*;
 

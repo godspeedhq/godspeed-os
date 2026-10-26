@@ -3,7 +3,7 @@
 //! with the bus, the backplane window, the firmware session and the join's keys held here instead of
 //! threaded through the loop.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed_wifi::bss::Scan;
 use godspeed_wifi::rxq::RxQueue;
 use godspeed_wifi::sdio::SdioHost;

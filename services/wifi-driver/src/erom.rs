@@ -22,7 +22,7 @@
 //! No code is taken. What is borrowed is the format of a table the silicon publishes, which is a fact
 //! about the part.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::Window;
 use godspeed_wifi::sdio::SdioHost;

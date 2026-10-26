@@ -92,7 +92,7 @@ pub(crate) const fn konst_u32(s: &str) -> u32 {
 }
 
 /// Check that the embedded blobs are the ones that were vendored. Returns false and says so if not.
-pub fn verify(ctx: &godspeed_sdk::ServiceContext) -> bool {
+pub fn verify(ctx: &godspeed::ServiceContext) -> bool {
     let img = fnv1a(IMAGE);
     let nvr = fnv1a(NVRAM);
     let clm = fnv1a(CLM);
@@ -124,7 +124,7 @@ pub fn verify(ctx: &godspeed_sdk::ServiceContext) -> bool {
 ///
 /// `ram_size` and `ram_base` come from the CR4 itself (`armcr4::probe`), so this is the chip's own answer
 /// checked against the image this build actually holds - not against a number from a document.
-pub fn report(ram_size: u32, ram_base: u32, ctx: &godspeed_sdk::ServiceContext) {
+pub fn report(ram_size: u32, ram_base: u32, ctx: &godspeed::ServiceContext) {
     // VERIFY BEFORE REPORTING A SIZE. Reporting "609309 bytes of image" while holding none of it is what
     // this whole mechanism exists to prevent, so the check runs first and its result is part of the report.
     if !verify(ctx) {

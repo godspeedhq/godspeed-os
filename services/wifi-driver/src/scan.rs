@@ -69,7 +69,7 @@
 //! Verified on hardware: ten networks on 2026-09-28 (docs/wifi.md 30). (This line said none of it had run
 //! on hardware, written away from the bench; corrected 2026-10-08.)
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::Window;
 use crate::ctrl;

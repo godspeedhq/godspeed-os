@@ -27,7 +27,7 @@ use core::cell::RefCell;
 
 use godspeed as gs;
 use gs::driver::wait::{Budget, Since};
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed_wifi::bss::Scan;
 use godspeed_wifi::rxq::RxQueue;
 use godspeed_wifi::station::{Link, Outcome, Pulled, ScanStep, Secret, Station};

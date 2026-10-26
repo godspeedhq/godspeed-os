@@ -26,7 +26,7 @@
 
 use godspeed as gs;
 use godspeed::driver::{Part, Registers};
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed::{ipc::Message, ServiceContext};
 
 // --- Device register map (byte offsets into the MMIO window) -----------------
 // Real values come from the device datasheet; these are illustrative.

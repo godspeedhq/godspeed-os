@@ -29,7 +29,7 @@
 
 use godspeed::driver::wait::{self, Budget};
 use godspeed::driver::{Arena, Part, Registers};
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 // ---- DMA block. `dwmac4_dma.h`. -----------------------------------------------------------------
 const DMA_BUS_MODE: usize = 0x1000;

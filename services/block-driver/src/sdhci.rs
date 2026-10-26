@@ -16,7 +16,7 @@
 
 use godspeed as gs;
 use godspeed::driver::Registers;
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 // Register offsets from the EMMC base.
 const BLKSIZECNT: usize = 0x04;

@@ -39,7 +39,7 @@
 //! is the cheapest question that distinguishes "function 1 reported ready" from "the backplane is
 //! actually alive".
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use godspeed_wifi::sdio::SdioHost;
 use crate::sdio;

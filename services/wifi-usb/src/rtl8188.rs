@@ -10,7 +10,7 @@
 
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed_wifi::usbfn;
 
 use crate::{dev, said};

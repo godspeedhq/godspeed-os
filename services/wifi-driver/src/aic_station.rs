@@ -30,7 +30,7 @@
 //!   this one does not hold a second queue, and IP and the access point's EAPOL both retransmit.
 
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed_wifi::bss::{self, Network, Scan};
 use godspeed_wifi::eapol;
 use godspeed_wifi::rxq::RxQueue;

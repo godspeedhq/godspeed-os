@@ -53,7 +53,7 @@
 // SDK only for what the stdlib does not wrap: `cpu_clock` (a privileged syscall, this service's alone) and
 // `power_pending` (query 28).
 use godspeed as gs;
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 /// The protocol, one opcode byte. Replies to `OP_HOLD` and `OP_RELEASE` lead with a status byte; the two cues are
 /// not answered.

@@ -25,7 +25,7 @@ const FNV: [u32; 5] = [
 ];
 
 /// Check every embedded file against the build's hash. Returns false, naming the file, if any differs.
-pub fn verify(ctx: &godspeed_sdk::ServiceContext) -> bool {
+pub fn verify(ctx: &godspeed::ServiceContext) -> bool {
     let files: [(&str, &[u8]); 5] =
         [("patch table", TABLE), ("ADID", ADID), ("patch", PATCH), ("ext0", EXT0), ("fmacfw", FMAC)];
     let mut ok = true;

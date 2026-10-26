@@ -32,7 +32,7 @@
 use crate::dwmac_ring::{Dwmac, Parts};
 use godspeed::driver::wait::{self, Budget};
 use godspeed::driver::Registers;
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 // The radio as the link's second backend (`radio.rs`), shared with the Pi 4's GENET - see the note where
 // `genet.rs` includes it. The VisionFive gained it in phase V6 (`docs/wifi-aic8800.md`): its AIC8800

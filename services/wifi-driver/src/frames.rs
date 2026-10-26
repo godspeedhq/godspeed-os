@@ -23,7 +23,7 @@
 //! Transmit is `ctrl::send_data`, the path the handshake proved. Credit for it comes back on RECEIVED
 //! frames (`Session::tx_max_seq`), so a stack that only sends would run dry; a dry window pulls first.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::Window;
 use crate::ctrl::{self, Session};

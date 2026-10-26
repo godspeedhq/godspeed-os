@@ -56,7 +56,7 @@
 //! It never reaches this module. The serve loop turns it into the pairwise master key the moment it arrives
 //! (`crypto::psk`) and keeps only the key (`utilities/56_wifi.md` §6). `Secret::Pmk` is that key.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::Window;
 use crate::ctrl::{self, Session};

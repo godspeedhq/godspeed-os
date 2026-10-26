@@ -16,5 +16,4 @@ name = "driver-skeleton"
 path = "src/main.rs"
 
 [dependencies]
-godspeed-sdk = { path = "../../sdk/rust" }
 godspeed = { path = "../../stdlib/rust" }

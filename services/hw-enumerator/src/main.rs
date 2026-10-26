@@ -54,7 +54,7 @@
 #![no_main]
 
 use godspeed as gs;
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 /// Buses to walk, at most.
 ///

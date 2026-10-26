@@ -53,7 +53,7 @@
 //!
 //! Writing the raw `.txt` would put comments and newlines where the firmware expects NUL-separated entries.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::aicore;
 use crate::backplane;

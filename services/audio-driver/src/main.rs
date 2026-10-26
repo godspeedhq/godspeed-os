@@ -40,7 +40,7 @@ use godspeed_audio::sine::Sine;
 use godspeed_audio::sounds::{self, Chime};
 use godspeed_audio::wire;
 use godspeed::driver::{Arena, Part, Registers};
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 // ---- Controller registers (HDA 1.0a section 3.3) ----------------------------------------------------
 const GCAP: usize = 0x00; // u16: output/input/bidirectional stream counts, 64-bit support

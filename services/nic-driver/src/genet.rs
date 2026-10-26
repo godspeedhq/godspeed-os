@@ -44,7 +44,7 @@
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed::driver::{Part, Registers};
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 // The radio as the link's second backend (`radio.rs`), shared with the VisionFive's `dwmac`. Included by
 // path from each backend that uses it rather than declared once behind a new `cfg`: only one backend is

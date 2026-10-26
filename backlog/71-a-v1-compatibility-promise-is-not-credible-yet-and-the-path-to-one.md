@@ -129,6 +129,21 @@ import path `gs` already re-exports (`service_context`, 108 uses) plus `hid` (20
 `gs`, or - like `adversarial`, the test-only fault module 18.1 designates - named as an exception with its
 reason where the gate can see it.
 
+**Done as a gate, 2026-10-26.** `scripts/sdk_dependency_check.py` (on the build path) lets a crate under
+`services/` or `examples/` list `godspeed-sdk` only if `scripts/SDK-DEPENDENCY.baseline.txt` names it with a
+reason; a new crate is on `gs` alone, and an exception that stops needing the SDK must leave the list. **25 of
+42 crates are on `gs` alone** now: twelve moved that day (`audio-driver`, `block-driver`, `hw-enumerator`,
+`nic-driver`, `observe`, `power`, `pwm-audio`, `recorder`, `time`, `wifi-driver`, `wifi-usb`,
+`driver-skeleton`), whose SDK use was only the `ServiceContext` and `Message` `gs` already re-exports. The
+17 exceptions split two ways, and the file says which is which:
+- **By role, permanent:** the supervisor's spawn ABI; the shell, `control`, `ask` and `godspeed-pm` talking
+  to the supervisor and the kernel's tables; `events`, the trace protocol's server; `chaos`, `probe` and
+  `mem-pressure` as harness (18.1); the USB hosts' `usbdev`, `usbfn` and `hid`; `console`'s framebuffer;
+  `copier`'s churn checksums.
+- **Gaps to close in `gs`:** `fs` and `net-stack` read a bounded call's raw result (`DeadlineOutcome`,
+  `DeadlineOutcomeInto`); the example `holder` reads `ReqOutcome`, which an example should get from
+  `gs::call`; `mem-pressure` needs the SDK's `AllocError`.
+
 **The order agreed:** (1) close `fix/backlog-80`; (2) a branch for the two `gs::driver` mechanisms and the window and arena types they hand back, proved
 on two unlike drivers (AHCI on x86, GENET on the Pi 4) and then the rest one at a time; (3) a v1 groundwork
 branch for steps 1, 3 and 4 below - the covered surface confirmed, a checked-in snapshot of the public `gs`

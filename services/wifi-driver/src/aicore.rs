@@ -61,7 +61,7 @@
 //! sequence does not show an equivalent write. So it is not implemented, and it is recorded here rather
 //! than guessed at: **if the ARM does not come up, that write is the first thing to read and add.**
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::Window;
 use godspeed_wifi::sdio::SdioHost;

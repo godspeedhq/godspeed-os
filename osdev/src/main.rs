@@ -539,6 +539,10 @@ const EXTRA_CHECKS: &[&str] = &[
     // and may not rise, per crate, and a new crate starts at zero. On the build path from its first day, so
     // it is never a release-time surprise the way the shared-surface ratchet was.
     "scripts/one_way_check.py",
+    // ...and the question underneath it (backlog/71 step 2): may this crate depend on the SDK at all? Only the
+    // named exceptions in scripts/SDK-DEPENDENCY.baseline.txt may, each with its reason; a new crate is on `gs`
+    // alone, and the list only shrinks.
+    "scripts/sdk_dependency_check.py",
     // ...and the other direction: an ordinary service that needs an SDK item `gs` has no route for. It
     // was on NO build path and had been failing on `main` (10 against a baseline of 8) since the audio
     // and radio drivers arrived, because its driver list is hand-kept. Found by the 2026-10-09 audit;

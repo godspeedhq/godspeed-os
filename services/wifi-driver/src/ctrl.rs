@@ -99,7 +99,7 @@
 //!
 //! Bounded and stack-only (§26.6.1): one `FRAME`-sized (4 KiB) buffer per reader, no heap, no allocation.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::{Window, ACCESS_WIDE, CHIPCOMMON_BASE, OFFSET_MASK};
 use godspeed_wifi::sdio::{blk_block_mode, blk_byte_mode, Geometry, SdioHost};

@@ -64,7 +64,7 @@ mod join;
 mod sdio;
 mod upload;
 
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 // The chip-independent half, shared with every radio driver (`sdk/wifi`). Imported at the root so the
 // modules here keep writing `crate::crypto` and friends.
 use godspeed_wifi::eapol;

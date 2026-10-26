@@ -23,7 +23,7 @@
 //! device out itself. The retry loop that waited here was unreachable and is gone (`request`).
 
 use godspeed as gs;
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 /// One block request to the USB host service, and its failure said.
 ///

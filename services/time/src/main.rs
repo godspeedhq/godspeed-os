@@ -44,7 +44,7 @@
 
 mod ntp_file;
 
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed::{ipc::Message, ServiceContext};
 
 use godspeed as gs;
 

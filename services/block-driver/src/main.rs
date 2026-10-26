@@ -22,7 +22,7 @@
 #![no_main]
 
 use godspeed as gs;
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 // Backend by board: x86 talks AHCI (SATA, MMIO+DMA); every USB board (Pi 2, Pi 4, VisionFive 2) stores
 // on a USB stick (`usbdisk`, which reaches it over IPC through `xhciblk` - the `dwc2` or `xhci`
@@ -119,7 +119,7 @@ impl Chaos {
     /// warm-up is MEASURED - a boot consumes ~795 completions - so boot and mount run untouched and
     /// the first fault lands in ordinary filesystem work.
     #[cfg(feature = "completion-chaos")]
-    pub fn fault(&mut self, ctx: &godspeed_sdk::ServiceContext) -> Fault {
+    pub fn fault(&mut self, ctx: &godspeed::ServiceContext) -> Fault {
         const WARMUP: u32 = 800;
         const STRIDE: u32 = 8;
         const LIMIT:  u32 = 3;
@@ -144,12 +144,12 @@ impl Chaos {
 
     #[cfg(not(feature = "completion-chaos"))]
     #[inline(always)]
-    pub fn fault(&mut self, _ctx: &godspeed_sdk::ServiceContext) -> Fault { Fault::None }
+    pub fn fault(&mut self, _ctx: &godspeed::ServiceContext) -> Fault { Fault::None }
 }
 
 impl Reply {
     /// Answer, with the tag in front. `body` is the reply exactly as it was before tagging.
-    pub fn send(&self, ctx: &godspeed_sdk::ServiceContext, body: &[u8]) {
+    pub fn send(&self, ctx: &godspeed::ServiceContext, body: &[u8]) {
         // 513 is the largest body (status + one block); one more for the tag. Fixed, on the stack,
         // no allocation (§26.6.1).
         let mut out = [0u8; 514];
@@ -190,8 +190,8 @@ impl Reply {
     }
 
     /// One send, with the undelivered report. Split out so a fault can emit zero, one or two.
-    fn emit(&self, ctx: &godspeed_sdk::ServiceContext, msg: &[u8]) {
-        if gs::ipc::try_send_to(ctx, self.cap, &godspeed_sdk::Message::from_bytes(msg)).is_err() {
+    fn emit(&self, ctx: &godspeed::ServiceContext, msg: &[u8]) {
+        if gs::ipc::try_send_to(ctx, self.cap, &godspeed::ipc::Message::from_bytes(msg)).is_err() {
             ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
         }
     }

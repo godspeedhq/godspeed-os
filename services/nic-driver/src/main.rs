@@ -37,7 +37,7 @@
 
 use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
-use godspeed_sdk::{ServiceContext, Message};
+use godspeed::{ipc::Message, ServiceContext};
 use godspeed::driver::{Arena, Part, Registers};
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).

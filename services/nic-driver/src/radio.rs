@@ -11,7 +11,7 @@
 //! through the same serve loop. GENET and `dwmac` also follow `wifi-usb` as the OTHER radio
 //! (`Radio::with_other`), for a dongle plugged into a board with its own.
 
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 use godspeed::driver::wait::{self, Budget};
 
 /// Which link carries `net-stack`'s frames.

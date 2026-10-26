@@ -35,7 +35,7 @@
 //! `INTERRUPT` after a failure always reads 0 and cannot tell a timeout from an error.
 
 use godspeed::driver::Registers;
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed::driver::wait::{self, Budget};
 
 // Register offsets from the controller base. SDHCI-standard; the BCM2711's Arasan is a conforming

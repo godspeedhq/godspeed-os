@@ -16,7 +16,7 @@ use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed as gs;
 use godspeed::driver::{Part, Registers};
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 // HBA Generic Host Control registers (offsets from ABAR).
 const HBA_CAP: usize = 0x00;

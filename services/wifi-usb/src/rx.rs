@@ -16,7 +16,7 @@
 use core::cell::RefCell;
 
 use godspeed as gs;
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed_wifi::bss::{self, Network, Scan};
 use godspeed_wifi::data::{self, DataIn};
 use godspeed_wifi::rxq::RxQueue;

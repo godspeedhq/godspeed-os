@@ -39,7 +39,7 @@ use godspeed_audio::sounds::{self, Chime};
 use godspeed_audio::wire;
 use godspeed::driver::Registers;
 use godspeed::driver::{Arena, Part};
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 // ---- The window: the PWM page at +0, the DMA engine's page at +0x1000 ------------------------------
 const WINDOW: usize = 0x2000;

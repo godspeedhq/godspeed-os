@@ -55,7 +55,7 @@
 //! What this module deliberately does NOT do is exchange a frame. That needs the SDPCM and BCDC headers and
 //! is the next step; this one ends with a bus that could carry one, and says so rather than implying more.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::{clk, f1, Window};
 use godspeed_wifi::sdio::SdioHost;

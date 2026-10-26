@@ -37,7 +37,7 @@ use godspeed as gs;
 use core::cell::RefCell;
 
 use godspeed::driver::bus::{UsbDevice, UsbError};
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 use godspeed_wifi::station::Station;
 use godspeed_wifi::wire;
 

@@ -41,7 +41,7 @@
 //! fallback - it re-establishes the SAME path.
 
 use godspeed as gs;
-use godspeed_sdk::{Message, ServiceContext};
+use godspeed::{ipc::Message, ServiceContext};
 
 use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, STATUS_OK, WRITE_RUN_MAX};
 

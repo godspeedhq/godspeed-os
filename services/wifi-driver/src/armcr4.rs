@@ -36,7 +36,7 @@
 //! constant quoted from `brcmfmac/chip.c` into this session (§26.14). No code taken; the bank encoding is
 //! a property of the core.
 
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 use crate::backplane::Window;
 use godspeed_wifi::sdio::SdioHost;

@@ -1,0 +1,24 @@
+# The crates under services/ and examples/ that may list `godspeed-sdk` in their Cargo.toml, each with its
+# reason (scripts/sdk_dependency_check.py, backlog/71 step 2). Every other crate depends on `gs` alone.
+# MAY SHRINK, MAY NOT GROW: a crate that stops needing the SDK leaves this list, and adding one is a decision
+# with its reason here and in the commit. A reason naming something `gs` merely lacks YET is a gap to close.
+#
+# crate = reason
+
+supervisor = spawns every service: the spawn request, the privilege bits and the device classes are the SDK's spawn ABI (CLAUDE.md 14.1), which no program but the supervisor names
+shell = the operator's interface: it decodes the trace wire format, sends the supervisor's operator commands (supcmd), reads the kernel's clock and capability tables, and verifies the churn checksums selfcheck writes
+control = the operator control channel: it carries the supervisor's operator commands (supcmd) for the test harness
+ask = reads the supervisor's own records (supcmd, death notices, the authority table) and the kernel's capability inspection (CapInfo); it answers about the system, not as a program in it
+godspeed-pm = the package manager asks the supervisor to install and uninstall (supcmd) and checks a package against LAYOUT_RELEASE, the program layout the SDK defines
+events = the trace sink: it decodes the wire format `gs::trace` encodes, and a protocol's server knows its own format
+chaos = the fault storm: it addresses services by the kernel's name bound (NAME_MAX) and stamps its seed with the kernel's Datetime; harness surface, not an ordinary program
+probe = the test probe: the test-only `adversarial` module reaches the raw ABI on purpose (CLAUDE.md 18.1), with the spawn request and supervisor commands its scenarios drive
+mem-pressure = memory-pressure harness: the test-only `adversarial` module (CLAUDE.md 18.1) and the SDK's AllocError, which `gs::memory` does not return yet
+copier = verifies a copy with the SDK's churn checksums, shared with the shell's selfcheck so both compute the same value
+console = the terminal: it is granted the Framebuffer, a device the SDK designates (CLAUDE.md 18.1) and `gs::driver` does not hand out yet
+xhci = a USB host: it speaks the supervisor's device reports (usbdev) and decodes HID with the SDK's hid module, which is a device class, not part of `gs`
+ehci = a USB host: device reports (usbdev), the USB function protocol it serves to an installed driver (usbfn), and HID decoding (hid)
+dwc2 = a USB host: device reports (usbdev) and HID decoding (hid), as xhci and ehci
+fs = the storage server: its block exchange reads DeadlineOutcomeInto, a bounded call's raw result, and builds a CapHandle, neither of which `gs` covers yet
+net-stack = its NIC exchange reads DeadlineOutcome, which `gs::call` does not expose yet, and its el0-fault-test uses the test-only `adversarial` module (CLAUDE.md 18.1)
+holder = an example of holding a reply capability: it reads ReqOutcome, which `gs::call` does not expose yet; as an example it should move to `gs` when it does

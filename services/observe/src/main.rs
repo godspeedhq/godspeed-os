@@ -16,7 +16,7 @@
 #![no_main]
 
 use godspeed as gs;
-use godspeed_sdk::ServiceContext;
+use godspeed::ServiceContext;
 
 const MAX_SLOTS:      u32 = 224;
 const YIELD_INTERVAL: u32 = 500;

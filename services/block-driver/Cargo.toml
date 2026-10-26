@@ -29,6 +29,5 @@ lying-flush-test = ["volatile-cache-test"]
 write-tap = []
 
 [dependencies]
-godspeed-sdk = { path = "../../sdk/rust" }
 # `gs::driver` (docs/driver-library.md): the bounded waits and holds.
 godspeed = { path = "../../stdlib/rust" }
