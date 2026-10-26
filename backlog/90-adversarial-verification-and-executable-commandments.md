@@ -1,6 +1,6 @@
 # 90. Adversarial verification of the kernel, and the commandments made more executable
 
-**Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19 (the last section).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
+**Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19; under way since 2026-10-26 on `feat/v1-groundwork`, with Kani and Creusot as layer C's tools (Next step).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
 the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
 enforcement-layer defects are listed below, NOT fixed; four executable prototypes exist outside the tree
 and are NOT landed. Both wait on the operator. The brief, as recorded on 2026-10-15, follows; only its list of checker
@@ -182,7 +182,7 @@ catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere
 | D5 | med | Call liveness, reply correlation, AcquireSendCap and ResourceInvoke key identity on a bare, LIFO-reused endpoint id (partly KNOWN) | `ipc/routing.rs:581-589`, `dispatch.rs:1312`/`:1350` |
 | D6 | med | a delivered reply loses to ReplyDead | `syscall/dispatch.rs:1638-1639` |
 | D9 | med | `CORE_PENDING_PML4` is one slot (leaks a root, an L1 slot on arm32); the pending-stack overflow branch frees the stack in use (a proof gap: nine undrained self-kills not shown reachable) | `task/scheduler.rs:852`, `:3107`, `:3156-3160` |
-| D11 | med | `run()` picks with interrupts on, then claims a different life of the slot: a kernel panic from userspace kill and spawn | `task/scheduler.rs:1569-1593` |
+| D11 | med | `run()` picks with interrupts on, then claims a different life of the slot: a kernel panic from userspace kill and spawn. **Seen in QEMU 2026-10-26** (`backlog/94`, where a guard for it was tried and reverted) | `task/scheduler.rs:1569-1593` |
 | D14 | med | the kill path publishes the death before it releases device state, IRQ routes and the band | `task/scheduler.rs:2560-2903` |
 | D15 | med | a failed spawn never frees its reply endpoint id, leaves its IRQ route on a reused id, strands the framebuffer (IRQ and T1 parts KNOWN) | `task/mod.rs:1450-1457`, `:1677-1683` |
 | D16 | med | `FREE_IDS` is a plain lock held by the preemptible supervisor respawn: a core-0 wedge | `ipc/mod.rs:47`, `:74` |
@@ -204,7 +204,7 @@ catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere
 
 | Id | Defect |
 |---|---|
-| E1 | `I-irq-lock` never reads the three arch ISR files it declares (`os.walk` on a file path yields nothing) |
+| E1 | `I-irq-lock` never reads the three arch ISR files it declares (`os.walk` on a file path yields nothing). **FIXED 2026-10-26** (`b920aa5a`): a scope entry may be a file, an entry that contributes no file fails, riscv64's ISR files joined; 7 files read instead of 2, and a red-team probe catches a plain `lock()` planted in one |
 | E2 | pins fail open on spelling; VII misses request flags and the probe table; no check pins syscall gates (15 gate mutations, 0 caught); IX passes on a comment; VI misses four `fs` statics; check-defining tables unratcheted; 10 of 21 checks have no red-team row |
 | E3 | `cargo test -p kernel --lib`, Miri and mutation run on no automatic path; `mutation.yml` ends `\|\| true`; results five months old |
 | E4 | the routing and naming host tests test models; the real `routing.rs` and `names.rs` host-compile with one constant stubbed |
@@ -257,11 +257,28 @@ kernel service, never a runtime dependency, nothing added to an image to check i
   that cross responsibilities rather than single functions: spawn and kill, grant, attenuate, transfer and revoke,
   send, receive, block and cancel, queue saturation and exhaustion, task-identity reuse, ownership and
   reclamation, supervisor and service death. Deterministic seeds; a failing sequence kept and replayable.
-- **C. Bounded formal verification (Kani, or an equivalent).** New here. Start with the capability table, task
-  identity and lifecycle transitions, the IPC queue and blocked-task records, and ownership and reclamation. Every
-  harness documents the property, the PRODUCTION functions it exercises, the input and state bounds, the
-  assumptions, what it does not support, and the result. **A bounded proof is never described as unrestricted, and
-  a simplified model is never presented as the implementation.**
+- **C. Machine-checked proofs: Kani for bounded proofs, Creusot for unbounded ones (the operator's choice,
+  2026-10-26).** New here. Start with the capability table, task identity and lifecycle transitions, the IPC queue
+  and blocked-task records, and ownership and reclamation. Every harness or proof documents the property, the
+  PRODUCTION functions it exercises, the bounds or the specification, the assumptions, what it does not support,
+  and the result. **A bounded proof is never described as unrestricted, and a simplified model is never presented
+  as the implementation.** The two tools, and what each result may claim:
+  - **Kani** (bounded model checking, through CBMC): a harness checks every input within its stated bounds, so a
+    result is PROVED WITHIN STATED BOUNDS, for exactly those bounds. Suited to the table and queue operations,
+    where the state is small and a bound covers it: rights narrowing, generation checks, `0 <= len <= capacity`,
+    a blocked-sender record kept or withdrawn.
+  - **Creusot** (deductive verification, through Why3 and its SMT solvers): a function is proved against a
+    contract written beside it (`#[requires]`, `#[ensures]`, loop invariants), for every input. A result is
+    PROVED, but only against that contract, so the contract is what a reviewer checks: a proof of the wrong
+    specification proves nothing useful. Suited to small pure functions whose property is the whole point -
+    `Rights::without`, `narrow_embedded_for_receiver` (SEC-7's GRANT strip, which no test checks today, E5),
+    `next_generation`, the queue index arithmetic.
+  - **Where they run.** Both are Linux and macOS tools; neither runs natively on Windows. On a Windows machine
+    they run under WSL. Each pins its own nightly Rust, and neither runs on the kernel's `no_std` targets, so
+    both prove the HOST build of the files they cover: the same files the kernel compiles (`capability/*.rs`, and
+    `routing.rs` and `endpoint.rs`, which E4 found host-compile with one constant stubbed), through the
+    `kernel/src/lib.rs` seam C2 already needs. A result is about that code as host-compiled; that the kernel's
+    target build is the same code is an assumption every proof states.
 - **D. Runtime chaos with invariant assertions.** The section 22 suites (property, fuzz, stress, adversarial, chaos) and
   `chaos max-carnage`. What changes: each run checks EXPLICIT invariants, not that the machine stayed up. **A
   surviving kernel is not necessarily a correct kernel.** Termination and recreation, IPC floods, memory
@@ -369,7 +386,9 @@ easier to review, and incorrect ones easier to reject.
 5. **Maintained**: a kernel change preserves the invariants it touches and extends verification when it adds a
    state transition.
 
-No TLA+ or theorem-proving programme unless a concrete gap justifies one.
+No TLA+ or theorem-proving programme unless a concrete gap justifies one. *(Amended 2026-10-26 by the operator:
+Creusot, a deductive verifier, joins Kani in layer C. The rule still bounds it: a Creusot proof is for a function
+whose property a test or a bounded proof cannot cover, never a programme to prove the kernel.)*
 
 ### Done when
 
@@ -391,8 +410,20 @@ review; claiming that green CI proves correctness.
 
 ## Next step
 
-The operator's choice, in two parts. Fixes: section 13 of the audit proposes D8, D7, D2, D1, D12 and D10
-first, each one change per flash, QEMU first. Checks: `cargo test -p kernel --lib` into the `osdev` gate and
-the syscall gate check first (no kernel change), then the capability and IPC harnesses as an
-expected-failure ledger. Still open from the brief: a concurrent model of IPC wake and block, weak memory
-on every port, and the remaining responsibilities at runtime on arm, aarch64 and riscv64.
+**Under way since 2026-10-26, on `feat/v1-groundwork`** (the operator: "Let's use this branch to do backlog 90").
+Order step 1, restoring trust in the enforcement layer, started there: **E1 is fixed.** Next in it: E2 to E6,
+then `cargo test -p kernel --lib` into the `osdev` gate and C4 (the syscall gate check) landed, neither a kernel
+change.
+
+Then, as before: the fixes in section 13's order (D8, D7, D2, D1, D12, D10), each one change per flash, QEMU
+first; and layer C with **Kani and Creusot** (above), first on the capability files C1 already drives, then
+`routing.rs` once the `kernel/src/lib.rs` seam exists. Neither tool is installed yet; both run under WSL on a
+Windows machine.
+
+**What the scheduler fixes need first.** D7, D8, D10 and D11 change the task-switch path, and on 2026-10-26
+`osdev test shell` could not judge a change there: in QEMU a supervisor respawn sits at the liveness watchdog's
+allowance, and a guard whose slow path never ran went with 5 wedges in 7 runs (`backlog/49`, `backlog/94`). So
+either `backlog/49` is fixed before them, or each is A/B-tested over several runs each way.
+
+Still open from the brief: a concurrent model of IPC wake and block, weak memory on every port, and the
+remaining responsibilities at runtime on arm, aarch64 and riscv64.
