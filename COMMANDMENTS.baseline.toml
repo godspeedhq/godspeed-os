@@ -569,6 +569,9 @@ POWER_OFF          = 19
 "riscv64/sv39.rs"             = "mmu"
 "riscv64/syscall.rs"          = "syscall-entry"
 "riscv64/trap.rs"             = "interrupts"
+# The PLIC, this port's interrupt controller - the role `aarch64/gic.rs` and `x86_64/ioapic.rs` hold. It
+# routes a PCI device's wired INTx to a vector and delivers it to the driver SERVICE; it drives no device.
+"riscv64/plic.rs"             = "interrupts"
 "riscv64/usermode.rs"         = "usermode"
 "riscv64/uaccess.rs"          = "uaccess"
 "riscv64/mod.rs"              = "arch-entry"
