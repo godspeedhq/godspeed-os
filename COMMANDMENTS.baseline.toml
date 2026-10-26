@@ -247,6 +247,11 @@ service_configs = [
 # a compromised holder must be seen by `power`'s warnings and `shutdown status`. It discloses no task's
 # state and confers no authority (docs/shutdown.md 6).
 introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28]
+#
+# The queries answered WITHOUT INTROSPECT - the `matches!` list beside the gate in handle_inspect_kernel,
+# whose comment gives each one's reason. Pinned separately (backlog/90 E2) because moving a query onto
+# this list widens who may ask it while the query set and the syscall count stay exactly the same.
+introspect_ungated = [0, 3, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 28]
 # Commandment I, where it actually bites. Pinning module NAMES cannot see a USB stack added under a
 # legitimate module, so every file under arch/ declares WHAT IT IS. A new file must be classified
 # before it builds, and classifying one honestly as a device driver fails the build - which is the

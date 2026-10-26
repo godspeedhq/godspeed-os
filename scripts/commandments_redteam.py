@@ -225,6 +225,41 @@ CASES = [
      lambda: edit("COMMANDMENTS.baseline.toml", '[kernel.contract_not_reconciled]\n',
                   '[kernel.contract_not_reconciled]\nno_such_key = "stale"\n'),
      ["COMMANDMENTS.baseline.toml"], []),
+
+    # backlog/90 E2: the I-* pins failed open on spelling. One row per spelling the audit named.
+    ("I-syscalls (raw arm)", "a dispatch arm on a raw number the enum never names",
+     lambda: edit("kernel/src/syscall/dispatch.rs", "        _ => -1, // Unknown syscall.",
+                  "        58 => handle_exit(arg0),\n        _ => -1, // Unknown syscall."),
+     ["kernel/src/syscall/dispatch.rs"], []),
+    ("I-introspect (or-pattern)", "a new query added as an or-pattern arm",
+     lambda: edit("kernel/src/syscall/dispatch.rs", "        0 => scheduler::current_task_alloc_bytes() as i64,",
+                  "        0 | 29 => scheduler::current_task_alloc_bytes() as i64,"),
+     ["kernel/src/syscall/dispatch.rs"], []),
+    ("I-introspect (ungated)", "a gated query moved past the INTROSPECT gate",
+     lambda: edit("kernel/src/syscall/dispatch.rs", "| 21 | 23 | 28)", "| 21 | 23 | 24 | 28)"),
+     ["kernel/src/syscall/dispatch.rs"], []),
+    ("I-authorities (hex)", "a new kernel authority with a hex id",
+     lambda: edit("kernel/src/capability/mod.rs", "pub const LOG_WRITE_RESOURCE: ResourceId = ResourceId(1);",
+                  "pub const LOG_WRITE_RESOURCE: ResourceId = ResourceId(1);\n"
+                  "pub const SNEAK_RESOURCE: ResourceId = ResourceId(0x40);"),
+     ["kernel/src/capability/mod.rs"], []),
+    ("I-authorities (pub(crate))", "a new kernel authority with crate visibility",
+     lambda: edit("kernel/src/capability/mod.rs", "pub const LOG_WRITE_RESOURCE: ResourceId = ResourceId(1);",
+                  "pub const LOG_WRITE_RESOURCE: ResourceId = ResourceId(1);\n"
+                  "pub(crate) const SNEAK_RESOURCE: ResourceId = ResourceId(64);"),
+     ["kernel/src/capability/mod.rs"], []),
+    ("I-kernel-deps (dotted)", "a kernel dependency written as a [dependencies.x] table",
+     lambda: edit("kernel/Cargo.toml", "[target.'cfg(target_arch = \"x86_64\")'.dependencies]",
+                  "[dependencies.sneak]\nversion = \"1\"\n\n[target.'cfg(target_arch = \"x86_64\")'.dependencies]"),
+     ["kernel/Cargo.toml"], []),
+    ("I-features (underscore)", "a kernel feature with an underscore in its name",
+     lambda: edit("kernel/Cargo.toml", "kill-abandon-test = []", "kill-abandon-test = []\nfast_path = []"),
+     ["kernel/Cargo.toml"], []),
+    ("I-kernel-spawns (const)", "a kernel spawn whose name is a const, not a literal",
+     lambda: edit("kernel/src/task/mod.rs",
+                  '        "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,',
+                  '        WHO, crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,'),
+     ["kernel/src/task/mod.rs"], []),
 ]
 
 base = run()

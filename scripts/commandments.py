@@ -338,7 +338,60 @@ def check_syscall_surface(check, pins):
         out.append(Violation("kernel/src/syscall/dispatch.rs", 0,
                              f"pinned syscall {name} is gone. Removing a responsibility is welcome - "
                              f"update the pin so the recorded surface stays true."))
+    # THE DISPATCH MATCH, not only the enum (backlog/90 E2). The enum is what the pin reads, but the
+    # match is what the kernel RUNS: an arm on a raw number (`57 => ...`) adds a syscall the enum never
+    # names, and the pin above stayed green over it. So every arm of `syscall_handler`'s match must be
+    # `n if n == SyscallNumber::X as u64 =>` naming an enum entry, or the closing `_ =>`; anything else
+    # is a spelling this check cannot read, and fails rather than passes.
+    for v in _match_arm_heads(src, r"fn syscall_handler\(", "match number {"):
+        if isinstance(v, Violation):
+            out.append(v)
+            continue
+        head, line = v
+        if head == "_":
+            continue
+        m = re.fullmatch(r"n if n == SyscallNumber::([A-Za-z][A-Za-z0-9]*)\s+as u64", head)
+        if not m:
+            out.append(Violation("kernel/src/syscall/dispatch.rs", line,
+                                 f"dispatch arm `{head} =>` is not `n if n == SyscallNumber::X as u64`. An arm "
+                                 f"the pin cannot read is a syscall it cannot see: name it in SyscallNumber."))
+        elif m.group(1) not in found:
+            out.append(Violation("kernel/src/syscall/dispatch.rs", line,
+                                 f"dispatch arm names SyscallNumber::{m.group(1)}, which the enum lacks."))
     return out
+
+
+def _match_arm_heads(src, fn_pattern, match_open):
+    """The arm heads of the first `match_open` inside the function `fn_pattern` names, with line numbers.
+
+    Arms are the lines at the first arm's indentation that contain `=>`; deeper lines (an arm's body, a
+    nested match) are not heads. Comment lines are skipped. Yields `(head, line)`, or one Violation when
+    the function or the match cannot be found - an unreadable surface fails, never passes.
+    """
+    fm = re.search(fn_pattern, src)
+    if not fm:
+        yield Violation("kernel/src/syscall/dispatch.rs", 0,
+                        f"cannot find `{fn_pattern}`: its match arms cannot be read, which is a failure")
+        return
+    start = src.find(match_open, fm.end())
+    if start < 0:
+        yield Violation("kernel/src/syscall/dispatch.rs", 0,
+                        f"cannot find `{match_open}` after `{fn_pattern}`: its arms cannot be read")
+        return
+    base_line = src.count("\n", 0, start) + 1
+    lines = src[start:].split("\n")
+    indent, depth = None, 0
+    for i, ln in enumerate(lines[1:], 1):
+        code = ln.split("//", 1)[0]
+        stripped = code.strip()
+        if indent is None and stripped:
+            indent = len(ln) - len(ln.lstrip())
+        if depth == 0 and stripped.startswith("}") and (len(ln) - len(ln.lstrip())) < (indent or 0):
+            return
+        if stripped and depth == 0 and (len(ln) - len(ln.lstrip())) == indent and "=>" in code:
+            yield code.split("=>", 1)[0].strip(), base_line + i
+        depth += code.count("{") - code.count("}")
+        depth = max(depth, 0)
 
 
 def check_arch_device_drivers(check, pins):
@@ -404,8 +457,24 @@ def check_kernel_authorities(check, pins):
     baked into every service's capability table.
     """
     src = read(os.path.join(ROOT, "kernel/src/capability/mod.rs"))
-    found = dict((m[0], m[1]) for m in re.findall(
-        r"pub const ([A-Z_]+)_RESOURCE: ResourceId = ResourceId\((\d+)\)", src))
+    # Any visibility and a hex or underscored id (backlog/90 E2): `pub(crate) const` and `ResourceId(0x20)`
+    # were both invisible to `pub const ... ResourceId(\d+)`. And a `_RESOURCE` const this cannot read
+    # fails outright, so the next spelling nobody thought of is a failure rather than a pass.
+    found, unread = {}, []
+    for ln_no, ln in enumerate(src.split("\n"), 1):
+        code = ln.split("//", 1)[0]
+        if not re.search(r"\bconst\s+[A-Z_0-9]+_RESOURCE\b", code):
+            continue
+        m = re.match(r"\s*(?:pub(?:\([a-z]+\))?\s+)?const\s+([A-Z_0-9]+)_RESOURCE\s*:\s*ResourceId\s*=\s*"
+                     r"ResourceId\(\s*(0[xX][0-9a-fA-F_]+|[0-9_]+)\s*\)\s*;", code)
+        if m:
+            found[m.group(1)] = str(int(m.group(2).replace("_", ""), 0))
+        else:
+            unread.append(ln_no)
+    if unread:
+        return [Violation("kernel/src/capability/mod.rs", n,
+                          "a `_RESOURCE` const this check cannot read: write it as `pub const X_RESOURCE: "
+                          "ResourceId = ResourceId(N);` so the authority pin can see it") for n in unread]
     if not found:
         return [Violation("kernel/src/capability/mod.rs", 0,
                           "cannot find any well-known ResourceId: the pin cannot be verified, and an "
@@ -429,6 +498,18 @@ def check_kernel_authorities(check, pins):
     return out
 
 
+def _cargo_tables(path):
+    """`(parsed Cargo.toml, None)`, or `({}, Violation)` when it cannot be parsed - never a silent empty."""
+    import toml_compat as tomllib  # tomllib on 3.11+, the subset parser below it (README: 3.8)
+    rel = os.path.relpath(path, ROOT).replace("\\", "/")
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh), None
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return {}, Violation(rel, 0, f"cannot parse {rel} ({e}): what the kernel links and which features "
+                                     f"it has cannot be verified, and that is a failure, never a pass")
+
+
 def check_kernel_dependencies(check, pins):
     """Commandment I: a crate the kernel links is a responsibility it did not write and must trust.
 
@@ -436,16 +517,17 @@ def check_kernel_dependencies(check, pins):
     passing any of these checks. "Why isn't this a service?" applies to a crate exactly as it applies to
     a subsystem - more sharply, because a service could link it under isolation instead.
     """
-    src = read(os.path.join(ROOT, "kernel/Cargo.toml"))
-    found = set()
-    for block in re.findall(r"^\[(?:target\.[^\]]*\.)?dependencies\](.*?)(?=^\[|\Z)", src, re.S | re.M):
-        for ln in block.split(chr(10)):
-            ln = ln.strip()
-            if not ln or ln.startswith("#"):
-                continue
-            m = re.match(r"([A-Za-z0-9_-]+)\s*=", ln)
-            if m:
-                found.add(m.group(1))
+    # PARSED, not matched (backlog/90 E2): a `[dependencies.foo]` table was invisible to the regex this
+    # replaced. Every dependency table Cargo reads counts - [dependencies], [build-dependencies] and each
+    # [target.*] one. [dev-dependencies] does not: it links into host tests only, never ring 0.
+    found, err = _cargo_tables(os.path.join(ROOT, "kernel/Cargo.toml"))
+    if err:
+        return [err]
+    deps = set(found.get("dependencies", {})) | set(found.get("build-dependencies", {}))
+    for t in (found.get("target") or {}).values():
+        if isinstance(t, dict):
+            deps |= set(t.get("dependencies", {})) | set(t.get("build-dependencies", {}))
+    found = deps
     pinned = set(pins.get("dependencies", []))
     out = [Violation("kernel/Cargo.toml", 0,
                      f"new kernel dependency '{d}': code that will run in ring 0 with the kernel's full "
@@ -511,15 +593,35 @@ def check_kernel_spawns(check, pins):
                           f"'{svc}' is pinned as kernel-spawned but nothing spawns it - update the pin.")
                 for svc in sorted(pinned - set(found))]
         return out
+    unread = []
     for base, _, names in os.walk(os.path.join(ROOT, "kernel/src")):
         for n in sorted(names):
             if not n.endswith(".rs"):
                 continue
             f = os.path.join(base, n)
+            rel = os.path.relpath(f, ROOT).replace("\\", "/")
+            text = read(f)
             # See the seam above: `spawn_service_with_image` is the post-step-C name. Both are
             # matched, because a checker that silently finds nothing after a rename fails open.
-            for m in re.finditer(r'spawn_service_with_(?:config|image)\(\s*"([a-z0-9-]+)"', read(f)):
-                found.setdefault(m.group(1), os.path.relpath(f, ROOT).replace("\\", "/"))
+            for m in re.finditer(r'spawn_service_with_(?:config|image)\(\s*"([a-z0-9-]+)"', text):
+                found.setdefault(m.group(1), rel)
+            # A NON-LITERAL first argument hides the name (backlog/90 E2): `const WHO: &str = "fs";`
+            # then `spawn_service_with_image(WHO, ...)` was a second kernel spawn nobody counted. The one
+            # sanctioned variable is inside `spawn_from_image`, which spawns what the SUPERVISOR's
+            # request names - mechanism a service asked for, not the kernel's own initiative.
+            code = "\n".join(ln.split("//", 1)[0] for ln in text.split("\n"))
+            for m in re.finditer(r'(\bfn\s+)?\bspawn_service_with_(?:config|image)\(\s*([^\s",)][^,)]*)', code):
+                if m.group(1):
+                    continue  # the definition's own signature
+                fns = re.findall(r"\bfn\s+([a-z_0-9]+)", code[:m.start()])
+                if fns and fns[-1] == "spawn_from_image" and m.group(2).strip() == "name":
+                    continue
+                unread.append((rel, code.count("\n", 0, m.start()) + 1, m.group(2).strip()))
+    if unread:
+        return [Violation(rel, ln, f"the kernel spawns `{arg}`, a name this check cannot read. The kernel "
+                                   f"spawns exactly ONE service by its own initiative and names it with a "
+                                   f"literal; only `spawn_from_image` passes the supervisor's `name` on.")
+                for rel, ln, arg in unread]
     out = [Violation(path, 0,
                      f"the kernel spawns '{svc}' on its own initiative. The kernel restarts exactly ONE "
                      f"service - the supervisor - and only because Commandment V leaves nothing else "
@@ -550,9 +652,45 @@ def check_introspect_queries(check, pins):
         return [Violation("kernel/src/syscall/dispatch.rs", 0,
                           "cannot find handle_inspect_kernel: the query pin cannot be verified, and an "
                           "unverifiable pin is a failure, never a pass")]
-    found = {int(m) for m in re.findall(r"^\s+(\d+) =>", body.group(0), re.M)}
+    # Every arm head, not only the single-integer ones (backlog/90 E2): `24 | 29 =>` added query 29
+    # unseen, and a range or a guard would too. An or-pattern of integers is read as its members;
+    # anything else but `_` fails, because a head this check cannot read is a query it cannot pin.
+    found, out = set(), []
+    for v in _match_arm_heads(src, r"fn handle_inspect_kernel\(", "match query_id {"):
+        if isinstance(v, Violation):
+            return [v]
+        head, line = v
+        if head == "_":
+            continue
+        if re.fullmatch(r"\d+(\s*\|\s*\d+)*", head):
+            found |= {int(x) for x in head.split("|")}
+        else:
+            out.append(Violation("kernel/src/syscall/dispatch.rs", line,
+                                 f"InspectKernel arm `{head} =>` is not an integer or `a | b` of them. A query "
+                                 f"this check cannot read is one it cannot pin: write the ids out."))
+    # THE UNGATED SET, pinned too. Moving a query into the `matches!` list beside the gate changes who
+    # may ask it - a widening of authority with no new query and no new syscall, which neither pin
+    # above could see.
+    um = re.search(r"if !matches!\(query_id,\s*([^)]*)\)\s*&&\s*!scheduler::current_task_holds_resource",
+                   body.group(0))
+    if not um or not re.fullmatch(r"\d+(\s*\|\s*\d+)*", um.group(1).strip()):
+        out.append(Violation("kernel/src/syscall/dispatch.rs", 0,
+                             "cannot read the ungated query list (`if !matches!(query_id, a | b ...) && "
+                             "!scheduler::current_task_holds_resource`): which queries skip the INTROSPECT "
+                             "gate cannot be verified, and that is a failure, never a pass"))
+    else:
+        ungated = {int(x) for x in um.group(1).split("|")}
+        pinned_u = {int(q) for q in pins.get("introspect_ungated", [])}
+        out += [Violation("kernel/src/syscall/dispatch.rs", 0,
+                          f"InspectKernel query {q} is UNGATED and not pinned as such. Answering it without "
+                          f"INTROSPECT is a widening of authority: add it to [kernel] introspect_ungated "
+                          f"deliberately, with the reason it discloses nobody's state.")
+                for q in sorted(ungated - pinned_u)]
+        out += [Violation("kernel/src/syscall/dispatch.rs", 0,
+                          f"query {q} is pinned as ungated but is gated now - update the pin.")
+                for q in sorted(pinned_u - ungated)]
     pinned = {int(q) for q in pins.get("introspect_queries", [])}
-    out = [Violation("kernel/src/syscall/dispatch.rs", 0,
+    out += [Violation("kernel/src/syscall/dispatch.rs", 0,
                      f"InspectKernel query {q} is NOT pinned. A new query is a new kernel "
                      f"responsibility that changes no visible surface - the syscall count stays the "
                      f"same. Ask 'why isn't this a service?', then add it to [kernel] "
@@ -575,9 +713,11 @@ def check_kernel_features(check, pins):
 
     Test-only features count too. A build the kernel can be put into is a build someone can ship.
     """
-    src = read(os.path.join(ROOT, "kernel/Cargo.toml"))
-    block = re.search(r"^\[features\](.*?)(?=^\[|\Z)", src, re.S | re.M)
-    found = set(re.findall(r"^([a-z0-9-]+)\s*=", block.group(1), re.M)) if block else set()
+    # Parsed, so an underscore name (`fast_path = []`) or a quoted one is seen (backlog/90 E2).
+    data, err = _cargo_tables(os.path.join(ROOT, "kernel/Cargo.toml"))
+    if err:
+        return [err]
+    found = set(data.get("features", {}))
     pinned = set(pins.get("features", []))
     out = [Violation("kernel/Cargo.toml", 0,
                      f"new kernel feature '{f}': a switch on what the kernel IS, which can add a "
