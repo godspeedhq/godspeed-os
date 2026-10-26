@@ -53,7 +53,7 @@ already answers.
 
 | File | Lines | Why |
 |------|-------|-----|
-| `arch/riscv64/plic.rs` | new, 4 | `rd` and `wr`: one volatile read and one volatile write of the PLIC the device tree described, inside the kernel's identity map, at offsets the RISC-V PLIC specification defines for the sources (`riscv,ndev`) and contexts (`interrupts-extended`) that same tree declared. `handle`: one read of this hart's id (`get_lapic_id`, a register read), and one call of `interrupt::route::deliver` from the trap handler with `sstatus.SIE` clear - the calling convention that `unsafe fn` names - before the claim is completed. |
+| `arch/riscv64/plic.rs` | new, 5 | `rd` and `wr`: one volatile read and one volatile write of the PLIC the device tree described, inside the kernel's identity map, at offsets the RISC-V PLIC specification defines for the sources (`riscv,ndev`) and contexts (`interrupts-extended`) that same tree declared. `handle`: one read of this hart's id (`get_lapic_id`, a register read), and one call of `interrupt::route::deliver` from the trap handler with `sstatus.SIE` clear - the calling convention that `unsafe fn` names - before the claim is completed. `this_hart`: the same id read, so each hart readies its OWN context on arrival - OpenSBI resets a hart's contexts (threshold 7, all off) when it starts the hart, after the boot hart's `init`, so readying them all from the boot hart left every secondary deaf (measured on QEMU `virt`). |
 | `arch/riscv64/trap.rs` | 7 -> 8 (+1) | `enable_external_interrupts` sets `sie.SEIE` on each hart. Sound for the reasons `enable_software_interrupts` is: `stvec` is installed first, and `plic::init` has already switched every supervisor source off, so the bit admits only the routes the kernel later makes. |
 
 ---
@@ -2781,7 +2781,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/sbi.rs | 12 | permitted |
 | arch/riscv64/sv39.rs | 29 | permitted |
 | arch/riscv64/trap.rs | 8 | permitted |
-| arch/riscv64/plic.rs | 4 | permitted |
+| arch/riscv64/plic.rs | 5 | permitted |
 | arch/riscv64/syscall.rs | 1 | permitted |
 | arch/riscv64/context_switch.rs | 35 | permitted |
 | arch/riscv64/usermode.rs | 17 | permitted |

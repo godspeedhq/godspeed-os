@@ -885,6 +885,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
     // with no console. Interrupts are enabled here so an arriving hart's first IPI has somewhere to
     // go; software interrupts are admitted on this hart for the same reason.
     trap::enable_software_interrupts();
+    plic::this_hart();
     trap::enable_external_interrupts();
     // SAFETY: the boot hart, once, with every structure a secondary reads on arrival already built.
     if let Some(bi) = boot_info.as_ref() {
@@ -3611,6 +3612,7 @@ pub mod ap_boot {
         // Software interrupts too: an IPI is how another core wakes this one, and `sie.SSIE` is what
         // admits it.
         trap::enable_software_interrupts();
+        plic::this_hart();
         trap::enable_external_interrupts();
 
         crate::smp::core::mark_ready(core_id);

@@ -92,9 +92,10 @@ fn be32(b: &[u8], i: usize) -> Option<u32> {
     Some(u32::from_be_bytes([w[0], w[1], w[2], w[3]]))
 }
 
-/// Find the PLIC, learn its contexts, switch every supervisor context's sources off, and read the PCI
-/// host bridge's interrupt map. Called once, on the boot hart, before any hart admits an external
-/// interrupt. Every outcome is printed: a machine with no PLIC routes nothing and says so.
+/// Find the PLIC, learn which context is each hart's, and read the PCI host bridge's interrupt map.
+/// Called once, on the boot hart, before any hart admits an external interrupt; each hart readies its
+/// own context on arrival (`this_hart`). Every outcome is printed: a machine with no PLIC routes nothing
+/// and says so.
 pub fn init(tree: &Fdt) {
     const COMPAT: [&str; 2] = ["riscv,plic0", "sifive,plic-1.0.0"];
     let mut want = [None];
@@ -117,17 +118,8 @@ pub fn init(tree: &Fdt) {
         while let (Some(ph), Some(cause)) = (be32(ext, 2 * ctx as usize), be32(ext, 2 * ctx as usize + 1)) {
             if cause == 9 {
                 if let Some(h) = tree.hart_of_intc(ph).filter(|&h| (h as usize) < MAX_HART) {
-                    S_CTX[h as usize].store(ctx, Ordering::Relaxed);
+                    S_CTX[h as usize].store(ctx, Ordering::Release);
                     harts += 1;
-                    // Nothing this kernel has not asked for: threshold 0 and every source off. Firmware
-                    // that left one enabled for S-mode would otherwise interrupt a hart with a source
-                    // no route names.
-                    wr(threshold(ctx), 0);
-                    let mut w = 0;
-                    while w * 32 <= ndev {
-                        wr(enable(ctx, w * 32), 0);
-                        w += 1;
-                    }
                 }
             }
             ctx += 1;
@@ -166,6 +158,28 @@ pub fn init(tree: &Fdt) {
     super::print_str("riscv64: pci INTx -> plic, ");
     super::print_dec(n as u64);
     super::print_str(" interrupt-map entries\n");
+}
+
+/// Ready THIS hart's supervisor context: threshold 0 and every source off. Called by each hart on
+/// arrival, just before it admits external interrupts - not once by the boot hart for all of them,
+/// because the firmware resets a hart's PLIC contexts when it starts that hart: OpenSBI's warm init
+/// leaves the threshold at 7 and every enable clear, and a source at priority 1 then never reaches the
+/// hart (measured on QEMU `virt`: hart 1's threshold read 7 after the boot hart had written 0).
+/// Sources off, so nothing reaches the hart that no route here names.
+pub fn this_hart() {
+    if BASE.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    // SAFETY: reading this hart's own id; architecturally side-effect free (see `get_lapic_id`).
+    let hart = unsafe { super::boot::get_lapic_id() } as usize;
+    let Some(ctx) = S_CTX.get(hart).map(|c| c.load(Ordering::Acquire)).filter(|&c| c != NONE) else { return };
+    let ndev = NDEV.load(Ordering::Relaxed);
+    let mut w = 0;
+    while w * 32 <= ndev {
+        wr(enable(ctx, w * 32), 0);
+        w += 1;
+    }
+    wr(threshold(ctx), 0);
 }
 
 /// The PLIC source a root-bus device's INTx `pin` (1 = INTA) reaches, from the bridge's map.
