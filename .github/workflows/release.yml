@@ -166,6 +166,14 @@ jobs:
       - name: Build aarch64 (Raspberry Pi 4)
         run: python3 scripts/pi4_build.py --release
 
+      # QEMU `virt` FIRST: both riscv64 builds write the same target ELF, so the virt one is copied out
+      # before the board build replaces it. It is the kernel QEMU loads with `-kernel` (at 0x8020_0000,
+      # where the VisionFive's enters at 0x4020_0000) - what GDCS boots to run a package on riscv64.
+      - name: Build riscv64 (QEMU virt)
+        run: |
+          python3 scripts/riscv_build.py --release
+          cp target/riscv64imac-unknown-none-elf/release/kernel build/godspeed-riscv64-qemu-virt.elf
+
       - name: Build riscv64 (StarFive VisionFive 2 Lite)
         run: python3 scripts/riscv_build.py --release --visionfive
 
@@ -198,6 +206,7 @@ jobs:
           cp build/kernel7.img                     "dist/godspeed-os-$V-arm32-pi2-kernel7.img"
           cp build/kernel8.img                     "dist/godspeed-os-$V-aarch64-pi4-kernel8.img"
           cp build/godspeed-riscv64-visionfive.img "dist/godspeed-os-$V-riscv64-visionfive.img"
+          cp build/godspeed-riscv64-qemu-virt.elf  "dist/godspeed-os-$V-riscv64-qemu-virt.elf"
           cp build/config-pi2.txt build/config-pi4.txt dist/
 
       # ---- THE GATE ---------------------------------------------------------------
@@ -210,7 +219,7 @@ jobs:
           set -e
           SHA="${{ steps.v.outputs.sha }}"
           bad=0
-          for f in dist/*.img; do
+          for f in dist/*.img dist/*.elf; do
             if grep -qa "$SHA" "$f"; then
               echo "  OK    $(basename "$f")  carries $SHA"
             else
