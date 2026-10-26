@@ -1724,7 +1724,8 @@ pub fn run(core_id: u32) -> ! {
                         core_release_current(cid, next);
                         core::sync::atomic::fence(Ordering::SeqCst);
                         abort = TASK_STATE[next].load(Ordering::SeqCst)
-                            != TaskState::Running as u8;
+                            != TaskState::Running as u8
+                            || !claimed_is_ours(next, TASK_CORE[next], cid);
                     }
                     if !abort {
                         if TASK_IS_USER[next] {
@@ -2164,7 +2165,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             core_release_current(cid, next);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
-                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8
+                || !claimed_is_ours(next, TASK_CORE[next], cid);
         }
         if abort_to_sched {
             // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
@@ -2351,7 +2353,8 @@ pub fn yield_current() {
             core_release_current(cid, next);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
-                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8
+                || !claimed_is_ours(next, TASK_CORE[next], cid);
         }
         if abort_to_sched {
             // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
@@ -3420,7 +3423,8 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                     core_release_current(cid, next);
                     core::sync::atomic::fence(Ordering::SeqCst);
                     abort_to_sched =
-                        TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+                        TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8
+                        || !claimed_is_ours(next, TASK_CORE[next], cid);
                 }
                 if abort_to_sched {
                     // Kill won the race: release its spin-wait (CORE_CURRENT off `next`)
@@ -3490,6 +3494,39 @@ pub fn take_recv_message() -> Option<Message> {
 /// Before the RR scan, checks `CORE_WAKE_HINT`: if a task was just woken by
 /// `wake_by_slot` it is returned immediately without scanning, so a recently
 /// woken task cannot be starved by the current RR position.
+/// Is the task this core has just claimed pinned to THIS core? `false` - and the claim given back - when it is
+/// not, which is always a bug: a task runs only on the core it was spawned on (9.1), and switching into one
+/// pinned elsewhere would run it on two cores at once.
+///
+/// **Seen once, not reproduced (`backlog/94`).** `osdev test driver-packages`, 2026-10-26: `godspeed-pm`'s
+/// slot 15 freed on core 0 and reused at once by a spawn on core 1, then `prepare_ring3_switch`'s 9.1
+/// assertion halting the machine as core 0 switched into slot 15, its `TASK_CORE` now 1. A slot can be
+/// killed, freed and reused between `pick_next` and the claim: the pick is three separate loads, the claim
+/// is a CAS on the state alone, and a kill does not wait for a core until that core publishes the slot. But
+/// widening that window did not reproduce it, so HOW core 0 came to hold the stale slot is not established;
+/// this guard is defensive, and written so it is right whatever the path.
+///
+/// Checked AFTER the claim is published and fenced, because only from then on must a kill wait for this core:
+/// the slot cannot be reused again under the check, so the task read here is the task claimed. A mismatch
+/// gives the claim back through `wake_by_slot`, which returns the state to Ready (or leaves a task killed
+/// meanwhile Dead) and wakes its own core, and the caller aborts the switch exactly as when a kill wins. Said
+/// for the first occurrence and every power of two after, so a storm of them is visible without flooding the
+/// log - and the first time it is said is the evidence `backlog/94` is waiting for.
+fn claimed_is_ours(next: usize, pinned: u32, cid: usize) -> bool {
+    if pinned == cid as u32 {
+        return true;
+    }
+    wake_by_slot(next, 0);
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::kprintln!(
+            "sched: core {} claimed slot {}, reused for a task pinned to core {} - claim given back, switch skipped ({} so far)",
+            cid, next, pinned, n);
+    }
+    false
+}
+
 fn pick_next(core_id: usize) -> Option<usize> {
     // Fast path: schedule the just-woken task immediately.
     let hint = CORE_WAKE_HINT.get(core_id).load(Ordering::Acquire);
