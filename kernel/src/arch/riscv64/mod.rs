@@ -16,6 +16,7 @@ pub mod sv39;
 pub mod context_switch;
 pub mod display;
 mod net;
+mod plic;
 mod sdio;
 mod usb;
 pub mod syscall;
@@ -441,14 +442,9 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
         print_str("\n");
     }
 
-    let mut none = [];
-    if let Some(p) = tree.find_compatible("riscv,plic0", &[], &mut none)
-        .or_else(|| tree.find_compatible("sifive,plic-1.0.0", &[], &mut none))
-    {
-        print_str("riscv64: plic ");
-        print_hex(p.base);
-        print_str("\n");
-    }
+    // The interrupt controller, its contexts and the PCI host bridge's interrupt map - before any hart
+    // admits an external interrupt, so every source starts off (`plic.rs`).
+    plic::init(&tree);
 
     // What the FIRMWARE says is off limits, reported separately from the map it feeds. Printed
     // because an empty list is a fact worth seeing: it means nothing but our own bookkeeping is
@@ -581,6 +577,11 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
                 }
             }
             pci::init();
+            // 6.4 asks that whether DMA can be confined be said at boot, and this port has no IOMMU
+            // driver: `iommu::confine_device` refuses every request. Said once, here, in the shape x86
+            // uses when its firmware describes none, so a driver given a DMA arena is not believed to
+            // be confined by anyone reading the log.
+            print_str("iommu: none on this port (no riscv64 IOMMU driver) - a driver given a DMA arena is not confined, and drivers stay in TCB (CLAUDE.md 6.4)\n");
 
             crate::capability::init();
             crate::ipc::init();
@@ -884,6 +885,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
     // with no console. Interrupts are enabled here so an arriving hart's first IPI has somewhere to
     // go; software interrupts are admitted on this hart for the same reason.
     trap::enable_software_interrupts();
+    trap::enable_external_interrupts();
     // SAFETY: the boot hart, once, with every structure a secondary reads on arrival already built.
     if let Some(bi) = boot_info.as_ref() {
         // SAFETY: the boot hart, once, with every structure a secondary reads on arrival built.
@@ -1071,6 +1073,11 @@ fn set_hart_core(hart: u32, core: u32) {
     if (hart as usize) < MAX_HART_ID {
         HART_TO_CORE[hart as usize].store(core, Ordering::Release);
     }
+}
+
+/// The hart that is `core`, or `None` if no hart was assigned it - the inverse of `hart_core`.
+fn core_hart(core: u32) -> Option<u32> {
+    (0..MAX_HART_ID as u32).find(|&h| HART_TO_CORE[h as usize].load(Ordering::Acquire) == core)
 }
 
 /// The core id assigned to `hart`, or `None` if nothing assigned one.
@@ -2434,11 +2441,11 @@ pub fn fb_extra_page_flags() -> page_tables::PageFlags {
 }
 
 pub mod interrupts {
-    /// MSI vector pool. Empty: RISC-V delivers device interrupts through the PLIC by wire, and MSI
-    /// (via AIA/IMSIC) is a separate controller this port does not have yet. A zero-length pool means
-    /// the neutral allocator hands out nothing rather than handing out vectors nobody routes.
-    pub const MSI_POOL_BASE: u8 = 0;
-    pub const MSI_POOL_LEN: usize = 0;
+    /// The vector pool the neutral allocator hands a PCI device that wants an interrupt. There is no
+    /// MSI controller on this port (AIA/IMSIC), so a vector here names a WIRED route instead: the
+    /// device's INTx pin through the host bridge's map to a PLIC source (`plic.rs`, `pci::program_msi`).
+    pub const MSI_POOL_BASE: u8 = super::plic::POOL_BASE;
+    pub const MSI_POOL_LEN: usize = super::plic::POOL_LEN;
 
     pub use crate::task::scheduler::Armed;
     /// This arch has no sub-tick one-shot wired up, so every request falls through to the tick path -
@@ -3502,13 +3509,29 @@ pub mod pci {
     pub fn xhci_bios_handoff() {}
     pub fn ehci_flr_probe() {}
 
-    /// MSI and MSI-X need an interrupt controller to deliver INTO, and this port has no PLIC yet.
-    /// Refusing is the honest answer: a driver that is told its MSI was programmed and then never
-    /// receives one waits forever, which is the failure mode invariant 12 exists to prevent.
-    pub fn program_msi(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
+    /// "Make this device raise `vector` on core `dest`". There is no MSI controller here, so the answer
+    /// is the device's INTx, routed through the PLIC (`plic::route_intx`) - true only when the route
+    /// exists, and every refusal printed, because a driver told it has an interrupt that never comes
+    /// waits forever (invariant 12).
+    pub fn program_msi(bdf: u32, vector: u8, dest: u8) -> bool { super::plic::route_intx(bdf, vector, dest as u32) }
+    /// MSI-X is the same request for a device with a table; there is still only the wire to give it,
+    /// and `program_msi` above has already given it when it could.
     pub fn program_msix(_bdf: u32, _vector: u8, _dest: u8) -> bool { false }
-    /// No LAPIC on ARM; the pool is x86-only until this port grows a generic MSI path.
-    pub fn msi_dest_lapic(_core_id: u32) -> u8 { 0 }
+    /// The destination `program_msi` is handed: on this port, the core id itself.
+    pub fn msi_dest_lapic(core_id: u32) -> u8 { core_id as u8 }
+
+    /// Clear INTx-disable in the command register and return the device's interrupt pin (1 = INTA), or
+    /// `None` for a device with none. The status half is written as zero, which leaves its write-one-
+    /// to-clear bits alone.
+    pub(super) fn intx_pin_enable(bdf: u32) -> Option<u8> {
+        let pin = ((cfg_read32(bdf, 0x3C)? >> 8) & 0xFF) as u8;
+        if pin == 0 || pin > 4 {
+            return None;
+        }
+        let cmd = cfg_read32(bdf, 0x04)? & 0xFFFF & !(1 << 10);
+        cfg_write32(bdf, 0x04, cmd);
+        Some(pin)
+    }
     pub fn program_ehci_msi(_core_id: u32) -> bool { false }
     pub fn route_ehci_intx() {}
 }
@@ -3525,8 +3548,10 @@ pub mod iommu {
 // ---------------------------------------------------------------------------
 pub mod ioapic {
     pub fn init() {}
-    pub fn mask_vector(vector: u8) {}
-    pub fn unmask_vector(vector: u8) {}
+    /// A PLIC-routed PCI vector's source is switched off and on in its context; any other vector has no
+    /// line to mask on this port.
+    pub fn mask_vector(vector: u8) { super::plic::set_vector(vector, false) }
+    pub fn unmask_vector(vector: u8) { super::plic::set_vector(vector, true) }
 }
 
 // ---------------------------------------------------------------------------
@@ -3586,6 +3611,7 @@ pub mod ap_boot {
         // Software interrupts too: an IPI is how another core wakes this one, and `sie.SSIE` is what
         // admits it.
         trap::enable_software_interrupts();
+        trap::enable_external_interrupts();
 
         crate::smp::core::mark_ready(core_id);
         crate::kprintln!("smp: hart {} ready as core {}", hartid, core_id);

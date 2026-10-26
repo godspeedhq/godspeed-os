@@ -42,6 +42,22 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-10-26 - the riscv64 PLIC: a PCI device's interrupt reaches its driver (feat/riscv-virt-e1000)
+
+riscv64 had no interrupt controller, so a driver package that asked for its PCI device's interrupt was
+given none (GDCS's HDA example, on QEMU `virt`). The port now routes the device's wired INTx through the
+host bridge's `interrupt-map` to a PLIC source, named by one of eight pool vectors the neutral allocator
+already hands out (`task::pci_msi_vector`), and delivers it through `interrupt::route::deliver`. No
+neutral kernel change: the arch answers `program_msi`, `mask_vector` and `unmask_vector`, which every port
+already answers.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/riscv64/plic.rs` | new, 4 | `rd` and `wr`: one volatile read and one volatile write of the PLIC the device tree described, inside the kernel's identity map, at offsets the RISC-V PLIC specification defines for the sources (`riscv,ndev`) and contexts (`interrupts-extended`) that same tree declared. `handle`: one read of this hart's id (`get_lapic_id`, a register read), and one call of `interrupt::route::deliver` from the trap handler with `sstatus.SIE` clear - the calling convention that `unsafe fn` names - before the claim is completed. |
+| `arch/riscv64/trap.rs` | 7 -> 8 (+1) | `enable_external_interrupts` sets `sie.SEIE` on each hart. Sound for the reasons `enable_software_interrupts` is: `stvec` is installed first, and `plic::init` has already switched every supervisor source off, so the bit admits only the routes the kernel later makes. |
+
+---
+
 ## 2026-10-17 - Exit: a program ends itself (feat/packages)
 
 A new syscall (57), with the constitution amended at 14.5 and the floor at 18.5. The kernel's handler adds NO
@@ -2764,7 +2780,8 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/fdt.rs | 3 | permitted |
 | arch/riscv64/sbi.rs | 12 | permitted |
 | arch/riscv64/sv39.rs | 29 | permitted |
-| arch/riscv64/trap.rs | 7 | permitted |
+| arch/riscv64/trap.rs | 8 | permitted |
+| arch/riscv64/plic.rs | 4 | permitted |
 | arch/riscv64/syscall.rs | 1 | permitted |
 | arch/riscv64/context_switch.rs | 35 | permitted |
 | arch/riscv64/usermode.rs | 17 | permitted |

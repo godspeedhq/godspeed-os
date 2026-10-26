@@ -154,6 +154,13 @@ impl<'a> Fdt<'a> {
     // past the closure body - which `find_compatible` and `usable_harts` both need in order to
     // remember which node they are inside across successive properties.
     fn walk<F: FnMut(&'a str, &'a str, &'a [u8], u32, u32) -> bool>(&self, mut f: F) {
+        self.walk_with_parent(|_, node, prop, val, ac, sc| f(node, prop, val, ac, sc));
+    }
+
+    /// [`Self::walk`], with the name of each property's node's PARENT first (`""` at the root). For a
+    /// node that is only meaningful by where it sits - a hart's interrupt controller is a child of its
+    /// `cpu@N` and carries no hart id of its own - which a flat walk cannot say.
+    fn walk_with_parent<F: FnMut(&'a str, &'a str, &'a str, &'a [u8], u32, u32) -> bool>(&self, mut f: F) {
         let mut off = self.off_struct;
         let mut depth: usize = 0;
         let mut cells = [(2u32, 1u32); MAX_DEPTH];
@@ -201,7 +208,8 @@ impl<'a> Fdt<'a> {
                             }
                         }
                         let parent = if d > 0 { cells[d - 1] } else { (2, 1) };
-                        if f(names[d], pname, val, parent.0, parent.1) {
+                        let up = if d > 0 { names[d - 1] } else { "" };
+                        if f(up, names[d], pname, val, parent.0, parent.1) {
                             return;
                         }
                     }
@@ -399,6 +407,23 @@ impl<'a> Fdt<'a> {
         });
         bank(cur_id, cur_ok, &mut n, out);
         n
+    }
+
+    /// The hart whose interrupt controller has `phandle`: the unit address of the `cpu@N` it sits in.
+    ///
+    /// A PLIC names the targets of its contexts by these phandles (`interrupts-extended`), never by hart
+    /// id, so this is how a context is tied to the hart that must claim from it. The unit address is the
+    /// node's `reg`, which for a `cpu` node is the hart id (devicetree spec, "cpus" node).
+    pub fn hart_of_intc(&self, phandle: u32) -> Option<u32> {
+        let mut hart = None;
+        self.walk_with_parent(|up, _node, prop, val, _, _| {
+            if prop == "phandle" && be32(val, 0) == Some(phandle) {
+                hart = up.strip_prefix("cpu@").and_then(|h| u32::from_str_radix(h, 16).ok());
+                return true;
+            }
+            false
+        });
+        hart
     }
 
     /// How many harts the tree says are USABLE, and the highest id among them.
