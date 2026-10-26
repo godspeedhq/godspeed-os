@@ -101,6 +101,35 @@ def files_in_scope(check):
     return sorted(inc), exc
 
 
+def compile_time_and_test_lines(text):
+    """The 1-based line numbers of code that never runs on GodspeedOS: a `const _: () = ...;` item (a
+    compile-time assertion; an `assert!` there fails the BUILD, never a running service) and a
+    `#[cfg(test)]` module (host tests). Found by brace matching from the item's first line, with string
+    and character literals and comments skipped so a brace inside one is not counted."""
+    lines = text.split("\n")
+    skip = set()
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        opener = re.match(r"(pub(\([a-z]+\))?\s+)?const\s+_\s*:\s*\(\)\s*=", s) or (
+            s.startswith("#[cfg(test)]") and i + 1 < len(lines)
+            and re.match(r"\s*(pub\s+)?mod\s+\w+\s*\{", lines[i + 1]))
+        if not opener:
+            i += 1
+            continue
+        depth, seen_open, j = 0, False, i
+        while j < len(lines):
+            code = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])\'|//.*', "", lines[j])
+            depth += code.count("{") + code.count("(") - code.count("}") - code.count(")")
+            seen_open = seen_open or "{" in code or "(" in code
+            skip.add(j + 1)
+            if seen_open and depth <= 0 and (code.rstrip().endswith(";") or code.rstrip().endswith("}")):
+                break
+            j += 1
+        i = j + 1
+    return skip
+
+
 def scope_entries_empty(check):
     """The scope entries of a source check that contribute no file: a path that does not exist, or one
     that names nothing a check reads. Each is a hole in what the check claims to cover."""
@@ -138,7 +167,11 @@ def scan_source(check, pins):
     inc, _ = files_in_scope(check)
     for f in inc:
         rel = os.path.relpath(f, ROOT).replace(os.sep, "/")
-        for i, ln in enumerate(read(f).split("\n"), 1):
+        body = read(f)
+        not_run = compile_time_and_test_lines(body) if check.get("runtime_only") else set()
+        for i, ln in enumerate(body.split("\n"), 1):
+            if i in not_run:
+                continue
             if matches_line(ln, rx, sk):
                 m = dk.search(ln) if dk else None
                 key = f"{rel}:{m.group(1)}" if m else None
@@ -155,7 +188,9 @@ def scan_source(check, pins):
 
 def matches_line(ln, rx, sk):
     s = ln.strip()
-    if s.startswith("//") or s.startswith("*") or s.startswith("#["):
+    # A block comment's continuation line is `*` alone, `* text` or `*/`. This read ANY line starting with
+    # `*` as a comment, so a deref assignment - `*slot = x.unwrap();` - was skipped (backlog/90 E2).
+    if s.startswith("//") or s == "*" or s.startswith("* ") or s.startswith("*/") or s.startswith("#["):
         return False
     if sk and sk.search(ln):
         return False
@@ -219,7 +254,11 @@ def check_managed_watched(check, pins):
 
     out = []
     w = re.search(r"fn is_watched\(name:\s*&str\)\s*->\s*bool\s*\{(.*?)\n\}", sup_code, re.S)
-    if not w or "MANAGED.contains(" not in w.group(1):
+    # THE EXACT SHAPE, not a substring (backlog/90 E2). Mentioning `MANAGED.contains(` passed
+    # `MANAGED.contains(&name) && name != "fs"`, which unwatches `fs`. The body must be the call, optionally
+    # OR-ed with names to ADD - `|| name == "counter"` widens the set and can never remove a managed service.
+    shape = r'MANAGED\.contains\(&name\)(?:\|\|name=="[a-z0-9-]+")*'
+    if not w or not re.fullmatch(shape, re.sub(r"\s+", "", w.group(1))):
         out.append(Violation("services/supervisor/src/main.rs", 0,
                              "`is_watched` is missing or does not answer from MANAGED: a managed service "
                              "would be spawned unwatched, so its death would never reach the supervisor "
@@ -1760,6 +1799,12 @@ CHECKS = [
              dict(why="is_watched that does not answer from MANAGED must be caught",
                   pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }".replace("MANAGED.contains(&name)", "name == \"fs\""),
                         "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=True),
+             dict(why="is_watched that EXCLUDES a managed service with `&&` must be caught (backlog/90 E2)",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }".replace("MANAGED.contains(&name)", "MANAGED.contains(&name) && name != \"fs\""),
+                        "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=True),
+             dict(why="is_watched that ADDS a name with `||` widens the set and must pass",
+                  pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }".replace("MANAGED.contains(&name)", "MANAGED.contains(&name) || name == \"counter\""),
+                        "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=False),
              dict(why="a spawn request that never sets the flag must be caught",
                   pins={"_managed_src": "const MANAGED: [&str; 2] = [\"fs\", \"time\"];\nfn is_watched(name: &str) -> bool {\n    MANAGED.contains(&name)\n}\nfn spawn() { req.flags = flags | if is_watched(name) { SPAWN_FLAG_WATCHED } else { 0 }; }\nfn on_death() { if !name.is_empty() && is_watched(name) { log_fmt(\"{} died, restarting\") } }".replace("SPAWN_FLAG_WATCHED", "0"),
                         "_notify_src": "if task_watched(slot) || task_name == \"supervisor\" { bump_name_restart(task_name); } if task_watched(slot) { ipc::names::lookup(\"supervisor\") }", "_flag_src": "req.flags & SPAWN_FLAG_WATCHED != 0, set_task_watched(task_slot, watched);"}, expect=True),
@@ -1791,7 +1836,13 @@ CHECKS = [
          exclude=[dict(glob="build.rs",
                        reason="host build scripts: they run on the developer's machine at build time, "
                               "never on GodspeedOS, so a panic there correctly fails the build")],
-         pattern=r"\.unwrap\(\)|\.expect\(|(^|[^a-z_])panic!|todo!|unimplemented!|unreachable!",
+         # The assert family panics at runtime too (backlog/90 E2). `runtime_only` skips what never runs on
+         # GodspeedOS - `const _: () = assert!(..)`, which fails the BUILD, and `#[cfg(test)]` modules - so a
+         # compile-time assertion stays the good pattern it is. `debug_assert*` is compiled out of the
+         # release builds the boards run, and is left to review.
+         pattern=r"\.unwrap\(\)|\.expect\(|(^|[^a-z_])panic!|todo!|unimplemented!|unreachable!"
+                 r"|(^|[^a-z_])assert(_eq|_ne)?!",
+         runtime_only=True,
          fix="a service must never halt the machine: return a loud error instead "
              "(unwrap_or / unwrap_or_else / let-else / an explicit match)",
          proves="no service contains a construct that panics by design",
@@ -1812,6 +1863,12 @@ CHECKS = [
                   code="let Some(x) = foo else { return };", expect=False),
              dict(why="a comment explaining the rule is not a violation of it",
                   code="// never call .unwrap() in a service", expect=False),
+             dict(why="a runtime assert! panics too (backlog/90 E2)", code="assert!(n < MAX);", expect=True),
+             dict(why="assert_eq! likewise", code="assert_eq!(a, b);", expect=True),
+             dict(why="a deref assignment is code, not a block comment (backlog/90 E2)",
+                  code="*slot = next.unwrap();", expect=True),
+             dict(why="a block comment's `* text` line is still a comment",
+                  code=" * never call .unwrap() here", expect=False),
          ]),
     dict(nature="rule", id="VI-static-mut", commandment="VI", title="no unowned global mutable state in services",
          kind="source", dirs=["services"],

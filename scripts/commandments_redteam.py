@@ -186,6 +186,22 @@ CASES = [
                   "\nstatic mut SNEAK: u32 = 0;\n#[no_mangle]\npub extern"),
      ["services/events/src/main.rs"], []),
 
+    # backlog/90 E2: V-no-panic missed the assert family, and skipped a line starting with `*` as a comment.
+    ("V-no-panic (assert)", "a runtime assert! in a service",
+     lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
+                  "\nfn boom(n: u32) { if n > 0 { assert!(n < 9); } }\n#[no_mangle]\npub extern"),
+     ["services/events/src/main.rs"], []),
+    ("V-no-panic (deref)", "an unwrap() on a line that starts with a deref",
+     lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
+                  "\nfn boom(s: &mut u32, o: Option<u32>) {\n    *s = o.unwrap();\n}\n#[no_mangle]\npub extern"),
+     ["services/events/src/main.rs"], []),
+
+    # backlog/90 E2: V-managed-watched tested a SUBSTRING, so an exclusion added to is_watched passed.
+    ("V-managed-watched", "is_watched excluding a managed service",
+     lambda: edit("services/supervisor/src/main.rs", '    MANAGED.contains(&name) || name == "counter"\n',
+                  '    MANAGED.contains(&name) && name != "fs" || name == "counter"\n'),
+     ["services/supervisor/src/main.rs"], []),
+
     # backlog/90 E2: the pattern missed a path-qualified type, which is how `fs` wrote its four.
     ("VI-static-mut (path)", "a path-qualified atomic static in a service",
      lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
