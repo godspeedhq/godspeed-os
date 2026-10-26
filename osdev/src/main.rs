@@ -485,6 +485,11 @@ const EXTRA_CHECKS: &[&str] = &[
     "scripts/arch_boundary_check.py",
     "scripts/arch_seam_check.py",
     "scripts/contract_check.py",
+    // EVERY SYSCALL IS GATED, or ungated by record with its reason (backlog/90 C4). The pins in
+    // `commandments.py` read the syscall NAMES and NUMBERS; nothing looked inside a handler, so 15 gate
+    // mutations of dispatch.rs were caught by 0 checks. This one reads each arm's gates, pins their
+    // signatures, and runs its own 18 mutants every time (about 6 s).
+    "scripts/syscall_gate_check.py",
     // A doc that names a FUNCTION must name one that exists. `doc_refs.py` checks the other half
     // (paths), and a RENAME breaks this half silently because the prose still reads correctly -
     // four had rotted when this was written, including one in CLAUDE.md pointing at a file an
