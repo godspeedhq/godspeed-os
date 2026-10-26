@@ -1514,8 +1514,15 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
 
     // VisionFive 2: the on-SoC DesignWare MAC, same posture as GENET on the Pi 4 - the kernel grants
     // the controller's window and a DMA arena by device kind and drives no ethernet itself.
+    //
+    // QEMU `virt` has PCIe, and there the kernel's NIC grant is the PCI ethernet controller it found
+    // (`arch/riscv64` prefers PCI class 0x020000 to the SoC MAC). So this arm asks the device first,
+    // exactly as the x86 arm does: an 82540EM takes the e1000 path below, anything else is the SoC
+    // MAC. Without this the dwmac backend was driven on the e1000's BAR and read zeros.
     #[cfg(target_arch = "riscv64")]
-    dwmac::dwmac_main(ctx);
+    if godspeed::driver::device::nic_vendor_device(&ctx) != E1000_82540EM {
+        dwmac::dwmac_main(ctx);
+    }
 
     // x86: ask the device. An Intel e1000 (the QEMU dev NIC) or a Realtek RTL8168 (the T630) - the
     // kernel maps whichever one's BAR and this sorts by the PCI identity. The three SoC ports are

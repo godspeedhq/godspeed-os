@@ -93,11 +93,10 @@ def main():
     ap.add_argument("--settle", type=float, default=8.0,
                     help="seconds to wait after each typed line for its output")
     ap.add_argument("--net", action="store_true",
-                    help="attach an Intel e1000 on QEMU user-net. NOTE: nic-driver on riscv64 drives "
-                         "only the VisionFive's Synopsys DesignWare MAC (dwmac), which QEMU does not "
-                         "model, and the e1000 path is compiled for x86 alone, so this device is found "
-                         "on the PCI bus and never driven: there is no network under QEMU on this port "
-                         "(checked 2026-10-16). Kept for the PCI discovery it still exercises.")
+                    help="attach an Intel e1000 on QEMU user-net. The kernel grants nic-driver the PCI "
+                         "ethernet controller it found ahead of the SoC MAC, and nic-driver asks the device: "
+                         "an 82540EM takes the e1000 path, as on x86, so DHCP and `ping` work here "
+                         "(2026-10-26; until then the dwmac backend was driven on the e1000's BAR).")
     ap.add_argument("--pcap", default="",
                     help="with --net, dump every frame to this file so the wire can be read when the "
                          "guest disagrees with itself about what it sent")
