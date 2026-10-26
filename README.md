@@ -152,10 +152,19 @@ reopens nothing.
 
 **As a package**, with no rebuild at all: its contract names the device (`hw_pci_class`, `hw_pci_bar`),
 the developer CLI packages and signs it, and the operator installs it on a running machine and approves the
-device. GodspeedOS 0.29.0 and 0.30.0 give a driver package its device's registers only; the release after
-0.30.0 adds its interrupt, a DMA arena (asked about separately, because on a machine whose IOMMU does not
-confine the device it is kernel-equivalent reach), taking over a device an in-tree driver handles, and USB
-devices by vendor and product. `docs/developer-services-design.md` 13.1 has the whole of it.
+device. GodspeedOS 0.29.0 and 0.30.0 give a driver package its device's registers only; 0.31.0 adds its
+interrupt, a DMA arena (asked about separately, because on a machine whose IOMMU does not confine the device it
+is kernel-equivalent reach), taking over a device an in-tree driver handles, and USB devices by vendor and
+product. `docs/developer-services-design.md` 13.1 has the whole of it.
+
+**Testing one.** The Godspeed Driver Conformance Suite,
+[**godspeed-gdcs**](https://github.com/godspeedhq/godspeed-gdcs), tests a driver package against a release. It
+checks the package offline, then installs it on that release's own image in QEMU, as an operator would, and
+watches it. Its [examples](https://github.com/godspeedhq/godspeed-gdcs/tree/main/examples) are reference
+drivers for devices QEMU emulates, each tested by GDCS. The drivers GodspeedOS ships in the tree have not been
+through GDCS: they came before it, and are tested by this repository's own suites and on hardware. They will
+move onto the same tools where the OS's design allows; godspeed-gdcs's README says which cannot move yet, and
+why.
 
 ## How it works
 
