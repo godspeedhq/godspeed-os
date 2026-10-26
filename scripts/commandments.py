@@ -1653,6 +1653,44 @@ def check_kernel_responsibilities(check, pins):
     return out
 
 
+# THE WHITELISTS, FROZEN (backlog/90 E2). `kernel_support_roles` and `arch_permitted_roles` decide what
+# the two checks above accept, and they lived only in the baseline - so a seventh responsibility entered
+# with two baseline lines, one role and one claim, and every check stayed green. A second copy here is
+# the ratchet: the baseline must state exactly these, so widening either list means editing this gate's
+# source as well, which 21 names as a change to be argued in the open ("weakens a gate"), never one made
+# quietly in a config. Shrinking is welcome; it is one more line to delete here.
+FROZEN_SUPPORT_ROLES = {"arch-layer", "syscall-entry", "boot-entry", "kernel-log-floor", "invariants"}
+FROZEN_ARCH_PERMITTED_ROLES = {
+    "arch-entry", "boot", "mmu", "interrupts", "timer", "context-switch", "scheduler-entry",
+    "syscall-entry", "usermode", "uaccess", "console", "discovery", "iommu", "clock", "test-scaffold",
+}
+# And the privilege keys IV reconciles may only GROW: moving one into `contract_not_reconciled` stops a
+# contract's claim of it being checked, which is the same silent loss the schema check above prevents.
+FROZEN_CONTRACT_PRIVILEGES = {"service_control", "resource_mint", "pci_cfg", "cpu_clock", "power_off"}
+
+
+def check_frozen_tables(check, pins):
+    out = []
+    for key, frozen in (("kernel_support_roles", FROZEN_SUPPORT_ROLES),
+                        ("arch_permitted_roles", FROZEN_ARCH_PERMITTED_ROLES)):
+        have = set(pins.get(key, {}) or [])
+        for r in sorted(have - frozen):
+            out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                                 f"`{r}` was added to {key}, which decides what counts as a sanctioned kernel "
+                                 f"role. Widening it is a constitutional change: amend CLAUDE.md, and change "
+                                 f"the frozen copy in scripts/commandments.py in the same commit, in the open."))
+        for r in sorted(frozen - have):
+            out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                                 f"`{r}` left {key} - welcome; delete it from the frozen copy in "
+                                 f"scripts/commandments.py too, so the two stay one record."))
+    mapped = set(pins.get("contract_privileges", {}) or {})
+    for k in sorted(FROZEN_CONTRACT_PRIVILEGES - mapped):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"`{k}` is no longer mapped in contract_privileges, so a contract's claim of it is "
+                             f"no longer reconciled against what is granted. That list may only grow."))
+    return out
+
+
 REQUIRED_PLAIN_KEYS = [
     "dependencies", "features", "service_configs", "arch_permitted_roles",
     "introspect_queries", "kernel_spawned_service",
@@ -1816,6 +1854,26 @@ CHECKS = [
              # module that goes back to claiming nothing breaks this probe again, in the other
              # direction.
              dict(why="the real module set has NO unclaimed modules (C1-6 closed, and must stay closed)",
+                  pins=None, expect=False),
+         ]),
+    dict(nature="rule", id="I-frozen-tables", commandment="I",
+         title="the whitelists the kernel checks trust are ratcheted",
+         kind="custom", fn=check_frozen_tables,
+         scope="kernel_support_roles, arch_permitted_roles and contract_privileges against frozen copies here",
+         proves="a sanctioned kernel role cannot be added, nor a privilege key unreconciled, by a baseline "
+                "edit alone",
+         does_not_prove="that an edit to both copies was argued for; that is review, 21",
+         probes=[
+             dict(why="a seventh responsibility entering as a support role must be caught",
+                  pins={"kernel_support_roles": {"arch-layer": "", "syscall-entry": "", "boot-entry": "",
+                                                 "kernel-log-floor": "", "invariants": "", "filesystem": ""}},
+                  expect=True),
+             dict(why="a peripheral role added to the arch whitelist must be caught",
+                  pins={"arch_permitted_roles": sorted(FROZEN_ARCH_PERMITTED_ROLES) + ["storage"]},
+                  expect=True),
+             dict(why="a privilege key dropped from IV's map must be caught",
+                  pins={"contract_privileges": {"service_control": "SERVICE_CONTROL"}}, expect=True),
+             dict(why="the real tables match their frozen copies",
                   pins=None, expect=False),
          ]),
     dict(nature="record", id="I-arch-drivers", commandment="I", title="no peripheral device driver lives in the kernel",

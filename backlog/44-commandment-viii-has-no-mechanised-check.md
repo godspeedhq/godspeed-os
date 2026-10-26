@@ -5,7 +5,7 @@ it is written down rather than left as a nice observation.
 
 ## The fact
 
-`scripts/commandments.py` carries 21 checks across the ten commandments. They cover **I, II, III, IV,
+`scripts/commandments.py` carries 22 checks across the ten commandments. They cover **I, II, III, IV,
 V, VI, VII, IX and X**. Commandment VIII - *"Thou shalt not rely upon timing for correctness. Wait
 for truth, not time"* - has **none**.
 

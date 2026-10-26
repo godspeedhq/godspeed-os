@@ -260,6 +260,20 @@ CASES = [
                   '        "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,',
                   '        WHO, crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,'),
      ["kernel/src/task/mod.rs"], []),
+
+    # backlog/90 E2: a seventh responsibility used to enter with two baseline lines and fail nothing.
+    ("I-frozen-tables (support role)", "a new sanctioned support role in the baseline",
+     lambda: edit("COMMANDMENTS.baseline.toml", 'invariants       = "',
+                  'filesystem       = "x"\ninvariants       = "'),
+     ["COMMANDMENTS.baseline.toml"], []),
+    ("I-frozen-tables (arch role)", "a peripheral role added to the arch whitelist",
+     lambda: edit("COMMANDMENTS.baseline.toml", '"clock", "test-scaffold",', '"clock", "test-scaffold", "storage",'),
+     ["COMMANDMENTS.baseline.toml"], []),
+    ("I-frozen-tables (privilege)", "a privilege key moved from mapped to not reconciled",
+     lambda: (edit("COMMANDMENTS.baseline.toml", 'power_off = "POWER_OFF"\n', ''),
+              edit("COMMANDMENTS.baseline.toml", '[kernel.contract_not_reconciled]\n',
+                   '[kernel.contract_not_reconciled]\npower_off = "moved"\n')),
+     ["COMMANDMENTS.baseline.toml"], []),
 ]
 
 base = run()
