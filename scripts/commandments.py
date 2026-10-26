@@ -1346,6 +1346,45 @@ def _grant_decomment(text):
     return re.sub(r'//[^\n]*', '', text)
 
 
+# The spawn flags that carry AUTHORITY: REQ_CONSOLE has the kernel mint CONSOLE_READ (the keyboard),
+# PEERS_GRANT mints every peer cap with GRANT, HANDOVER lets a second instance run under a live name
+# (2.5 amendment 2026-10-17). REQ_RECV, CORE_STRICT and WATCHED shape the task, not its reach.
+AUTHORITY_FLAGS = {"REQ_CONSOLE", "PEERS_GRANT", "HANDOVER"}
+
+
+def _row_fields(src, open_paren):
+    """The top-level comma-separated fields of the tuple whose `(` is at `open_paren`."""
+    depth, fields, cur = 0, [], []
+    for ch in src[open_paren:]:
+        if ch in "([{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                fields.append("".join(cur).strip())
+                return fields
+        elif ch == "," and depth == 1:
+            fields.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(ch)
+    return []
+
+
+def _word_tokens(field, name_re, kind):
+    """`kind:X` for each name in a `|`-joined word of named bits, and `kind-unread:<text>` when the
+    field holds anything else but `0` - a literal or a constant this cannot see through."""
+    toks = {f"{kind}:{n}" for n in re.findall(name_re, field)}
+    rest = re.sub(r'(?:[a-z_]+::)*' + name_re.replace("([A-Z_0-9]+)", "[A-Z_0-9]+").replace("([A-Z_]+)", "[A-Z_]+"),
+                  '', field)
+    rest = re.sub(r'[\s|]', '', rest)
+    if rest not in ("", "0"):
+        toks.add(f"{kind}-unread:{rest}")
+    return toks
+
+
 def _peer_consts(sup_src):
     """`{CONST_NAME: [peer, ...]}` for every `pub const NAME: &[&str] = ..` in the supervisor.
 
@@ -1431,6 +1470,52 @@ def _service_grants():
                 # LOUD, never silent. An unresolvable peer slot becomes a token that must be pinned,
                 # so the gap is visible in the baseline instead of reading as "no peers".
                 add(name, f"peer-unresolved:{named.group(1)}", sup_path)
+        # THE FLAGS AND THE PRIVILEGE WORD, read as FIELDS (backlog/90 E2). A grep for `privbits::X`
+        # sees only that spelling: a literal word (`0x40`) or a named constant granted the same bits
+        # invisibly, and the spawn flags were not read at all - though REQ_CONSOLE has the kernel mint
+        # CONSOLE_READ, the keyboard, and PEERS_GRANT makes every peer cap re-delegatable. So the row is
+        # split at its top-level commas; an authority-bearing flag is a token, and a field this cannot
+        # read is a token too, which must be pinned - loud, never a silent pass.
+        fields = _row_fields(sup, m.start())
+        if len(fields) != 9:
+            add(name, "row-unreadable", sup_path)
+        else:
+            for tok in _word_tokens(fields[2], r"SPAWN_FLAG_([A-Z_]+)", "flag"):
+                if tok.startswith("flag:") and tok[5:] not in AUTHORITY_FLAGS:
+                    continue
+                add(name, tok, sup_path)
+            for tok in _word_tokens(fields[6], r"privbits::([A-Z_0-9]+)", "priv"):
+                add(name, tok, sup_path)
+
+    # ---- the probe table the supervisor compiles in ----------------------------------------------
+    # Every probe's privileges come from functions in this one file, keyed on its name, so the file is
+    # pinned as one grantor: every privilege, class and flag it can hand ANY probe. A REBOOT added for a
+    # probe is a widening like any other, and was invisible until this read it.
+    probe_path = "services/probe/src/table.rs"
+    if os.path.exists(os.path.join(ROOT, probe_path)):
+        probe = _grant_decomment(read(os.path.join(ROOT, probe_path)))
+        for priv in re.findall(r'privbits::([A-Z_0-9]+)', probe):
+            add("probe-table", f"priv:{priv}", probe_path)
+        for hw in re.findall(r'hwclass::([A-Za-z_0-9]+)', probe):
+            add("probe-table", f"hw:{hw}", probe_path)
+        for flag in re.findall(r'SPAWN_FLAG_([A-Z_]+)', probe):
+            if flag in AUTHORITY_FLAGS:
+                add("probe-table", f"flag:{flag}", probe_path)
+        for rhs in re.findall(r'\bp\s*(?:\|=|=)\s*([^;]+);', probe):
+            if re.sub(r'privbits::[A-Z_0-9]+|[\s|]', '', rhs):
+                add("probe-table", "priv-unread:" + re.sub(r'\s+', '', rhs), probe_path)
+
+    # ---- what the kernel lets the supervisor delegate --------------------------------------------
+    # The ceiling on every grant above: the kernel refuses a privilege the supervisor cannot delegate.
+    # Widening it widens what ANY row may ask for, so it is pinned as one more grantor.
+    ker_path = "kernel/src/task/mod.rs"
+    ker_raw = _grant_decomment(read(os.path.join(ROOT, ker_path)))
+    dm = re.search(r'const SUPERVISOR_DELEGATABLE\s*:[^=]*=\s*&\[(.*?)\];', ker_raw, re.S)
+    if not dm:
+        add("kernel-delegatable", "unreadable", ker_path)
+    else:
+        for priv in re.findall(r'privbits::([A-Z_0-9]+)', dm.group(1)):
+            add("kernel-delegatable", f"priv:{priv}", ker_path)
 
     # ---- what the kernel still grants by name ----------------------------------------------------
     ker_path = "kernel/src/task/mod.rs"

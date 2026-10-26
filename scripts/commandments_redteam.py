@@ -274,6 +274,37 @@ CASES = [
               edit("COMMANDMENTS.baseline.toml", '[kernel.contract_not_reconciled]\n',
                    '[kernel.contract_not_reconciled]\npower_off = "moved"\n')),
      ["COMMANDMENTS.baseline.toml"], []),
+
+    # backlog/90 E2: VII read only `privbits::X` spellings in supervisor rows.
+    ("VII-service-grants (flag)", "the keyboard granted to fs by a spawn flag",
+     lambda: edit("services/supervisor/src/main.rs",
+                  '("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,',
+                  '("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV'
+                  ' | godspeed_sdk::service_context::SPAWN_FLAG_REQ_CONSOLE,'),
+     ["services/supervisor/src/main.rs"], []),
+    ("VII-service-grants (literal word)", "a privilege granted as a literal bit, not a privbits name",
+     lambda: edit("services/supervisor/src/main.rs",
+                  '("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, '
+                  '&["block-driver", "events"],\n     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),',
+                  '("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, '
+                  '&["block-driver", "events"],\n     godspeed_sdk::service_context::privbits::RESOURCE_MINT | 0x40, 0, 0),'),
+     ["services/supervisor/src/main.rs"], []),
+    ("VII-service-grants (const word)", "a privilege granted through a named constant",
+     lambda: edit("services/supervisor/src/main.rs",
+                  '("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, '
+                  '&["block-driver", "events"],\n     godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),',
+                  '("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, '
+                  '&["block-driver", "events"],\n     FS_EXTRA_PRIVS, 0, 0),'),
+     ["services/supervisor/src/main.rs"], []),
+    ("VII-service-grants (probe)", "REBOOT handed to every test probe",
+     lambda: edit("services/probe/src/table.rs", 'if name != "adv-a13" { p |= privbits::ACQUIRE_ANY; }',
+                  'if name != "adv-a13" { p |= privbits::ACQUIRE_ANY; }\n    p |= privbits::REBOOT;'),
+     ["services/probe/src/table.rs"], []),
+    ("VII-service-grants (delegatable)", "IMAGE_SPAWN made delegatable by the kernel",
+     lambda: edit("kernel/src/task/mod.rs", "    (privbits::POWER_OFF,       POWER_OFF_RESOURCE),",
+                  "    (privbits::POWER_OFF,       POWER_OFF_RESOURCE),\n"
+                  "    (privbits::IMAGE_SPAWN,     IMAGE_SPAWN_RESOURCE),"),
+     ["kernel/src/task/mod.rs"], []),
 ]
 
 base = run()

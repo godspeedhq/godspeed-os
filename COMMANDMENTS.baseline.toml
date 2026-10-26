@@ -811,7 +811,9 @@ SpawnImage               = 52
 # denied one step earlier and prove nothing about naming. No peers - the transfer it demonstrates
 # has no receiver, by design.
 "cap-grant" = ["priv:ACQUIRE_ANY"]
-"chaos" = ["peer:supervisor", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
+# flag:REQ_CONSOLE (pinned 2026-10-26, backlog/90 E2, read for the first time): the spawn flag that has the
+# kernel mint CONSOLE_READ, the keyboard. chaos owns the console foreground while a storm runs, so it reads its own quit key.
+"chaos" = ["flag:REQ_CONSOLE", "peer:supervisor", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "console" = ["hw:FRAMEBUFFER", "peer:events"]
 "control" = ["peer:events", "peer:supervisor", "priv:FIRE_IRQ", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 # copier: peer:audio-driver and peer:pwm-audio (2026-10-09) - the "done" system sound when a background job
@@ -842,7 +844,9 @@ SpawnImage               = 52
 # VisionFive (services/nic-driver/src/radio.rs).
 "nic-driver" = ["hw:BAR_AUTO", "hw:NIC", "hw:pci", "peer:dwc2", "peer:events", "peer:wifi-driver", "peer:wifi-usb"]
 "observe" = ["priv:INTROSPECT"]
-"observe-live" = ["priv:INTROSPECT"]
+# flag:REQ_CONSOLE (pinned 2026-10-26, backlog/90 E2, read for the first time): the spawn flag that has the
+# kernel mint CONSOLE_READ, the keyboard. observe-live is a full-screen view that reads the keys that page and quit it.
+"observe-live" = ["flag:REQ_CONSOLE", "priv:INTROSPECT"]
 "observe-now" = ["priv:INTROSPECT"]
 "ping" = ["peer:pong"]
 # power: peer:fs and peer:copier (2026-10-14) - a shutdown's last-second tidy-up (docs/shutdown.md 4.3).
@@ -852,7 +856,9 @@ SpawnImage               = 52
 "power" = ["peer:copier", "peer:fs", "priv:CPU_CLOCK", "priv:INTROSPECT"]
 "recorder" = ["peer:events", "peer:fs"]
 "resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
-"shell" = ["peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:POWER_OFF", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
+# flag:REQ_CONSOLE (pinned 2026-10-26, backlog/90 E2, read for the first time): the spawn flag that has the
+# kernel mint CONSOLE_READ, the keyboard. The shell IS the keyboard's reader.
+"shell" = ["flag:REQ_CONSOLE", "peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:POWER_OFF", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
 "supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
 "time" = ["peer:events", "peer:fs", "peer:net-stack"]
 # wifi-driver: hw:WIFI_SDIO - the Arasan SDIO host the radio sits on, and its power control, granted by
@@ -868,6 +874,16 @@ SpawnImage               = 52
 # when the binding changes; `try_send`, no reply expected - the grant `dwc2` carries for the same notice.
 # peer:supervisor (2026-10-06) - its USB device report (`usbdev`), as `dwc2`'s: facts only, never answered.
 "xhci" = ["hw:XHCI", "hw:pci_irq", "peer:events", "peer:supervisor", "peer:wifi-usb", "priv:CONSOLE_PUSH"]
+# Two grantors that are not services (backlog/90 E2, 2026-10-26), pinned because each widens reach as surely
+# as a row does and neither was read before:
+# probe-table: `services/probe/src/table.rs`, compiled into the supervisor, gives every test probe its
+# privileges by name - SPAWN and SERVICE_CONTROL (they start and kill victims), ACQUIRE_ANY (all but adv-a13,
+# whose subject is being denied it), INTROSPECT (the prop- and stress- drivers read generations), and the
+# software test interrupt for probe-11a. A probe granted REBOOT would appear here.
+"probe-table" = ["hw:TEST_IRQ", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
+# kernel-delegatable: SUPERVISOR_DELEGATABLE in kernel/src/task/mod.rs, the ceiling on every row above - the
+# kernel refuses any privilege the supervisor cannot delegate. IMAGE_SPAWN is absent by design (14.1).
+"kernel-delegatable" = ["priv:ACQUIRE_ANY", "priv:CONSOLE_PUSH", "priv:CPU_CLOCK", "priv:FIRE_IRQ", "priv:GPIO", "priv:INTROSPECT", "priv:NET_DEVICE", "priv:PCI_CFG", "priv:POWER_OFF", "priv:REBOOT", "priv:RESOURCE_MINT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
 
 # --------------------------------------------------------------------------------------------------
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by
