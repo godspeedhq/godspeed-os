@@ -171,6 +171,16 @@ CASES = [
                   "\nfn sneak() { let _g = SNEAK.lock(); }\npub fn enable_external_interrupts() {"),
      ["kernel/src/arch/riscv64/trap.rs"], []),
 
+    # backlog/90 E2: IX matched raw text, so a COMMENT naming a reacquire API passed a service with no
+    # recovery path. hw-enumerator has none (it is in the debt list); take it off the list and give it
+    # only a comment.
+    ("IX-peer-reacquire", "a recovery path that is only a comment",
+     lambda: (edit("COMMANDMENTS.baseline.toml", 'peer_reacquire_debt = ["console", "hw-enumerator"]',
+                   'peer_reacquire_debt = ["console"]'),
+              edit("services/hw-enumerator/src/main.rs", "#[no_mangle]",
+                   "// on failure: gs::cap::reacquire(ctx, peer)\n#[no_mangle]")),
+     ["COMMANDMENTS.baseline.toml", "services/hw-enumerator/src/main.rs"], []),
+
     ("VI-static-mut", "unowned global mutable state in a service",
      lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
                   "\nstatic mut SNEAK: u32 = 0;\n#[no_mangle]\npub extern"),

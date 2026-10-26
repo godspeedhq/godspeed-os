@@ -962,6 +962,14 @@ def check_peer_reacquire(check, pins):
                 if fn.endswith(".rs"):
                     with open(os.path.join(dirpath, fn), encoding="utf-8", errors="replace") as fh:
                         text += fh.read()
+        # CODE, not prose, and the crate under either name (backlog/90 E2). This matched the raw text, so a
+        # comment that named an API counted as a recovery path: `nic-driver` passed on its comments, while
+        # its real call, `godspeed::cap::reacquire`, was not recognised, because the API list spells the
+        # standard library `gs::` (the alias most services give it) and `nic-driver` uses its crate name.
+        # A trailing `//` comment is cut at the marker; a `//` inside a string literal cuts the rest of
+        # that line too, which can only make the check stricter.
+        text = "\n".join(ln.split("//", 1)[0] for ln in text.split("\n"))
+        text = re.sub(r"\bgodspeed::", "gs::", text)
         if any(api in text for api in apis):
             continue
         peers = ", ".join(sorted(t[5:] for t in grants[name] if t.startswith("peer:")))
