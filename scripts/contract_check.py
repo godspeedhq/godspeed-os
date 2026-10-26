@@ -19,10 +19,13 @@ Structural fields (elf, probe_mode, has_recv_endpoint) are kernel-only and not r
 fixtures have no `.toml` (single source, the kernel) and are not checked.
 
 IT DOES NOT RECONCILE AUTHORITY, and that is worth saying here so nobody reads this file and concludes
-the contract is fully checked. `service_control`, `spawn`, `resource_mint` and `pci_cfg` are reconciled
-by `IV-contract-authority` in `scripts/commandments.py`, against the grant set that `VII-service-grants`
-reads (the supervisor's spawn rows plus the kernel's by-name table) rather than against `service_config`.
-Until 2026-09-14 nothing reconciled them at all, and a contract could claim an authority nothing granted.
+the contract is fully checked. The privilege keys mapped in `[kernel.contract_privileges]` of
+`COMMANDMENTS.baseline.toml` (`service_control`, `resource_mint`, `pci_cfg`, `cpu_clock`, `power_off`) are
+reconciled by `IV-contract-authority` in `scripts/commandments.py`, against the grant set that
+`VII-service-grants` reads (the supervisor's spawn rows plus the kernel's by-name table) rather than against
+`service_config`. Every other schema key is listed in `[kernel.contract_not_reconciled]` with the reason.
+`spawn` is NOT reconciled: it is a dead key and SPAWN cannot be declared (backlog/90 E2). Until 2026-09-14
+nothing reconciled any of them, and a contract could claim an authority nothing granted.
 
 A second check, `check_print_authority`, runs only when the reconcile passes: a crate that prints
 through `godspeed::io` must declare `log_write`, and a `console_push` declaration must be used.

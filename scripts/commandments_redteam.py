@@ -214,6 +214,17 @@ CASES = [
      lambda: edit("COMMANDMENTS.baseline.toml", '  "services/fs/src/main.rs:PEER_OUTAGES",\n',
                   '  "services/fs/src/main.rs:PEER_OUTAGES",\n  "services/fs/src/main.rs:NO_SUCH_STATIC",\n'),
      ["COMMANDMENTS.baseline.toml"], []),
+
+    # backlog/90 E2: deleting a mapping used to stop IV reconciling that key, silently.
+    ("IV-contract-authority (unmapped)", "a privilege mapping deleted from the baseline",
+     lambda: edit("COMMANDMENTS.baseline.toml", 'power_off = "POWER_OFF"\n', ''),
+     ["COMMANDMENTS.baseline.toml"], []),
+
+    # ...and a decision about a key the schema does not have is stale, not harmless.
+    ("IV-contract-authority (stale)", "a not-reconciled entry for a key the schema lacks",
+     lambda: edit("COMMANDMENTS.baseline.toml", '[kernel.contract_not_reconciled]\n',
+                  '[kernel.contract_not_reconciled]\nno_such_key = "stale"\n'),
+     ["COMMANDMENTS.baseline.toml"], []),
 ]
 
 base = run()

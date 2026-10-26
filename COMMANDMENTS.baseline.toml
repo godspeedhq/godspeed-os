@@ -892,6 +892,27 @@ pci_cfg = "PCI_CFG"
 cpu_clock = "CPU_CLOCK"
 power_off = "POWER_OFF"
 
+# Every OTHER schema capability key, and why IV does not reconcile it (backlog/90 E2). IV fails a
+# schema key that is in neither table, and an entry here that the schema no longer has, so the
+# decision the comment above asks for is now forced rather than hoped for. A reason says where the
+# key IS checked, or why nothing can be.
+[kernel.contract_not_reconciled]
+ipc_send = "a send peer, not a privilege: contract_check.py reconciles it against the spawn row's send_peers"
+ipc_receive = "an endpoint the service registers itself at runtime; nothing is granted from it"
+log_write = "the kernel mints it to every task, in slot 0 (task/mod.rs); contract_check.py checks a printer declares it"
+handover = "a declaration, not a grant (2.5 amendment 2026-10-17): it asks the kernel for nothing"
+hw_device = "a device class, not a privilege: contract_check.py reconciles it against the spawn row's hwclass"
+hw_pci_class = "a device class, not a privilege: contract_check.py reconciles it against the spawn row"
+hw_pci_bar = "part of the device class: contract_check.py reconciles it with hw_pci_class"
+hw_pci_irq = "part of the device class: contract_check.py reconciles it against the row's vector request"
+hw_interrupt = "review-only by the schema's own description: the kernel refuses raw vectors (14.1), nothing grants from it"
+hw_mmio = "review-only by the schema's own description: the kernel refuses raw MMIO (14.1), nothing grants from it"
+hw_pio = "DEAD KEY: the ATA-PIO backend was retired and hw_pio exists nowhere in kernel/ or sdk/"
+hw_dma = "an INSTALLED package's key: the supervisor grants it at install from the signed contract itself, so there is no second declaration to drift (14.1 amendment 2026-10-23)"
+hw_usb = "an INSTALLED package's key: the supervisor binds it at install from the signed contract itself (14.1 amendment 2026-10-23)"
+spawn = "OPEN GAP, backlog/90 E2: the key is DEAD and array-typed, so SPAWN cannot be declared at all, and chaos, control, shell and the supervisor are granted it undeclared. Closing it needs a schema key, which is covered surface (docs/compatibility.md): the operator's decision"
+console_push = "OPEN GAP, backlog/90 E2: dwc2, ehci and xhci are granted CONSOLE_PUSH undeclared, and contract_check.py fails a declaration unless the crate calls console_push( literally, while these push through gs::driver::input::push. Mapping it needs that check taught the wrapper first"
+
 # Commandment X - which utility spec covers which VERBS, where the filename is not the verb.
 # Read by `X-user-vocabulary`. Two specs each cover a set:
 #   30_first-last.md   a pair

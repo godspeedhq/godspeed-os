@@ -47,6 +47,7 @@ is UNMISSABILITY. Three structural defences:
     or amend the constitution deliberately. `COMMANDMENTS.baseline.toml` has the full rules.
 """
 
+import json
 import os
 import re
 import sys
@@ -922,6 +923,33 @@ def check_contract_authority(check, pins):
     debt = set(pins.get("contract_authority_debt", []) or [])
     grants = _service_grants()
     out, seen_debt = [], set()
+
+    # EVERY SCHEMA CAPABILITY KEY IS DECIDED (backlog/90 E2). The docstring above has always said that
+    # keeping the map in the baseline "forces a decision" when the schema gains a key - and nothing forced
+    # one: deleting a mapping silently stopped that key being reconciled, and a new schema key was simply
+    # never looked at. Now each key is either mapped to the privilege it claims, or listed in
+    # `contract_not_reconciled` with the reason, and a key in neither - or a listed key the schema no
+    # longer has - fails.
+    not_rec = pins.get("contract_not_reconciled", {}) or {}
+    try:
+        with open(os.path.join(ROOT, "contracts/schema/service.schema.json"), encoding="utf-8") as fh:
+            schema_keys = set(json.load(fh)["properties"]["capabilities"]["properties"])
+    except (OSError, ValueError, KeyError) as e:
+        return [Violation("contracts/schema/service.schema.json", 0,
+                          f"cannot read the schema's capability keys ({e}): which keys IV reconciles cannot "
+                          f"be decided, and an undecidable scope is a failure, never a pass")]
+    for key in sorted(schema_keys - set(mapping) - set(not_rec)):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"the schema's capability key `{key}` is neither mapped in contract_privileges nor "
+                             f"listed in contract_not_reconciled. Decide: map it to the privilege it claims, "
+                             f"or list it with the reason it is not reconciled here."))
+    for key in sorted((set(mapping) | set(not_rec)) - schema_keys):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"`{key}` is mapped or listed for IV but is not a capability key in the schema. "
+                             f"Delete the stale entry."))
+    for key in sorted(set(mapping) & set(not_rec)):
+        out.append(Violation("COMMANDMENTS.baseline.toml", 0,
+                             f"`{key}` is both mapped and listed as not reconciled. It is one or the other."))
 
     for name, (path, caps) in sorted(_contracts().items()):
         if caps is None:
