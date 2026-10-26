@@ -153,7 +153,6 @@ version = "0.1.0"
 dependencies = [
  "godspeed",
  "godspeed-audio",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -230,7 +229,6 @@ name = "block-driver"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -516,7 +514,6 @@ name = "driver-skeleton"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -968,7 +965,6 @@ name = "hw-enumerator"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -1323,7 +1319,6 @@ name = "nic-driver"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -1431,7 +1426,6 @@ name = "observe"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -1569,7 +1563,6 @@ name = "power"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -1638,7 +1631,6 @@ version = "0.1.0"
 dependencies = [
  "godspeed",
  "godspeed-audio",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -1711,7 +1703,6 @@ name = "recorder"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -2111,7 +2102,6 @@ name = "time"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
 ]
 
 [[package]]
@@ -2462,7 +2452,6 @@ name = "wifi-driver"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
  "godspeed-wifi",
 ]
 
@@ -2471,7 +2460,6 @@ name = "wifi-usb"
 version = "0.1.0"
 dependencies = [
  "godspeed",
- "godspeed-sdk",
  "godspeed-wifi",
 ]
 
