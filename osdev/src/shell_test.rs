@@ -8461,11 +8461,11 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let none = run!(b"godspeed search zzzz\r", 180);
         check!(none.contains("0 packages") && none.contains("verified: root"), "a word nothing matches is an empty list, not a failure, with the chain it was checked by");
         let info = run!(b"godspeed info godspeed/hello\r", 180);
-        check!(info.contains("godspeed/hello 0.3.0") && info.contains("latest; published") && info.contains("bankole"),
+        check!(info.contains("godspeed/hello 0.4.0") && info.contains("latest; published") && info.contains("bankole"),
                "`godspeed info` is a card headed by the release: the latest, when and by whom");
         check!(info.contains("The service template") && info.contains("licence") && info.contains("GPL-2.0-only") && !info.contains("ITEM"),
                "the card gives the manifest's description and licence, and is not a three-column table");
-        check!(info.contains("built for") && info.contains("0.29.0") && info.contains("ships") && info.contains("this machine's, x86_64, is one"),
+        check!(info.contains("built for") && info.contains("0.31.0") && info.contains("ships") && info.contains("this machine's, x86_64, is one"),
                "and the release it was built for, the architectures it ships and whether this machine's is one");
         check!(info.contains("requests") && info.contains("log_write") && info.contains("an active key of the publisher's"),
                "and what its contract requests and who signed it");
@@ -8473,7 +8473,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(nope.contains("never published on this registry"), "a package the snapshot does not list is said to be unpublished");
 
         let fetched = run!(b"godspeed fetch godspeed/hello\r", 240);
-        check!(fetched.contains("/system/packages/godspeed/hello/0.3.0") && fetched.contains("fetched"),
+        check!(fetched.contains("/system/packages/godspeed/hello/0.4.0") && fetched.contains("fetched"),
                "`godspeed fetch` verifies the package and fetches it to /system/packages/");
         check!(fetched.contains("x86_64") && fetched.contains("its size and digest the manifest's"),
                "it keeps this machine's binary, checked against the manifest");
@@ -8481,23 +8481,23 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fetched.contains("log_write"), "it says what the contract requests");
         check!(fetched.contains("installed") && fetched.contains("not installed") && fetched.contains("`godspeed install` starts it"),
                "and that it is fetched, not installed, and how to install it");
-        check!(fetched.contains("downloading godspeed/hello 0.3.0  ") && !fetched.contains("downloading godspeed/hello 0.3.0  [")
+        check!(fetched.contains("downloading godspeed/hello 0.4.0  ") && !fetched.contains("downloading godspeed/hello 0.4.0  [")
                && !fetched.contains("downloading x86_64.elf"),
                "`godspeed fetch` names the package, not the file, while it downloads");
         check!(fetched.contains("
   [####") && fetched.contains("[A"),
                "and draws its bar on the line under the words, going back up to redraw both");
         check!(fetched.contains("-> signature -> contract -> binary"), "and says what was verified, in order, under the card");
-        let kept = run!(b"dir /system/packages/godspeed/hello/0.3.0\r", 60);
+        let kept = run!(b"dir /system/packages/godspeed/hello/0.4.0\r", 60);
         check!(kept.contains("x86_64.elf") && kept.contains("manifest.toml") && kept.contains("manifest.sig")
                && kept.contains("contract.toml") && kept.contains("origin") && !kept.contains("aarch64.elf"),
                "the folder holds the binary, the documents that prove it, and where it came from - and no other architecture's");
-        let twice = run!(b"godspeed fetch godspeed/hello@0.3.0\r", 240);
+        let twice = run!(b"godspeed fetch godspeed/hello@0.4.0\r", 240);
         check!(twice.contains("already fetched"), "fetching a fetched version again leaves it as it is");
         let listed = run!(b"godspeed list fetched\r", 60);
         check!(listed.contains("PACKAGE") && listed.contains("VERSION") && listed.contains("FROM") && listed.contains("SIZE"),
                "`godspeed list fetched` is a list with real columns");
-        check!(listed.contains("godspeed/hello") && listed.contains("0.3.0") && listed.contains("default"), "it shows the package, its version and registry");
+        check!(listed.contains("godspeed/hello") && listed.contains("0.4.0") && listed.contains("default"), "it shows the package, its version and registry");
         check!(listed.contains("KiB") && listed.contains("1 package,"), "with its size, and the count and total under the list");
         let verified = run!(b"godspeed verify\r", 120);
         check!(verified.contains("intact") && verified.contains("1 checked, 0 damaged"), "`godspeed verify` checks the fetched copy from the disk: intact");
@@ -8524,11 +8524,11 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         let notfetched = run!(b"godspeed install godspeed/nothing-here yes\r", 60);
         check!(notfetched.contains("not fetched here"), "installing what is not fetched is refused, naming `godspeed fetch`");
         let inst = run!(b"godspeed install godspeed/hello yes\r", 180);
-        check!(inst.contains("godspeed/hello 0.3.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
+        check!(inst.contains("godspeed/hello 0.4.0 asks for nothing") && inst.contains("[y/N]: yes (given on the command line)"),
                "`godspeed install` asks once, naming everything the package would be given, and `yes` answers it");
         check!(inst.contains("installed") && inst.contains("running, as the task godspeed/hello") && inst.contains("privilege"),
                "the supervisor started it, under its package name, with no privilege");
-        check!(inst.contains("installed godspeed/hello 0.3.0 started") && inst.contains("checked from disk"),
+        check!(inst.contains("installed godspeed/hello 0.4.0 started") && inst.contains("checked from disk"),
                "the supervisor says it checked the copy from the disk before starting it");
         check!(inst.contains("hello: started"), "and the installed program ran");
         let li = run!(b"godspeed list installed\r", 60);
@@ -8555,10 +8555,10 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
 
         // A UTILITY: installed, run by its name for one command line, its output shown and piped, its status said.
         let uf = run!(b"godspeed fetch godspeed/hello-utility\r", 240);
-        check!(uf.contains("godspeed/hello-utility 0.2.0") && uf.contains("fetched") && uf.contains("a utility: `godspeed install` makes it a command"),
+        check!(uf.contains("godspeed/hello-utility 0.3.0") && uf.contains("fetched") && uf.contains("a utility: `godspeed install` makes it a command"),
                "`godspeed fetch` fetches a utility package and says what installing it does");
         let ui = run!(b"godspeed install godspeed/hello-utility yes\r", 180);
-        check!(ui.contains("godspeed/hello-utility 0.2.0 asks for nothing (no peers, no privilege) and becomes a command, run when typed")
+        check!(ui.contains("godspeed/hello-utility 0.3.0 asks for nothing (no peers, no privilege) and becomes a command, run when typed")
                && ui.contains("a utility: type `hello-utility"),
                "installing a utility asks once and says how to run it");
         check!(ui.contains("checked from disk - a utility, run when typed") && !ui.contains("hello-utility' spawned OK"),
@@ -8604,40 +8604,40 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
                 up.push_str(&collect_until(&buf, &mut cursor, b"\n", Duration::from_secs(5)).unwrap_or_default());
             }
         }
-        check!(up.contains("upgrade from 0.8.0") && up.contains("0.9.0"), "`godspeed upgrade` offers 0.9.0 in place of 0.8.0");
+        check!(up.contains("upgrade from 0.8.0") && up.contains("0.10.0"), "`godspeed upgrade` offers 0.10.0 in place of 0.8.0");
         check!(up.contains("task: spawn 'godspeed/hello-service' beside the running one: a live handover"),
                "the kernel starts the new version beside the running one, under the same name");
-        check!(up.contains("hello-service 0.8.0: handing over at") && up.contains("hello-service 0.9.0: took over, live, at"),
+        check!(up.contains("hello-service 0.8.0: handing over at") && up.contains("hello-service 0.10.0: took over, live, at"),
                "the running version hands its state over, and the new one takes it");
         let carried = up.split("took over, live, at ").nth(1).and_then(|r| r.split_whitespace().next()).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
         check!(carried > 0, "the count it took over is the one the old version had, not zero: the state carried across");
-        check!(up.contains("live, with no restart") && !up.contains("died, restarting") && !up.contains("hello-service 0.9.0: started") && !up.contains("wrong key"),
+        check!(up.contains("live, with no restart") && !up.contains("died, restarting") && !up.contains("hello-service 0.10.0: started") && !up.contains("wrong key"),
                "it was replaced live: no death, no restart, no fresh start");
         let lr = run!(b"godspeed list installed\r", 60);
-        check!(lr.contains("godspeed/hello-service") && lr.contains("0.9.0") && lr.contains("running"), "0.9.0 is the installed one, running");
+        check!(lr.contains("godspeed/hello-service") && lr.contains("0.10.0") && lr.contains("running"), "0.10.0 is the installed one, running");
         // VERSIONS: every release, newest first, and what each is here. Then an older one installed by its version.
         let lv = run!(b"godspeed list versions godspeed/hello-service\r", 180);
-        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.9.0") && lv.contains("0.7.0")
-               && lv.contains("installed") && lv.contains("9 versions, the latest 0.9.0"),
+        check!(lv.contains("VERSION") && lv.contains("PUBLISHED") && lv.contains("0.10.0") && lv.contains("0.7.0")
+               && lv.contains("installed") && lv.contains("10 versions, the latest 0.10.0"),
                "`godspeed list versions` lists every release, newest first, the installed one marked");
-        check!(lv.find("0.9.0").unwrap_or(usize::MAX) < lv.find("0.7.0").unwrap_or(0), "newest first");
+        check!(lv.find("0.10.0").unwrap_or(usize::MAX) < lv.find("0.7.0").unwrap_or(0), "newest first");
         // A VERSION BUILT BEFORE 0.29.0 (names to 128 bytes) is refused, and the running one is left alone.
         let _ = run!(b"godspeed fetch godspeed/hello-service@0.6.0\r", 240);
         let old = run!(b"godspeed install godspeed/hello-service@0.6.0 yes\r", 180);
         check!(old.contains("built for GodspeedOS 0.28.0") && old.contains("must rebuild it"),
                "a package built for a release before the layout change is refused, and says its publisher must rebuild it");
         let still = run!(b"godspeed list installed\r", 60);
-        check!(still.contains("godspeed/hello-service") && still.contains("0.9.0") && still.contains("running"),
+        check!(still.contains("godspeed/hello-service") && still.contains("0.10.0") && still.contains("running"),
                "the refused install leaves the running version running");
         let _ = run!(b"godspeed fetch godspeed/hello-service@0.7.0\r", 240);
         let dg = run!(b"godspeed install godspeed/hello-service@0.7.0 yes\r", 180);
-        check!(dg.contains("a DOWNGRADE from the installed 0.9.0, whose data stays as that version left it"),
+        check!(dg.contains("a DOWNGRADE from the installed 0.10.0, whose data stays as that version left it"),
                "installing an older version says it is a downgrade, and what that means for its data");
         check!(dg.contains("installed godspeed/hello-service 0.7.0 started") && dg.contains("stopped and started"),
-               "0.7.0 cannot hand over, so it replaces 0.9.0 by a stop and start - and says so");
+               "0.7.0 cannot hand over, so it replaces 0.10.0 by a stop and start - and says so");
         let lv2 = run!(b"godspeed list installed\r", 60);
-        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.7.0") && !lv2.contains("0.9.0"), "the older version is the installed one now");
-        for v in ["0.6.0", "0.8.0", "0.9.0"] {
+        check!(lv2.contains("godspeed/hello-service") && lv2.contains("0.7.0") && !lv2.contains("0.10.0"), "the older version is the installed one now");
+        for v in ["0.6.0", "0.8.0", "0.10.0"] {
             let _ = run!(format!("godspeed remove godspeed/hello-service@{}\r", v).as_bytes(), 60);
         }
         let su = run!(b"godspeed uninstall godspeed/hello-service yes\r", 60);
@@ -8695,7 +8695,7 @@ pub fn run_godspeed(image_path: &Path, persist_path: &str, smp: u32) {
         check!(fresh.contains("first contact: root 1 matched the pin"), "and the registry is met again from root 1");
 
         // DAMAGE on disk is found without the network.
-        let _ = run!(b"write /system/packages/godspeed/hello/0.3.0/contract.toml name = \"other\"\r", 60);
+        let _ = run!(b"write /system/packages/godspeed/hello/0.4.0/contract.toml name = \"other\"\r", 60);
         let damaged = run!(b"godspeed verify godspeed/hello\r", 120);
         check!(damaged.contains("DAMAGED") && damaged.contains("contract.toml is not the contract the manifest names"),
                "`godspeed verify` finds a fetched file changed on disk, and names it");
@@ -11914,14 +11914,14 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             let _ = run!(b"godspeed config\r", 60);
             // MADE ON THE MACHINE: a fetch that keeps every document it read, as one file.
             let saved = run!(b"godspeed fetch godspeed/hello-utility offline\r", 300);
-            check!(saved.contains("saved") && saved.contains("/users/default/hello-utility-0.2.0.gsp") && saved.contains("installs it with no network"),
+            check!(saved.contains("saved") && saved.contains("/users/default/hello-utility-0.3.0.gsp") && saved.contains("installs it with no network"),
                    "`godspeed fetch ... offline` writes the verified release as one file, named from it, in this folder");
             let listed = run!(b"dir /users/default\r", 30);
-            check!(listed.contains("hello-utility-0.2.0.gsp"), "the file is on the disk");
+            check!(listed.contains("hello-utility-0.3.0.gsp"), "the file is on the disk");
             // The fetched copy the save left goes: what is checked next must come from the file or the registry.
             let _ = run!(b"godspeed remove godspeed/hello-utility\r", 60);
             // INSPECTED, the file and the registry's copy alike: every check, nothing kept.
-            let insp = run!(b"godspeed inspect hello-utility-0.2.0.gsp\r", 300);
+            let insp = run!(b"godspeed inspect hello-utility-0.3.0.gsp\r", 300);
             check!(insp.contains("inspected from a package file") && insp.contains("nothing was kept, nothing installed")
                        && insp.contains("offline, as of"),
                    "`godspeed inspect <file>.gsp` checks the file through the whole chain and keeps nothing");
@@ -11932,7 +11932,7 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             check!(!still.contains("hello-utility"), "inspecting kept nothing: it is not fetched");
             // A MACHINE THAT HAS NEVER BEEN ONLINE: no fetched copy, no record of the registry.
             let _ = run!(b"godspeed trust reset default yes\r", 60);
-            let inst = run!(b"godspeed install hello-utility-0.2.0.gsp yes\r", 300);
+            let inst = run!(b"godspeed install hello-utility-0.3.0.gsp yes\r", 300);
             check!(inst.contains("unpacked from a package file") && inst.contains("offline, as of"),
                    "installing the file checks it offline and unpacks it, saying as of when");
             check!(inst.contains("asks for nothing") && inst.contains("a utility: type `hello-utility"),
@@ -11978,7 +11978,7 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             let stopped = run!(b"hello-utility Cy\r", 60);
             check!(!stopped.contains("hello, Cy") && stopped.contains("hello-utility: not run - its signing key is not one this machine's operator trusts"),
                    "and the supervisor's check at the next start refuses what it signed, saying why on the shell's own line");
-            // CLEANUP: 0.9.0 is installed and 0.2.0 still fetched, and an interrupted fetch left a `.partial`.
+            // CLEANUP: 0.9.0 is installed and 0.3.0 still fetched, and an interrupted fetch left a `.partial`.
             let _ = run!(b"mkdir /system/packages/godspeed/hello-utility/0.1.0.partial\r", 30);
             send(&mut write_half, b"godspeed cleanup\r");
             let listed = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(60)).unwrap_or_default();
@@ -11988,15 +11988,15 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             let declined = run!(b"n\r", 60);
             check!(declined.contains("nothing was deleted"), "answered no, nothing is deleted");
             let still = run!(b"godspeed list fetched\r", 60);
-            check!(still.contains("0.2.0"), "and the copy is still there");
+            check!(still.contains("0.3.0"), "and the copy is still there");
             let cleaned = run!(b"godspeed cleanup yes\r", 120);
             check!(cleaned.contains("deleted 1 fetched copy") && cleaned.contains("1 leftover"), "`godspeed cleanup yes` deletes them, with no question");
             let after = run!(b"godspeed list fetched\r", 60);
-            check!(!after.contains("0.2.0") && after.contains("0.9.0"), "and the installed version is kept");
+            check!(!after.contains("0.3.0") && after.contains("0.9.0"), "and the installed version is kept");
             let empty = run!(b"godspeed cleanup\r", 60);
             check!(empty.contains("nothing to clean up") && !empty.contains("[y/N]"), "with nothing to clean, it says so and asks nothing");
             let file_kept_c = run!(b"dir /users/default\r", 30);
-            check!(file_kept_c.contains("hello-utility-0.2.0.gsp"), "and the package file is not touched");
+            check!(file_kept_c.contains("hello-utility-0.3.0.gsp"), "and the package file is not touched");
             // PURGE: uninstalled AND every fetched version deleted, in one command that asks first, naming both.
             send(&mut write_half, b"godspeed uninstall godspeed/hello-utility purge\r");
             let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(30)).unwrap_or_default();
@@ -12010,7 +12010,7 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             let none_left = run!(b"godspeed list fetched\r", 60);
             check!(!none_left.contains("hello-utility"), "and no version of it is left fetched");
             let file_kept = run!(b"dir /users/default\r", 30);
-            check!(file_kept.contains("hello-utility-0.2.0.gsp"), "the package file the operator keeps is not touched");
+            check!(file_kept.contains("hello-utility-0.3.0.gsp"), "the package file the operator keeps is not touched");
         } else {
             // `net` FIRST, ON PURPOSE: with no link, net-stack holds the shell's requests and answers every one of them
             // after the shell has moved on. Those late answers used to land on the endpoint the next command's
@@ -12018,11 +12018,11 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             // 2026-10-18). The shell's requests now go through its reply mailbox; this is the test that they do.
             let netless = run!(b"net\r", 30);
             check!(netless.contains("link     down"), "`net` answers with no network");
-            let old_insp = run!(b"godspeed inspect hello-utility-0.2.0.gsp\r", 300);
+            let old_insp = run!(b"godspeed inspect hello-utility-0.3.0.gsp\r", 300);
             check!(old_insp.contains("installing it would ask"), "inspecting an old file says installing it would ask");
             check!(!old_insp.contains("does not read as an answer"), "and `net`'s late answers did not become this command's");
             // OLD: asked, and `yes` does not answer it.
-            send(&mut write_half, b"godspeed install hello-utility-0.2.0.gsp yes\r");
+            send(&mut write_half, b"godspeed install hello-utility-0.3.0.gsp yes\r");
             let asked = collect_until(&buf, &mut cursor, b"[y/N]", Duration::from_secs(300)).unwrap_or_default();
             check!(asked.contains("its registry check ran out on") && asked.contains("days ago") && asked.contains("Install it anyway?"),
                    "a file older than offline-max-age-days asks, saying how old its check is");
@@ -12032,13 +12032,13 @@ pub fn run_gsp(image_path: &Path, persist_path: &str, smp: u32) {
             let none = run!(b"godspeed list fetched\r", 60);
             check!(!none.contains("hello-utility"), "and nothing was unpacked");
             // `accept-old` answers it.
-            let ok = run!(b"godspeed install hello-utility-0.2.0.gsp yes accept-old\r", 300);
+            let ok = run!(b"godspeed install hello-utility-0.3.0.gsp yes accept-old\r", 300);
             check!(ok.contains("accepted although old") && ok.contains("a utility: type `hello-utility"),
                    "`accept-old` accepts it, the card says so, and it installs with no network");
             let ran = run!(b"hello-utility offline\r", 60);
             check!(ran.contains("hello, offline"), "and it runs");
-            let origin = run!(b"read /system/packages/godspeed/hello-utility/0.2.0/origin\r", 30);
-            check!(origin.contains("from-file /users/default/hello-utility-0.2.0.gsp") && origin.contains("accepted although old"),
+            let origin = run!(b"read /system/packages/godspeed/hello-utility/0.3.0/origin\r", 30);
+            check!(origin.contains("from-file /users/default/hello-utility-0.3.0.gsp") && origin.contains("accepted although old"),
                    "its origin records the file and the acceptance");
         }
         let _ = child.kill();
