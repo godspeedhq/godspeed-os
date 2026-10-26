@@ -79,7 +79,18 @@ def files_in_scope(check):
     inc, exc = [], 0
     excludes = [e["glob"] for e in check.get("exclude", [])]
     for d in check["dirs"]:
-        for base, _, names in os.walk(os.path.join(ROOT, d)):
+        path = os.path.join(ROOT, d)
+        # A scope entry may name ONE FILE. `os.walk` on a file path yields nothing at all, so a check
+        # declared over `arch/arm/irq.rs` scanned no file and passed: `I-irq-lock` read none of the three
+        # ISR files it names (backlog/90 E1). `scope_entries_empty` below fails an entry that contributes
+        # nothing, so a renamed or deleted file cannot shrink a check to nothing again.
+        if os.path.isfile(path):
+            if os.path.basename(path) in excludes:
+                exc += 1
+            elif path.endswith(".rs"):
+                inc.append(path)
+            continue
+        for base, _, names in os.walk(path):
             for n in sorted(names):
                 if not n.endswith(".rs"):
                     continue
@@ -88,6 +99,21 @@ def files_in_scope(check):
                     continue
                 inc.append(os.path.join(base, n))
     return sorted(inc), exc
+
+
+def scope_entries_empty(check):
+    """The scope entries of a source check that contribute no file: a path that does not exist, or one
+    that names nothing a check reads. Each is a hole in what the check claims to cover."""
+    empty = []
+    for d in check["dirs"]:
+        path = os.path.join(ROOT, d)
+        if os.path.isfile(path):
+            if not path.endswith(".rs"):
+                empty.append(d)
+            continue
+        if not any(n.endswith(".rs") for _, _, names in os.walk(path) for n in names):
+            empty.append(d)
+    return empty
 
 
 def scan_source(check, _pins):
@@ -100,6 +126,9 @@ def scan_source(check, _pins):
     rx = re.compile(check["pattern"])
     sk = re.compile(check["skip"]) if check.get("skip") else None
     out = []
+    for d in scope_entries_empty(check):
+        out.append(Violation(d, 0, "this scope entry contributes no file to the check - the path is missing, "
+                             "or names nothing it reads. Fix the path, or remove the entry and say why."))
     inc, _ = files_in_scope(check)
     for f in inc:
         for i, ln in enumerate(read(f).split("\n"), 1):
@@ -1791,7 +1820,8 @@ CHECKS = [
          title="a lock held in interrupt code masks interrupts",
          kind="source",
          dirs=["kernel/src/interrupt", "kernel/src/arch/arm/irq.rs",
-               "kernel/src/arch/aarch64/exceptions.rs", "kernel/src/arch/x86_64/interrupts.rs"],
+               "kernel/src/arch/aarch64/exceptions.rs", "kernel/src/arch/x86_64/interrupts.rs",
+               "kernel/src/arch/riscv64/trap.rs", "kernel/src/arch/riscv64/plic.rs"],
          # A spinlock is NOT reentrant. A hold taken with a plain `lock()` stays preemptible, so the
          # interrupt can fire on the SAME core mid-hold and spin forever on a lock that core already
          # owns. The core keeps taking interrupts and makes no progress - which is precisely what the

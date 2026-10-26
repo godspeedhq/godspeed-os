@@ -164,6 +164,13 @@ CASES = [
                   "\nfn boom() { let x: Option<u32> = None; let _ = x.unwrap(); }\n#[no_mangle]\npub extern"),
      ["services/events/src/main.rs"], []),
 
+    # backlog/90 E1: this check walked its FILE entries with `os.walk`, which yields nothing for a file, so
+    # it read none of the ISR files it names. The probe plants the bug in one of those files.
+    ("I-irq-lock", "a plain lock() in an ISR file",
+     lambda: edit("kernel/src/arch/riscv64/trap.rs", "\npub fn enable_external_interrupts() {",
+                  "\nfn sneak() { let _g = SNEAK.lock(); }\npub fn enable_external_interrupts() {"),
+     ["kernel/src/arch/riscv64/trap.rs"], []),
+
     ("VI-static-mut", "unowned global mutable state in a service",
      lambda: edit("services/events/src/main.rs", "\n#[no_mangle]\npub extern",
                   "\nstatic mut SNEAK: u32 = 0;\n#[no_mangle]\npub extern"),
