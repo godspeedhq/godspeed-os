@@ -226,6 +226,14 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
         return;
     }
 
+    if interrupt && code == 9 {
+        // Supervisor EXTERNAL: a device, through the PLIC. Claimed, delivered to its driver and
+        // completed there (`plic::handle`), which is the only place that knows which source it was.
+        super::plic::handle();
+        super::note_stage(super::stage::TRAP_EXIT);
+        return;
+    }
+
     // The boot's deliberate `rdcycle`, and only while the probe is executing it. Armed for one
     // instruction, so an illegal instruction anywhere else still halts loudly.
     if !interrupt && code == 2 && !frame.from_user() && super::claim_rdcycle_probe() {
@@ -630,6 +638,19 @@ pub fn enable_software_interrupts() {
     // an IPI admitted with no vector installed would have nowhere to go.
     unsafe {
         core::arch::asm!("csrs sie, {ssie}", ssie = in(reg) 1u64 << 1, options(nostack));
+    }
+}
+
+/// Admit device interrupts, through the PLIC, on this hart.
+///
+/// `sie.SEIE` only lets the PLIC's supervisor line in; which sources reach it is the PLIC's, and
+/// `plic::init` switched every one of them off before any hart got here, so this admits exactly the
+/// routes the kernel later makes (`plic::route_intx`).
+pub fn enable_external_interrupts() {
+    // SAFETY: setting `sie.SEIE`. Sound because `stvec` is installed before any hart enables this, and
+    // `plic::init` has already left every supervisor source disabled.
+    unsafe {
+        core::arch::asm!("csrs sie, {seie}", seie = in(reg) 1u64 << 9, options(nostack));
     }
 }
 

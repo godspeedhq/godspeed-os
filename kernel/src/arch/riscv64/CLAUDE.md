@@ -88,6 +88,7 @@ fence on **every** switch, not only when the `satp` value changes.
 |---|---|
 | `mod.rs` | boot, the `arch::imp` surface, device discovery, PCI/ECAM, per-hart state |
 | `trap.rs` | the trap vector, `TrapFrame`, fault reporting, the double-fault guard |
+| `plic.rs` | the PLIC: each hart's supervisor context from the device tree (readied by that hart on arrival, because the firmware resets it when it starts the hart), and a PCI device's INTx routed through the host bridge's `interrupt-map` to the driver holding the device, as a vector from the pool the neutral spawn path hands out. PCI INTx only, root bus only (2026-10-26) |
 | `sv39.rs` | page tables |
 | `context_switch.rs` | the switch, split Pi-style: Rust installs `satp`, naked asm swaps registers |
 | `usermode.rs`, `uaccess.rs`, `syscall.rs` | the U-mode boundary |

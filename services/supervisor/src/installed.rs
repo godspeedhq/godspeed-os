@@ -136,6 +136,8 @@ pub struct Installed {
     /// The device each USB host has bound for a driver of its own, as it last reported: (vendor, product), by the
     /// host's number (`usbdev::HOST_*`). A PC has two such hosts, and one saying it has nothing says nothing of the other.
     usb_attached: [Option<(u16, u16)>; usbdev::HOSTS],
+    /// The kernel's `NIC` kind is a PCI ethernet controller here (`crate::in_tree_driver_of`). Asked once, at start.
+    nic_on_bus: bool,
 }
 
 /// How long the boot read waits for `fs` to answer before it says it gave up. `fs` mounts, and replays its
@@ -145,8 +147,15 @@ pub struct Installed {
 const BOOT_WAIT_SECS: i64 = 120;
 
 impl Installed {
-    pub fn new() -> Installed {
-        Installed { e: [None; MAX_INSTALLED], image: None, boot_pending: false, boot_since: 0, boot_said: false, returned: None, usb_attached: [None; usbdev::HOSTS] }
+    pub fn new(ctx: &ServiceContext) -> Installed {
+        // A PCI identity is reported only for a controller on a bus; a SoC MAC, and every Arm port, reports 0.
+        let nic_on_bus = godspeed::driver::device::nic_vendor_device(ctx) != 0;
+        Installed { e: [None; MAX_INSTALLED], image: None, boot_pending: false, boot_since: 0, boot_said: false, returned: None, usb_attached: [None; usbdev::HOSTS], nic_on_bus }
+    }
+
+    /// The built-in driver of PCI class `class` (`crate::in_tree_driver_of`), on this machine.
+    fn in_tree_driver(&self, class: u32) -> Option<&'static str> {
+        crate::in_tree_driver_of(class, self.nic_on_bus)
     }
 
     /// Is the installed list still to be read (`fs` has not answered yet)? The supervisor's loop then waits
@@ -216,7 +225,7 @@ impl Installed {
     /// Is `driver`, a built-in driver, stood down because an installed package holds its device? The death notice,
     /// the reconcile sweep and the startup convergence all ask, so none of them starts it beside the package.
     pub fn holds(&self, driver: &str) -> bool {
-        self.e.iter().flatten().any(|x| x.pci_class.is_some_and(|c| crate::in_tree_driver_of(c) == Some(driver))
+        self.e.iter().flatten().any(|x| x.pci_class.is_some_and(|c| self.in_tree_driver(c) == Some(driver))
             || x.usb.is_some_and(|d| self.in_tree_usb_driver(d) == Some(driver)))
     }
 
@@ -239,7 +248,7 @@ impl Installed {
         let class = e.pci_class.take();
         let usb = e.usb.take();
         self.e[i] = Some(e);
-        if let Some(holder) = class.and_then(crate::in_tree_driver_of) {
+        if let Some(holder) = class.and_then(|c| self.in_tree_driver(c)) {
             ctx.log_fmt(format_args!("supervisor: {}'s device (class {:06x}) goes back to {}", pkg, class.unwrap_or(0), holder));
             self.returned = Some(holder);
         }
@@ -396,7 +405,7 @@ impl Installed {
         let Ok(c) = check::package(ctx, publisher, name, version, this_arch(), &mut |_, _| true) else { return };
         if c.kind != Kind::Driver { return; }
         let holder = match (c.contract.pci_class, c.contract.usb) {
-            (Some(class), _) => { self.class_of(pkg, Some(class)); crate::in_tree_driver_of(class) }
+            (Some(class), _) => { self.class_of(pkg, Some(class)); self.in_tree_driver(class) }
             (None, Some((v, p))) => { self.usb_of(pkg, Some((v, p))); self.in_tree_usb_driver((v, p)) }
             (None, None) => return,
         };
@@ -598,7 +607,7 @@ impl Installed {
             if checked.contract.pci_irq { req.flags |= SPAWN_FLAG_REQ_RECV; }
             req.bdf = 0;
             req.dma_pages = dma.div_ceil(4096) as u32;
-            stood_down = crate::in_tree_driver_of(class);
+            stood_down = self.in_tree_driver(class);
         }
         req.memory_limit = match checked.contract.memory_limit { 0 => MEMORY_DEFAULT, m => m.min(MEMORY_MAX) };
         // A handover-capable start carries a fresh KEY in its spawn mode, which only this supervisor can set: an offer
