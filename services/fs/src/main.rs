@@ -2472,6 +2472,15 @@ impl Fs {
         self.blk_end(ctx, t);
         got
     }
+    /// Zero one run of bitmap blocks for `check` (`(first, len)` relative to `bitmap_start`), metered.
+    /// `None` is nothing to do. A refused write fails the check, as the whole-bitmap zero did.
+    fn zero_bitmap_run(&self, ctx: &ServiceContext, run: Option<(u64, u64)>) -> Result<(), &'static str> {
+        let Some((first, len)) = run else { return Ok(()) };
+        let t = self.blk_begin(ctx);
+        let ok = block_write_zeros(ctx, self.bitmap_start + first, len);
+        self.blk_end(ctx, t);
+        if ok { Ok(()) } else { Err("bitmap zero failed") }
+    }
 
     fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
         let t_blk = self.blk_begin(ctx);
@@ -4219,14 +4228,34 @@ fn replay_window(_ctx: &ServiceContext) {}
         // that is 9 blocks; on a 30 GB disk it is 15,332, which roughly doubles the walk. That is a
         // real cost, paid by an occasional operator-invoked command, to detect the failure whose
         // signature is otherwise a file quietly becoming someone else's data.
+        //
+        // ZERO ONLY WHAT IS NOT ALREADY ZERO, in the same pass (2026-10-27). This used to read the whole
+        // bitmap and then zero the whole bitmap - on the Pi 2's 16 GB stick that is 7,634 blocks each way,
+        // and on a mostly empty disk nearly every one of them is already zero, so most of a 72 s `drives
+        // check` was writing zeros over zeros (`fs: op 27 took 71674332 us, 8380 block ops` against
+        // `scrub`'s 602 blocks of the same tree in 2.9 s). The read pass already sees each block, so a
+        // block that had a bit set - or that could not be read, whose contents are unknown - is zeroed,
+        // in runs of consecutive such blocks, and the rest are left. The postcondition is unchanged: every
+        // bitmap block is zero before the rebuild below.
         let bitmap_blocks = self.journal_start - self.bitmap_start;
         let mut old_set: u64 = 0;
+        let mut run: Option<(u64, u64)> = None;   // (first, len) of the dirty blocks not yet zeroed
         for b in 0..bitmap_blocks {
-            if let Some(blk) = self.block_read_m(ctx, self.bitmap_start + b) {
-                for byte in blk.iter() { old_set += byte.count_ones() as u64; }
-            }
+            let dirty = match self.block_read_m(ctx, self.bitmap_start + b) {
+                Some(blk) => {
+                    let set: u64 = blk.iter().map(|byte| byte.count_ones() as u64).sum();
+                    old_set += set;
+                    set != 0
+                }
+                None => true,
+            };
+            run = match (run, dirty) {
+                (Some((s, l)), true) if s + l == b => Some((s, l + 1)),
+                (prev, true) => { self.zero_bitmap_run(ctx, prev)?; Some((b, 1)) }
+                (prev, false) => { self.zero_bitmap_run(ctx, prev)?; None }
+            };
         }
-        if !block_write_zeros(ctx, self.bitmap_start, bitmap_blocks) { return Err("bitmap zero failed"); }
+        self.zero_bitmap_run(ctx, run)?;
         // System blocks [0, data_start): superblock + bitmap + journal. Plus the backup block.
         self.bm_set_range(ctx, 0, self.data_start, true)?;
         self.bm_set_range(ctx, self.total_blocks - 1, 1, true)?;
