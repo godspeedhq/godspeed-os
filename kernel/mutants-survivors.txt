@@ -22,27 +22,8 @@ kernel/src/capability/rights.rs: replace & with ^ in Rights::without
 kernel/src/capability/rights.rs: replace & with | in Rights::without
 kernel/src/capability/rights.rs: replace << with >>
 kernel/src/capability/rights.rs: replace | with ^ in <impl core::ops::BitOr for Rights>::bitor
-kernel/src/capability/table.rs: delete ! in CapTable::get
-kernel/src/capability/table.rs: replace && with || in CapTable::holds_resource
-kernel/src/capability/table.rs: replace += with *= in GlobalResourceTable::register_at_gen
-kernel/src/capability/table.rs: replace += with -= in GlobalResourceTable::register_at_gen
 kernel/src/capability/table.rs: replace < with <= in GlobalResourceTable::bump_generation
-kernel/src/capability/table.rs: replace < with <= in GlobalResourceTable::get_record
-kernel/src/capability/table.rs: replace < with <= in GlobalResourceTable::register_at_gen
-kernel/src/capability/table.rs: replace == with != in CapTable::holds_resource
-kernel/src/capability/table.rs: replace == with != in GlobalResourceTable::bump_generation
-kernel/src/capability/table.rs: replace == with != in GlobalResourceTable::get_record
 kernel/src/capability/table.rs: replace >= with < in CapTable::get
-kernel/src/capability/table.rs: replace CapTable::for_each_slot with ()
-kernel/src/capability/table.rs: replace CapTable::holds_resource -> bool with false
-kernel/src/capability/table.rs: replace CapTable::holds_resource -> bool with true
-kernel/src/capability/table.rs: replace bump_resource_generation with ()
-kernel/src/capability/table.rs: replace cap_read_rights -> Option<super::rights::Rights> with None
-kernel/src/capability/table.rs: replace get_resource_generation -> Option<Generation> with None
-kernel/src/capability/table.rs: replace mark_dead_resource with ()
-kernel/src/capability/table.rs: replace register_resource with ()
-kernel/src/capability/table.rs: replace register_resource_at_gen with ()
-kernel/src/capability/table.rs: replace revoke_resource with ()
 kernel/src/clock.rs: replace + with - in packed_from_epoch
 kernel/src/clock.rs: replace - with + in epoch_secs
 kernel/src/clock.rs: replace - with + in packed_from_epoch
