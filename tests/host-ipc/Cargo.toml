@@ -1,0 +1,29 @@
+# Host tests over the REAL kernel IPC routing code (backlog/90 E4, and the regression half of step 2).
+#
+# kernel/src/lib.rs host-tests MODELS of routing and naming (`routing_model.rs`, `names_model.rs`), so
+# the code the kernel runs was tested by nothing off the board. This crate compiles the real
+# kernel/src/ipc/{routing,queue,message,endpoint}.rs, kernel/src/capability/{cap,generation,rights}.rs and
+# kernel/src/smp/spinlock.rs by `#[path]`, with the smallest stubs for what they import: the arch seam's
+# interrupt save/restore, `task::scheduler::MAX_TASKS`, and a `kprintln!` that prints nothing. Nothing
+# under kernel/ is modified. Each tests/*.rs is its own process, so routing's global statics start empty
+# for every scenario.
+#
+# Written by the 2026-10-16 audit as `caps-transit` and rerun at 537e6861; landed 2026-10-27. Not a
+# workspace member and its own workspace root, like tests/kani. scripts/host_test_check.py runs it.
+[package]
+name = "host-ipc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
+
+[dev-dependencies]
+# The real files carry their own `#[cfg(test)]` proptest modules; they run here too.
+proptest = "1"
+
+[workspace]

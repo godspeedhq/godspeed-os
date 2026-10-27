@@ -18,6 +18,7 @@ Exit: 0 if every listed file compiles and every test in it passes, and `cargo te
 passes, 1 otherwise.
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -92,7 +93,51 @@ def main() -> int:
         failed += 1
     else:
         print(f"host tests: kernel --lib - {summary[-1]}")
+    failed += host_ipc(root)
     return 1 if failed else 0
+
+
+def host_ipc(root):
+    """tests/host-ipc: the REAL routing code on the host (backlog/90 E4), and its known defects.
+
+    Two runs. The ordinary one must pass: positive controls, and the real files' own unit tests. Then
+    `--ignored`, where every test is a DEFECT the 2026-10-16 audit found, marked with its backlog/90 id,
+    and each must still FAIL. One that passes means its defect was fixed - or the scenario stopped
+    exercising it - and either way the ignore must go, so the test becomes the fix's regression test
+    rather than a reproduction nobody runs.
+    """
+    crate = os.path.join(root, "tests", "host-ipc")
+    bad = 0
+    # The one stubbed constant must match the kernel's, or the harness tests a different table size.
+    with open(os.path.join(root, "kernel", "src", "task", "scheduler.rs"), encoding="utf-8") as f:
+        k = re.search(r"pub const MAX_TASKS: usize = (\d+);", f.read())
+    with open(os.path.join(crate, "src", "lib.rs"), encoding="utf-8") as f:
+        h = re.search(r"pub const MAX_TASKS: usize = (\d+);", f.read())
+    if not k or not h or k.group(1) != h.group(1):
+        print(f"host tests: tests/host-ipc stubs MAX_TASKS = {h and h.group(1)}, the kernel has "
+              f"{k and k.group(1)} - they must agree")
+        bad += 1
+    r = subprocess.run(["cargo", "test", "-q", "--no-fail-fast"], cwd=crate, capture_output=True, text=True)
+    if r.returncode != 0:
+        print("host tests: tests/host-ipc FAILED")
+        print(r.stdout[-4000:])
+        print(r.stderr[-4000:])
+        return bad + 1
+    passed = sum(int(m) for m in re.findall(r"test result: ok\. (\d+) passed", r.stdout))
+    r = subprocess.run(["cargo", "test", "--no-fail-fast", "--", "--ignored"], cwd=crate,
+                       capture_output=True, text=True)
+    outcomes = re.findall(r"^test (\S+) \.\.\. (ok|FAILED)$", r.stdout, re.M)
+    if not outcomes:
+        print("host tests: tests/host-ipc --ignored ran nothing - the defect scenarios cannot be read")
+        print(r.stdout[-2000:])
+        return bad + 1
+    for name, outcome in outcomes:
+        if outcome == "ok":
+            print(f"host tests: tests/host-ipc `{name}` PASSES now. It reproduced a backlog/90 defect; if the "
+                  f"fix landed, delete its #[ignore] so it guards the fix, and close the defect")
+            bad += 1
+    print(f"host tests: tests/host-ipc - {passed} passed, {len(outcomes)} known defect(s) still reproduce")
+    return bad
 
 
 if __name__ == "__main__":
