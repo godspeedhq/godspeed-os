@@ -2455,6 +2455,24 @@ impl Fs {
             .saturating_add(gs::driver::wait::ticks(ctx).saturating_sub(t0)));
     }
 
+    /// `data_read` / `block_read`, METERED. Those two are free functions, so the volume's walks (`check`,
+    /// `scrub`) called them outside `blk_begin`/`blk_end`: every data block they verified went uncounted,
+    /// and the Pi 2's `drives check` reported "176 block ops, 0% of it inside them" for a 76 s walk whose
+    /// 176 were only the bitmap and directory blocks (2026-10-27). That reads as 76 s of `fs` compute,
+    /// which it is not. The walks read through these now, so the line counts what they actually do.
+    fn data_read_m(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+        let t = self.blk_begin(ctx);
+        let got = data_read(ctx, lba);
+        self.blk_end(ctx, t);
+        got
+    }
+    fn block_read_m(&self, ctx: &ServiceContext, lba: u64) -> Option<[u8; BLOCK]> {
+        let t = self.blk_begin(ctx);
+        let got = block_read(ctx, lba);
+        self.blk_end(ctx, t);
+        got
+    }
+
     fn durable_or_warn(&self, ctx: &ServiceContext) -> bool {
         let t_blk = self.blk_begin(ctx);
         let outcome = block_flush_outcome(ctx);
@@ -4204,7 +4222,7 @@ fn replay_window(_ctx: &ServiceContext) {}
         let bitmap_blocks = self.journal_start - self.bitmap_start;
         let mut old_set: u64 = 0;
         for b in 0..bitmap_blocks {
-            if let Some(blk) = block_read(ctx, self.bitmap_start + b) {
+            if let Some(blk) = self.block_read_m(ctx, self.bitmap_start + b) {
                 for byte in blk.iter() { old_set += byte.count_ones() as u64; }
             }
         }
@@ -4314,7 +4332,7 @@ fn replay_window(_ctx: &ServiceContext) {}
                             self.bm_set_range(ctx, s, l, true)?; // data runs are referenced → used
                             st.3 += l;
                             for j in 0..l {
-                                let got = data_read(ctx, s + j);
+                                let got = self.data_read_m(ctx, s + j);
                                 self.note_walk_read(got.is_some())?;
                                 if got.is_none() {
                                     ctx.log_fmt(format_args!(
@@ -4333,7 +4351,7 @@ fn replay_window(_ctx: &ServiceContext) {}
             } else {
                 let mut ok = true;
                 for bi in 0..count {
-                    let got = data_read(ctx, first + bi);
+                    let got = self.data_read_m(ctx, first + bi);
                     self.note_walk_read(got.is_some())?;
                     if got.is_none() {
                         // WHICH block of the extent, not just which LBA. `data_read` already names the
@@ -4437,7 +4455,7 @@ fn replay_window(_ctx: &ServiceContext) {}
                             let (s, l) = exts[i];
                             st.3 += l;
                             for j in 0..l {
-                                let got = data_read(ctx, s + j);
+                                let got = self.data_read_m(ctx, s + j);
                                 self.note_walk_read(got.is_some())?;
                                 if got.is_none() { ok = false; }
                             }
@@ -4450,7 +4468,7 @@ fn replay_window(_ctx: &ServiceContext) {}
                 st.3 += count;
                 let mut ok = true;
                 for bi in 0..count {
-                    let got = data_read(ctx, first + bi);
+                    let got = self.data_read_m(ctx, first + bi);
                     self.note_walk_read(got.is_some())?;
                     if got.is_none() { ok = false; }
                 }
