@@ -678,20 +678,45 @@ fn xorshift64(state: &mut u64) -> u64 {
     *state
 }
 
+/// The return codes a send or try_send may give (dispatch.rs `ipc_err_to_i64`/`cap_err_to_i64`): Ok,
+/// the five capability refusals, EndpointDead, QueueFull, MessageTooLarge, ReplyDead. Read RAW,
+/// because the SDK's decoder maps every code it does not know - and CapRevoked and CapWrongScope - to
+/// EndpointDead, so an oracle written on `IpcError` could not see an undefined return.
+const SEND_CODES: [i64; 10] = [0, -2, -3, -4, -5, -6, -7, -8, -10, -12];
+/// A refusal BEFORE anything is queued: the cap is not held, lacks SEND, or is the wrong kind.
+const CAP_REFUSALS: [i64; 3] = [-2, -3, -5];
+
+/// A raw send (`nr` 1) or try_send (`nr` 3) on `slot`, returning the kernel's code unchanged.
+fn raw_send(nr: u64, slot: u64, payload: &[u8]) -> i64 {
+    adversarial::fuzz_syscall(nr, slot, payload.as_ptr() as u64, payload.len() as u64)
+}
+
 fn mode_prop_p1(ctx: &ServiceContext) -> ! {
     // P1 - Cap unforgeability (§7.3, §3.1).
-    // 10,000 random u32 values used as cap slots. prop-p1 holds no SEND caps,
-    // so every try_send must return Err. Any Ok is a constitutional violation.
+    // prop-p1 holds no SEND cap (no send peers), so no slot number can send. 10,000 tries, HALF of
+    // them inside the 64-slot table where its real caps sit - random u32s alone almost only reach the
+    // out-of-range path (backlog/90 E5). In range the answer must be a capability refusal; anywhere,
+    // never Ok, and never a code the kernel does not define.
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 20;
-    let msg = Message::from_bytes(b"p1");
-    for _ in 0..10_000u32 {
-        let slot = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
-        if gs::ipc::try_send_to(ctx, slot, &msg).is_ok() {
-            ctx.log("prop: P1 FAIL - random cap slot accepted as valid SEND");
+    let payload = *b"p1";
+    for i in 0..10_000u32 {
+        let r = xorshift64(&mut rng);
+        let slot = if i % 2 == 0 { r % 64 } else { r as u32 as u64 };
+        let code = raw_send(3, slot, &payload);
+        if code == 0 {
+            ctx.log("prop: P1 FAIL - a cap slot was accepted as a valid SEND");
+            idle(ctx);
+        }
+        if slot < 64 && !CAP_REFUSALS.contains(&code) {
+            ctx.log_fmt(format_args!("prop: P1 FAIL - in-table slot {} gave {}, not a cap refusal", slot, code));
+            idle(ctx);
+        }
+        if !SEND_CODES.contains(&code) {
+            ctx.log_fmt(format_args!("prop: P1 FAIL - slot {} gave undefined code {}", slot, code));
             idle(ctx);
         }
     }
-    ctx.log("prop: P1 pass (10000/10000)");
+    ctx.log("prop: P1 pass (10000/10000) - 5000 of them inside the table");
     idle(ctx)
 }
 
@@ -722,18 +747,28 @@ fn mode_prop_p9(ctx: &ServiceContext) -> ! {
 }
 
 fn mode_prop_p10(ctx: &ServiceContext) -> ! {
-    // P10 - Every try_send returns without hanging (§8.6, §8.2).
-    // 10,000 random (slot, payload) pairs. try_send is non-blocking by spec;
-    // completing all iterations within the harness timeout proves the property.
-    // Any return value (Ok or Err) is accepted - correctness is timing, not value.
+    // P10 - Every send returns exactly one DEFINED outcome (§8.6, §8.2).
+    // 10,000 random (syscall, slot, payload length) triples, both the blocking `send` and `try_send`,
+    // half the slots inside the 64-slot table. Each return is checked against the kernel's defined
+    // codes, read raw (the SDK would fold an undefined one into EndpointDead). prop-p10 holds no SEND
+    // cap, so a blocking `send` must be REFUSED, not block: finishing at all is the no-hang half.
+    // Lengths run past 4 KiB, so MessageTooLarge is reached too.
+    // What this does NOT reach: a send on a valid cap to a full queue, the path backlog/90 D1 and D2
+    // are about (tests/host-ipc reproduces those on the host).
     let mut rng: u64 = 0xDEAD_BEEF_u64 ^ 22;
-    for _ in 0..10_000u32 {
-        let slot    = gs::cap::Cap::from(CapHandle(xorshift64(&mut rng) as u32));
-        let raw     = xorshift64(&mut rng);
-        let msg     = Message::from_bytes(&raw.to_le_bytes());
-        let _       = gs::ipc::try_send_to(ctx, slot, &msg);
+    let payload = [0x5Au8; 4200];
+    for i in 0..10_000u32 {
+        let r = xorshift64(&mut rng);
+        let nr = if i % 2 == 0 { 1 } else { 3 };
+        let slot = if (i / 2) % 2 == 0 { r % 64 } else { r as u32 as u64 };
+        let len = (xorshift64(&mut rng) % 4200) as usize;
+        let code = raw_send(nr, slot, &payload[..len]);
+        if !SEND_CODES.contains(&code) || code == 0 {
+            ctx.log_fmt(format_args!("prop: P10 FAIL - syscall {} slot {} len {} gave {}", nr, slot, len, code));
+            idle(ctx);
+        }
     }
-    ctx.log("prop: P10 pass (10000/10000)");
+    ctx.log("prop: P10 pass (10000/10000) - every outcome a defined code");
     idle(ctx)
 }
 
