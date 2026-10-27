@@ -1,0 +1,68 @@
+# cargo-mutants survivors of `cargo test -p kernel --lib`, by scripts/mutants_check.py.
+# May only shrink: a new survivor fails mutation.yml, and so does an entry that is now caught.
+# Each is a mutation of the kernel no host test notices - backlog/90 E5's work list.
+kernel/src/capability/delegated.rs: delete ! in owner_of
+kernel/src/capability/delegated.rs: delete ! in revoke_owned
+kernel/src/capability/delegated.rs: replace % with + in Band::claim
+kernel/src/capability/delegated.rs: replace % with / in Band::claim
+kernel/src/capability/delegated.rs: replace + with * in Band::claim
+kernel/src/capability/delegated.rs: replace += with *= in release_owner
+kernel/src/capability/delegated.rs: replace += with -= in release_owner
+kernel/src/capability/delegated.rs: replace allocate -> Option<ResourceId> with None
+kernel/src/capability/delegated.rs: replace owner_of -> Option<OwnerId> with None
+kernel/src/capability/delegated.rs: replace owner_of -> Option<OwnerId> with Some(Default::default())
+kernel/src/capability/delegated.rs: replace release with ()
+kernel/src/capability/delegated.rs: replace release_owner -> u32 with 0
+kernel/src/capability/delegated.rs: replace release_owner -> u32 with 1
+kernel/src/capability/delegated.rs: replace revoke_owned -> bool with false
+kernel/src/capability/delegated.rs: replace revoke_owned -> bool with true
+kernel/src/capability/generation.rs: replace == with != in next_generation
+kernel/src/capability/rights.rs: delete ! in Rights::without
+kernel/src/capability/rights.rs: replace & with ^ in Rights::without
+kernel/src/capability/rights.rs: replace & with | in Rights::without
+kernel/src/capability/rights.rs: replace << with >>
+kernel/src/capability/rights.rs: replace | with ^ in <impl core::ops::BitOr for Rights>::bitor
+kernel/src/capability/table.rs: delete ! in CapTable::get
+kernel/src/capability/table.rs: replace && with || in CapTable::holds_resource
+kernel/src/capability/table.rs: replace += with *= in GlobalResourceTable::register_at_gen
+kernel/src/capability/table.rs: replace += with -= in GlobalResourceTable::register_at_gen
+kernel/src/capability/table.rs: replace < with <= in GlobalResourceTable::bump_generation
+kernel/src/capability/table.rs: replace < with <= in GlobalResourceTable::get_record
+kernel/src/capability/table.rs: replace < with <= in GlobalResourceTable::register_at_gen
+kernel/src/capability/table.rs: replace == with != in CapTable::holds_resource
+kernel/src/capability/table.rs: replace == with != in GlobalResourceTable::bump_generation
+kernel/src/capability/table.rs: replace == with != in GlobalResourceTable::get_record
+kernel/src/capability/table.rs: replace >= with < in CapTable::get
+kernel/src/capability/table.rs: replace CapTable::for_each_slot with ()
+kernel/src/capability/table.rs: replace CapTable::holds_resource -> bool with false
+kernel/src/capability/table.rs: replace CapTable::holds_resource -> bool with true
+kernel/src/capability/table.rs: replace bump_resource_generation with ()
+kernel/src/capability/table.rs: replace cap_read_rights -> Option<super::rights::Rights> with None
+kernel/src/capability/table.rs: replace get_resource_generation -> Option<Generation> with None
+kernel/src/capability/table.rs: replace mark_dead_resource with ()
+kernel/src/capability/table.rs: replace register_resource with ()
+kernel/src/capability/table.rs: replace register_resource_at_gen with ()
+kernel/src/capability/table.rs: replace revoke_resource with ()
+kernel/src/clock.rs: replace + with - in packed_from_epoch
+kernel/src/clock.rs: replace - with + in epoch_secs
+kernel/src/clock.rs: replace - with + in packed_from_epoch
+kernel/src/clock.rs: replace - with / in epoch_secs
+kernel/src/clock.rs: replace - with / in packed_from_epoch
+kernel/src/clock.rs: replace < with <= in deglitch_epoch
+kernel/src/clock.rs: replace < with <= in packed_from_epoch
+kernel/src/clock.rs: replace | with ^ in packed_from_epoch
+kernel/src/ipc/message.rs: replace <impl core::fmt::Debug for Message>::fmt -> core::fmt::Result with Ok(Default::default())
+kernel/src/ipc/queue.rs: delete ! in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace % with + in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace % with / in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace + with * in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace + with - in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace - with + in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace - with / in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace -= with += in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace -= with /= in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace == with != in MessageQueue::dequeue_matching
+kernel/src/ipc/queue.rs: replace MessageQueue::dequeue_matching -> Option<Message> with None
+kernel/src/ipc/queue.rs: replace MessageQueue::len -> usize with 0
+kernel/src/ipc/queue.rs: replace MessageQueue::len -> usize with 1
+kernel/src/ipc/queue.rs: replace MessageQueue::reset with ()

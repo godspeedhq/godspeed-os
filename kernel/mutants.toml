@@ -1,38 +1,32 @@
 # cargo-mutants configuration - kernel crate.
 #
-# Only the five pure-logic modules in the lib target are mutated.
-# Everything else either requires the no_std/hardware environment or
-# is the bin entry point that cannot compile for the host.
+# WHAT IS MUTATED is the hardware-free code `kernel/src/lib.rs` compiles for the host, named by an
+# INCLUDE list. This used to be an exclude list, and it had drifted both ways (backlog/90 E3): it still
+# excluded `control.rs`, deleted long ago, and - because cargo-mutants discovers files through the BIN
+# target's module tree as well as the lib's - it mutated files no host test can reach (`bootcon/` and
+# others), 881 mutants instead of the intended set. An include list cannot drift into new files: a
+# file joins it on purpose, when lib.rs starts compiling it.
 #
-# Mutated: capability/cap.rs, capability/generation.rs, capability/rights.rs,
-#          ipc/message.rs, ipc/queue.rs
+# Mutated: elf_flags.rs, clock.rs, capability/{cap,generation,rights,table,delegated}.rs,
+#          ipc/{message,queue}.rs. table.rs and delegated.rs were excluded before; lib.rs compiles both
+#          for its tests, and the capability table is the code the most depends on.
 #
 # Test command: cargo test -p kernel --lib
-# Approximate run time: ~5-10 min (50-100 mutations × ~3 s each).
-#
-# NOTE: cargo-mutants matches exclude_globs against workspace-root-relative
-# paths (kernel/src/...), so all patterns must use the kernel/src/ prefix.
+# Run: cargo mutants --package kernel --config kernel/mutants.toml --jobs 4 -- --lib
+#      then  python scripts/mutants_check.py mutants.out   (the survivor ratchet, kernel/mutants-survivors.txt)
+# Time: about 50 minutes on four jobs for ~716 mutants (2026-10-27). Each is listed twice, once per
+# target, which cargo-mutants does not merge.
 
 timeout_multiplier = 5.0
 
-exclude_globs = [
-    "kernel/src/arch/**",
-    "kernel/src/memory/**",
-    "kernel/src/smp/**",
-    "kernel/src/task/**",
-    "kernel/src/syscall/**",
-    "kernel/src/interrupt/**",
-    "kernel/src/invariants/**",
-    "kernel/src/ipc/endpoint.rs",
-    "kernel/src/ipc/routing.rs",
-    "kernel/src/ipc/names.rs",
-    "kernel/src/ipc/mod.rs",
+examine_globs = [
+    "kernel/src/elf_flags.rs",
+    "kernel/src/clock.rs",
+    "kernel/src/capability/cap.rs",
+    "kernel/src/capability/generation.rs",
+    "kernel/src/capability/rights.rs",
     "kernel/src/capability/table.rs",
-    "kernel/src/capability/revoke.rs",
-    "kernel/src/capability/mod.rs",
-    "kernel/src/log.rs",
-    "kernel/src/main.rs",
-    "kernel/src/lib.rs",
-    "kernel/src/loader.rs",
-    "kernel/src/control.rs",
+    "kernel/src/capability/delegated.rs",
+    "kernel/src/ipc/message.rs",
+    "kernel/src/ipc/queue.rs",
 ]

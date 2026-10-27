@@ -7,6 +7,7 @@ jobs:
   mutation:
     name: Mutation testing
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -17,21 +18,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin
-          key: cargo-tools-${{ runner.os }}-mutants-v1
+          key: cargo-tools-${{ runner.os }}-mutants-27.0.0
 
+      # PINNED: another version generates a different mutant set, and the survivor baseline was
+      # made with this one (2026-10-27). An install failure fails the job instead of being hidden.
       - name: Install cargo-mutants
-        run: cargo install cargo-mutants --locked 2>/dev/null || true
+        run: cargo install cargo-mutants --locked --version 27.0.0
 
-      # Run mutations against the kernel lib target only.
-      # kernel/mutants.toml scopes mutations to the five pure-logic modules.
-      # Exit code is non-zero if any mutant survives; we capture the report
-      # regardless and upload it as an artefact.  Once the baseline kill rate
-      # has been triaged and accepted, remove the `|| true` to make CI strict.
+      # Run mutations against the kernel lib target only. kernel/mutants.toml names the files
+      # (an include list: the hardware-free code lib.rs compiles for the host).
+      #
+      # This step used to end `|| true`, so a run could never fail. It now fails when the
+      # survivors differ from kernel/mutants-survivors.txt in EITHER direction: a new survivor
+      # (a test got weaker, or new code arrived untested) or a listed one now caught (delete it,
+      # so the list only shrinks). scripts/mutants_check.py is the ratchet (backlog/90 E3).
       - name: Run mutation tests
-        # --config kernel/mutants.toml: exclude_globs use kernel/src/ prefix
-        # (workspace-root-relative paths). Without --config the file is not
-        # found and all 2000+ mutations run instead of the intended ~120.
-        run: cargo mutants --package kernel --config kernel/mutants.toml -- --lib 2>&1 | tee mutation-report.txt || true
+        shell: bash
+        run: |
+          set +e
+          cargo mutants --package kernel --config kernel/mutants.toml --jobs 4 -- --lib 2>&1 | tee mutation-report.txt
+          set -e
+          python3 scripts/mutants_check.py mutants.out
 
       - name: Upload mutation report
         if: always()
