@@ -76,6 +76,7 @@ assert fails whatis banana
 assert fails whatis
 assert ok whatis help
 about | assert contains GodspeedOS
+about | assert contains Version
 version | assert contains GodspeedOS
 cores | assert contains cores
 mem | assert contains used
