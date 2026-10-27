@@ -619,6 +619,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut ntp: Option<NtpAsk> = None;           // the NTP query in flight, if any
     let mut ntp_said: Option<&'static str> = None; // the last NTP outcome logged, so a repeat stays quiet
     let mut no_cap: u32 = 0;                      // capless messages seen (a flood, usually)
+    let mut beat = gs::driver::wait::Since::now(&ctx); // when the heartbeat below last ran
     loop {
         // (Two earlier designs, both superseded by "ALWAYS a timed wait" below: waking only while a floor
         // read or write was outstanding, and then only while the clock was unsynced. Once settled the
@@ -672,95 +673,104 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         } else {
             SETTLED_WAKE_MS
         };
-        let req = {
-            match gs::ipc::recv_within_ms(&ctx, wake_ms) {
-                Some(m) => m,
-                None => {
-                    // A pending WRITE first: the clock is already known, and this is the copy that
-                    // survives a power cycle.
-                    //
-                    // Retrying HERE, on the timer, is what makes this reliable rather than best-effort.
-                    // A write whose reply says "failed" is retried from the reply arm below; a write
-                    // whose SEND failed - `fs` not spawned yet, or dead and not yet respawned - has no
-                    // reply coming at all, so without this it would be attempted once and silently
-                    // never again. That is the difference between "we tried" and "it gets written".
-                    // KEEP THE PERSISTED FLOOR FRESH, on this service's own heartbeat.
-                    //
-                    // The refresh used to ride on `OP_NOW`, which meant it only happened if somebody
-                    // asked the time. A machine left alone therefore persisted nothing, and a reboot
-                    // resumed from however old the last question was. Owning the clock includes owning
-                    // the copy that survives a power cut, and that cannot depend on being asked.
-                    //
-                    // Only a clock worth persisting: a floor-derived reading re-persisting itself would
-                    // just rewrite what it was handed, and an unset one has nothing to write.
-                    if store_left == 0 && clock.source != SRC_UNSET && clock.source != SRC_FLOOR {
-                        let reading = clock.now(&ctx);
-                        if reading > 0 && reading - store_epoch >= FLOOR_REFRESH_SECS {
-                            store_epoch = reading;
-                            store_left = FLOOR_STORE_TRIES;
-                            let _ = floor_store(&ctx, store_epoch);
+        // THE HEARTBEAT RUNS ON ELAPSED TIME, NOT ON SILENCE. It used to run only when `recv_within_ms`
+        // returned `None` - two seconds with NO message at all - so a client asking the time every second or
+        // two kept a respawned `time` from ever sending its floor read or its first NTP query: the Pi 4's
+        // `selfcheck` polled `date epoch` once a second for 20 s after killing `time` and the clock stayed
+        // unset the whole time, then was set two seconds after the polling stopped (2026-10-27). Asking the
+        // time must never be what stops the clock being found. So wait at most what is left of the beat, and
+        // when the beat is due run it, then handle whatever arrived.
+        let waited = gs::ipc::recv_within_ms(&ctx, wake_ms.saturating_sub(beat.elapsed_ms(&ctx)).max(1));
+        if beat.elapsed_ms(&ctx) >= wake_ms {
+            beat = gs::driver::wait::Since::now(&ctx);
+            'beat: {
+                // A pending WRITE first: the clock is already known, and this is the copy that
+                // survives a power cycle.
+                //
+                // Retrying HERE, on the timer, is what makes this reliable rather than best-effort.
+                // A write whose reply says "failed" is retried from the reply arm below; a write
+                // whose SEND failed - `fs` not spawned yet, or dead and not yet respawned - has no
+                // reply coming at all, so without this it would be attempted once and silently
+                // never again. That is the difference between "we tried" and "it gets written".
+                // KEEP THE PERSISTED FLOOR FRESH, on this service's own heartbeat.
+                //
+                // The refresh used to ride on `OP_NOW`, which meant it only happened if somebody
+                // asked the time. A machine left alone therefore persisted nothing, and a reboot
+                // resumed from however old the last question was. Owning the clock includes owning
+                // the copy that survives a power cut, and that cannot depend on being asked.
+                //
+                // Only a clock worth persisting: a floor-derived reading re-persisting itself would
+                // just rewrite what it was handed, and an unset one has nothing to write.
+                if store_left == 0 && clock.source != SRC_UNSET && clock.source != SRC_FLOOR {
+                    let reading = clock.now(&ctx);
+                    if reading > 0 && reading - store_epoch >= FLOOR_REFRESH_SECS {
+                        store_epoch = reading;
+                        store_left = FLOOR_STORE_TRIES;
+                        let _ = floor_store(&ctx, store_epoch);
+                    }
+                }
+                // A QUERY NOBODY ANSWERED is given up on, so a new one can go - see `NTP_GIVE_UP_SECS`.
+                if let Some(a) = ntp {
+                    if gs::task::epoch_secs_monotonic(&ctx) - a.sent_at >= NTP_GIVE_UP_SECS {
+                        ntp = None;
+                        if ntp_said != Some("lost") {
+                            ntp_said = Some("lost");
+                            ctx.log("time: the NTP query got no answer at all (net-stack restarted, or the answer was lost) - asking again");
                         }
                     }
-                    // A QUERY NOBODY ANSWERED is given up on, so a new one can go - see `NTP_GIVE_UP_SECS`.
-                    if let Some(a) = ntp {
-                        if gs::task::epoch_secs_monotonic(&ctx) - a.sent_at >= NTP_GIVE_UP_SECS {
-                            ntp = None;
-                            if ntp_said != Some("lost") {
-                                ntp_said = Some("lost");
-                                ctx.log("time: the NTP query got no answer at all (net-stack restarted, or the answer was lost) - asking again");
-                            }
-                        }
+                }
+                // ASK FOR THE TIME, since nobody else will - see `SYNC_NUDGE_SECS`. Through `net-stack`'s
+                // op 12, which sends the datagram and goes on serving: nothing waits on the answer, here or
+                // there, so a `ping` never queues behind a time server.
+                //
+                // THE SETTING FIRST. Until its file has answered nothing is asked; with no answer in
+                // the floor's ~30 s there is no disk to hold one, so there is nothing to honour and the
+                // default is asked, said once.
+                if ntp_cfg == NtpCfg::Unread && cfg_tries > 0 {
+                    cfg_tries -= 1;
+                    let _ = ntp_cfg_load(&ctx);
+                    if cfg_tries == 0 {
+                        ntp_cfg = NtpCfg::Use(ntp_file::DEFAULT);
+                        ctx.log("time: fs gave no answer for /system/services/time/ntp - asking the default NTP server, 162.159.200.123");
                     }
-                    // ASK FOR THE TIME, since nobody else will - see `SYNC_NUDGE_SECS`. Through `net-stack`'s
-                    // op 12, which sends the datagram and goes on serving: nothing waits on the answer, here or
-                    // there, so a `ping` never queues behind a time server.
-                    //
-                    // THE SETTING FIRST. Until its file has answered nothing is asked; with no answer in
-                    // the floor's ~30 s there is no disk to hold one, so there is nothing to honour and the
-                    // default is asked, said once.
-                    if ntp_cfg == NtpCfg::Unread && cfg_tries > 0 {
-                        cfg_tries -= 1;
-                        let _ = ntp_cfg_load(&ctx);
-                        if cfg_tries == 0 {
-                            ntp_cfg = NtpCfg::Use(ntp_file::DEFAULT);
-                            ctx.log("time: fs gave no answer for /system/services/time/ntp - asking the default NTP server, 162.159.200.123");
-                        }
+                }
+                if let (true, None, NtpCfg::Use(server)) = (sync_due, ntp, ntp_cfg) {
+                    ntp = ntp_ask(&ctx, server);
+                    let ok = ntp.is_some();
+                    // ONLY A SENT QUERY COUNTS AGAINST THE INTERVAL: a failed send is retried at the
+                    // heartbeat, not rewarded with the full twenty seconds (see `SYNC_NUDGE_SECS`).
+                    if ok {
+                        last_nudge = gs::task::epoch_secs_monotonic(&ctx);
                     }
-                    if let (true, None, NtpCfg::Use(server)) = (sync_due, ntp, ntp_cfg) {
-                        ntp = ntp_ask(&ctx, server);
-                        let ok = ntp.is_some();
-                        // ONLY A SENT QUERY COUNTS AGAINST THE INTERVAL: a failed send is retried at the
-                        // heartbeat, not rewarded with the full twenty seconds (see `SYNC_NUDGE_SECS`).
-                        if ok {
-                            last_nudge = gs::task::epoch_secs_monotonic(&ctx);
-                        }
-                        if nudge_ok != Some(ok) {
-                            nudge_ok = Some(ok);
-                            ctx.log(if ok {
-                                "time: asking the network for the time (NTP, through net-stack)"
-                            } else {
-                                "time: cannot reach net-stack to ask for the network time - retrying"
-                            });
-                        }
+                    if nudge_ok != Some(ok) {
+                        nudge_ok = Some(ok);
+                        ctx.log(if ok {
+                            "time: asking the network for the time (NTP, through net-stack)"
+                        } else {
+                            "time: cannot reach net-stack to ask for the network time - retrying"
+                        });
                     }
-                    if store_left > 0 && !floor_store(&ctx, store_epoch) {
-                        store_left -= 1;
-                        if store_left == 0 {
-                            ctx.log("time: cannot reach fs to persist the clock floor - the next boot starts with no floor (the clock itself is set and unaffected)");
-                        }
-                        continue;
+                }
+                if store_left > 0 && !floor_store(&ctx, store_epoch) {
+                    store_left -= 1;
+                    if store_left == 0 {
+                        ctx.log("time: cannot reach fs to persist the clock floor - the next boot starts with no floor (the clock itself is set and unaffected)");
                     }
-                    if !floor_settled && tries_left > 0 {
-                        tries_left -= 1;
-                        // Send the READ and carry straight on - the answer arrives as a tagged message
-                        // below. Nothing here waits on `fs`.
-                        if !floor_load(&ctx) && tries_left == 0 {
-                            ctx.log("time: no persisted clock floor on disk - the clock stays unset until the network sets it");
-                        }
+                    break 'beat;
+                }
+                if !floor_settled && tries_left > 0 {
+                    tries_left -= 1;
+                    // Send the READ and carry straight on - the answer arrives as a tagged message
+                    // below. Nothing here waits on `fs`.
+                    if !floor_load(&ctx) && tries_left == 0 {
+                        ctx.log("time: no persisted clock floor on disk - the clock stays unset until the network sets it");
                     }
-                    continue;
                 }
             }
+        }
+        let req = match waited {
+            Some(m) => m,
+            None => continue,
         };
         // OUR OWN fs REPLY, or a client request? A client request carries a reply cap; a reply to the
         // non-blocking floor I/O does not, and carries one of our tags. Handling it here - in the

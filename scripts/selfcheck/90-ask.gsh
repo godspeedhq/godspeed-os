@@ -49,7 +49,9 @@ ask "why did time restart?" | where label=verdict | assert lacks CRASHED
 # full `selfcheck` skipped the whole package lifecycle, while `selfcheck packages` alone ran it (Pi 4,
 # 2026-10-27). Wait for the clock to come back, bounded at 20 tries a second apart. READ ONLY: `date epoch`
 # asks and sets nothing (part 2 says why a check must not sync the clock), and a machine whose clock was
-# never set just spends the 20 s and goes on.
+# never set just spends the 20 s and goes on. (The first version of this wait found a bug in `time`: it
+# retried its floor read only after two SILENT seconds, so this very polling kept the clock unset for all
+# 20 s. `time` now retries on elapsed time, and the clock comes back within a few seconds of the kill.)
 let mut clock_tries = 0
 loop {
     if date epoch { break }
