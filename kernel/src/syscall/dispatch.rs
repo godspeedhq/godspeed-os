@@ -503,8 +503,11 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
     if buf_len == 0 || buf_len > MAX_MESSAGE_SIZE { return -1; }
     if !validate_user_ptr(out_buf, buf_len) { return -1; }
 
-    let my_slot = scheduler::current_task_slot();
-    match crate::ipc::routing::dequeue(endpoint_id, cap.generation, Some(my_slot)) {
+    // `None`: a try_recv never blocks, so it must never be RECORDED as a blocked receiver. It was
+    // (`Some(my_slot)`), and the next message for this endpoint then woke the task out of whatever it
+    // was waiting in by then - a blocking send told 0, "delivered", with its message still waiting
+    // (backlog/90 D2).
+    match crate::ipc::routing::dequeue(endpoint_id, cap.generation, None) {
         Ok((msg, sender_to_wake)) => {
             if let Some(slot) = sender_to_wake {
                 scheduler::wake_by_slot(slot, 0);
@@ -583,6 +586,8 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
         }
     };
     scheduler::clear_wake_deadline(my_slot);
+    // A timed-out or failed wait leaves the registration its last dequeue made (backlog/90 D2).
+    crate::ipc::routing::withdraw_receiver(endpoint_id, my_slot);
     result
 }
 
@@ -730,6 +735,9 @@ fn build_message(msg_ptr: u64, msg_len: u64) -> Result<Message, i64> {
     // caller whatever message reached its queue first and desynced fs's reply stream on hardware.
     // A task with no endpoint stamps 0, which matches no target.
     msg.sender_ep = scheduler::current_task_endpoint().map(|e| e.0).unwrap_or(0);
+    // ...and WHICH incarnation of it (backlog/90 D5): ids are reused, so the id alone matched a dead
+    // predecessor's late reply. Recorded per task at spawn, so this is one atomic load, not a lookup.
+    msg.sender_gen = if msg.sender_ep == 0 { 0 } else { scheduler::current_task_endpoint_gen() };
     Ok(msg)
 }
 
@@ -1623,7 +1631,7 @@ fn do_call(
     let call_h0 = scheduler::core_idle_halts(scheduler::current_core_id());
     let mut call_blocks: u32 = 0;
     let result = loop {
-        match crate::ipc::routing::call_dequeue(recv_ep, recv_cap.generation, target_ep, my_slot) {
+        match crate::ipc::routing::call_dequeue(recv_ep, recv_cap.generation, target_ep, target_cap.generation, my_slot) {
             Ok((reply, sender_to_wake)) => {
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
@@ -1663,6 +1671,13 @@ fn do_call(
         }
     };
     scheduler::clear_wake_deadline(my_slot);
+    // A Call that ends without its reply - a CallDeadline past its deadline, or a wait that failed -
+    // leaves what call_dequeue step 3 recorded: the caller as its mailbox's blocked receiver, and the
+    // call as awaiting `target_ep`. Both must go before returning: the first made a late reply wake a
+    // task no longer waiting for it, the second made `target_ep`'s later death wake it with ReplyDead
+    // in whatever it was doing by then (backlog/90 D2). No-ops when a reply consumed them.
+    crate::ipc::routing::withdraw_receiver(recv_ep, my_slot);
+    crate::ipc::routing::clear_call_await(my_slot);
 
     // Bounded and quiet: 100 ms is far past any healthy call, so a healthy machine prints nothing,
     // and past it only every 256th, so a slow system cannot drown itself in reports about being

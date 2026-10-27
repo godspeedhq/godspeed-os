@@ -261,6 +261,12 @@ pub fn set_task_reply_endpoint(slot: usize, endpoint: Option<crate::ipc::Endpoin
 static TASK_ENDPOINT: [AtomicU64; MAX_TASKS] =
     [const { AtomicU64::new(0) }; MAX_TASKS];
 
+/// The generation `TASK_ENDPOINT[slot]` was registered at, read once at `commit_task` (the endpoint
+/// is registered before it). The send path stamps it into every message so a Call can tell a reply
+/// from this incarnation from one sent by an earlier owner of the same id (backlog/90 D5).
+static TASK_ENDPOINT_GEN: [core::sync::atomic::AtomicU32; MAX_TASKS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TASKS];
+
 /// Encode/decode `Option<EndpointId>` as the `u64` held in a `TASK_ENDPOINT` slot.
 #[inline] fn ep_to_u64(e: Option<EndpointId>) -> u64 { match e { Some(EndpointId(id)) => id, None => 0 } }
 #[inline] fn ep_from_u64(v: u64) -> Option<EndpointId> { if v == 0 { None } else { Some(EndpointId(v)) } }
@@ -1188,6 +1194,8 @@ pub unsafe fn commit_task(
         if is_user { crate::arch::imp::note_user_task(slot); }
         TASK_KERNEL_STACK_TOP[slot].store(kernel_stack_top, Ordering::Relaxed);
         TASK_ENDPOINT[slot].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
+        TASK_ENDPOINT_GEN[slot].store(
+            endpoint_id.map(|e| crate::ipc::routing::get_generation(e).0).unwrap_or(0), Ordering::Relaxed);
         // TASK_STATE must be last: once Ready is visible to other cores, every
         // other field in this slot must already be correctly set.  A concurrent
         // kill_task_by_slot that observes Ready will immediately read
@@ -1287,6 +1295,17 @@ pub fn current_task_holds_resource(
 
 /// Return the current task's own recv endpoint id, if it has one. Used by `ResourceMint`/
 /// `ResourceRevoke` (§7.10) to record/check the owner of a delegated resource.
+/// The generation of the current task's endpoint (0 if it has none), as recorded at spawn.
+pub fn current_task_endpoint_gen() -> u32 {
+    let cid = current_core_id();
+    let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
+    if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
+        TASK_ENDPOINT_GEN[cur].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 pub fn current_task_endpoint() -> Option<EndpointId> {
     let cid = current_core_id();
     let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);

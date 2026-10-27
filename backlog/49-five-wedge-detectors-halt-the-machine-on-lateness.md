@@ -128,6 +128,18 @@ AHCI and GENET on them, and net-stack's subnet mask - all userspace): `778769040
 checks after it then failed because the machine had halted, so one late vCPU read as 21 failures. The
 rerun, on the same build: 276 passed, 0 failed, 2 skipped, and no panic.
 
+**And three more times, 2026-10-27, on `feat/v1-groundwork`** (the backlog/90 D2 and D5 kernel fixes), two
+of them back to back on one build: `7789450287` ticks against `7773654000`, 1.002x, core 0 running `shell`,
+the second supervisor kill. Every sighting, including the three logs kept from 2026-10-21 and 2026-10-26
+before any of these fixes existed, stops on the same line - right after `spawn[ipc]: 'supervisor' takes back
+a reply mailbox released by a service that died - 69 of 96 routing slots free, reserve 72` - so the late
+core is inside the supervisor's respawn SPAWN, and it took 0 timer interrupts for the whole allowance:
+interrupts were off on core 0 for about 7.8 s while the kernel loaded the supervisor's image (which embeds
+every other service's). That is a fact this entry did not have, and it moves the question from "the detector
+is too strict" to "why is a spawn running that long with interrupts off". The same build's other suites all
+passed (reply-dead 5, fs-restart 11, file-cap 16, identity 24, property 10, adv 15, chaos 8), and the D2-only
+build ran this suite clean (276/0) once. Not fixed; the switch-path work this entry gates is the place.
+
 **A third time, 2026-10-21, the same test, the same line and the same shape**, on `feat/gs-driver` (the shell's
 history load, the console's blink and comment corrections - all userspace): `7785467269` ticks against
 `7769721900` allowed, 1.0020x, core 0 running `shell`, at the second of four supervisor kills, and 21 checks

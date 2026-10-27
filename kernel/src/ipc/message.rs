@@ -32,14 +32,20 @@ pub struct Message {
     /// send paths (`0` = kernel-generated or unstamped). This is what lets a blocked `Call` take only
     /// its actual REPLY from the caller's queue: the reply's sender is the task that owns the endpoint
     /// the request was sent to, so `call_dequeue` matches `sender_ep == target` and leaves every other
-    /// message (an unrelated client's request, a stale reply from a dead incarnation - whose endpoint
-    /// id differs) queued for the ordinary recv loop. Before this existed, `call` returned whatever
+    /// message (an unrelated client's request, a stale reply from a dead incarnation) queued for the
+    /// ordinary recv loop. The id alone cannot tell incarnations apart - endpoint ids are reused, LIFO,
+    /// so a respawn usually takes its predecessor's id back - which is why `sender_gen` exists. Before this existed, `call` returned whatever
     /// message reached the queue head first: observed on hardware as `fs` receiving a shell REQUEST as
     /// block-driver's read "reply" ("MALFORMED reply (3 bytes, first 14) - protocol desync"), and -
     /// the undetectable case - a stale 513-byte read-reply accepted as a DIFFERENT block's data, which
     /// is how a healthy root record repeatedly "failed its CRC". Kernel-internal: never crosses to
     /// userspace (the SDK sees payload + badge only), so no ABI change.
     pub sender_ep: u64,
+    /// The GENERATION of `sender_ep` when this was sent (`0` with `sender_ep` 0). A reply matches a
+    /// Call only if its id AND generation are the target's NOW, so a late reply from a dead
+    /// incarnation, or a request from a dead client whose id a new task took, is never taken as the
+    /// reply (backlog/90 D5).
+    pub sender_gen: u32,
 }
 
 impl core::fmt::Debug for Message {
@@ -61,6 +67,7 @@ impl Message {
             badge_id: 0,
             badge_right: 0,
             sender_ep: 0,
+            sender_gen: 0,
         };
         msg.payload[..payload.len()].copy_from_slice(payload);
         Ok(msg)
@@ -83,6 +90,7 @@ impl Message {
             badge_id:    0,
             badge_right: 0,
             sender_ep:   0,   // kernel-generated: no sending task, never matches a Call's replier
+            sender_gen:  0,
         };
         msg.payload[0] = irq;
         msg

@@ -673,10 +673,11 @@ fn dequeue_reply_locked(
     endpoint: EndpointId,
     cap_gen: Generation,
     target: EndpointId,
+    target_gen: Generation,
 ) -> Result<(Message, Option<usize>), IpcError> {
     let idx = find_index(table, endpoint).ok_or(IpcError::EndpointDead)?;
     check_live(&table[idx], cap_gen)?;
-    let msg = match table[idx].queue.dequeue_matching(target.0) {
+    let msg = match table[idx].queue.dequeue_matching(target.0, target_gen.0) {
         Some(m) => m,
         None => return Err(IpcError::QueueEmpty),
     };
@@ -703,16 +704,22 @@ fn dequeue_reply_locked(
 /// All three steps run under the one `TABLE` lock, so they are atomic with respect to
 /// `kill_endpoint(target)` - the registration-vs-death race is closed exactly as it is for a blocked
 /// sender. `Err(EndpointDead)` here means the caller's *own* endpoint died (it is being killed).
+///
+/// `target_gen` is the generation the request was sent at (the caller's cap to `target`). Both steps
+/// that ask about the target ask about THAT incarnation: a reply must carry it, and an entry for
+/// `target` at any other generation is a successor that never saw the request - the replier is dead
+/// (backlog/90 D5; ids are reused LIFO, so a respawn usually has the same id).
 pub fn call_dequeue(
     recv_ep: EndpointId,
     recv_gen: Generation,
     target: EndpointId,
+    target_gen: Generation,
     caller_slot: usize,
 ) -> Result<(Message, Option<usize>), IpcError> {
     let mut table = TABLE.lock_irq();
 
     // 1. Take an already-delivered REPLY - and only a reply - without registering as blocked.
-    match dequeue_reply_locked(&mut *table, recv_ep, recv_gen, target) {
+    match dequeue_reply_locked(&mut *table, recv_ep, recv_gen, target, target_gen) {
         Ok(got) => {
             clear_call_await_inner(caller_slot);
             return Ok(got);
@@ -727,7 +734,7 @@ pub fn call_dequeue(
     // 2. Queue empty: if the would-be replier is already dead, the reply can never arrive.
     let target_alive = matches!(
         find_index(&*table, target),
-        Some(i) if table[i].liveness == EndpointLiveness::Alive
+        Some(i) if table[i].liveness == EndpointLiveness::Alive && target_gen.matches(table[i].generation)
     );
     if !target_alive {
         clear_call_await_inner(caller_slot);
@@ -741,6 +748,20 @@ pub fn call_dequeue(
     }
     set_call_await(caller_slot, target);
     Err(IpcError::QueueEmpty)
+}
+
+/// Withdraw `slot` as the blocked receiver of `ep`, if it is still the one recorded. A wait that ends
+/// WITHOUT a message taking the registration - a `RecvTimeout` or `CallDeadline` whose deadline passed,
+/// or one that failed - must call this before returning to user space: otherwise the next message for
+/// `ep` asks to wake a task that is no longer waiting on it, which then returns early from whatever it
+/// IS waiting in (backlog/90 D2). A no-op when the registration was consumed or is someone else's.
+pub fn withdraw_receiver(ep: EndpointId, slot: usize) {
+    let mut table = TABLE.lock_irq();
+    if let Some(idx) = find_index(&*table, ep) {
+        if table[idx].blocked_receiver == Some(slot) {
+            table[idx].blocked_receiver = None;
+        }
+    }
 }
 
 /// Pop one task slot blocked-in-CALL awaiting a reply from `dead_ep`, clearing its record; `None`

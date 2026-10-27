@@ -34,18 +34,18 @@ fn t0_reply_matched_and_replydead_on_registered_waiter() {
     routing::register(r, 0, g(1));
     routing::register(s, 0, g(2));
     // Caller slot 7 awaits a reply from s.
-    assert!(matches!(routing::call_dequeue(r, g(1), s, 7), Err(IpcError::QueueEmpty)));
+    assert!(matches!(routing::call_dequeue(r, g(1), s, g(2), 7), Err(IpcError::QueueEmpty)));
     // An unrelated message does not satisfy the call; the reply from s does.
     routing::enqueue(r, msg(0x55, 999), g(1), None).unwrap();
-    routing::enqueue(r, msg(0x66, 203), g(1), None).unwrap();
-    let (m, _) = routing::call_dequeue(r, g(1), s, 7).unwrap();
+    routing::enqueue(r, reply(0x66, 203, 2), g(1), None).unwrap();
+    let (m, _) = routing::call_dequeue(r, g(1), s, g(2), 7).unwrap();
     assert_eq!(m.payload_bytes()[0], 0x66);
     // A registered waiter is found when s dies.
-    assert!(matches!(routing::call_dequeue(r, g(1), s, 7), Err(IpcError::QueueEmpty)));
+    assert!(matches!(routing::call_dequeue(r, g(1), s, g(2), 7), Err(IpcError::QueueEmpty)));
     routing::kill_endpoint(s);
     assert_eq!(routing::take_call_waiter(s), Some(7));
     // And a call to an already-dead target refuses at once.
-    assert!(matches!(routing::call_dequeue(r, g(1), s, 7), Err(IpcError::ReplyDead)));
+    assert!(matches!(routing::call_dequeue(r, g(1), s, g(2), 7), Err(IpcError::ReplyDead)));
 }
 
 #[test]

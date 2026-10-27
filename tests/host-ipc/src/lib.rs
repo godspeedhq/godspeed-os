@@ -48,6 +48,14 @@ pub fn msg(tag: u8, sender_ep: u64) -> Message {
     m
 }
 
+/// A message as the kernel stamps one SENT by the task owning endpoint `sender_ep` at generation
+/// `sender_gen` - what a reply looks like (dispatch.rs `build_message`, backlog/90 D5).
+pub fn reply(tag: u8, sender_ep: u64, sender_gen: u32) -> Message {
+    let mut m = msg(tag, sender_ep);
+    m.sender_gen = sender_gen;
+    m
+}
+
 pub fn ep(id: u64) -> EndpointId { EndpointId(id) }
 pub fn g(n: u32) -> Generation { Generation(n) }
 

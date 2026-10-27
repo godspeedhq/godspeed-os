@@ -6,12 +6,12 @@
 // call_dequeue step 2 tests liveness by endpoint ID only (routing.rs:582-585), not by the generation
 // the request was sent at; endpoint ids are reused LIFO (ipc/mod.rs:45-53) and the kill path frees
 // the primary id last (scheduler.rs ~2748), so a respawn takes the SAME id back.
-// EXPECTED ON 537e6861: FAIL.
+// FAILED on 537e6861. FIXED 2026-10-27: call_dequeue takes the generation the request was sent at
+// and treats an entry for the id at any other generation as a successor - the replier is dead.
 use host_ipc::*;
 use host_ipc::ipc::{routing, message::IpcError, queue::QUEUE_DEPTH};
 
 #[test]
-#[ignore = "backlog/90 D5: ReplyDead keyed on a bare, reused endpoint id - reproduces the defect; remove this ignore with its fix (host_test_check.py fails when it passes)"]
 fn t3_replydead_lost_when_target_id_is_reused_before_caller_registers() {
     let s = ep(150);   // server S, first incarnation at generation 5
     let rc = ep(151);  // caller C's reply mailbox; C is slot 30
@@ -31,7 +31,7 @@ fn t3_replydead_lost_when_target_id_is_reused_before_caller_registers() {
     // Supervisor respawns S; alloc_endpoint_id hands back id 150; fresh generation 9.
     assert!(routing::try_register(s, 0, g(9)));
     // C finally runs: block_and_reschedule returned 0, so do_call falls through to await the reply.
-    let r = routing::call_dequeue(rc, g(6), s, 30);
+    let r = routing::call_dequeue(rc, g(6), s, g(5), 30);
     assert!(matches!(r, Err(IpcError::ReplyDead)),
         "I-RD violated: the instance C's request went to is dead, but call_dequeue returned {:?} (C registers and blocks; the new S never saw the request; with Call 41 the deadline is 0 = forever, dispatch.rs:1586-1588)",
         r.map(|_| ()));

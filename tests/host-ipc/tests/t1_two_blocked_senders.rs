@@ -40,13 +40,15 @@ fn t1b_kill_wakes_every_blocked_sender_oldest_first() {
     let e = ep(211);
     routing::register(e, 0, g(1));
     fill(e);
-    let _ = routing::enqueue(e, msg(0xA1, 401), g(1), Some(10));
-    let _ = routing::enqueue(e, msg(0xB1, 402), g(1), Some(11));
+    // Slots 12 and 13, not t1a's 10 and 11: blocked-send records are per task SLOT and global, and
+    // tests in one binary run in parallel, so two tests sharing a slot would replace each other's.
+    let _ = routing::enqueue(e, msg(0xA1, 401), g(1), Some(12));
+    let _ = routing::enqueue(e, msg(0xB1, 402), g(1), Some(13));
     // The kill path: kill_endpoint, then take_blocked_sender until none remain (scheduler.rs).
     let (rx, tx) = routing::kill_endpoint(e);
     assert_eq!(rx, None);
-    assert_eq!(tx, Some(10), "I-BLK: the OLDEST blocked sender comes first");
-    assert_eq!(routing::take_blocked_sender(e), Some(11), "I-BLK violated: the second sender is never woken");
+    assert_eq!(tx, Some(12), "I-BLK: the OLDEST blocked sender comes first");
+    assert_eq!(routing::take_blocked_sender(e), Some(13), "I-BLK violated: the second sender is never woken");
     assert_eq!(routing::take_blocked_sender(e), None, "no sender is woken twice");
 }
 

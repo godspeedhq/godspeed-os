@@ -84,10 +84,14 @@ impl MessageQueue {
     /// "MALFORMED reply / protocol desync" line), including the undetectable case where a stale
     /// 513-byte read-reply was accepted as a different block's data. Bounded: one pass over at most
     /// `QUEUE_DEPTH` (16) slots; the compaction shift preserves arrival order for the untouched rest.
-    pub fn dequeue_matching(&mut self, sender_ep: u64) -> Option<Message> {
+    ///
+    /// A message matches only if BOTH its sender's endpoint id and that endpoint's generation are the
+    /// ones asked for: ids are reused, so the id alone matched a dead incarnation's reply (D5).
+    pub fn dequeue_matching(&mut self, sender_ep: u64, sender_gen: u32) -> Option<Message> {
         for i in 0..self.len {
             let idx = (self.head + i) % QUEUE_DEPTH;
-            let matches = self.slots[idx].as_ref().is_some_and(|m| m.sender_ep == sender_ep);
+            let matches = self.slots[idx].as_ref()
+                .is_some_and(|m| m.sender_ep == sender_ep && m.sender_gen == sender_gen);
             if !matches { continue; }
             let msg = self.slots[idx].take();
             // Close the gap: shift every later message back one slot, keeping FIFO order.
@@ -271,7 +275,7 @@ mod tests {
         q.enqueue(from(2, 20)).unwrap();
         q.enqueue(from(1, 11)).unwrap();
         q.enqueue(from(3, 30)).unwrap();
-        let got = q.dequeue_matching(2).unwrap();
+        let got = q.dequeue_matching(2, 0).unwrap();
         assert_eq!((got.sender_ep, got.payload_bytes()), (2, &[20][..]));
         assert_eq!(q.len(), 3);
         for (ep, b) in [(1, 10), (1, 11), (3, 30)] {
@@ -287,9 +291,24 @@ mod tests {
         let mut q = MessageQueue::new();
         q.enqueue(from(5, 1)).unwrap();
         q.enqueue(from(5, 2)).unwrap();
-        assert_eq!(q.dequeue_matching(5).unwrap().payload_bytes(), &[1]);
-        assert_eq!(q.dequeue_matching(5).unwrap().payload_bytes(), &[2]);
-        assert!(q.dequeue_matching(5).is_none());
+        assert_eq!(q.dequeue_matching(5, 0).unwrap().payload_bytes(), &[1]);
+        assert_eq!(q.dequeue_matching(5, 0).unwrap().payload_bytes(), &[2]);
+        assert!(q.dequeue_matching(5, 0).is_none());
+    }
+
+    /// Same endpoint id, another generation: a different incarnation, never the reply (D5).
+    #[test]
+    fn dequeue_matching_needs_the_generation_too() {
+        let mut q = MessageQueue::new();
+        let mut late = from(7, 1);
+        late.sender_gen = 5; // the dead incarnation of endpoint 7
+        let mut now = from(7, 2);
+        now.sender_gen = 9;  // its successor, same id
+        q.enqueue(late).unwrap();
+        q.enqueue(now).unwrap();
+        assert_eq!(q.dequeue_matching(7, 9).unwrap().payload_bytes(), &[2]);
+        assert!(q.dequeue_matching(7, 9).is_none(), "the dead incarnation's message is not the reply");
+        assert_eq!(q.len(), 1);
     }
 
     /// No match leaves the queue exactly as it was.
@@ -298,11 +317,11 @@ mod tests {
         let mut q = MessageQueue::new();
         q.enqueue(from(1, 1)).unwrap();
         q.enqueue(from(2, 2)).unwrap();
-        assert!(q.dequeue_matching(9).is_none());
+        assert!(q.dequeue_matching(9, 0).is_none());
         assert_eq!(q.len(), 2);
         assert_eq!(q.dequeue().unwrap().payload_bytes(), &[1]);
         assert_eq!(q.dequeue().unwrap().payload_bytes(), &[2]);
-        assert!(MessageQueue::new().dequeue_matching(0).is_none());
+        assert!(MessageQueue::new().dequeue_matching(0, 0).is_none());
     }
 
     /// A FULL queue: the slot past the tail is the head, so a shift that ran one step too far would move
@@ -314,7 +333,7 @@ mod tests {
             for _ in 0..head { q.enqueue(msg(0)).unwrap(); q.dequeue(); }
             for b in 0..QUEUE_DEPTH as u8 { q.enqueue(from(if b == 6 { 9 } else { 1 }, b)).unwrap(); }
             assert!(q.is_full());
-            assert_eq!(q.dequeue_matching(9).unwrap().payload_bytes(), &[6]);
+            assert_eq!(q.dequeue_matching(9, 0).unwrap().payload_bytes(), &[6]);
             for b in (0..QUEUE_DEPTH as u8).filter(|&b| b != 6) {
                 assert_eq!(q.dequeue().unwrap().payload_bytes(), &[b]);
             }
@@ -330,7 +349,7 @@ mod tests {
         for _ in 0..(QUEUE_DEPTH - 2) { q.dequeue(); }
         // head is now QUEUE_DEPTH - 2; these four occupy the last two slots and the first two.
         for (ep, b) in [(1, 1), (1, 2), (7, 3), (1, 4)] { q.enqueue(from(ep, b)).unwrap(); }
-        assert_eq!(q.dequeue_matching(7).unwrap().payload_bytes(), &[3]);
+        assert_eq!(q.dequeue_matching(7, 0).unwrap().payload_bytes(), &[3]);
         for b in [1u8, 2, 4] { assert_eq!(q.dequeue().unwrap().payload_bytes(), &[b]); }
         assert!(q.is_empty());
     }
@@ -424,7 +443,7 @@ mod tests {
                         prop_assert_eq!(got, model.pop_front());
                     }
                     COp::Match(e) => {
-                        let got = q.dequeue_matching(e).map(|m| (m.sender_ep, m.payload_bytes()[0]));
+                        let got = q.dequeue_matching(e, 0).map(|m| (m.sender_ep, m.payload_bytes()[0]));
                         let want = model.iter().position(|&(s, _)| s == e).and_then(|i| model.remove(i));
                         prop_assert_eq!(got, want);
                     }

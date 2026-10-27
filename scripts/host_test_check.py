@@ -126,6 +126,18 @@ def host_ipc(root):
         print(r.stderr[-4000:])
         return bad + 1
     passed = sum(int(m) for m in re.findall(r"test result: ok\. (\d+) passed", r.stdout))
+    # How many reproductions the SOURCE holds, counted before running them: with none left (every
+    # known defect fixed and its test unignored), there is nothing for `--ignored` to run, and that is
+    # the good outcome, said as such. With some, a run that reports none is still a failure below.
+    tests_dir = os.path.join(crate, "tests")
+    marked = 0
+    for name in sorted(os.listdir(tests_dir)):
+        if name.endswith(".rs"):
+            with open(os.path.join(tests_dir, name), encoding="utf-8") as f:
+                marked += len(re.findall(r"^\s*#\[ignore\b", f.read(), re.M))
+    if marked == 0:
+        print(f"host tests: tests/host-ipc - {passed} passed, no known defect left to reproduce")
+        return bad
     r = subprocess.run(["cargo", "test", "--no-fail-fast", "--", "--ignored"], cwd=crate,
                        capture_output=True, text=True)
     outcomes = re.findall(r"^test (\S+) \.\.\. (ok|FAILED)$", r.stdout, re.M)
