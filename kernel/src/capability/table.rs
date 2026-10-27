@@ -512,6 +512,9 @@ mod tests {
         assert_eq!(t.get_record(ResourceId(b)).unwrap().generation.0, 1);
         assert_eq!(t.get_record(ResourceId(b)).unwrap().liveness, Liveness::Revoked);
         assert_eq!(t.get_record(ResourceId(a)).unwrap().generation.0, 0, "a bump touches one record");
+        // The FIRST overflow id is in the list, not past the end of the direct array.
+        t.bump_generation(ResourceId(a), Liveness::Dead);
+        assert_eq!(t.get_record(ResourceId(a)).unwrap().generation.0, 1);
         t.bump_generation(ResourceId(DIRECT_CAP as u64 - 1), Liveness::Dead);
         assert!(t.get_record(ResourceId(DIRECT_CAP as u64 - 1)).is_none(), "an unregistered id is not created");
     }

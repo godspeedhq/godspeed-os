@@ -234,10 +234,125 @@ mod tests {
         assert_eq!(q.dequeue().unwrap().payload_bytes(), &[77]);
     }
 
+    #[test]
+    fn reset_empties_a_queue_that_was_not_drained() {
+        let mut q = MessageQueue::new();
+        for i in 0..5u8 { q.enqueue(msg(i)).unwrap(); }
+        q.reset();
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+        q.enqueue(msg(77)).unwrap();
+        assert_eq!(q.dequeue().unwrap().payload_bytes(), &[77]);
+    }
+
+    #[test]
+    fn len_is_the_number_waiting() {
+        let mut q = MessageQueue::new();
+        assert_eq!(q.len(), 0);
+        for i in 0..3u8 { q.enqueue(msg(i)).unwrap(); }
+        assert_eq!(q.len(), 3);
+        q.dequeue();
+        assert_eq!(q.len(), 2);
+    }
+
+    // --- reply correlation: dequeue_matching (§8.2 Call) ----------------------
+
+    fn from(sender_ep: u64, byte: u8) -> Message {
+        let mut m = msg(byte);
+        m.sender_ep = sender_ep;
+        m
+    }
+
+    /// The awaited reply is taken from the middle of the queue; the requests around it stay, in order.
+    #[test]
+    fn dequeue_matching_takes_the_reply_and_keeps_the_rest_in_order() {
+        let mut q = MessageQueue::new();
+        q.enqueue(from(1, 10)).unwrap();
+        q.enqueue(from(2, 20)).unwrap();
+        q.enqueue(from(1, 11)).unwrap();
+        q.enqueue(from(3, 30)).unwrap();
+        let got = q.dequeue_matching(2).unwrap();
+        assert_eq!((got.sender_ep, got.payload_bytes()), (2, &[20][..]));
+        assert_eq!(q.len(), 3);
+        for (ep, b) in [(1, 10), (1, 11), (3, 30)] {
+            let m = q.dequeue().unwrap();
+            assert_eq!((m.sender_ep, m.payload_bytes()), (ep, &[b][..]));
+        }
+        assert!(q.is_empty());
+    }
+
+    /// Two from the same sender: the OLDER one is taken.
+    #[test]
+    fn dequeue_matching_takes_the_oldest_match() {
+        let mut q = MessageQueue::new();
+        q.enqueue(from(5, 1)).unwrap();
+        q.enqueue(from(5, 2)).unwrap();
+        assert_eq!(q.dequeue_matching(5).unwrap().payload_bytes(), &[1]);
+        assert_eq!(q.dequeue_matching(5).unwrap().payload_bytes(), &[2]);
+        assert!(q.dequeue_matching(5).is_none());
+    }
+
+    /// No match leaves the queue exactly as it was.
+    #[test]
+    fn dequeue_matching_without_a_match_changes_nothing() {
+        let mut q = MessageQueue::new();
+        q.enqueue(from(1, 1)).unwrap();
+        q.enqueue(from(2, 2)).unwrap();
+        assert!(q.dequeue_matching(9).is_none());
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.dequeue().unwrap().payload_bytes(), &[1]);
+        assert_eq!(q.dequeue().unwrap().payload_bytes(), &[2]);
+        assert!(MessageQueue::new().dequeue_matching(0).is_none());
+    }
+
+    /// A FULL queue: the slot past the tail is the head, so a shift that ran one step too far would move
+    /// the oldest message into the tail. Every message but the reply must come out once, in order.
+    #[test]
+    fn dequeue_matching_in_a_full_queue() {
+        for head in [0usize, 5] {
+            let mut q = MessageQueue::new();
+            for _ in 0..head { q.enqueue(msg(0)).unwrap(); q.dequeue(); }
+            for b in 0..QUEUE_DEPTH as u8 { q.enqueue(from(if b == 6 { 9 } else { 1 }, b)).unwrap(); }
+            assert!(q.is_full());
+            assert_eq!(q.dequeue_matching(9).unwrap().payload_bytes(), &[6]);
+            for b in (0..QUEUE_DEPTH as u8).filter(|&b| b != 6) {
+                assert_eq!(q.dequeue().unwrap().payload_bytes(), &[b]);
+            }
+            assert!(q.is_empty());
+        }
+    }
+
+    /// Across the wrap: head near the end of the slot array, the match past it, the shift crossing it.
+    #[test]
+    fn dequeue_matching_across_the_wrap() {
+        let mut q = MessageQueue::new();
+        for i in 0..(QUEUE_DEPTH - 2) as u8 { q.enqueue(msg(i)).unwrap(); }
+        for _ in 0..(QUEUE_DEPTH - 2) { q.dequeue(); }
+        // head is now QUEUE_DEPTH - 2; these four occupy the last two slots and the first two.
+        for (ep, b) in [(1, 1), (1, 2), (7, 3), (1, 4)] { q.enqueue(from(ep, b)).unwrap(); }
+        assert_eq!(q.dequeue_matching(7).unwrap().payload_bytes(), &[3]);
+        for b in [1u8, 2, 4] { assert_eq!(q.dequeue().unwrap().payload_bytes(), &[b]); }
+        assert!(q.is_empty());
+    }
+
     // --- property tests (§22 P6) --------------------------------------------
 
     #[derive(Debug, Clone)]
     enum Op { Enq(u8), Deq }
+
+    #[derive(Debug, Clone)]
+    enum COp { Enq(u64, u8), Deq, Match(u64) }
+
+    fn call_ops() -> impl Strategy<Value = Vec<COp>> {
+        proptest::collection::vec(
+            prop_oneof![
+                (0u64..4, any::<u8>()).prop_map(|(e, b)| COp::Enq(e, b)),
+                Just(COp::Deq),
+                (0u64..5).prop_map(COp::Match),
+            ],
+            0..96,
+        )
+    }
 
     fn ops() -> impl Strategy<Value = Vec<Op>> {
         proptest::collection::vec(
@@ -289,6 +404,38 @@ mod tests {
                 let msg = q.dequeue().unwrap();
                 prop_assert_eq!(msg.payload_bytes(), &[b]);
             }
+        }
+
+        /// The queue under enqueue, dequeue and dequeue_matching behaves exactly as a plain ordered
+        /// list, wrap included: same answer from every operation, same contents after it (§8.2, §8.5).
+        #[test]
+        fn queue_matches_a_list_model_under_reply_correlation(sequence in call_ops()) {
+            let mut q = MessageQueue::new();
+            let mut model: std::collections::VecDeque<(u64, u8)> = std::collections::VecDeque::new();
+            for op in &sequence {
+                match *op {
+                    COp::Enq(e, b) => {
+                        let full = model.len() == QUEUE_DEPTH;
+                        prop_assert_eq!(q.enqueue(from(e, b)).is_err(), full);
+                        if !full { model.push_back((e, b)); }
+                    }
+                    COp::Deq => {
+                        let got = q.dequeue().map(|m| (m.sender_ep, m.payload_bytes()[0]));
+                        prop_assert_eq!(got, model.pop_front());
+                    }
+                    COp::Match(e) => {
+                        let got = q.dequeue_matching(e).map(|m| (m.sender_ep, m.payload_bytes()[0]));
+                        let want = model.iter().position(|&(s, _)| s == e).and_then(|i| model.remove(i));
+                        prop_assert_eq!(got, want);
+                    }
+                }
+                prop_assert_eq!(q.len(), model.len());
+            }
+            while let Some(want) = model.pop_front() {
+                let m = q.dequeue().unwrap();
+                prop_assert_eq!((m.sender_ep, m.payload_bytes()[0]), want);
+            }
+            prop_assert!(q.is_empty());
         }
 
         /// drain always yields an empty queue regardless of prior state (§8.6).

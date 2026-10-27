@@ -199,6 +199,35 @@ mod epoch_tests {
         }
     }
 
+    /// The PACKED value itself, not only the round trip. A January packed as month 13 of the year
+    /// before reads back as the same instant, so a round trip cannot see it; the fields can.
+    #[test]
+    fn packed_from_epoch_gives_the_exact_fields() {
+        use super::packed_from_epoch;
+        assert_eq!(packed_from_epoch(0), pack(1970, 1, 1, 0, 0, 0));
+        assert_eq!(packed_from_epoch(946_684_800), pack(2000, 1, 1, 0, 0, 0));
+        assert_eq!(packed_from_epoch(951_782_400), pack(2000, 2, 29, 0, 0, 0));
+        assert_eq!(packed_from_epoch(2_147_483_648), pack(2038, 1, 19, 3, 14, 8));
+        assert_eq!(packed_from_epoch(1_798_761_599), pack(2026, 12, 31, 23, 59, 59));
+        assert_eq!(packed_from_epoch(1_798_761_600), pack(2027, 1, 1, 0, 0, 0));
+        // 2100 is a century that is NOT a leap year: the day before March 1 is Feb 28. The century
+        // correction in civil_from_days decides it, and a round trip does not see that correction go
+        // wrong (the year and the day of the year err together and cancel).
+        assert_eq!(packed_from_epoch(4_107_456_000), pack(2100, 2, 28, 0, 0, 0));
+        assert_eq!(packed_from_epoch(4_107_542_400), pack(2100, 3, 1, 0, 0, 0));
+    }
+
+    /// Year 0 of the proleptic Gregorian calendar, the one place the negative-era branches of both
+    /// directions run (0000-01-01 is 62,167,219,200 s before the Unix epoch).
+    #[test]
+    fn year_zero_takes_the_negative_era_branches() {
+        use super::packed_from_epoch;
+        const Y0: i64 = -62_167_219_200;
+        assert_eq!(epoch_secs(pack(0, 1, 1, 0, 0, 0)), Y0);
+        assert_eq!(packed_from_epoch(Y0), pack(0, 1, 1, 0, 0, 0));
+        assert_eq!(epoch_secs(pack(0, 3, 1, 0, 0, 0)), Y0 + 60 * 86_400); // year 0 is a leap year
+    }
+
     #[test]
     fn leap_rules_are_exact_at_the_feb_boundary() {
         // Feb->Mar is exactly one day across every leap rule.

@@ -122,6 +122,16 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// A message prints as its lengths, never its payload: a panic or a log line showing one must not
+    /// spill up to 4 KiB of another task's data.
+    #[test]
+    fn debug_shows_the_lengths_not_the_payload() {
+        let m = Message::new(b"SECRET-PAYLOAD").unwrap();
+        let s = format!("{:?}", m);
+        assert_eq!(s, "Message { payload_len: 14, cap_count: 0 }");
+        assert!(!s.contains("SECRET"));
+    }
+
     // --- property tests (§8.5 size enforcement) -----------------------------
 
     proptest! {

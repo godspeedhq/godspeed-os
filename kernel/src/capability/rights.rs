@@ -110,6 +110,32 @@ mod tests {
         assert_eq!((a | b).0, a.union(b).0);
     }
 
+    /// Overlapping operands: a right held on both sides stays held (an exclusive-or would drop it).
+    #[test]
+    fn bitor_keeps_a_right_both_sides_hold() {
+        let a = Rights::READ | Rights::GRANT;
+        let b = Rights::GRANT | Rights::SEND;
+        assert_eq!((a | b).0, (Rights::READ | Rights::GRANT | Rights::SEND).0);
+        assert_eq!((a | a).0, a.0);
+    }
+
+    /// `without` clears exactly the mask and keeps everything else (SEC-7 strips GRANT this way).
+    #[test]
+    fn without_clears_exactly_the_mask() {
+        let r = Rights::READ | Rights::SEND | Rights::GRANT;
+        assert_eq!(r.without(Rights::GRANT).0, (Rights::READ | Rights::SEND).0);
+        assert_eq!(r.without(Rights::WRITE).0, r.0, "a right not held is not added");
+        assert_eq!(r.without(Rights::empty()).0, r.0);
+        assert_eq!(r.without(Rights::all()).0, 0);
+    }
+
+    /// Each named right is its own bit.
+    #[test]
+    fn the_named_rights_are_the_six_low_bits() {
+        let named = [Rights::READ, Rights::WRITE, Rights::SEND, Rights::RECV, Rights::GRANT, Rights::REVOKE];
+        for (i, r) in named.iter().enumerate() { assert_eq!(r.0, 1 << i); }
+    }
+
     #[test]
     fn empty_contains_nothing() {
         let e = Rights::empty();

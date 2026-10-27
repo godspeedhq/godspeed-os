@@ -70,6 +70,16 @@ mod tests {
         assert_eq!(Generation::INITIAL.0, 0);
     }
 
+    /// A new endpoint's starting generation is never 0 (`INITIAL`, the stable resources') and every
+    /// later one is strictly higher - what makes a respawn's caps distinct from every earlier life's.
+    #[test]
+    fn next_generation_is_nonzero_and_strictly_increasing() {
+        let a = next_generation();
+        let b = next_generation();
+        assert!(a.0 != 0);
+        assert!(b.0 > a.0);
+    }
+
     #[test]
     fn bump_is_monotonic() {
         let g = Generation::INITIAL;

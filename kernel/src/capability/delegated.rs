@@ -271,4 +271,103 @@ mod tests {
             assert_eq!(slot_of(id_of(slot)), slot);
         }
     }
+
+    /// The cursor wraps: with the band filled to its last slot and one slot freed behind the cursor,
+    /// the next claim finds that slot, and the one after that finds nothing.
+    #[test]
+    fn claim_wraps_to_a_slot_freed_behind_the_cursor() {
+        let mut b = Box::new(Band::new());
+        for _ in 0..DELEGATED_CAP { b.claim(ep(1)).unwrap(); }
+        b.free(1);
+        assert_eq!(b.claim(ep(2)), Some(1));
+        assert_eq!(b.claim(ep(2)), None);
+    }
+
+    /// The cursor moves ON past what it handed out: a slot freed behind it is not the next one
+    /// claimed, so a just-closed file's id is not reissued at once (it waits for the cursor to come
+    /// round, and comes back at a higher generation then).
+    #[test]
+    fn a_slot_freed_behind_the_cursor_is_not_reissued_next() {
+        let mut b = Box::new(Band::new());
+        for want in 0..3 { assert_eq!(b.claim(ep(1)), Some(want)); }
+        b.free(0);
+        assert_eq!(b.claim(ep(1)), Some(3));
+        // ...including the slot it handed out last.
+        b.free(3);
+        assert_eq!(b.claim(ep(1)), Some(4));
+    }
+
+    // The rest go through the REAL global band and resource table - the path `ResourceMint`,
+    // `ResourceInvoke`, `ResourceRevoke` and endpoint death take. Tests run in parallel in one
+    // process, so each uses owner ids no other test uses and checks only the ids it allocated.
+
+    use super::super::cap::CapError;
+    use super::super::rights::Rights;
+    use super::super::table::{mint_cap, CapTable};
+
+    #[test]
+    fn allocate_registers_an_owned_resource_in_the_band() {
+        let owner = ep(0xD1_0001);
+        let id = allocate(owner).expect("the band has room");
+        assert!(is_delegated(id));
+        assert_eq!(owner_of(id), Some(owner));
+        assert!(get_resource_generation(id).is_some(), "allocate registers it globally");
+        // An id outside the band has no owner, whatever the band holds.
+        assert_eq!(owner_of(ResourceId(100)), None);
+        assert_eq!(owner_of(ResourceId(DELEGATED_BASE + DELEGATED_CAP as u64)), None);
+        release(id);
+    }
+
+    #[test]
+    fn release_frees_the_slot() {
+        let owner = ep(0xD1_0002);
+        let id = allocate(owner).unwrap();
+        release(id);
+        assert_eq!(owner_of(id), None);
+        release(ResourceId(100)); // outside the band: nothing to free, and no panic
+    }
+
+    /// Ownership IS the check: a non-owner's revoke changes nothing; the owner's makes every
+    /// outstanding cap `CapRevoked` and frees the slot; a second revoke is refused.
+    #[test]
+    fn revoke_owned_only_by_the_owner_and_it_invalidates_the_cap() {
+        let (owner, other) = (ep(0xD1_0003), ep(0xD1_0004));
+        let id = allocate(owner).unwrap();
+        let mut t = Box::new(CapTable::empty());
+        let slot = t.insert(mint_cap(id, Rights::READ)).unwrap();
+        let before = get_resource_generation(id).unwrap();
+
+        assert!(!revoke_owned(id, other));
+        assert_eq!(owner_of(id), Some(owner));
+        assert!(t.get(slot, Rights::READ).is_ok());
+
+        assert!(revoke_owned(id, owner));
+        assert_eq!(owner_of(id), None);
+        assert!(get_resource_generation(id).unwrap().0 > before.0);
+        assert_eq!(t.get(slot, Rights::READ), Err(CapError::CapRevoked));
+
+        assert!(!revoke_owned(id, owner), "a freed id has no owner to revoke it");
+        assert!(!revoke_owned(ResourceId(100), owner), "outside the band");
+    }
+
+    /// An owner's death reclaims everything it owns - each cap goes `EndpointDead` - and nothing
+    /// anyone else owns. The count is exact.
+    #[test]
+    fn release_owner_reclaims_exactly_what_the_owner_held() {
+        let (dying, survivor) = (ep(0xD1_0005), ep(0xD1_0006));
+        let mut t = Box::new(CapTable::empty());
+        let mut slots = [0usize; 3];
+        for s in slots.iter_mut() {
+            *s = t.insert(mint_cap(allocate(dying).unwrap(), Rights::READ)).unwrap();
+        }
+        let kept = allocate(survivor).unwrap();
+
+        assert_eq!(release_owner(dying), 3);
+        for s in slots {
+            assert_eq!(t.get(s, Rights::READ), Err(CapError::EndpointDead));
+        }
+        assert_eq!(release_owner(dying), 0);
+        assert_eq!(owner_of(kept), Some(survivor));
+        release(kept);
+    }
 }
