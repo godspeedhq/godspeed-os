@@ -43,6 +43,20 @@ echo '===== ask: how a service ended, from the kernel death notice ====='
 assert ok chaos kill-storm time 1
 ask "why did time restart?" | where label=verdict | assert contains WAS KILLED BY
 ask "why did time restart?" | where label=verdict | assert lacks CRASHED
+# The kill restarted `time`, and on a board with no clock chip (the Pis, the VisionFive) the wall clock
+# lives THERE: the new instance re-reads its saved floor and asks the network again. The next part,
+# packages, checks a certificate's dates against that clock, and found it unset - so on those boards the
+# full `selfcheck` skipped the whole package lifecycle, while `selfcheck packages` alone ran it (Pi 4,
+# 2026-10-27). Wait for the clock to come back, bounded at 20 tries a second apart. READ ONLY: `date epoch`
+# asks and sets nothing (part 2 says why a check must not sync the clock), and a machine whose clock was
+# never set just spends the 20 s and goes on.
+let mut clock_tries = 0
+loop {
+    if date epoch { break }
+    clock_tries = $clock_tries + 1
+    if $clock_tries > 20 { break }
+    wait 1
+}
 
 echo ''
 echo '===== ask: what it will not do, and what it does not understand ====='
