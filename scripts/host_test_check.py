@@ -108,15 +108,17 @@ def host_ipc(root):
     """
     crate = os.path.join(root, "tests", "host-ipc")
     bad = 0
-    # The one stubbed constant must match the kernel's, or the harness tests a different table size.
-    with open(os.path.join(root, "kernel", "src", "task", "scheduler.rs"), encoding="utf-8") as f:
-        k = re.search(r"pub const MAX_TASKS: usize = (\d+);", f.read())
+    # The stubbed constants must match the kernel's, or the harness tests a different table size.
     with open(os.path.join(crate, "src", "lib.rs"), encoding="utf-8") as f:
-        h = re.search(r"pub const MAX_TASKS: usize = (\d+);", f.read())
-    if not k or not h or k.group(1) != h.group(1):
-        print(f"host tests: tests/host-ipc stubs MAX_TASKS = {h and h.group(1)}, the kernel has "
-              f"{k and k.group(1)} - they must agree")
-        bad += 1
+        stubs = f.read()
+    for const, home in (("MAX_TASKS", "scheduler.rs"), ("PEER_NAME_BYTES", "mod.rs")):
+        with open(os.path.join(root, "kernel", "src", "task", home), encoding="utf-8") as f:
+            k = re.search(r"pub const %s: usize = (\d+);" % const, f.read())
+        h = re.search(r"pub const %s: usize = (\d+);" % const, stubs)
+        if not k or not h or k.group(1) != h.group(1):
+            print(f"host tests: tests/host-ipc stubs {const} = {h and h.group(1)}, the kernel has "
+                  f"{k and k.group(1)} - they must agree")
+            bad += 1
     r = subprocess.run(["cargo", "test", "-q", "--no-fail-fast"], cwd=crate, capture_output=True, text=True)
     if r.returncode != 0:
         print("host tests: tests/host-ipc FAILED")

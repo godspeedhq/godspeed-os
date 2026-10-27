@@ -23,6 +23,9 @@ pub mod task {
         // The kernel's value (kernel/src/task/scheduler.rs, MAX_TASKS); host_test_check.py checks they agree.
         pub const MAX_TASKS: usize = 224;
     }
+    // The kernel's value (kernel/src/task/mod.rs, PEER_NAME_BYTES), the name directory's longest name;
+    // host_test_check.py checks they agree.
+    pub const PEER_NAME_BYTES: usize = 128;
 }
 
 pub mod ipc;

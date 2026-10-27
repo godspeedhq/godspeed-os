@@ -8,3 +8,5 @@ pub mod message;
 pub mod queue;
 #[path = "../../../../kernel/src/ipc/routing.rs"]
 pub mod routing;
+#[path = "../../../../kernel/src/ipc/names.rs"]
+pub mod names;
