@@ -45,10 +45,9 @@ struct RoutingEntry {
     queue: MessageQueue,
     /// Task-slot of the task blocked on `recv` (waiting for a message).
     blocked_receiver: Option<usize>,
-    /// Task-slot of the task blocked on `send` (queue was full).
-    blocked_sender: Option<usize>,
-    /// Message the blocked sender wants to deliver.
-    pending_send: Option<Message>,
+    /// How many tasks are blocked SENDING here (the queue was full). Their messages are in `PENDING`,
+    /// one record per task; this count lets a dequeue skip the scan when nobody waits.
+    waiting: u16,
 }
 
 impl RoutingEntry {
@@ -61,9 +60,171 @@ impl RoutingEntry {
             liveness: EndpointLiveness::Alive,
             queue: MessageQueue::new(),
             blocked_receiver: None,
-            blocked_sender: None,
-            pending_send: None,
+            waiting: 0,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blocked senders (§8.4, §8.6; backlog/90 D1 and D3).
+// ---------------------------------------------------------------------------
+
+/// One task's blocked send: the endpoint it waits on, when it started waiting, and its message.
+///
+/// **Why per TASK, not per endpoint.** Each endpoint used to hold ONE blocked sender and ONE pending
+/// message, so a second sender to a full queue overwrote the first: the first's message, and any cap
+/// it carried, were destroyed and the first was never woken - a task in `BlockedOnSend` for ever
+/// (backlog/90 D1). Any number of tasks may wait on one endpoint, but a task waits in at most ONE send,
+/// so one record per task is the exact bound: `MAX_TASKS` records hold every possible waiter.
+///
+/// **The contract is unchanged.** A sender whose queue was full is woken with 0 when its message has
+/// been moved INTO the queue - delivered, not "try again" - and with `EndpointDead` if the endpoint
+/// dies first. Waiters are served oldest first (`seq`), so order among blocked senders is exact FIFO.
+#[derive(Copy, Clone)]
+struct PendingSend {
+    /// The endpoint id this task is blocked sending to; 0 means it is not blocked (no endpoint is 0).
+    ep: u64,
+    /// When it began waiting, from `PendingSends::next_seq`; the smallest is served first.
+    seq: u64,
+    msg: Option<Message>,
+}
+
+struct PendingSends {
+    by_task: [PendingSend; crate::task::scheduler::MAX_TASKS],
+    next_seq: u64,
+}
+
+// Taken ONLY while `TABLE` is held, so the two can never be taken in the other order. Zero is a valid
+// value (`ep` 0 = not blocked, `msg` None, as `TABLE`'s own zeroed `Option<Message>` slots rely on).
+#[link_section = ".bss"]
+static PENDING: SpinLock<PendingSends> = SpinLock::ZEROED;
+
+/// Blocked sends dropped because their sender died while waiting (D3). Never accepted - the send had
+/// not returned - so not a delivery lost, but counted and said, never silent.
+static SENDS_ABANDONED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Record `slot` as blocked sending `msg` to `table[idx]` (TABLE held).
+fn block_sender(entry: &mut RoutingEntry, slot: usize, msg: Message) {
+    let mut p = PENDING.lock();
+    if slot >= p.by_task.len() {
+        crate::kprintln!("routing: task slot {} is past MAX_TASKS - its send cannot be held", slot);
+        return;
+    }
+    if p.by_task[slot].ep != 0 {
+        // A task waits in one send at a time, and its death clears its record (`forget_blocked_sender`),
+        // so this means a record outlived its task. Say so; the stale record is replaced, and the
+        // endpoint it named copes with a count that finds no record (`take_oldest`).
+        crate::kprintln!("routing: task slot {} still recorded as sending to endpoint {} - replaced",
+            slot, p.by_task[slot].ep);
+    }
+    let seq = p.next_seq;
+    p.next_seq += 1;
+    p.by_task[slot] = PendingSend { ep: entry.id.0, seq, msg: Some(msg) };
+    entry.waiting = entry.waiting.saturating_add(1);
+}
+
+/// Take the OLDEST blocked sender on `entry`, clearing its record: `(slot, its message)`. TABLE held.
+/// A count with no record behind it (a record replaced above) is corrected to zero, never trusted.
+fn take_oldest(entry: &mut RoutingEntry) -> Option<(usize, Option<Message>)> {
+    if entry.waiting == 0 {
+        return None;
+    }
+    let mut p = PENDING.lock();
+    let mut best: Option<usize> = None;
+    for s in 0..p.by_task.len() {
+        if p.by_task[s].ep == entry.id.0 && best.map_or(true, |b| p.by_task[s].seq < p.by_task[b].seq) {
+            best = Some(s);
+        }
+    }
+    let Some(s) = best else {
+        entry.waiting = 0;
+        return None;
+    };
+    let msg = p.by_task[s].msg.take();
+    p.by_task[s].ep = 0;
+    entry.waiting -= 1;
+    Some((s, msg))
+}
+
+/// A slot was just freed in `entry`'s queue: move the oldest blocked sender's message into it and
+/// return that sender's slot to wake (with 0 - delivered). TABLE held.
+fn promote_waiter(entry: &mut RoutingEntry) -> Option<usize> {
+    let (slot, msg) = take_oldest(entry)?;
+    if let Some(m) = msg {
+        if let Err(m) = entry.queue.enqueue(m) {
+            // Cannot happen - the caller freed a slot under this lock - but if it did, the sender keeps
+            // waiting with its message rather than being woken to a delivery that did not happen.
+            block_sender(entry, slot, m);
+            return None;
+        }
+    }
+    Some(slot)
+}
+
+/// Pop one task blocked SENDING to `ep`, oldest first, clearing its record; `None` when none remain.
+/// The kill path calls this repeatedly after `kill_endpoint` and wakes each with `EndpointDead`
+/// (§8.6): the endpoint is dead, so their messages are never delivered, and their senders are told.
+///
+/// It searches the records, not the entry: `register` may reuse a DEAD entry for another id between
+/// `kill_endpoint` and this drain, and the waiters it left must still be found and woken.
+pub fn take_blocked_sender(ep: EndpointId) -> Option<usize> {
+    let mut table = TABLE.lock_irq();
+    let mut p = PENDING.lock();
+    let mut best: Option<usize> = None;
+    for s in 0..p.by_task.len() {
+        if p.by_task[s].ep == ep.0 && best.map_or(true, |b| p.by_task[s].seq < p.by_task[b].seq) {
+            best = Some(s);
+        }
+    }
+    let s = best?;
+    p.by_task[s].ep = 0;
+    p.by_task[s].msg = None;
+    drop(p);
+    if let Some(idx) = find_index(&*table, ep) {
+        table[idx].waiting = table[idx].waiting.saturating_sub(1);
+    }
+    Some(s)
+}
+
+/// The task in `slot` is dying: if it was blocked sending, withdraw it, so a later dequeue on that
+/// endpoint cannot wake the slot's NEXT occupant (backlog/90 D3). Its message was never accepted (the
+/// send had not returned), so it is dropped - counted and said - and any cap it carried goes with it,
+/// as it does for a send to an endpoint that died.
+pub fn forget_blocked_sender(slot: usize) {
+    let mut table = TABLE.lock_irq();
+    let mut p = PENDING.lock();
+    if slot >= p.by_task.len() || p.by_task[slot].ep == 0 {
+        return;
+    }
+    let ep = EndpointId(p.by_task[slot].ep);
+    p.by_task[slot].ep = 0;
+    p.by_task[slot].msg = None;
+    drop(p);
+    if let Some(idx) = find_index(&*table, ep) {
+        table[idx].waiting = table[idx].waiting.saturating_sub(1);
+    }
+    let n = SENDS_ABANDONED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 || n % 64 == 0 {
+        crate::kprintln!(
+            "routing: task slot {} died blocked sending to endpoint {} - its message was never delivered ({} total)",
+            slot, ep.0, n);
+    }
+}
+
+/// Clear every record naming `ep` (TABLE held). Used when an id is (re)registered: its earlier life's
+/// waiters were drained by its kill path, so finding one here means a drain was missed - said loudly.
+fn clear_waiters_for(ep: EndpointId) {
+    let mut p = PENDING.lock();
+    let mut stale = 0u32;
+    for rec in p.by_task.iter_mut() {
+        if rec.ep == ep.0 {
+            rec.ep = 0;
+            rec.msg = None;
+            stale += 1;
+        }
+    }
+    if stale > 0 {
+        crate::kprintln!("routing: endpoint {} registered with {} stale blocked sender(s) - dropped", ep.0, stale);
     }
 }
 
@@ -84,12 +245,12 @@ static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = SpinLock::ZEROED;
 /// indexed by the caller's task slot. **Bounded**: exactly one entry per task - a blocked task has at
 /// most one in-flight call - so it never grows (no allocation, no list).
 ///
-/// This is the reply-side twin of `RoutingEntry::blocked_sender`. When a task makes a synchronous
+/// This is the reply-side twin of the blocked-sender records (`PENDING`). When a task makes a synchronous
 /// CALL (send request + block awaiting the reply), it records the **target** endpoint here. If that
 /// endpoint later dies, `take_call_waiter` finds the caller and the kill path wakes it with
 /// `ReplyDead` - exactly as `kill_endpoint` returns a blocked *sender* to wake with `EndpointDead`.
 ///
-/// Race-freedom mirrors `blocked_sender` (no new lock): every read and write below happens while the
+/// Race-freedom mirrors the blocked-sender records (no new lock): every read and write below happens while the
 /// `TABLE` lock is held, so registration (`call_dequeue`) and the death scan (`take_call_waiter`) are
 /// mutually exclusive and ordered with `kill_endpoint`'s liveness bump. A registration only happens
 /// after observing the target **alive** under the lock; once `kill_endpoint` has marked it dead, a
@@ -172,8 +333,8 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
             entry.liveness         = EndpointLiveness::Alive;
             entry.queue.reset();
             entry.blocked_receiver = None;
-            entry.blocked_sender   = None;
-            entry.pending_send     = None;
+            entry.waiting          = 0;
+            clear_waiters_for(id);
         }
         // BOOT-TIME CALLERS ONLY. Spawning a task goes through `try_register` and REFUSES the spawn
         // when the table is full, because a chaos kill storm reaching this panic took the whole
@@ -348,8 +509,8 @@ pub fn try_register(id: EndpointId, core_id: u32, generation: Generation) -> boo
             entry.liveness         = EndpointLiveness::Alive;
             entry.queue.reset();
             entry.blocked_receiver = None;
-            entry.blocked_sender   = None;
-            entry.pending_send     = None;
+            entry.waiting          = 0;
+            clear_waiters_for(id);
             true
         }
         None => false,
@@ -430,8 +591,7 @@ fn enqueue_locked(
                 // as blocked if it asked to be.
                 table[idx].blocked_receiver = Some(slot);
                 if let Some(s) = blocked_sender_slot {
-                    table[idx].blocked_sender = Some(s);
-                    table[idx].pending_send   = Some(msg);
+                    block_sender(&mut table[idx], s, msg);
                 }
                 return Err(IpcError::QueueFull);
             }
@@ -440,13 +600,13 @@ fn enqueue_locked(
 
     match table[idx].queue.enqueue(msg) {
         Ok(()) => Ok(None),
-        Err(_) => {
+        Err(msg) => {
             // Queue full.
             if let Some(slot) = blocked_sender_slot {
                 // Atomically record the sender as blocked under the same lock,
-                // preventing a concurrent dequeue from missing the wakeup.
-                table[idx].blocked_sender = Some(slot);
-                table[idx].pending_send   = Some(msg);
+                // preventing a concurrent dequeue from missing the wakeup. Behind every sender
+                // already waiting, never over one (backlog/90 D1).
+                block_sender(&mut table[idx], slot, msg);
             }
             Err(IpcError::QueueFull)
         }
@@ -496,15 +656,8 @@ fn dequeue_locked(
         }
     };
 
-    // If a sender was blocked, move its pending message into the freed slot.
-    let sender_slot = if let Some(slot) = table[idx].blocked_sender.take() {
-        if let Some(pending) = table[idx].pending_send.take() {
-            table[idx].queue.enqueue(pending).ok();
-        }
-        Some(slot)
-    } else {
-        None
-    };
+    // If a sender was blocked, move the OLDEST one's message into the freed slot.
+    let sender_slot = promote_waiter(&mut table[idx]);
 
     Ok((msg, sender_slot))
 }
@@ -527,15 +680,8 @@ fn dequeue_reply_locked(
         Some(m) => m,
         None => return Err(IpcError::QueueEmpty),
     };
-    // A slot was freed: promote a blocked sender's pending message, exactly as dequeue_locked does.
-    let sender_slot = if let Some(slot) = table[idx].blocked_sender.take() {
-        if let Some(pending) = table[idx].pending_send.take() {
-            table[idx].queue.enqueue(pending).ok();
-        }
-        Some(slot)
-    } else {
-        None
-    };
+    // A slot was freed: promote the oldest blocked sender's message, exactly as dequeue_locked does.
+    let sender_slot = promote_waiter(&mut table[idx]);
     Ok((msg, sender_slot))
 }
 
@@ -713,17 +859,15 @@ pub fn enqueue_from_kernel_blocking(
                 // `enqueue_locked`, `backlog/fixed/65`). The receiver keeps waiting; the writer is blocked
                 // exactly as it is on the plain full path below.
                 table[idx].blocked_receiver = Some(slot);
-                table[idx].blocked_sender = Some(sender_slot);
-                table[idx].pending_send = Some(msg);
+                block_sender(&mut table[idx], sender_slot, msg);
                 return Err(IpcError::QueueFull);
             }
         }
     }
     match table[idx].queue.enqueue(msg) {
         Ok(()) => Ok(None),
-        Err(_) => {
-            table[idx].blocked_sender = Some(sender_slot);
-            table[idx].pending_send = Some(msg);
+        Err(msg) => {
+            block_sender(&mut table[idx], sender_slot, msg);
             Err(IpcError::QueueFull)
         }
     }
@@ -780,8 +924,9 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     }
     table[idx].queue.drain();
     let rx = table[idx].blocked_receiver.take();
-    let tx = table[idx].blocked_sender.take();
-    table[idx].pending_send = None;
+    // The oldest blocked sender. Any others are drained by the caller with `take_blocked_sender`,
+    // which every kill path runs right after this (there can be many since backlog/90 D1).
+    let tx = take_oldest(&mut table[idx]).map(|(slot, _)| slot);
     (rx, tx)
 }
 

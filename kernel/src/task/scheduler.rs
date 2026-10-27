@@ -2715,6 +2715,10 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // spuriously wake the slot's new occupant with ReplyDead (§8.6 reply-side death-wake).
         crate::ipc::routing::clear_call_await(slot);
 
+        // ...and likewise if it was blocked SENDING (backlog/90 D3): withdraw it, so a dequeue on that
+        // endpoint cannot later wake the slot's next occupant.
+        crate::ipc::routing::forget_blocked_sender(slot);
+
         // If this task owned the console foreground (a TUI app like `chaos`), release it so a dead owner
         // cannot leave the system muted forever, and wake any shell parked in a muted blocking read.
         // Unconditional (before the endpoint cleanup) since the owner need not have an endpoint; the
@@ -2729,6 +2733,10 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
             let (rx, tx) = crate::ipc::routing::kill_endpoint(rep_id);
             if let Some(s) = rx { if s != slot { wake_by_slot(s, -7); } }
             if let Some(s) = tx { if s != slot { wake_by_slot(s, -7); } }
+            // Every other sender blocked on it (backlog/90 D1: there can be many). Before the id is freed.
+            while let Some(s) = crate::ipc::routing::take_blocked_sender(rep_id) {
+                if s != slot { wake_by_slot(s, -7); }
+            }
             crate::capability::table::mark_dead_resource(
                 crate::capability::cap::ResourceId::from(rep_id));
             TASK_REPLY_ENDPOINT[slot].store(0, Ordering::Relaxed);
@@ -2765,6 +2773,10 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
             // freed page tables - the root cause of the use-after-free cascade.
             if let Some(s) = rx_slot { if s != slot { wake_by_slot(s, -7); } }
             if let Some(s) = tx_slot { if s != slot { wake_by_slot(s, -7); } }
+            // Every other blocked sender, oldest first (backlog/90 D1: there can be many now).
+            while let Some(s) = crate::ipc::routing::take_blocked_sender(ep_id) {
+                if s != slot { wake_by_slot(s, -7); }
+            }
 
             // Reply-side death-wake (§8.6, Commandment VIII): wake every caller blocked in a
             // synchronous CALL awaiting a reply from this now-dead endpoint, with ReplyDead (-12) -
@@ -3359,7 +3371,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         // consumes the registration and leaves the CAS below nothing to trip over).
         //
         // RECV ONLY, deliberately. A blocked SENDER is woken because the kernel DELIVERED its
-        // `pending_send` from the routing entry; declining to block would skip that delivery and
+        // message from its blocked-send record (`routing::PENDING`); declining to block would skip that delivery and
         // silently drop the request, turning a latency bug into a lost message. A blocked receiver
         // has no such side effect - its caller loops and re-checks the queue, which is precisely what
         // it should do.
