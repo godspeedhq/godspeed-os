@@ -21459,7 +21459,13 @@ const FS_TREE_SECS:   i64 = 120;  // recursive delete - bounded by how much ther
 /// This was 600, on my assumption that they swept the whole disk. I did not check, and the cost was
 /// the user sitting in front of a `drives scrub` that would not answer for ten minutes - a bound so
 /// loose it is indistinguishable from the hang it replaced.
-const FS_FSCK_SECS:   i64 = 60;
+///
+/// 60 -> 180 (2026-10-27), on MEASUREMENT this time: the Pi 2's `drives check` took 76 s twice running
+/// (`fs: op 27 took 75953945 us, 176 block ops, 0% of it inside them`) and 46 s on a quieter run, so 60
+/// failed a healthy check. The time is CPU in `fs`, not the device - 0% of it inside block ops - which is
+/// being investigated separately; this bound is for the walk as it is today, with room for a slower
+/// stick, and the command stays q-abortable, so the operator is never held for the whole of it.
+const FS_FSCK_SECS:   i64 = 180;
 /// Format and reset DO rewrite the volume, and are the one thing here that legitimately takes
 /// minutes on a 15 GiB stick.
 const FS_FORMAT_SECS: i64 = 600;
