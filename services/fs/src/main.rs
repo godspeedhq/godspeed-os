@@ -4250,11 +4250,13 @@ fn replay_window(_ctx: &ServiceContext) {}
         // trips were most of what was left of a Pi 2 check once the zeroing went. A run that does not arrive
         // whole is read block by block, so an unreadable block is still found, and zeroed, as itself.
         let mut b = 0u64;
+        let mut runs_refused = 0u64;               // read runs that did not arrive whole - said below
         while b < bitmap_blocks {
             let n = ((bitmap_blocks - b) as usize).min(READ_RUN_MAX);
             let t = self.blk_begin(ctx);
             let got = block_read_run(ctx, self.bitmap_start + b, n);
             self.blk_end(ctx, t);
+            if got.is_none() { runs_refused += 1; }
             for i in 0..n {
                 let at = b + i as u64;
                 let blk = match &got {
@@ -4278,6 +4280,14 @@ fn replay_window(_ctx: &ServiceContext) {}
             b += n as u64;
         }
         self.zero_bitmap_run(ctx, run)?;
+        // SAID. A refused run falls back to single reads, which is correct and slow - and was SILENT: it hid
+        // two bugs in one day (`xhci` dropping the op, `block-driver` cutting the reply to one block), each
+        // found only by counting block ops. One line per check, owned by this walk.
+        if runs_refused > 0 {
+            ctx.log_fmt(format_args!(
+                "fs: check - {} of the bitmap's read runs did not arrive whole and were read block by block (correct, slower; the block path is refusing OP_READ_BLOCKS)",
+                runs_refused));
+        }
         // System blocks [0, data_start): superblock + bitmap + journal. Plus the backup block.
         self.bm_set_range(ctx, 0, self.data_start, true)?;
         self.bm_set_range(ctx, self.total_blocks - 1, 1, true)?;
@@ -5420,6 +5430,8 @@ fn block_read_run(ctx: &ServiceContext, lba: u64, count: usize) -> Option<[[u8; 
     let mut rbuf = [0u8; BLK_CALL_MAX];
     let n = block_rpc_into(ctx, &req, &mut rbuf)?;
     // [tag, status, count x 512]: the length is checked, not trusted, for the reason `block_read` gives.
+    // A failure is the CALLER's to say (its walk counts them and says so once, see `check`): this function
+    // holds no state of its own, and a latch here would be unowned global state (Commandment VI).
     if n != 2 + count * BLOCK || rbuf[1] != BLK_OK { return None; }
     let mut out = [[0u8; BLOCK]; READ_RUN_MAX];
     for (i, blk) in out.iter_mut().enumerate().take(count) {

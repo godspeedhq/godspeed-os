@@ -150,10 +150,18 @@ impl Chaos {
 impl Reply {
     /// Answer, with the tag in front. `body` is the reply exactly as it was before tagging.
     pub fn send(&self, ctx: &godspeed::ServiceContext, body: &[u8]) {
-        // 513 is the largest body (status + one block); one more for the tag. Fixed, on the stack,
-        // no allocation (§26.6.1).
-        let mut out = [0u8; 514];
+        // The largest body is a read run (status + `READ_RUN_MAX` blocks), one more for the tag. Fixed, on
+        // the stack, no allocation (§26.6.1). It was 514 - status and ONE block - and a run reply was cut
+        // to that without a word, so `fs` saw every run short, refused it, and read block by block: correct,
+        // and no faster, on every board (2026-10-27, the VisionFive's `drives check` counting 9,394 block
+        // ops where runs would be about 1,800). A body that does not fit is now said, never cut silently.
+        let mut out = [0u8; 2 + READ_RUN_MAX * 512];
         out[0] = self.tag;
+        if body.len() > out.len() - 1 {
+            ctx.log_fmt(format_args!(
+                "block-driver: a {}-byte reply does not fit the {}-byte reply buffer - CUT SHORT (a bug: the caller will refuse it)",
+                body.len(), out.len() - 1));
+        }
         let n = body.len().min(out.len() - 1);
         out[1..1 + n].copy_from_slice(&body[..n]);
         // TRY_SEND, NEVER SEND - §8.9, and a deadlock rather than a style preference.
