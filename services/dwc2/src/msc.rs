@@ -513,6 +513,24 @@ pub fn read_block(
     bot(ctx, mmio, dma, t, disk, &cdb, true, block as usize).is_some()
 }
 
+/// READ(10): `count` consecutive blocks into the arena's data buffer, in ONE command - a multi-packet bulk IN
+/// (`OP_READ_BLOCKS`, 2026-10-27). The write side's multi-packet bulk OUT stalls the Pi 2's stick
+/// (`write_blocks`); this is the IN side, tried on its own and measured on the card. `true` only when the
+/// whole run arrived: `bot` refuses a short data stage by the device's RESIDUE, not by `moved`, which this
+/// controller's buffer-DMA mode does not keep as a byte count (see `bot`) - comparing `moved` would refuse
+/// every good run.
+pub fn read_blocks(
+    ctx: &ServiceContext, mmio: &Registers, dma: &Parts, t: &Target, disk: &mut Disk, lba: u32, count: u16, block: u32,
+) -> bool {
+    let cdb = [
+        0x28u8, 0,
+        (lba >> 24) as u8, (lba >> 16) as u8, (lba >> 8) as u8, lba as u8,
+        0, (count >> 8) as u8, count as u8, 0,
+    ];
+    let want = count as usize * block as usize;
+    want <= DATA_MAX && bot(ctx, mmio, dma, t, disk, &cdb, true, want).is_some()
+}
+
 
 // --- The block IPC protocol (what `block-driver` already speaks on the Pi 4) -------------------
 //
@@ -530,10 +548,10 @@ pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;
 /// A run of consecutive blocks READ, `[op, lba:u64, count:u8]` -> `[status, count x 512]`
-/// (`block-driver`'s `OP_READ_BLOCKS`). Answered once, but each block is still its own READ(10): a
-/// multi-block bulk OUT through this core stalls the Pi 2's stick (`write_blocks`), and a multi-packet bulk
-/// IN has not been tried, so this takes the round trips out of the two IPC hops and leaves the device's
-/// commands as they were. One READ(10) for the run is the next step, to be measured on its own.
+/// (`block-driver`'s `OP_READ_BLOCKS`), as ONE READ(10) - a multi-packet bulk IN (`read_blocks`). It was a
+/// READ(10) per block behind the one request until the operator asked for this to be tried (2026-10-27): a
+/// multi-block bulk OUT through this core stalls the Pi 2's stick (`write_blocks`), and the IN side had not
+/// been tried at all.
 pub const OP_READ_BLOCKS: u8 = 7;
 /// The most blocks one read run answers - `block-driver`'s `READ_RUN_MAX`.
 pub const READ_RUN_MAX: usize = 7;
@@ -716,16 +734,12 @@ pub fn serve(
             // block, so the bad one is reported as itself.
             let ok = (1..=READ_RUN_MAX).contains(&count)
                 && (lba as u64).saturating_add(count as u64) <= sectors
-                && (0..count).all(|s| {
-                    let at = lba + s as u32;
-                    let got = with_busy_retry(ctx, 30_000, || read_block(ctx, mmio, dma, t, disk, at, 512));
-                    if got {
-                        for i in 0..512 {
-                            out[1 + s * 512 + i] = dma.disk.read8(i);
-                        }
-                    }
-                    got
-                });
+                && with_busy_retry(ctx, 30_000, || read_blocks(ctx, mmio, dma, t, disk, lba, count as u16, 512));
+            if ok {
+                for i in 0..count * 512 {
+                    out[1 + i] = dma.disk.read8(i);
+                }
+            }
             if ok {
                 out[0] = STATUS_OK;
                 1 + count * 512

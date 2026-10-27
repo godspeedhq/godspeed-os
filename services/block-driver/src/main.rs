@@ -261,7 +261,7 @@ const WRITE_RUN_MAX: usize = 7;
 // of OP_WRITE_BLOCKS, 1 to `READ_RUN_MAX` consecutive blocks in one request. `fs`'s `drives check` reads
 // the whole free bitmap, 7,634 blocks on a 16 GB stick, and at one block per round trip that was most of
 // a 35-47 s check on the Pi 2 (2026-10-27). AHCI issues it as one READ DMA EXT; the USB backend forwards
-// it to the host service, which serves it the same way. A failure is the whole run's: `fs` then reads
+// it to the host service, which issues one READ(10) for it (`xhci`, and `dwc2` as a multi-packet bulk IN). A failure is the whole run's: `fs` then reads
 // the run block by block, so one bad sector is still reported as that sector.
 const OP_READ_BLOCKS: u8 = 7;
 /// The most blocks one `OP_READ_BLOCKS` answers: 1 (the tag) + 1 (status) + 7 x 512 is 3,586 bytes,

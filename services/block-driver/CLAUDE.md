@@ -82,7 +82,7 @@ The **tag** is a correlation byte `fs` puts at byte 0 of every request and block
 believed. The op constants live in `main.rs`, and `services/fs` must match them.
 
 The LBA is **u64** (persistence §6.3) so GSFS's u64 capacity fields reach the device at
-full width. A read moves one 512-byte block (= one sector), or a run of up to seven (`OP_READ_BLOCKS`, 2026-10-27: `drives check` reads the whole free bitmap, 7,634 blocks on a 16 GB stick), which AHCI and `xhci` issue as one READ, and `dwc2` as one READ(10) per block behind one request; a write moves one, or a run of up to seven
+full width. A read moves one 512-byte block (= one sector), or a run of up to seven (`OP_READ_BLOCKS`, 2026-10-27: `drives check` reads the whole free bitmap, 7,634 blocks on a 16 GB stick), which AHCI, `xhci` and `dwc2` each issue as one READ (on `dwc2` a multi-packet bulk IN, hardware-verified on the Pi 2 2026-10-27 - unlike the multi-block bulk OUT, which stalls its stick); a write moves one, or a run of up to seven
 consecutive ones (`OP_WRITE_BLOCKS`, 2026-10-20: a file's chunk is seven blocks, which was seven requests),
 which AHCI issues as one multi-sector command; through `xhci` it is gathered into WRITE(10)s of up to 56 KiB, and through `dwc2` it is written block by block, one WRITE(10) per block (since 2026-10-24: a multi-block WRITE(10) stalled the Pi 2's stick, `services/dwc2/src/msc.rs` `write_blocks`). `fs` owns file layout;
 `block-driver` only moves sectors - policy above, mechanism below.
