@@ -11,3 +11,7 @@ pub mod generation;
 pub mod rights;
 #[path = "../../../../kernel/src/capability/table.rs"]
 pub mod table;
+// `table.rs` asks `delegated::is_delegated` which kind a reused id is (CapTable::get), so the band
+// module comes with it, as the kernel builds it.
+#[path = "../../../../kernel/src/capability/delegated.rs"]
+pub mod delegated;

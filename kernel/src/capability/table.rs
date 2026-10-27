@@ -65,7 +65,19 @@ impl CapTable {
             return Err(match record.liveness {
                 Liveness::Dead    => CapError::EndpointDead,
                 Liveness::Revoked => CapError::CapRevoked,
-                Liveness::Alive   => CapError::CapRevoked, // gen mismatch with live resource
+                // A LIVE record at another generation: the id was reused after the cap's resource
+                // ended. For an ENDPOINT that is a death (ids are reused LIFO, so a respawn or any new
+                // spawn usually takes the id straight back), and saying CapRevoked told a sender its
+                // capability was taken away when the service it named had died - 7.7 keeps the two
+                // apart. Found when the SDK stopped folding -6 into EndpointDead: adversarial A5 sent
+                // after a kill and, when another probe's spawn took the id first, got CapRevoked
+                // (2026-10-27). A delegated id (a file) that is live again was revoked or released and
+                // reissued, so it stays CapRevoked: the capability is finished, not its owner.
+                Liveness::Alive => if super::delegated::is_delegated(cap.resource_id) {
+                    CapError::CapRevoked
+                } else {
+                    CapError::EndpointDead
+                },
             });
         }
 
@@ -457,6 +469,21 @@ mod tests {
             // A cap minted AFTER the death carries the new generation, and is valid again.
             let fresh = ct.insert(mint_cap(ResourceId(id), Rights::SEND)).unwrap();
             assert!(ct.get(fresh, Rights::SEND).is_ok());
+        }
+    }
+
+    /// An id REUSED after its resource ended - registered again, alive, at a higher generation, as a
+    /// respawn or any new spawn does with an endpoint id (LIFO). A stale cap to an ENDPOINT id is told
+    /// its endpoint died; a stale cap to a DELEGATED id (a file) is told it was revoked. The endpoint case
+    /// said CapRevoked until adversarial A5 caught it (2026-10-27).
+    #[test]
+    fn a_stale_cap_to_a_reused_id_is_dead_for_an_endpoint_and_revoked_for_a_file() {
+        for (id, want) in [(3001u64, CapError::EndpointDead), (5010, CapError::CapRevoked)] {
+            register_resource_at_gen(ResourceId(id), Generation(4));
+            let mut ct = CapTable::empty();
+            let slot = ct.insert(mint_cap(ResourceId(id), Rights::SEND)).unwrap();
+            register_resource_at_gen(ResourceId(id), Generation(9)); // reused: alive, a later generation
+            assert_eq!(ct.get(slot, Rights::SEND).unwrap_err(), want, "id {id}");
         }
     }
 
