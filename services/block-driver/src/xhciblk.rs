@@ -43,7 +43,8 @@
 use godspeed as gs;
 use godspeed::{ipc::Message, ServiceContext};
 
-use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, STATUS_OK, WRITE_RUN_MAX};
+use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_READ_BLOCKS, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, READ_RUN_MAX,
+            STATUS_OK, WRITE_RUN_MAX};
 
 /// The USB host-controller SERVICE that owns the disk, by name - so a restart is transparent (§3.11).
 ///
@@ -297,6 +298,27 @@ pub fn read(ctx: &ServiceContext, lba: u64, buf: &mut [u8; 512]) -> bool {
         return false;
     }
     buf.copy_from_slice(&p[1..513]);
+    true
+}
+
+/// Read a run of consecutive sectors from `lba` into `out`, which holds 1 to `READ_RUN_MAX` of them, in ONE
+/// request answered once (`OP_READ_BLOCKS`). `false` means the run did not arrive WHOLE - a short or failed
+/// reply fills nothing the caller can trust, and the caller reads the blocks one at a time instead.
+pub fn read_run(ctx: &ServiceContext, lba: u64, out: &mut [u8]) -> bool {
+    let count = out.len() / 512;
+    if count == 0 || count > READ_RUN_MAX || out.len() != count * 512 {
+        return false;
+    }
+    let mut req = [0u8; 10];
+    req[0] = OP_READ_BLOCKS;
+    req[1..9].copy_from_slice(&lba.to_le_bytes());
+    req[9] = count as u8;
+    let Some(r) = rpc(ctx, &req) else { return false };
+    let p = r.payload_bytes();
+    if p.len() < 1 + count * 512 || p[0] != STATUS_OK {
+        return false;
+    }
+    out.copy_from_slice(&p[1..1 + count * 512]);
     true
 }
 

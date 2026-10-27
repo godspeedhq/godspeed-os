@@ -529,6 +529,14 @@ pub const OP_FLUSH: u8 = 5;
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;
+/// A run of consecutive blocks READ, `[op, lba:u64, count:u8]` -> `[status, count x 512]`
+/// (`block-driver`'s `OP_READ_BLOCKS`). Answered once, but each block is still its own READ(10): a
+/// multi-block bulk OUT through this core stalls the Pi 2's stick (`write_blocks`), and a multi-packet bulk
+/// IN has not been tried, so this takes the round trips out of the two IPC hops and leaves the device's
+/// commands as they were. One READ(10) for the run is the next step, to be measured on its own.
+pub const OP_READ_BLOCKS: u8 = 7;
+/// The most blocks one read run answers - `block-driver`'s `READ_RUN_MAX`.
+pub const READ_RUN_MAX: usize = 7;
 // A run must fit the gather buffer, with room for the next before it is written.
 const _: () = assert!(WRITE_RUN_MAX * 512 <= GATHER_BYTES);
 pub const STATUS_OK: u8 = 0;
@@ -669,7 +677,7 @@ pub fn serve(
         return false;
     }
 
-    let mut out = [0u8; 520];
+    let mut out = [0u8; 1 + READ_RUN_MAX * 512];
     // Anything but a run, or a capacity (no I/O), writes what is held first: a read then sees it, and a
     // single write or a flush is ordered after it - `fs`'s barriers order everything before them.
     if p[0] != OP_WRITE_BLOCKS && p[0] != OP_CAPACITY {
@@ -697,6 +705,31 @@ pub fn serve(
                 // client copy whatever its message buffer held into a sector `fs` then trusts -
                 // which is the corruption the client's own length check exists to catch, and it
                 // should never have to.
+                out[0] = STATUS_ERR;
+                1
+            }
+        }
+        OP_READ_BLOCKS if p.len() >= 10 => {
+            let count = p[9] as usize;
+            let lba = u64::from_le_bytes([p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8]]) as u32;
+            // Whole or not at all: a block that fails fails the run, and the client reads the run block by
+            // block, so the bad one is reported as itself.
+            let ok = (1..=READ_RUN_MAX).contains(&count)
+                && (lba as u64).saturating_add(count as u64) <= sectors
+                && (0..count).all(|s| {
+                    let at = lba + s as u32;
+                    let got = with_busy_retry(ctx, 30_000, || read_block(ctx, mmio, dma, t, disk, at, 512));
+                    if got {
+                        for i in 0..512 {
+                            out[1 + s * 512 + i] = dma.disk.read8(i);
+                        }
+                    }
+                    got
+                });
+            if ok {
+                out[0] = STATUS_OK;
+                1 + count * 512
+            } else {
                 out[0] = STATUS_ERR;
                 1
             }

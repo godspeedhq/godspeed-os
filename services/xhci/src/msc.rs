@@ -1035,6 +1035,15 @@ pub const OP_FLUSH: u8 = 5;
 pub const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one run carries - `block-driver`'s `WRITE_RUN_MAX`.
 pub const WRITE_RUN_MAX: usize = 7;
+/// A run of consecutive blocks READ, `[op, lba:u64, count:u8]` -> `[status, count x 512]`: one READ(10)
+/// for up to `READ_RUN_MAX` blocks instead of one each (`block-driver`'s `OP_READ_BLOCKS`).
+pub const OP_READ_BLOCKS: u8 = 7;
+/// The most blocks one read run answers - `block-driver`'s `READ_RUN_MAX`.
+pub const READ_RUN_MAX: usize = 7;
+/// The reply buffer `serve_block` fills: a status byte and, at most, a read run.
+pub const REPLY_MAX: usize = 1 + READ_RUN_MAX * SECTOR as usize;
+// A read run is ONE transfer, so it must fit the data buffer `read10` fills.
+const _: () = assert!(READ_RUN_MAX as u32 * SECTOR <= MAX_XFER);
 // A run must fit a gather buffer, with room for the next before the buffer is written.
 const _: () = assert!(WRITE_RUN_MAX * SECTOR as usize <= GATHER_BYTES);
 pub const STATUS_OK: u8 = 0;
@@ -1060,7 +1069,7 @@ pub fn serve_block(
     ir0: usize,
     disk: &mut Option<Disk>,
     req: &[u8],
-    out: &mut [u8; 520],
+    out: &mut [u8; REPLY_MAX],
     ev_idx: &mut usize,
     ev_cycle: &mut u32,
     eaten: &mut EvMail,
@@ -1185,6 +1194,28 @@ pub fn serve_block(
             } else {
                 1
             }
+        }
+        OP_READ_BLOCKS => {
+            // [op, lba:u64, count:u8] - one READ(10) of `count` sectors, copied out whole or not at all.
+            let count = req.get(9).copied().unwrap_or(0) as usize;
+            if req.len() < 10 || count == 0 || count > READ_RUN_MAX {
+                return 1;
+            }
+            let lba = lba_of(req);
+            let ok = read10(ctx, dma, mmio, dboff, ir0, d, lba, count as u32, ev_idx, ev_cycle, eaten);
+            if !ok {
+                if !core::mem::replace(&mut d.read_fail_said, true) {
+                    ctx.log_fmt(format_args!(
+                        "xhci: READ(10) of {} sectors at lba {} FAILED on a bound disk (further failures silenced)",
+                        count, lba));
+                }
+                return 1;
+            }
+            out[0] = STATUS_OK;
+            for i in 0..count * SECTOR as usize {
+                out[1 + i] = data_read8(dma, i);
+            }
+            1 + count * SECTOR as usize
         }
         OP_WRITE_BLOCK => {
             if req.len() < 9 + SECTOR as usize {

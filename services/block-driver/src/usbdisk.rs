@@ -70,6 +70,9 @@ fn dev_write(ctx: &ServiceContext, lba: u64, buf: &[u8; 512]) -> i64 {
     if super::xhciblk::write(ctx, lba, buf) { 0 } else { -1 }
 }
 
+fn dev_read_run(ctx: &ServiceContext, lba: u64, out: &mut [u8]) -> i64 {
+    if super::xhciblk::read_run(ctx, lba, out) { 0 } else { -1 }
+}
 fn dev_write_run(ctx: &ServiceContext, lba: u64, data: &[u8]) -> i64 {
     if super::xhciblk::write_run(ctx, lba, data) { 0 } else { -1 }
 }
@@ -79,8 +82,8 @@ fn dev_flush(ctx: &ServiceContext) -> super::xhciblk::Flush { super::xhciblk::fl
 /// Serve one block-IPC request. Same wire protocol as the AHCI backend - `fs` is unaware of which one
 /// it is talking to.
 fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
-    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, OP_WRITE_ZEROS,
-                STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
+    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_READ_BLOCKS, OP_WRITE_BLOCK, OP_WRITE_BLOCKS,
+                OP_WRITE_ZEROS, READ_RUN_MAX, STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
     let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
     if p.is_empty() { return err(ctx); }
     if p[0] == OP_FLUSH {
@@ -135,6 +138,17 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
                 reply.send(ctx, &out);
+            } else { err(ctx); }
+        }
+        OP_READ_BLOCKS => {
+            // A run, passed to the USB host as one request and answered once (`xhciblk::read_run`): one
+            // round trip for up to seven blocks instead of seven, on each of the two hops.
+            let count = p.get(9).copied().unwrap_or(0) as usize;
+            if count == 0 || count > READ_RUN_MAX { return err(ctx); }
+            let mut out = [0u8; 1 + READ_RUN_MAX * 512];
+            if request(ctx, "read-run", lba, || dev_read_run(ctx, lba, &mut out[1..1 + count * 512])) {
+                out[0] = STATUS_OK;
+                reply.send(ctx, &out[..1 + count * 512]);
             } else { err(ctx); }
         }
         OP_WRITE_BLOCK => {

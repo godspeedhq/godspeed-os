@@ -221,7 +221,7 @@ mod xhciblk;
 
 // Block IPC protocol (fs <-> block-driver). MUST match `services/fs`.
 //   Request : [tag:u8, op:u8, lba:u64 LE, (WriteBlock: 512 data bytes; WriteBlocks: count:u8, count x 512)]
-//   Reply   : [tag:u8, status:u8, (ReadBlock only: 512 data bytes)]
+//   Reply   : [tag:u8, status:u8, (ReadBlock: 512 data bytes; ReadBlocks: count x 512)]
 // `tag` is the caller's correlation byte, echoed unread (`Reply`); the op lines below omit it.
 // The LBA is u64 (persistence §6.3): GSFS capacity fields are u64, so the block
 // address reaches the device at full width.
@@ -249,6 +249,16 @@ const OP_WRITE_BLOCKS: u8 = 6;
 /// The most blocks one `OP_WRITE_BLOCKS` carries: 1 (the tag) + 10 + 7 x 512 is 3,595 bytes, inside one
 /// 4 KiB message. `fs` sends no more (its own `WRITE_RUN_MAX`).
 const WRITE_RUN_MAX: usize = 7;
+// Read a run: [OP_READ_BLOCKS, lba:u64, count:u8] -> [status, (OK only: count x 512 data)]. The read twin
+// of OP_WRITE_BLOCKS, 1 to `READ_RUN_MAX` consecutive blocks in one request. `fs`'s `drives check` reads
+// the whole free bitmap, 7,634 blocks on a 16 GB stick, and at one block per round trip that was most of
+// a 35-47 s check on the Pi 2 (2026-10-27). AHCI issues it as one READ DMA EXT; the USB backend forwards
+// it to the host service, which serves it the same way. A failure is the whole run's: `fs` then reads
+// the run block by block, so one bad sector is still reported as that sector.
+const OP_READ_BLOCKS: u8 = 7;
+/// The most blocks one `OP_READ_BLOCKS` answers: 1 (the tag) + 1 (status) + 7 x 512 is 3,586 bytes,
+/// inside one 4 KiB message - the same seven as a write run.
+const READ_RUN_MAX: usize = 7;
 const STATUS_OK: u8 = 0;
 const STATUS_ERR: u8 = 1;
 // A flush that reached NO device: the USB host service did not answer, or had no disk bound. `fs`

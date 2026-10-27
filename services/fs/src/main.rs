@@ -236,6 +236,12 @@ const OP_WRITE_BLOCKS: u8 = 6; // [op, lba:u64, count:u8, count x 512] - a run o
 /// The most blocks one `OP_WRITE_BLOCKS` carries - a streamed chunk's seven (`IO_CHUNK`, 7 x 508) - which
 /// keeps the request, 3,595 bytes with its tag, inside one message. `block-driver` refuses more.
 const WRITE_RUN_MAX: usize = 7;
+/// Read a run: `[op, lba:u64, count:u8]` -> `[status, count x 512]`, 1 to `READ_RUN_MAX` consecutive
+/// blocks in one request (`block-driver`'s `OP_READ_BLOCKS`). For the walks that read long stretches:
+/// `check`'s pass over the whole free bitmap was 7,634 single-block round trips on a 16 GB stick.
+const OP_READ_BLOCKS: u8 = 7;
+/// The most blocks one read run answers: tag + status + 7 x 512 is 3,586 bytes, inside one message.
+const READ_RUN_MAX: usize = 7;
 const BLK_OK: u8 = 0;
 const BLK_ERR: u8 = 1;        // the driver's STATUS_ERR - it answered, and said the operation failed
 const BLK_UNREACHABLE: u8 = 2; // on a flush: the driver answered, but reached no device (its USB host was
@@ -4240,20 +4246,36 @@ fn replay_window(_ctx: &ServiceContext) {}
         let bitmap_blocks = self.journal_start - self.bitmap_start;
         let mut old_set: u64 = 0;
         let mut run: Option<(u64, u64)> = None;   // (first, len) of the dirty blocks not yet zeroed
-        for b in 0..bitmap_blocks {
-            let dirty = match self.block_read_m(ctx, self.bitmap_start + b) {
-                Some(blk) => {
-                    let set: u64 = blk.iter().map(|byte| byte.count_ones() as u64).sum();
-                    old_set += set;
-                    set != 0
-                }
-                None => true,
-            };
-            run = match (run, dirty) {
-                (Some((s, l)), true) if s + l == b => Some((s, l + 1)),
-                (prev, true) => { self.zero_bitmap_run(ctx, prev)?; Some((b, 1)) }
-                (prev, false) => { self.zero_bitmap_run(ctx, prev)?; None }
-            };
+        // READ IN RUNS of up to `READ_RUN_MAX`, one request each (2026-10-27): the 7,634 single-block round
+        // trips were most of what was left of a Pi 2 check once the zeroing went. A run that does not arrive
+        // whole is read block by block, so an unreadable block is still found, and zeroed, as itself.
+        let mut b = 0u64;
+        while b < bitmap_blocks {
+            let n = ((bitmap_blocks - b) as usize).min(READ_RUN_MAX);
+            let t = self.blk_begin(ctx);
+            let got = block_read_run(ctx, self.bitmap_start + b, n);
+            self.blk_end(ctx, t);
+            for i in 0..n {
+                let at = b + i as u64;
+                let blk = match &got {
+                    Some(blks) => Some(blks[i]),
+                    None => self.block_read_m(ctx, self.bitmap_start + at),
+                };
+                let dirty = match blk {
+                    Some(blk) => {
+                        let set: u64 = blk.iter().map(|byte| byte.count_ones() as u64).sum();
+                        old_set += set;
+                        set != 0
+                    }
+                    None => true,
+                };
+                run = match (run, dirty) {
+                    (Some((s, l)), true) if s + l == at => Some((s, l + 1)),
+                    (prev, true) => { self.zero_bitmap_run(ctx, prev)?; Some((at, 1)) }
+                    (prev, false) => { self.zero_bitmap_run(ctx, prev)?; None }
+                };
+            }
+            b += n as u64;
         }
         self.zero_bitmap_run(ctx, run)?;
         // System blocks [0, data_start): superblock + bitmap + journal. Plus the backup block.
@@ -4989,6 +5011,19 @@ fn report_peer_recovered(ctx: &ServiceContext) {
 /// more, and a full queue yields and sends once more. A request that was delivered and not answered
 /// within `BLOCK_RPC_SECS` is NOT re-sent (see the gate below).
 fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
+    let mut rbuf = [0u8; BLK_CALL_MAX];
+    let n = block_rpc_into(ctx, req, &mut rbuf)?;
+    if n > BLK_REPLY_MAX { return None; }
+    let mut buf = [0u8; BLK_REPLY_MAX];
+    buf[..n].copy_from_slice(&rbuf[..n]);
+    Some(BlockReply { buf, len: n - 1 })
+}
+
+/// `block_rpc`'s exchange, into a buffer the CALLER owns: the reply's length, tag included at `rbuf[0]`,
+/// or `None`. `block_rpc` copies into a `BlockReply` of `BLK_REPLY_MAX` so a 4 KiB buffer is not carried
+/// back through every caller; a read RUN (`block_read_run`, up to 3,586 bytes) is the one reply larger than
+/// that, and reads it from here directly.
+fn block_rpc_into(ctx: &ServiceContext, req: &[u8], rbuf: &mut [u8; BLK_CALL_MAX]) -> Option<usize> {
     // BOUNDED, on the LEAN await. The undeadlined form wakes only on the peer's DEATH, so a
     // block-driver that is alive but silent hung `fs` permanently and every shell command behind it.
     //
@@ -5010,8 +5045,6 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
     // saw a 512-byte body where 513 belongs and rejected it as a desync - "block read at lba 0 got a
     // MALFORMED reply (512 bytes)". The shape check did its job; the buffer was simply a byte short.
     // A reply is at most `BLK_XFER_MAX`; the buffer is larger because it carries a run out too.
-    let mut rbuf = [0u8; BLK_CALL_MAX];
-
     // CORRELATION TAG at byte 0, echoed by `block-driver` and interpreted no further.
     //
     // Without it a reply is matched to a request by ARRIVAL ORDER, and after a chaos storm that order
@@ -5106,7 +5139,7 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
             }
         }
         match ctx.request_with_reply_deadline_outcome_into(
-            "block-driver", treq, &mut rbuf, BLOCK_RPC_SECS)
+            "block-driver", treq, rbuf, BLOCK_RPC_SECS)
         {
             DeadlineOutcomeInto::Reply(n) => {
                 if n == 0 {
@@ -5125,10 +5158,7 @@ fn block_rpc(ctx: &ServiceContext, req: &[u8]) -> Option<BlockReply> {
                     return None;
                 }
                 // A reply is at most a tag, a status and one block; more is the peer out of step.
-                if n > BLK_REPLY_MAX { return None; }
-                let mut buf = [0u8; BLK_REPLY_MAX];
-                buf[..n].copy_from_slice(&rbuf[..n]);
-                return Some(BlockReply { buf, len: n - 1 });
+                return Some(n);
             }
             // Delivered, unanswered. The peer is alive and holding the request; re-sending would ask
             // for the work twice and desync the tags.
@@ -5378,6 +5408,26 @@ fn data_block(blk: &mut [u8; BLOCK], payload: &[u8]) {
 
 /// Write `blocks` to consecutive LBAs from `lba` in ONE request (`OP_WRITE_BLOCKS`), at most
 /// `WRITE_RUN_MAX`. Direct, as `data_write` is. The answers are `block_write_kind`'s, said for the run.
+/// Read `count` (1 to `READ_RUN_MAX`) consecutive blocks from `lba` in ONE request. `None` unless the run
+/// arrived WHOLE - the caller then reads the stretch block by block, so a bad block is still reported as
+/// that block and a driver without the op costs one refused request, not a wrong answer.
+fn block_read_run(ctx: &ServiceContext, lba: u64, count: usize) -> Option<[[u8; BLOCK]; READ_RUN_MAX]> {
+    if count == 0 || count > READ_RUN_MAX { return None; }
+    let mut req = [0u8; 10];
+    req[0] = OP_READ_BLOCKS;
+    req[1..9].copy_from_slice(&lba.to_le_bytes());
+    req[9] = count as u8;
+    let mut rbuf = [0u8; BLK_CALL_MAX];
+    let n = block_rpc_into(ctx, &req, &mut rbuf)?;
+    // [tag, status, count x 512]: the length is checked, not trusted, for the reason `block_read` gives.
+    if n != 2 + count * BLOCK || rbuf[1] != BLK_OK { return None; }
+    let mut out = [[0u8; BLOCK]; READ_RUN_MAX];
+    for (i, blk) in out.iter_mut().enumerate().take(count) {
+        blk.copy_from_slice(&rbuf[2 + i * BLOCK..2 + (i + 1) * BLOCK]);
+    }
+    Some(out)
+}
+
 fn block_write_run(ctx: &ServiceContext, lba: u64, blocks: &[[u8; BLOCK]]) -> bool {
     // A run the protocol cannot carry is refused and said, never shortened: shortened, the blocks past
     // `WRITE_RUN_MAX` would be reported written and never reach the disk (Audit 19). The one caller sends

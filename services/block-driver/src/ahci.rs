@@ -450,6 +450,18 @@ impl<'a> Ahci<'a> {
         Ok(())
     }
 
+    /// Read `count` consecutive sectors from `lba` into `out` (`count` x 512 bytes) in ONE READ DMA EXT,
+    /// with `read_block`'s bounded retry (`OP_READ_BLOCKS`). `count` is at most `READ_RUN_MAX`, well
+    /// inside the `data` part (`MAX_PER` sectors), as a write run is.
+    #[cfg_attr(feature = "volatile-cache-test", allow(dead_code))]
+    fn read_blocks(&self, ctx: &ServiceContext, lba: u64, out: &mut [u8], count: usize) -> Result<(), &'static str> {
+        self.issue_io(ctx, "read", ATA_READ_DMA_EXT, lba, count as u16, false, (count * 512) as u32)?;
+        for i in 0..count * 128 {
+            out[i * 4..i * 4 + 4].copy_from_slice(&self.data.read32(i * 4).to_le_bytes());
+        }
+        Ok(())
+    }
+
     /// Record a sector this driver just wrote: its ORDER, its LBA and its bytes
     /// (`write-tap` build only; compiled to nothing otherwise).
     ///
@@ -660,8 +672,8 @@ impl<'a> Ahci<'a> {
     }
 
     fn serve(&self, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
-        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_BLOCKS, OP_WRITE_ZEROS,
-                    STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
+        use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_READ_BLOCKS, OP_WRITE_BLOCK, OP_WRITE_BLOCKS,
+                    OP_WRITE_ZEROS, READ_RUN_MAX, STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
         let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
         if p.is_empty() {
             err(ctx);
@@ -730,6 +742,32 @@ impl<'a> Ahci<'a> {
                         reply.send(ctx, &out);
                     }
                     Err(_) => err(ctx),
+                }
+            }
+            OP_READ_BLOCKS => {
+                // [op, lba:u64, count:u8] -> [status, count x 512] - a run of consecutive blocks, one command.
+                let count = p.get(9).copied().unwrap_or(0) as usize;
+                if count == 0 || count > READ_RUN_MAX {
+                    err(ctx);
+                    return;
+                }
+                let mut out = [0u8; 1 + READ_RUN_MAX * 512];
+                // The cache model answers block by block, as `OP_READ_BLOCK` asks it.
+                #[cfg(feature = "volatile-cache-test")]
+                let ok = (0..count).all(|s| {
+                    let mut sec = [0u8; 512];
+                    let at = lba + s as u64;
+                    let got = self.cache_read(at, &mut sec) || self.read_block(ctx, at, &mut sec).is_ok();
+                    if got { out[1 + s * 512..1 + (s + 1) * 512].copy_from_slice(&sec); }
+                    got
+                });
+                #[cfg(not(feature = "volatile-cache-test"))]
+                let ok = self.read_blocks(ctx, lba, &mut out[1..1 + count * 512], count).is_ok();
+                if ok {
+                    out[0] = STATUS_OK;
+                    reply.send(ctx, &out[..1 + count * 512]);
+                } else {
+                    err(ctx);
                 }
             }
             OP_WRITE_BLOCK => {
