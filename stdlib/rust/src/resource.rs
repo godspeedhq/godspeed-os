@@ -116,6 +116,7 @@ pub(crate) fn invoke(
             | IpcError::CapError(CapError::EndpointDead)
             | IpcError::EndpointDead
             | IpcError::ReplyDead => Error::Revoked,
+            IpcError::Unknown(_) => Error::Failed,
             _ => Error::Unreachable,
         });
     }

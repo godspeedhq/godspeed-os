@@ -121,6 +121,9 @@ fn from_ipc(e: IpcError) -> Error {
         IpcError::CapError(CapError::CapInsufficientRights)
         | IpcError::CapError(CapError::CapNotGrantable)
         | IpcError::CapError(CapError::CapWrongScope) => Error::PermissionDenied,
+        // A code the SDK does not know is a kernel/SDK disagreement, not a peer that went away:
+        // reacquiring the name and sending again would only repeat it.
+        IpcError::Unknown(_) => Error::Failed,
         _ => Error::Unreachable,
     }
 }

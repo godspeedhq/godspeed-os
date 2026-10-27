@@ -2032,7 +2032,7 @@ fn mode_adv_a5(ctx: &ServiceContext) -> ! {
     match gs::ipc::exact::try_send(ctx, "adv-a5-victim", &msg) {
         Err(IpcError::EndpointDead) => ctx.log("adv: A5 pass - EndpointDead after kill"),
         Ok(())  => ctx.log("adv: A5 FAIL - send succeeded after victim killed"),
-        Err(_)  => ctx.log("adv: A5 FAIL - unexpected error after kill"),
+        Err(e)  => ctx.log_fmt(format_args!("adv: A5 FAIL - unexpected error after kill: {:?}", e)),
     }
     idle(ctx)
 }

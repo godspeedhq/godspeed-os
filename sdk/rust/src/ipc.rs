@@ -47,6 +47,11 @@ pub enum IpcError {
     /// for a failed send.
     ReplyDead,
     CapError(crate::capability::CapError),
+    /// A code the kernel returned that this SDK does not define. It means the two disagree - a bug -
+    /// and it is carried as itself, never folded into a code it is not: this decoder used to answer
+    /// `EndpointDead` for anything it did not know, so a mismatch arrived as "the peer died" and was
+    /// retried by reacquiring the name (backlog/90, found by the P10 probe 2026-10-27).
+    Unknown(i64),
 }
 
 // ---------------------------------------------------------------------------
@@ -325,16 +330,23 @@ pub fn call_deadline_into(
 // Error conversion.
 // ---------------------------------------------------------------------------
 
+/// Every code the kernel's `ipc_err_to_i64` / `cap_err_to_i64` (`syscall/dispatch.rs`) can return, as
+/// ITSELF. -5 and -6 had no arm and, with every unknown code, came out as `EndpointDead`: a revoked file
+/// capability and a capability of the wrong kind both read as "the endpoint died", which CLAUDE.md 7.7
+/// keeps apart on purpose and 2.4 forbids as a silent fallback.
 pub(crate) fn i64_to_ipc_error(code: i64) -> IpcError {
+    use crate::capability::CapError;
     match code {
-        -2  => IpcError::CapError(crate::capability::CapError::CapNotHeld),
-        -3  => IpcError::CapError(crate::capability::CapError::CapInsufficientRights),
-        -4  => IpcError::CapError(crate::capability::CapError::CapNotGrantable),
+        -2  => IpcError::CapError(CapError::CapNotHeld),
+        -3  => IpcError::CapError(CapError::CapInsufficientRights),
+        -4  => IpcError::CapError(CapError::CapNotGrantable),
+        -5  => IpcError::CapError(CapError::CapWrongScope),
+        -6  => IpcError::CapError(CapError::CapRevoked),
         -7  => IpcError::EndpointDead,
         -8  => IpcError::QueueFull,
         -9  => IpcError::QueueFull, // QueueEmpty on caller side == retry
         -10 => IpcError::MessageTooLarge,
         -12 => IpcError::ReplyDead,
-        _   => IpcError::EndpointDead,
+        other => IpcError::Unknown(other),
     }
 }
