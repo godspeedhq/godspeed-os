@@ -200,6 +200,33 @@ catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere
 | D28 | low | serial output under hot locks; panic path not re-entrant; `nomem` interrupt-mask asm | `ipc/routing.rs:776-779` |
 | D29 | low | KNOWN A5-10: the loader never bounds `p_vaddr`; on x86 that reaches the shared kernel half | `loader.rs:262-332` |
 
+### Proposed fix for D1, for the operator (2026-10-27; a kernel change, so not made)
+
+`tests/host-ipc` reproduces D1 three ways (`t1a`, `t1b`, `t1c`). The cause is shape, not a slip: each
+`RoutingEntry` has ONE `blocked_sender` and ONE `pending_send: Option<Message>`, so a second sender to a
+full queue overwrites the first, whose message and any carried cap are destroyed and who is never
+woken. Giving each endpoint a queue of pending MESSAGES would fix it at up to 4 KiB a waiter, which across
+96 endpoints is megabytes of kernel memory for a rare case.
+
+The proposal keeps the message where it already is, on the sender's kernel stack in `handle_send`:
+
+- `RoutingEntry` drops `blocked_sender` and `pending_send` for a FIFO of waiting TASK SLOTS, bounded by
+  `MAX_TASKS` (a task blocks in at most one send), about 224 bytes an endpoint, 21 KiB in all - and frees
+  the 4 KiB `pending_send` each entry carries today.
+- On a full queue, `enqueue` appends the caller's slot and returns `QueueFull`, as now. `handle_send`
+  becomes a loop: block; on a wake of 0, RETRY its own enqueue; on `EndpointDead`, return it. A dequeue
+  that frees a slot wakes the head of the FIFO, which retries; `kill_endpoint` wakes them all with
+  `EndpointDead`.
+- `enqueue_from_kernel_blocking` (the console writers, `t1c`) takes the same path.
+
+What it costs and what it leaves, said plainly: a woken sender can lose its retry to a non-blocking sender
+and queue again, so FIFO order is per blocking sender, not absolute - a starvation bound rather than the
+loss there is today. A dying task must leave every FIFO it is in (D3 is the same question for today's one
+slot). D2 (a stale receiver registration) and D4 (CallDeadline's send leg) touch the same records and are
+best done in the same pass. It changes `routing.rs` and `dispatch.rs` but not the task-switch path, so it
+does not wait on `backlog/49`. The proof it works is `t1a`/`t1b`/`t1c` passing with their `#[ignore]`
+removed, then `osdev test identity`, `adv` and the chaos suites, then one card per board.
+
 ## Enforcement-layer defects (scripts and tests; the audit's section 11)
 
 | Id | Defect |

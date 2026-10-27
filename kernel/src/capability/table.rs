@@ -414,4 +414,105 @@ mod tests {
             }
         }
     }
+
+    // --- The GLOBAL path: what a syscall really calls (backlog/90 E5) --------------------------
+    //
+    // Everything above builds a LOCAL GlobalResourceTable, so `CapTable::get`, `holds_resource`,
+    // `mint_cap` and the revoke and death paths - the ones every syscall goes through - were run by no
+    // host test, and the 2026-10-27 mutation run showed it: deleting get's rights check, making
+    // holds_resource return true, and turning revoke_resource into a no-op all survived. These use the
+    // real GLOBAL_RESOURCES. Tests run on parallel threads in one process, so each owns its ids.
+
+    use super::{cap_read_rights, get_resource_generation, mark_dead_resource, mint_cap,
+                register_resource, register_resource_at_gen, revoke_resource, bump_resource_generation};
+    use crate::capability::cap::CapError;
+
+    #[test]
+    fn get_refuses_a_right_the_cap_does_not_hold() {
+        register_resource(ResourceId(5001));
+        let mut ct = CapTable::empty();
+        let slot = ct.insert(mint_cap(ResourceId(5001), Rights::READ)).unwrap();
+        assert_eq!(ct.get(slot, Rights::READ).map(|c| c.resource_id), Ok(ResourceId(5001)));
+        assert_eq!(ct.get(slot, Rights::WRITE).unwrap_err(), CapError::CapInsufficientRights);
+        assert_eq!(ct.get(slot + 1, Rights::READ).unwrap_err(), CapError::CapNotHeld);
+    }
+
+    #[test]
+    fn get_after_a_revoke_is_cap_revoked() {
+        register_resource(ResourceId(5002));
+        let mut ct = CapTable::empty();
+        let slot = ct.insert(mint_cap(ResourceId(5002), Rights::SEND)).unwrap();
+        revoke_resource(ResourceId(5002));
+        assert_eq!(ct.get(slot, Rights::SEND).unwrap_err(), CapError::CapRevoked);
+    }
+
+    #[test]
+    fn get_after_a_death_is_endpoint_dead() {
+        for id in [5003u64, 5004] {
+            register_resource(ResourceId(id));
+            let mut ct = CapTable::empty();
+            let slot = ct.insert(mint_cap(ResourceId(id), Rights::SEND)).unwrap();
+            if id == 5003 { mark_dead_resource(ResourceId(id)) } else { bump_resource_generation(ResourceId(id)) }
+            assert_eq!(ct.get(slot, Rights::SEND).unwrap_err(), CapError::EndpointDead);
+            // A cap minted AFTER the death carries the new generation, and is valid again.
+            let fresh = ct.insert(mint_cap(ResourceId(id), Rights::SEND)).unwrap();
+            assert!(ct.get(fresh, Rights::SEND).is_ok());
+        }
+    }
+
+    #[test]
+    fn get_of_an_unregistered_resource_is_not_held() {
+        let mut ct = CapTable::empty();
+        let slot = ct.insert(make_cap(5005, Rights::READ.0, 0)).unwrap();
+        assert_eq!(ct.get(slot, Rights::READ).unwrap_err(), CapError::CapNotHeld);
+    }
+
+    #[test]
+    fn a_resource_registered_at_a_generation_mints_at_it() {
+        register_resource_at_gen(ResourceId(5006), Generation(9));
+        assert_eq!(get_resource_generation(ResourceId(5006)).map(|g| g.0), Some(9));
+        assert_eq!(mint_cap(ResourceId(5006), Rights::READ).generation.0, 9);
+        assert!(get_resource_generation(ResourceId(5007)).is_none());
+    }
+
+    // The by-holdings gate of Kill, Reboot, PowerOff and the introspection reads.
+    #[test]
+    fn holds_resource_needs_the_resource_and_the_right() {
+        let mut ct = CapTable::empty();
+        ct.insert(make_cap(7, Rights::READ.0, 0)).unwrap();
+        assert!(ct.holds_resource(ResourceId(7), Rights::READ));
+        assert!(!ct.holds_resource(ResourceId(7), Rights::WRITE), "the right is part of the gate");
+        assert!(!ct.holds_resource(ResourceId(8), Rights::READ), "so is the resource");
+        assert!(!CapTable::empty().holds_resource(ResourceId(7), Rights::READ));
+    }
+
+    #[test]
+    fn cap_read_rights_and_for_each_slot_see_what_is_held() {
+        let mut ct = CapTable::empty();
+        let a = ct.insert(make_cap(11, Rights::SEND.0, 0)).unwrap();
+        ct.insert(make_cap(12, Rights::RECV.0, 0)).unwrap();
+        assert_eq!(cap_read_rights(&ct, a), Some(Rights::SEND));
+        assert_eq!(cap_read_rights(&ct, MAX_CAPS_PER_TASK - 1), None);
+        let mut seen = Vec::new();
+        ct.for_each_slot(|c| seen.push(c.resource_id.0));
+        assert_eq!(seen, vec![11, 12]);
+    }
+
+    // Ids at and past DIRECT_CAP live in the overflow list: the boundary, two of them, and a bump.
+    #[test]
+    fn the_overflow_list_holds_ids_past_the_direct_array() {
+        let mut t = Box::new(GlobalResourceTable::new());
+        let (a, b) = (DIRECT_CAP as u64, DIRECT_CAP as u64 + 7);
+        t.register(ResourceId(a));
+        t.register(ResourceId(b));
+        assert!(t.get_record(ResourceId(a)).is_some());
+        assert!(t.get_record(ResourceId(b)).is_some());
+        assert!(t.get_record(ResourceId(a + 1)).is_none());
+        t.bump_generation(ResourceId(b), Liveness::Revoked);
+        assert_eq!(t.get_record(ResourceId(b)).unwrap().generation.0, 1);
+        assert_eq!(t.get_record(ResourceId(b)).unwrap().liveness, Liveness::Revoked);
+        assert_eq!(t.get_record(ResourceId(a)).unwrap().generation.0, 0, "a bump touches one record");
+        t.bump_generation(ResourceId(DIRECT_CAP as u64 - 1), Liveness::Dead);
+        assert!(t.get_record(ResourceId(DIRECT_CAP as u64 - 1)).is_none(), "an unregistered id is not created");
+    }
 }
