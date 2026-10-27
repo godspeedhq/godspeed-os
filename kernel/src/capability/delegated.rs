@@ -109,6 +109,24 @@ fn id_of(slot: usize) -> ResourceId {
     ResourceId(DELEGATED_BASE + slot as u64)
 }
 
+/// SEC-7: narrow an embedded cap for its RECEIVER before installing it. A DELEGATED-resource cap
+/// (a file/socket, §7.10) is installed WITHOUT GRANT - the owning service (e.g. fs) mints it with
+/// GRANT only so it can transfer it (§8.5 rule 1: an embedded cap must be grantable), but the
+/// recipient only USES it (invokes); it must not re-delegate it - the owner controls delegation by
+/// minting fresh caps. Endpoint caps are returned unchanged: re-delegating an endpoint (e.g. the
+/// shell wiring a pipe stage, or a reply cap) is a legitimate part of the IPC model, so GRANT is
+/// preserved for those. This is the default "narrow to need" §8.5 wants, enforced at the boundary.
+///
+/// Lives here rather than in `syscall/dispatch.rs`, its one caller, so the host tests can reach it
+/// (backlog/90 E5: nothing at any level checked that SEC-7 removes GRANT).
+pub fn narrow_embedded_for_receiver(cap: super::cap::Capability) -> super::cap::Capability {
+    if is_delegated(cap.resource_id) {
+        cap.without_grant()
+    } else {
+        cap
+    }
+}
+
 /// Allocate a fresh delegated resource owned by `owner`, register it in the global table,
 /// and return its `ResourceId`. `None` if the band is full (loud failure at the caller).
 /// Generation is monotonic across reuse (ABA-safe, see module docs).
@@ -269,6 +287,26 @@ mod tests {
     fn slot_id_roundtrip() {
         for slot in [0usize, 1, 1000, DELEGATED_CAP - 1] {
             assert_eq!(slot_of(id_of(slot)), slot);
+        }
+    }
+
+    /// SEC-7: a delegated cap reaches its receiver without GRANT, and with every other right it had.
+    /// An endpoint cap reaches it unchanged, GRANT included. The band's two edges are both stripped.
+    #[test]
+    fn sec7_strips_grant_from_a_delegated_cap_and_only_from_one() {
+        use super::super::cap::Capability;
+        use super::super::generation::Generation;
+        use super::super::rights::Rights;
+        let rw_grant = Rights::READ | Rights::WRITE | Rights::GRANT;
+        let cap = |id| Capability { resource_id: ResourceId(id), rights: rw_grant, generation: Generation(3) };
+        let last = DELEGATED_BASE + DELEGATED_CAP as u64 - 1;
+        for id in [DELEGATED_BASE, DELEGATED_BASE + 17, last] {
+            let n = narrow_embedded_for_receiver(cap(id));
+            assert_eq!(n.rights.0, (Rights::READ | Rights::WRITE).0, "id {id}");
+            assert_eq!((n.resource_id, n.generation.0), (ResourceId(id), 3));
+        }
+        for id in [100, DELEGATED_BASE - 1, last + 1] {
+            assert!(narrow_embedded_for_receiver(cap(id)) == cap(id), "id {id} is an endpoint, kept whole");
         }
     }
 

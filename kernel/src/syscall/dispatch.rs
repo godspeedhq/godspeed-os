@@ -387,21 +387,6 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     }
 }
 
-/// SEC-7: narrow an embedded cap for its RECEIVER before installing it. A DELEGATED-resource cap
-/// (a file/socket, §7.10) is installed WITHOUT GRANT - the owning service (e.g. fs) mints it with
-/// GRANT only so it can transfer it (§8.5 rule 1: an embedded cap must be grantable), but the
-/// recipient only USES it (invokes); it must not re-delegate it - the owner controls delegation by
-/// minting fresh caps. Endpoint caps are returned unchanged: re-delegating an endpoint (e.g. the
-/// shell wiring a pipe stage, or a reply cap) is a legitimate part of the IPC model, so GRANT is
-/// preserved for those. This is the default "narrow to need" §8.5 wants, enforced at the boundary.
-fn narrow_embedded_for_receiver(cap: crate::capability::cap::Capability) -> crate::capability::cap::Capability {
-    if crate::capability::delegated::is_delegated(cap.resource_id) {
-        cap.without_grant()
-    } else {
-        cap
-    }
-}
-
 /// Install the capabilities a received message carries into the receiver's table, and queue each
 /// slot for `TakePendingCap` - every receive path's one way of doing it.
 ///
@@ -415,7 +400,7 @@ fn install_received_caps(msg: &Message) {
     for i in 0..n_caps {
         if let Some(embedded_cap) = msg.caps[i] {
             let who = scheduler::task_name(scheduler::current_task_slot());
-            match scheduler::current_task_insert_cap(narrow_embedded_for_receiver(embedded_cap)) {
+            match scheduler::current_task_insert_cap(crate::capability::delegated::narrow_embedded_for_receiver(embedded_cap)) {
                 Ok(new_slot) => {
                     if !scheduler::push_pending_recv_cap(new_slot as u32) {
                         scheduler::current_task_remove_cap(new_slot);
