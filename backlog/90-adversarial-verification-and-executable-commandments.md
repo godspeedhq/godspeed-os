@@ -322,6 +322,24 @@ kernel service, never a runtime dependency, nothing added to an image to check i
     files the kernel compiles (`capability/*.rs`, and `routing.rs` and `endpoint.rs`, which E4 found host-compile
     with one constant stubbed), through the `kernel/src/lib.rs` seam C2 already needs - so that the kernel's target
     build is the same code is an assumption every result states.
+  - **Kani landed, 2026-10-27: `tests/kani`, 15 harnesses, all PROVED WITHIN STATED BOUNDS** over the real
+    `capability/{cap,generation,rights,table}.rs` and `smp/spinlock.rs`, run in `.github/workflows/verify.yml`
+    (Kani 0.68.0 pinned, `ubuntu-24.04`, on a pull request touching those files). Rights narrowing, `without`,
+    `contains` as a partial order, the empty right, union; `validate` exact; a narrowed or GRANT-stripped cap
+    keeps its identity; a generation bump strictly increases and never wraps; a slot round-trips; an empty slot
+    is `CapNotHeld`; and lazy invalidation - after a revoke or a death the SAME held cap is `CapRevoked` or
+    `EndpointDead` for any rights and right asked. **Bounds, stated:** the revocation proof runs at three
+    CONCRETE ids (100, 4096, 8191), one harness each, because a symbolic index into the 8192-entry
+    `GLOBAL_RESOURCES` took CBMC past 15 GB even when limited to three values; concrete, each takes seconds in
+    about 50 MB. A full `CapTable` is not proved (64 concrete inserts left nothing symbolic and CBMC ran 25
+    minutes); the host proptest covers it. **Shown not vacuous:** with CapRevoked and EndpointDead swapped in
+    the expectation, the revocation proof FAILED on that assertion. Not yet a required merge check: that is a
+    branch-protection setting, the operator's.
+  - **Creusot installed and calibrated, 2026-10-27, no proof of kernel code yet.** Creusot 0.15.0-dev with
+    Alt-Ergo 2.6.4, Z3 5.1.0, CVC4 1.8, CVC5 1.4.1, on Ubuntu 24.04 (its Z3 needs glibc 2.39, so 22.04 cannot
+    run it). A true bit-level spec and a true integer spec proved, and a deliberately false one failed. A bound
+    from a bit operation to an integer (`(a & b)@ <= a@`) is NOT proved unaided, which matters for
+    `Rights::without`: its contract is best written on the `u8`, not on its integer value.
 - **D. Runtime chaos with invariant assertions.** The section 22 suites (property, fuzz, stress, adversarial, chaos) and
   `chaos max-carnage`. What changes: each run checks EXPLICIT invariants, not that the machine stayed up. **A
   surviving kernel is not necessarily a correct kernel.** Termination and recreation, IPC floods, memory

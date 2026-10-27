@@ -1,0 +1,60 @@
+name: verify
+
+# backlog/90 layer C: bounded model checking of the kernel's capability code, in a job anyone can rerun
+# rather than on one workstation. The tool is pinned to an exact version, so a proof result is
+# attributable to the commit and the checker that produced it, the same argument rust-toolchain.toml
+# makes for the compiler.
+#
+# Runs only where it can say something: on a pull request that touches the files it includes, and by
+# hand. The other test workflows are paused to conserve CI minutes; this one is scoped instead.
+on:
+  pull_request:
+    paths:
+      - 'kernel/src/capability/**'
+      - 'kernel/src/smp/spinlock.rs'
+      - 'tests/kani/**'
+      - '.github/workflows/verify.yml'
+  workflow_dispatch:
+
+jobs:
+  kani:
+    name: Kani (tests/kani)
+    # 24.04, the same image the local runs use (WSL Ubuntu-24.04), so a local proof and a CI proof
+    # run on one glibc and one compiler.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      KANI_VERSION: 0.68.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache the Kani install
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ runner.os }}-${{ env.KANI_VERSION }}
+
+      - name: Install Kani ${{ env.KANI_VERSION }}
+        run: |
+          if ! cargo kani --version 2>/dev/null | grep -q "$KANI_VERSION"; then
+            cargo install --locked kani-verifier --version "$KANI_VERSION"
+            cargo kani setup
+          fi
+          cargo kani --version
+
+      - name: Prove every harness
+        working-directory: tests/kani
+        # `shell: bash` is what turns on pipefail, so a failed proof fails the job rather than `tee`
+        # passing it.
+        shell: bash
+        run: cargo kani 2>&1 | tee kani-report.txt
+
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kani-report-${{ github.sha }}
+          path: tests/kani/kani-report.txt

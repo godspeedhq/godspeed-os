@@ -1,0 +1,18 @@
+# Bounded model checking of the REAL kernel capability code with Kani (backlog/90, layer C).
+#
+# Not a workspace member, and its own workspace root: it is built only by `cargo kani`, which needs a
+# Linux host (the CI job, or WSL on Windows - tests/kani/README.md). It includes the kernel's own files
+# by `#[path]`, exactly as they are, so a harness checks the code that ships, not a copy of it.
+[package]
+name = "kernel-kani"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
