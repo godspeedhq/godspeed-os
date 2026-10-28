@@ -1018,6 +1018,10 @@ pub enum AllocError {
 // test suite (identity and fs-restart are all cross-core), so a change here cannot be validated by
 // those suites. If blocking is attempted again, it needs a same-core request/reply test first.
 
+/// Whether this service has said that its clock is uncalibrated (`duration_cycles`, backlog/27). One flag in
+/// each service's own address space, set once; it decides only whether a line is printed.
+static UNCALIBRATED_SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Passed by the kernel to `service_main`. Non-Copy; one per service instance.
 pub struct ServiceContext {
     _private: (),
@@ -3513,9 +3517,20 @@ impl ServiceContext {
     /// zero here would convert a bounded wait into an unbounded one - a hang produced by a unit
     /// conversion. An uncalibrated machine (query 16 reads 0) also lands on the floor, which is exactly
     /// the one-quantum behaviour those platforms had before any of this existed.
+    ///
+    /// **And the floor is said, once per service** (backlog/27). Every timed wait in a service is built on
+    /// this, so a 0 from query 16 turns every one of them - a 3 s deadline, a 1 s pace - into a single
+    /// tick, and what fails afterwards reports some other cause. The value returned is unchanged; the
+    /// line is what makes a degraded clock visible where it happens (invariant 12). No shipping board
+    /// answers 0: a scaffold port does, and an aarch64 build without its board feature.
     pub fn duration_cycles(&self, ms: u64) -> u64 {
         let per_10ms = self.tsc_ticks_per_10ms();
-        if per_10ms == 0 { return 1; }              // uncalibrated: floor to one quantum
+        if per_10ms == 0 {                          // uncalibrated: floor to one quantum
+            if !UNCALIBRATED_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                self.log("sdk: the kernel reports no calibrated clock (query 16 is 0) - every timed wait in this service is ONE tick, not the time it asks for");
+            }
+            return 1;
+        }
         let c = per_10ms.saturating_mul(ms) / 10;
         if c == 0 { 1 } else { c }
     }
