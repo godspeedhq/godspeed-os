@@ -90,7 +90,7 @@ fn serve(sectors: u64, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
         // The one backend that genuinely needs this: a stick acknowledges a WRITE(10) into its own
         // buffer, so without SYNCHRONIZE CACHE a reset loses the tail of everything just written.
         // Unreachable is said as itself: `fs` must not read "the device refused" into a flush that
-        // reached no device (`backlog/57`).
+        // reached no device (`backlog/fixed/57`).
         let status = match dev_flush(ctx) {
             super::xhciblk::Flush::Durable => STATUS_OK,
             super::xhciblk::Flush::Refused => STATUS_ERR,

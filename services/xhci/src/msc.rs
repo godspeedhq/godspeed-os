@@ -1050,13 +1050,13 @@ pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device. Distinct from `STATUS_ERR`, which
 /// is a DEVICE that answered and failed: a flush refused by a stick is evidence about the stick
-/// (CLAUDE.md 6.1), and a flush with no stick bound is evidence about nothing (`backlog/57`).
+/// (CLAUDE.md 6.1), and a flush with no stick bound is evidence about nothing (`backlog/fixed/57`).
 pub const STATUS_NO_DISK: u8 = 2;
 
 /// Build the reply for one block-IPC request, into `out`, returning how many bytes of it are valid.
 ///
 /// Returns an error status rather than nothing whenever the request cannot be honoured: `STATUS_ERR`
-/// for a malformed request or a device that failed, `STATUS_NO_DISK` when no disk is bound (`backlog/57`
+/// for a malformed request or a device that failed, `STATUS_NO_DISK` when no disk is bound (`backlog/fixed/57`
 /// - a refusal by a device and the absence of one are different facts). A caller blocked awaiting a reply must always
 /// get one; silently dropping the request would hang `fs` on a disk that merely returned an error
 /// (§26.7 - a failure has to be visible, and an answer that never comes is the least visible kind).

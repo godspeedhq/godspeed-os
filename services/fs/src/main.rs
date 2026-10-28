@@ -245,7 +245,7 @@ const READ_RUN_MAX: usize = 7;
 const BLK_OK: u8 = 0;
 const BLK_ERR: u8 = 1;        // the driver's STATUS_ERR - it answered, and said the operation failed
 const BLK_UNREACHABLE: u8 = 2; // on a flush: the driver answered, but reached no device (its USB host was
-                               // silent or had no disk bound) - `backlog/57`
+                               // silent or had no disk bound) - `backlog/fixed/57`
 
 // fs file API (client <-> fs). `[op, path_len, path, (WriteFile: data | Rename/Move: tail)]`.
 const OP_WRITE_FILE: u8 = 10;
@@ -2500,7 +2500,7 @@ impl Fs {
                 // only one that is evidence about the drive.
                 FlushOutcome::Refused => ctx.log("fs: durability NOT attested - this drive ANSWERED and refused the cache flush, so journal write ordering is unenforced and a power loss may leave metadata torn. Metadata stays CRC-checked, so damage is detected on read; what is missing is automatic repair. See CLAUDE.md 6.1 (2026-07-25)."),
                 // THE DRIVER ANSWERED AND REACHED NO DEVICE. Six chaos sightings of the line above were
-                // this, every one with an unreachable `xhci` just before it (`backlog/57`).
+                // this, every one with an unreachable `xhci` just before it (`backlog/fixed/57`).
                 FlushOutcome::Unreachable => ctx.log("fs: durability NOT attested - the block driver could not reach the drive (its USB host was restarting, or had no disk bound). The barrier did not happen for this transaction; this says NOTHING about whether the drive supports a cache flush."),
                 // NOBODY ANSWERED. The barrier did not happen, so the same risk applies to THIS
                 // transaction - but it says nothing about the device, and must not be read as though

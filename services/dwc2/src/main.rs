@@ -153,7 +153,7 @@ fn notify(ctx: &ServiceContext, args: ::core::fmt::Arguments) {
 
 /// Answer a request `dispatch` could not route (an empty payload) with `STATUS_ERR`, instead of consuming
 /// the message and going quiet. A BLOCK request with no disk no longer comes here: `dispatch` answers it
-/// `STATUS_NO_DISK` (`backlog/57`). The history below is why this exists at all.
+/// `STATUS_NO_DISK` (`backlog/fixed/57`). The history below is why this exists at all.
 ///
 /// `recv_timeout` CONSUMES. The two call sites below used to take a message and then drop it whenever
 /// `disk` was None, so a client blocked in request/reply waited forever for an answer that was never
@@ -189,7 +189,7 @@ fn answer_no_disk(ctx: &ServiceContext, capless: &mut bool) {
 /// with an absent device, a radio op `ST_NO_DEVICE` (an `OP_SYNC` only gives its capability back, as
 /// `rtl::serve` does), a net op the empty `[0]`, and a block op `STATUS_NO_DISK` - no disk can be bound to
 /// a host with no hardware, and a flush answered `STATUS_ERR` would read as the drive refusing it
-/// (`backlog/57`).
+/// (`backlog/fixed/57`).
 fn answer_ungranted(ctx: &ServiceContext, msg: &godspeed_sdk::Message, capless: &mut bool) {
     let p = msg.payload_bytes();
     let Some(&op) = p.first() else { return };
@@ -267,7 +267,7 @@ fn dispatch(
     }
     match disk {
         Some((dk, dt, sectors)) => msc::serve(ctx, m, d, dt, dk, msg, *sectors, reply, capless),
-        // A BLOCK request with no disk bound: one byte, `STATUS_NO_DISK` (`backlog/57`), on the cap this
+        // A BLOCK request with no disk bound: one byte, `STATUS_NO_DISK` (`backlog/fixed/57`), on the cap this
         // function already took - not `answer_no_disk`'s `STATUS_ERR`, so a flush here reads as "no
         // device reached" rather than as a stick refusing it. Only block requests reach here now - before, a diskless dwc2 answered
         // EVERY request this way, net and radio included, because the no-disk paths never routed by
@@ -736,7 +736,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     // after `take` meant answering a request it had already CONSUMED - first by
                     // dropping it (its owner waited forever), then with `answer_no_disk`'s
                     // `STATUS_ERR`, which on a flush reads to `fs` as the DRIVE refusing the barrier
-                    // while a disk was bound and no device had been asked (`backlog/57`). Declining to
+                    // while a disk was bound and no device had been asked (`backlog/fixed/57`). Declining to
                     // take leaves the request queued for the next pass, which is true.
                     if drained >= MSG_DRAIN_MAX {
                         ctx.log("dwc2-svc: block drain hit its bound - a sender is enqueuing as fast as we retire");

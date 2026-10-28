@@ -1,6 +1,10 @@
 # 57 - `fs` reports "the drive REFUSED the flush" when the drive was never reached
 
-**Status:** OPEN - fix (1) BUILT 2026-10-11 on `feat/ask`; step (2), the chaos re-run that shows it, needs
+**Status:** CLOSED 2026-10-28 (operator) - the false verdict did not come back in two Pi 4 storms on
+`8c102286`, and the corrected line is shown to be one a storm on this stack does not reach (both in "Closed
+2026-10-28" at the end). It found a fault in `churn`, fixed with it.
+
+**Previous status:** OPEN - fix (1) BUILT 2026-10-11 on `feat/ask`; step (2), the chaos re-run that shows it, needs
 the Pi 4 or the VisionFive (see the last section). An instrument defect that produced false evidence for a
 CONSTITUTIONAL claim (CLAUDE.md 6.1), which is why it is filed rather than noted.
 **Found:** 2026-09-26, during the `feat/stdlib-complete` five-board pass, by following up a warning
@@ -163,3 +167,34 @@ The six sightings were `xhci` under `max-carnage` on the Pi 4 and the VisionFive
 **Step (2) is therefore still open:** re-run `chaos max-carnage` on the Pi 4 or the VisionFive with this
 build. Every durability line should now read "could not reach the drive" where the six read "refused".
 A `Refused` that survives is real, and is the evidence 6.1 asks for.
+
+## Closed 2026-10-28: step (2) run twice on the Pi 4, and what it could and could not show
+
+**Run 1, `chaos max-carnage 50`** (`8c102286`): 50 rounds, 381 kills, 38 services died and came back,
+`block-driver` reported its USB host silent three times. **No durability line of either kind**: `fs` was not
+at a barrier when `xhci` was away.
+
+**Run 2, `background churn 120` then `chaos kill-storm xhci 10` and `100`**: all 110 recovered, writes in
+flight throughout. Still no durability line. Every outage reached `fs` as a failed block WRITE or READ
+first - `fs: block write failed at lba 7635 (device I/O error)`, then a re-mount, `degrading`, and later
+`storage recovered - re-mounted GSFS0008` - so no transaction got as far as its flush. That is the Pi 2's
+behaviour recorded above, now seen on the Pi 4 as well.
+
+**So:** the defect - "the drive REFUSED the flush" printed when no drive was asked - did not recur in 160
+storm rounds on the board where all six sightings were. The corrected line ("could not reach the drive")
+was never seen, and the run says why: on this stack an unreachable host fails the I/O before the barrier.
+It stays in the code for the case where one does not, and a `Refused` that appears from now on is real.
+
+## What the second run found instead: `churn` stopped renaming after an outage (fixed)
+
+`churn` renames `fN.bin` to `fN.ren` and deletes `fN.ren`, every fifth iteration. During the storm some
+renames landed and their deletes did not, which stranded `.ren` files; every later rename onto one was
+refused. After storage came back (10:40:14) all 58 renames failed until the run ended (10:41:34): the run
+went on as writes only while its line still said write, rename and delete. A test tool's defect, not
+`fs`'s - the refusal was correct.
+
+**Fixed 2026-10-28** in both churns, the background one in `copier` and the foreground one in the shell:
+when the rename fails and deleting `fN.ren` succeeds, there was a leftover, so it is counted and the
+rename runs again. Each says so (`copier: churn removed a .ren an interrupted rename left behind`, and a
+line in each run's report). `selfcheck` plants `f4.ren` where the first rename lands and checks it is
+gone after `churn 2` (`scripts/selfcheck/60-data.gsh`).

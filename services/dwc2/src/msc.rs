@@ -560,7 +560,7 @@ const _: () = assert!(WRITE_RUN_MAX * 512 <= GATHER_BYTES);
 pub const STATUS_OK: u8 = 0;
 pub const STATUS_ERR: u8 = 1;
 /// No mass-storage device is bound, so the request reached no device - the same value and meaning as
-/// `xhci`'s (`backlog/57`): a refusal by a device and the absence of one are different facts.
+/// `xhci`'s (`backlog/fixed/57`): a refusal by a device and the absence of one are different facts.
 pub const STATUS_NO_DISK: u8 = 2;
 
 /// WRITE(10): `count` consecutive blocks from the start of the arena's data buffer, ONE BLOCK PER COMMAND.

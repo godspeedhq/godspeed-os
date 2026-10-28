@@ -202,6 +202,8 @@ struct Job {
     writes: u64,
     renames: u64,
     deletes: u64,
+    /// `.ren` files an interrupted rename-then-delete left behind, removed so the rename can run.
+    cleared: u64,
     src: [u8; PATH_MAX],
     slen: usize,
     dst: [u8; PATH_MAX],
@@ -224,6 +226,7 @@ impl Job {
             writes: 0,
             renames: 0,
             deletes: 0,
+            cleared: 0,
             src: [0u8; PATH_MAX],
             slen: 0,
             dst: [0u8; PATH_MAX],
@@ -542,7 +545,20 @@ fn churn_step(ctx: &ServiceContext, fs: &mut gs::fs::Fs, job: &mut Job) {
         // OP_RENAME takes the NEW NAME, not a path: the slice starts after the final `/`, or every
         // rename is refused for containing a slash and the run silently becomes writes-only.
         let name_at = DIR.len() + 1;
-        if matches!(fs_rename(ctx, fs, &path[..pl], &np[name_at..pl]), Fs::Ok(_)) {
+        let mut renamed = matches!(fs_rename(ctx, fs, &path[..pl], &np[name_at..pl]), Fs::Ok(_));
+        // A rename that landed and a delete that did not (storage went away between them) leaves
+        // `fN.ren` behind, and every later rename onto it is refused: a churn that outlived an outage
+        // went on as writes only while its line still claimed three shapes (seen on the Pi 4,
+        // 2026-10-28, backlog/fixed/57). So when the rename fails and the delete of `fN.ren` succeeds,
+        // there WAS a leftover: count it, say so once, and rename again.
+        if !renamed && matches!(fs_delete(ctx, fs, &np[..pl]), Fs::Ok(_)) {
+            if job.cleared == 0 {
+                ctx.log("copier: churn removed a .ren an interrupted rename left behind, and renamed again");
+            }
+            job.cleared += 1;
+            renamed = matches!(fs_rename(ctx, fs, &path[..pl], &np[name_at..pl]), Fs::Ok(_));
+        }
+        if renamed {
             job.renames += 1;
             if matches!(fs_delete(ctx, fs, &np[..pl]), Fs::Ok(_)) {
                 job.deletes += 1;
@@ -564,8 +580,12 @@ fn render_churn(out: &mut [u8; 160], job: &Job) -> usize {
         }
     }
     let mut sink = Sink { buf: out, n: 0 };
-    let _ = write!(sink, "churn: {} writes, {} renames, {} deletes in {}s\n",
+    let _ = write!(sink, "churn: {} writes, {} renames, {} deletes in {}s",
                    job.writes, job.renames, job.deletes, job.total);
+    if job.cleared > 0 {
+        let _ = write!(sink, "; {} left over by an interrupted rename cleared", job.cleared);
+    }
+    let _ = write!(sink, "\n");
     sink.n
 }
 

@@ -22317,6 +22317,8 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     let mut buf = [0u8; 3000];
     let mut path = [0u8; 32];
     let (mut writes, mut renames, mut deletes, mut bytes, mut failures) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    // `.ren` files an interrupted rename-then-delete left behind, removed so the rename can run.
+    let mut cleared = 0u64;
     let start = gs::task::epoch_secs_monotonic(ctx);
     let mut last_beat = start;
     let mut i = 0u64;
@@ -22376,7 +22378,16 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
             // writes" would have hidden this indefinitely, which is the argument for a tool
             // reporting what it DID rather than that it ran.
             let name_at = DIR.len() + 1;
-            if gfs.rename(&path[..pl], &np[name_at..pl]).is_ok() {
+            let mut renamed = gfs.rename(&path[..pl], &np[name_at..pl]).is_ok();
+            // A rename that landed and a delete that did not leaves `fN.ren` behind, and every later
+            // rename onto it is refused, so the run goes on as writes only (backlog/fixed/57, the
+            // background churn's twin). When the rename fails and deleting `fN.ren` succeeds, there
+            // WAS a leftover: count it and rename again.
+            if !renamed && gfs.delete(&np[..pl]).is_ok() {
+                cleared += 1;
+                renamed = gfs.rename(&path[..pl], &np[name_at..pl]).is_ok();
+            }
+            if renamed {
                 renames += 1;
                 if gfs.delete(&np[..pl]).is_ok() {
                     deletes += 1;
@@ -22389,6 +22400,9 @@ fn cmd_churn(ctx: &ShellCtx, arg: &str, out: &mut Out) -> Result<(), ShellError>
     out.line_fmt(ctx, format_args!(
         "churn: done - {} writes, {} renames, {} deletes, {} bytes, {} refused",
         writes, renames, deletes, bytes, failures));
+    if cleared > 0 {
+        out.line_fmt(ctx, format_args!("churn: {} .ren left over by an interrupted rename removed, and renamed again", cleared));
+    }
     out.line(ctx, "churn: after a cut run `churn verify` (content) and `drives check` (structure) - both, they answer different questions");
     out.line(ctx, "churn: /system/scratch/churn is left in place (it is the evidence); `churn reset` removes it");
     ctx.fs_tag.set(gfs.tag());

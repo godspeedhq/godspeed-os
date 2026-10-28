@@ -117,6 +117,15 @@ if churn 4 {
         fail 'churn: a file was torn by an UNINTERRUPTED run - that is a write-path fault, not a power cut'
     }
     churn reset
+    # A `.ren` that an interrupted rename-then-delete left behind must not stop the renames: storage
+    # going away between the two used to strand one, and every later rename onto it was refused, so a
+    # churn that outlived an outage went on as writes only (backlog/fixed/57). Plant one where the
+    # first rename lands (iteration 4 renames slot 4) and see it cleared.
+    mkdir /system/scratch/churn
+    write /system/scratch/churn/f4.ren stale
+    churn 2
+    dir /system/scratch/churn | assert lacks f4.ren
+    churn reset
 } else {
     skip 'churn - no storage to churn on this machine; not a failure'
 }
