@@ -1,6 +1,6 @@
 # 85. The Pi 4's and VisionFive's PCIe `xhci` window is a fixed size, not its BAR
 
-**Status: OPEN, 2026-10-13.** Moved out of `backlog/fixed/80` (K1) when that entry was closed, because
+**Status: OPEN - FIX BUILT 2026-10-28 (`cee3dca0`), QEMU-verified on riscv64 `virt` (`xhci` 16384 bytes, e1000 131072, each the BAR), awaiting the Pi 4 and VisionFive cards.** The VisionFive's `xhci` turned out NOT to be PCIe: it is the JH7110's Cadence controller, sized from its device-tree `reg`. *Was:* OPEN, 2026-10-13. Moved out of `backlog/fixed/80` (K1) when that entry was closed, because
 it was the one part of K1 left open and was recorded only there.
 
 ## What is true

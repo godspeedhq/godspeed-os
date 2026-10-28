@@ -1,6 +1,6 @@
 # 59 - `SET_CLOCK` is granted and never checked, and net-stack blames the kernel for the `time` service
 
-**Status:** OPEN - two findings from one dead seam. The second (the log line) is GONE with the code that
+**Status:** OPEN - FIX BUILT 2026-10-28 (`0014777c`): the resource, both privilege bits, the grants and the seven arch stubs removed; QEMU x86 identity 24/0, adv 15/0, script 11/0; awaiting all five cards (a spawn-path change). *Was:* OPEN - two findings from one dead seam. The second (the log line) is GONE with the code that
 printed it: `net-stack` no longer handles the clock at all (2026-10-01, later, below). The first - the
 kernel half - is still open, though `net-stack` no longer holds the capability.
 **Found:** 2026-09-26, by following a stale comment: three comments named a `SetClock` syscall, and

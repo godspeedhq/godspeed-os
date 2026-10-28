@@ -1,5 +1,7 @@
 # 27. A wait bounded by a clock that may not exist, and the absence is handled by not waiting
 
+**Status: OPEN - option 1 BUILT 2026-10-28 (`1ea97c14`):** `duration_cycles` says once per service when the clock is uncalibrated, value unchanged; no shipping board reaches it, so the cards show only that nothing regressed. Option 2 stays the recorded route.
+
 **Severity:** correctness, latent. Nothing is known to be broken on the five machines; what is
 recorded is a shape that turns a three-second wait into no wait at all, silently, and then reports a
 different cause.

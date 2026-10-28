@@ -1,6 +1,6 @@
 # 76. The Pi 2's hardware RNG fails its first read after boot, and its output is now fed to crypto
 
-**Status: OPEN - found 2026-10-06 on the USB WiFi dongle's R5c card (`docs/wifi-usb.md` 13). A kernel change,
+**Status: OPEN - FIX BUILT 2026-10-28 (`470a9184`): the RNG starts at boot and the wait is bounded by time; awaiting the Pi 2 card (the first join after boot should no longer print the weaker-nonce line).** *Was:* OPEN - found 2026-10-06 on the USB WiFi dongle's R5c card (`docs/wifi-usb.md` 13). A kernel change,
 so not made without the operator's go-ahead and a QEMU boot first.**
 
 ## What was seen
