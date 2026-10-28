@@ -100,6 +100,7 @@ it, and is why `selfcheck` stays out however good the buffer gets.
 
 Refused by name, leading with the reason, and naming what to type instead:
 
+<!-- doc-command-ok: an example of a REFUSAL - `selfcheck` is deliberately not detachable -->
 ```
 gsh> background selfcheck
 background: `selfcheck` not supported for it runs inside the shell - a job runs as a detachable separate service.

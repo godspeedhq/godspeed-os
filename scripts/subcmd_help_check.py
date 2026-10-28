@@ -21,6 +21,12 @@ Rules:
    args[1])` for `argc >= 4`), so this checks that the fallback exists.
 3. The completer appends `help` at positions 1, 2 and 3: position 1 via the `["version", "help"]` append,
    positions 2 and 3 via `complete_with_help` / the `avail[a] = "help"` line.
+4. The OTHER DIRECTION (2026-10-28): every literal first word a utility's own help rows name - `shutdown
+   status` in `("shutdown status", ...)`, both halves of `gpio high|low` - is a word Tab offers there,
+   from `SUBCMD_FIRST` or from that utility's own completer (`"<util>".as_bytes() == cmd`). Rules 1-3
+   asked whether what Tab offers answers `help`; nothing asked whether Tab offers what a command takes,
+   and `shutdown`, `reboot`, `assert`, `background`, `fmt`, `gpio`, `input`, `jobs` and `scrollback` had
+   drifted out of it - `shutdown` seen first, on the Wyse, by the operator.
 
 Exit 1 with the list on any failure; exit 0 with a one-line summary otherwise.
 """
@@ -63,6 +69,41 @@ def fn_body(src, name):
     return m.group(0) if m else ''
 
 
+def help_row_words(src):
+    """{util: {word}} - the literal first words of each utility's TOP-LEVEL help block rows.
+
+    A row's signature is `util word ...`; the word counts when it is a plain keyword (`status`,
+    `fails-with`), and each half of an alternation (`high|low`) counts. Placeholders (`<path>`), options
+    in brackets and quoted prompts are not keywords and are skipped."""
+    out = {}
+    blk = re.compile(r'^\s*"([a-z][a-z0-9-]*)"\s*=>\s*help_block\(ctx,\s*"([^"]+)",\s*"(?:[^"\\]|\\.)*",\s*&\[(.*?)\]\s*,\s*(?:true|false)\)',
+                     re.S | re.M)
+    for m in blk.finditer(src):
+        util, title, rows = m.group(1), m.group(2), m.group(3)
+        if title.split()[0] != util:
+            continue
+        for sig in re.findall(r'\(\s*"((?:[^"\\]|\\.)*)"\s*,', rows):
+            toks = sig.split()
+            if len(toks) < 2 or toks[0] != util:
+                continue
+            for w in toks[1].split('|'):
+                if re.fullmatch(r'[a-z][a-z0-9-]*', w) and w not in ('help', 'version'):
+                    out.setdefault(util, set()).add(w)
+    return out
+
+
+def own_completer_words(src):
+    """{util: {word}} for a utility with its own completer (`if "<util>".as_bytes() == cmd ...`): every
+    string literal in that block, up to the `return complete_from_list` that ends it."""
+    out = {}
+    for m in re.finditer(r'"([a-z-]+)"\.as_bytes\(\) == cmd', src):
+        end = src.find('return complete_from_list', m.end())
+        if end < 0:
+            continue
+        out.setdefault(m.group(1), set()).update(re.findall(r'"([^"]+)"', src[m.end():end]))
+    return out
+
+
 def main():
     src = io.open(SHELL, encoding='utf-8').read().replace('\r\n', '\n')
     words = first_level(src)
@@ -103,6 +144,17 @@ def main():
             problems.append("    `%s %s help`  (no arm in sub_help%s)" % (
                 util, word, " or " + delegated[util][0] if util in delegated else ""))
 
+    tabbed = {}
+    for util, word in words:
+        tabbed.setdefault(util, set()).add(word)
+    own = own_completer_words(src)
+    untabbed = sorted((u, w) for u, ws in help_row_words(src).items() if u in util_set
+                      for w in ws if w not in tabbed.get(u, set()) and w not in own.get(u, set()))
+    if untabbed:
+        problems.append("%d word(s) a utility's help rows name are not offered by Tab (rule 4):" % len(untabbed))
+        for util, word in untabbed:
+            problems.append("    `%s %s`  (add it to SUBCMD_FIRST, with its `sub_help` arm)" % (util, word))
+
     if 'if argc >= 4 && args[argc - 1] == "help" && is_util(args[0])' not in src:
         problems.append("depth 3+ has no `help`: the `argc >= 4` fallback to `sub_help(util, args[1])` is gone")
 
@@ -128,7 +180,8 @@ def main():
         return 1
 
     print("subcmd help: every one of %d first-level word(s) under a utility answers `help`%s; depth 3+ "
-          "falls back to the word above; `help` completes at positions 1, 2 and 3" % (
+          "falls back to the word above; `help` completes at positions 1, 2 and 3; every help-row keyword is "
+          "offered by Tab" % (
               len(words) - len(skipped),
               (" (%d word(s) belong to library scripts and are not checked: %s)" % (
                   len(skipped), ", ".join(sorted({u for u, _ in skipped})))) if skipped else ""))

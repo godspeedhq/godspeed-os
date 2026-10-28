@@ -977,6 +977,9 @@ util name where
 util name wifi
 util name write
 util sub ask evidence
+util sub assert fails
+util sub assert fails-with
+util sub assert ok
 util sub audio hardware
 util sub audio info
 util sub audio mute
@@ -990,6 +993,10 @@ util sub audio system
 util sub audio tone
 util sub audio unmute
 util sub audio volume
+util sub background churn
+util sub background copy
+util sub background delete
+util sub background drives
 util sub busiest mem
 util sub busiest queue
 util sub busiest restarts
@@ -1008,6 +1015,7 @@ util sub events log
 util sub events metrics
 util sub events persist
 util sub events status
+util sub fmt check
 util sub from json
 util sub godspeed check
 util sub godspeed cleanup
@@ -1026,6 +1034,11 @@ util sub godspeed trust
 util sub godspeed uninstall
 util sub godspeed upgrade
 util sub godspeed verify
+util sub gpio high
+util sub gpio input
+util sub gpio low
+util sub gpio output
+util sub gpio read
 util sub hardware compare
 util sub hardware cpu
 util sub hardware display
@@ -1040,6 +1053,8 @@ util sub hardware soc
 util sub hardware tree
 util sub hardware usb
 util sub hardware why
+util sub input secret
+util sub jobs quit
 util sub match except
 util sub net arp
 util sub net dns
@@ -1048,6 +1063,13 @@ util sub net renew
 util sub net scan
 util sub net stats
 util sub observe now
+util sub reboot cancel
+util sub reboot now
+util sub reboot status
+util sub scrollback save
+util sub shutdown cancel
+util sub shutdown now
+util sub shutdown status
 util sub sort reverse
 util sub to json
 util sub to yaml

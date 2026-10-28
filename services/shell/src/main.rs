@@ -1269,6 +1269,18 @@ const SUBCMD_FIRST: &[(&str, &[&str])] = &[
     ("match",   &["except"]),
     ("to",      &["json", "yaml"]),
     ("from",    &["json"]),
+    // The words these utilities' help rows name and Tab did not offer, found 2026-10-28 when `shutdown`
+    // was seen not to complete: each was reachable only by typing it out. `subcmd_help_check.py` now
+    // fails a help row whose literal first word Tab does not reach, so the next one cannot drift in.
+    ("shutdown", &["now", "status", "cancel"]),
+    ("reboot",  &["now", "status", "cancel"]),
+    ("assert",  &["ok", "fails", "fails-with"]),
+    ("background", &["copy", "delete", "drives", "churn"]),
+    ("fmt",     &["check"]),
+    ("gpio",    &["input", "output", "high", "low", "read"]),
+    ("input",   &["secret"]),
+    ("jobs",    &["quit"]),
+    ("scrollback", &["save"]),
 ];
 
 /// The COLUMNS each record producer emits, so a pipe stage can complete them.
@@ -1327,6 +1339,8 @@ const SUBCMD_SECOND: &[(&str, &str, &[&str])] = &[
     ("audio",  "debug",        &audio_wire::DEBUG_VIEWS),
     ("audio",  "system",       &["sounds"]),
     ("wifi",   "debug",        &["events", "stats", "firmware", "transport", "trace"]),
+    // What `background drives` can detach (`DETACHABLE`).
+    ("background", "drives",   &["check", "scrub"]),
 ];
 
 /// `wifi join <Tab>` / `wifi forget <Tab>`: the names a key is held for, asked of the driver now, plus `help`.
@@ -6075,6 +6089,73 @@ fn sub_help(ctx: &ServiceContext, util: &str, sub: &str) -> bool {
         ("events", v) => return trace_sub_help(ctx, v) || events_sub_help(ctx, v),
         ("trace", v) => return trace_sub_help(ctx, v),
         ("chaos", v) => return chaos_sub_help(ctx, v),
+        ("shutdown", "now") => help_block(ctx, "shutdown now", "turn the machine off at once", &[
+            ("shutdown now", "at once, with no countdown", "shutdown now"),
+        ], false),
+        ("shutdown", "status") => help_block(ctx, "shutdown status", "is a shutdown pending, and when", &[
+            ("shutdown status", "whether one is pending, and how long is left", "shutdown status"),
+        ], false),
+        ("shutdown", "cancel") => help_block(ctx, "shutdown cancel", "stop a pending shutdown", &[
+            ("shutdown cancel", "stop a pending shutdown", "shutdown cancel"),
+        ], false),
+        ("reboot", "now") => help_block(ctx, "reboot now", "reset the machine at once", &[
+            ("reboot now", "at once, with no countdown", "reboot now"),
+        ], false),
+        ("reboot", "status") => help_block(ctx, "reboot status", "is a reboot pending, and when", &[
+            ("reboot status", "whether one is pending, and how long is left", "reboot status"),
+        ], false),
+        ("reboot", "cancel") => help_block(ctx, "reboot cancel", "stop a pending reboot", &[
+            ("reboot cancel", "stop a pending reboot", "reboot cancel"),
+        ], false),
+        ("assert", "ok") => help_block(ctx, "assert ok", "the command must succeed", &[
+            ("assert ok <command>", "the command must succeed", "assert ok read /notes.txt"),
+        ], false),
+        ("assert", "fails") => help_block(ctx, "assert fails", "the command must fail", &[
+            ("assert fails <command>", "the command must fail (negative test)", "assert fails read /nope"),
+        ], false),
+        ("assert", "fails-with") => help_block(ctx, "assert fails-with", "the command must fail with a named error", &[
+            ("assert fails-with <V> <command>", "must fail with the named Err variant", "assert fails-with FileNotFound read /nope"),
+        ], false),
+        ("background", "copy") => help_block(ctx, "background copy", "a copy, detached", &[
+            ("background copy <src> <dst>", "start the copy and give the prompt straight back", "background copy /big.bin /backup/big.bin"),
+        ], false),
+        ("background", "delete") => help_block(ctx, "background delete", "a recursive delete, detached", &[
+            ("background delete <path> recursive", "remove a whole subtree detached", "background delete /old recursive"),
+        ], false),
+        ("background", "drives") => help_block(ctx, "background drives", "a check or a scrub of the volume, detached", &[
+            ("background drives check", "check the volume detached; `foreground` replays the verdict", "background drives check"),
+            ("background drives scrub", "read-only CRC sweep, detached", "background drives scrub"),
+        ], false),
+        ("background", "churn") => help_block(ctx, "background churn", "write traffic, detached", &[
+            ("background churn <seconds>", "sustained write traffic, detached - the prompt stays yours", "background churn 300"),
+        ], false),
+        ("fmt", "check") => help_block(ctx, "fmt check", "is a script already canonical", &[
+            ("fmt check <path>", "Ok if already canonical, else loud + Err; never writes", "fmt check /script.gsh"),
+        ], false),
+        ("gpio", "input") => help_block(ctx, "gpio input|output", "set a pin's direction", &[
+            ("gpio input|output <pin>", "set a pin's direction, 0 to 53", "gpio output 18"),
+        ], false),
+        ("gpio", "output") => help_block(ctx, "gpio input|output", "set a pin's direction", &[
+            ("gpio input|output <pin>", "set a pin's direction, 0 to 53", "gpio output 18"),
+        ], false),
+        ("gpio", "high") => help_block(ctx, "gpio high|low", "drive an output pin", &[
+            ("gpio high|low <pin>", "drive an output pin", "gpio high 18"),
+        ], false),
+        ("gpio", "low") => help_block(ctx, "gpio high|low", "drive an output pin", &[
+            ("gpio high|low <pin>", "drive an output pin", "gpio high 18"),
+        ], false),
+        ("gpio", "read") => help_block(ctx, "gpio read", "read a pin's level", &[
+            ("gpio read <pin>", "read a pin's level", "gpio read 18"),
+        ], false),
+        ("input", "secret") => help_block(ctx, "input secret", "read a line nobody sees typed", &[
+            ("input secret \"prompt\"", "invisible entry; the value is tainted (never echoed to console)", "let pw = $(input secret \"Password: \")"),
+        ], false),
+        ("jobs", "quit") => help_block(ctx, "jobs quit", "stop a job without attaching to it", &[
+            ("jobs quit <job>", "stop a job without attaching to it first", "jobs quit 1"),
+        ], false),
+        ("scrollback", "save") => help_block(ctx, "scrollback save", "write the whole history to a file", &[
+            ("scrollback save <path>", "write the whole history to a file, unclipped", "scrollback save /log.txt"),
+        ], false),
         ("net", "stats") => help_block(ctx, "net stats", "the NIC's raw registers", &[
             ("net stats", "dump the NIC's raw registers (chip state: RE/RCR/RX ring)", "net stats"),
         ], false),
