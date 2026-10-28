@@ -11,7 +11,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, SET_CLOCK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE, DEVICE_POWER_RESOURCE, CPU_CLOCK_RESOURCE, POWER_OFF_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE, DEVICE_POWER_RESOURCE, CPU_CLOCK_RESOURCE, POWER_OFF_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -999,17 +999,10 @@ pub mod privbits {
     /// still refuses it unless the caller may delegate it, and the supervisor's table simply does not
     /// set it elsewhere.
     pub const GPIO:            u32 = 1 << 8;
-    /// SET_CLOCK with READ, not WRITE. The narrow right: raise the persisted clock FLOOR, which only
-    /// constrains which clock values are acceptable - where WRITE would let the holder step every
-    /// task's view of the time of day. Granting plain SET_CLOCK instead would hand over exactly the
-    /// authority that split was built to withhold, and would fail anyway (a WRITE cap does not satisfy
-    /// a READ check).
-    pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
-    /// SET_CLOCK with WRITE: SET the wall clock (net-stack held it for SNTP on RTC-less ARM; nothing does
-    /// since the clock moved to `time`, and no syscall spends it - `SET_CLOCK_RESOURCE`). Distinct
-    /// from SET_CLOCK_FLOOR above, which is the same resource with READ - see the note there for why
-    /// the split exists and must not be collapsed.
-    pub const SET_CLOCK:       u32 = 1 << 10;
+    // Bits 9 and 10 were SET_CLOCK_FLOOR and SET_CLOCK, the two strengths of a wall-clock authority
+    // that nothing checked once the clock moved to the `time` service (clock slice 3). Removed with
+    // their resource (backlog/59). The bits stay unassigned rather than reused, and `KNOWN` leaves them
+    // out, so a spawner that still asks for one is refused as asking for an unknown privilege.
     /// NET_DEVICE: move ethernet frames through the in-kernel network device (`NetFrame*`/`NetInfo`,
     /// syscalls 42-44). HELD BY NOTHING NOW: on arm32 the USB-net device moved into the `dwc2`
     /// SERVICE, and on aarch64 GENET moved into `nic-driver` itself, which drives the MAC through its
@@ -1040,7 +1033,7 @@ pub mod privbits {
     /// quietly ask for a privilege this kernel would ignore.
     pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
                          | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
-                         | GPIO | SET_CLOCK_FLOOR | SET_CLOCK | NET_DEVICE | PCI_CFG | CPU_CLOCK | POWER_OFF;
+                         | GPIO | NET_DEVICE | PCI_CFG | CPU_CLOCK | POWER_OFF;
 }
 
 /// Which requested privilege the CALLING task does not itself hold, if any.
@@ -1050,7 +1043,7 @@ pub mod privbits {
 pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
     use crate::capability::*;
     if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
-    let checks: [(u32, ResourceId, &'static str); 15] = [
+    let checks: [(u32, ResourceId, &'static str); 13] = [
         (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
         (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
         (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
@@ -1060,8 +1053,6 @@ pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
         (privbits::ACQUIRE_ANY,     ACQUIRE_ANY_RESOURCE,     "ACQUIRE_ANY"),
         (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE,   "RESOURCE_MINT"),
         (privbits::GPIO,            GPIO_DEVICE_RESOURCE,     "GPIO"),
-        (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE,       "SET_CLOCK_FLOOR"),
-        (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE,       "SET_CLOCK"),
         (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE,      "NET_DEVICE"),
         (privbits::PCI_CFG,         PCI_CFG_RESOURCE,         "PCI_CFG"),
         (privbits::CPU_CLOCK,       CPU_CLOCK_RESOURCE,       "CPU_CLOCK"),
@@ -1099,8 +1090,6 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::FIRE_IRQ,        FIRE_IRQ_RESOURCE),
     (privbits::REBOOT,          REBOOT_RESOURCE),
     (privbits::GPIO,            GPIO_DEVICE_RESOURCE),
-    (privbits::SET_CLOCK_FLOOR, SET_CLOCK_RESOURCE),
-    (privbits::SET_CLOCK,       SET_CLOCK_RESOURCE),
     (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE),
     (privbits::PCI_CFG,         PCI_CFG_RESOURCE),
     (privbits::CPU_CLOCK,       CPU_CLOCK_RESOURCE),
@@ -1125,8 +1114,6 @@ struct Privileges {
     power_off:       bool, // POWER_OFF: turn the machine off, or halt it (the shell)
     usb_disk:        bool, // USB_DISK: read/write blocks on an in-kernel USB mass-storage device (held by nothing now)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
-    set_clock:       bool, // SET_CLOCK (WRITE): set the wall clock (no syscall spends it now; SET_CLOCK_RESOURCE)
-    set_clock_floor: bool, // SET_CLOCK (READ): raise the persisted clock floor only (the shell)
     /// IMAGE_SPAWN: start a task from a CALLER-SUPPLIED image (`SpawnImage`). The supervisor alone -
     /// see `IMAGE_SPAWN_RESOURCE` for why this is not the same authority as `spawn`, and why it is
     /// deliberately absent from `SUPERVISOR_DELEGATABLE`.
@@ -1220,13 +1207,6 @@ fn service_privileges(name: &str) -> Privileges {
         usb_disk: false,
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: false, // delegated in the spawn request (step C)
-        //   SET_CLOCK, in two strengths (rights narrow, §7.4): WRITE = set the wall clock, READ = raise
-        //   the persisted clock FLOOR only. NO SYSCALL CHECKS EITHER any more: the wall clock moved to the
-        //   `time` SERVICE in clock slice 3, so `SET_CLOCK_RESOURCE` is minted and never spent (see its
-        //   note in `capability/mod.rs`, `backlog/59`). The supervisor still delegates SET_CLOCK_FLOOR to
-        //   the shell and no longer requests SET_CLOCK for net-stack.
-        set_clock:       false, // never by name; see above
-        set_clock_floor: false, // delegated in the spawn request (step C)
     }
 }
 
@@ -1602,8 +1582,6 @@ fn spawn_service_with_image(
             reboot:          bits & privbits::REBOOT          != 0,
             acquire_any:     bits & privbits::ACQUIRE_ANY     != 0,
             gpio:            bits & privbits::GPIO            != 0,
-            set_clock_floor: bits & privbits::SET_CLOCK_FLOOR != 0,
-            set_clock:       bits & privbits::SET_CLOCK       != 0,
             net_device:      bits & privbits::NET_DEVICE      != 0,
             pci_cfg:         bits & privbits::PCI_CFG         != 0,
             cpu_clock:       bits & privbits::CPU_CLOCK       != 0,
@@ -1951,25 +1929,6 @@ fn spawn_service_with_image(
     if privs.image_spawn {
         let is_cap = mint_cap(IMAGE_SPAWN_RESOURCE, Rights::WRITE);
         caps.insert(is_cap)
-            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
-    }
-
-    // SET_CLOCK: once net-stack's, to set the wall clock from SNTP. Minted here if `privs` asks for it;
-    // the supervisor no longer requests it for anyone.
-    //
-    // MINTED AND CHECKED BY NOBODY, on every arch. This said the authority is spent through a
-    // `SetClock` syscall, "inert (no-op syscall) off ARM" - implying it is live ON arm. There is no
-    // such syscall on any arch: clock slice 3 moved the wall clock to the `time` SERVICE, which
-    // `net-stack` asks over IPC. The grant is real and nothing consumes it (`backlog/59`).
-    if privs.set_clock {
-        let sc_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::WRITE);
-        caps.insert(sc_cap)
-            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
-    }
-    // The floor-only strength: READ raises the bound, it cannot set the clock (§7.4 - rights narrow).
-    if privs.set_clock_floor {
-        let cf_cap = mint_cap(SET_CLOCK_RESOURCE, Rights::READ);
-        caps.insert(cf_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 

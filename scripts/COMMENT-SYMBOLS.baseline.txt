@@ -75,7 +75,6 @@ boot_cpuid_phys
 brcm_pcie_perst_set_generic
 bytes_sent
 civil_from_days
-clock_synced_secs_ago
 commandments_redteam
 console_lock
 console_scroll

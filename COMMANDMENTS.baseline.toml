@@ -465,7 +465,6 @@ ACQUIRE_ANY        = 9
 NET_DEVICE         = 10
 GPIO_DEVICE        = 11
 USB_DISK           = 12
-SET_CLOCK          = 13
 FIRE_IRQ           = 14
 # IMAGE_SPAWN - start a task from a CALLER-SUPPLIED image (`SpawnImage`, syscall 52).
 #
@@ -858,7 +857,7 @@ SpawnImage               = 52
 "resource-server" = ["peer:holder", "priv:RESOURCE_MINT"]
 # flag:REQ_CONSOLE (pinned 2026-10-26, backlog/90 E2, read for the first time): the spawn flag that has the
 # kernel mint CONSOLE_READ, the keyboard. The shell IS the keyboard's reader.
-"shell" = ["flag:REQ_CONSOLE", "peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:POWER_OFF", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
+"shell" = ["flag:REQ_CONSOLE", "peer:block-driver", "peer:console", "peer:events", "peer:fs", "peer:supervisor", "peer:time", "priv:ACQUIRE_ANY", "priv:GPIO", "priv:INTROSPECT", "priv:POWER_OFF", "priv:REBOOT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 "supervisor" = ["kernel-priv:acquire_any", "kernel-priv:image_spawn", "kernel-priv:introspect", "kernel-priv:recv_endpoint", "kernel-priv:service_control", "kernel-priv:spawn"]
 "time" = ["peer:events", "peer:fs", "peer:net-stack"]
 # wifi-driver: hw:WIFI_SDIO - the Arasan SDIO host the radio sits on, and its power control, granted by
@@ -883,7 +882,7 @@ SpawnImage               = 52
 "probe-table" = ["hw:TEST_IRQ", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 # kernel-delegatable: SUPERVISOR_DELEGATABLE in kernel/src/task/mod.rs, the ceiling on every row above - the
 # kernel refuses any privilege the supervisor cannot delegate. IMAGE_SPAWN is absent by design (14.1).
-"kernel-delegatable" = ["priv:ACQUIRE_ANY", "priv:CONSOLE_PUSH", "priv:CPU_CLOCK", "priv:FIRE_IRQ", "priv:GPIO", "priv:INTROSPECT", "priv:NET_DEVICE", "priv:PCI_CFG", "priv:POWER_OFF", "priv:REBOOT", "priv:RESOURCE_MINT", "priv:SERVICE_CONTROL", "priv:SET_CLOCK", "priv:SET_CLOCK_FLOOR", "priv:SPAWN"]
+"kernel-delegatable" = ["priv:ACQUIRE_ANY", "priv:CONSOLE_PUSH", "priv:CPU_CLOCK", "priv:FIRE_IRQ", "priv:GPIO", "priv:INTROSPECT", "priv:NET_DEVICE", "priv:PCI_CFG", "priv:POWER_OFF", "priv:REBOOT", "priv:RESOURCE_MINT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 
 # --------------------------------------------------------------------------------------------------
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by
@@ -895,7 +894,7 @@ SpawnImage               = 52
 #                                       are different kinds of fact; pretending to reconcile them
 #                                       would be the defect this check exists to catch.
 #   CONSOLE_PUSH, INTROSPECT, REBOOT,   sanctioned kernel-only grants (the U15 doctrine, see
-#   GPIO, SET_CLOCK*, NET_DEVICE        kernel/src/task/mod.rs). The kernel is their single source and
+#   GPIO, NET_DEVICE                    kernel/src/task/mod.rs). The kernel is their single source and
 #                                       they have no contract key by design.
 #
 # Adding a capability key to contracts/schema/service.schema.json should force a decision here:

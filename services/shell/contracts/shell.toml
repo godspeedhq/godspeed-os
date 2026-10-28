@@ -3,8 +3,8 @@
 # inherited descriptors. It reads the console, and either answers itself or asks a service.
 #
 # Restartable like everything else: a crash gives a fresh prompt and loses the in-flight command, not
-# the session (§6.2). Its SPAWN, INTROSPECT, SERVICE_CONTROL, ACQUIRE_ANY, REBOOT, GPIO and
-# SET_CLOCK_FLOOR privileges and its console-read authority arrive in the supervisor's spawn request
+# the session (§6.2). Its SPAWN, INTROSPECT, SERVICE_CONTROL, ACQUIRE_ANY, REBOOT, POWER_OFF and GPIO
+# privileges and its console-read authority arrive in the supervisor's spawn request
 # (its IMAGES row; CLAUDE.md 13.6), so this file understates what it can do.
 name    = "shell"
 version = "0.1.0"

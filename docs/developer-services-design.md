@@ -326,7 +326,7 @@ identity suite, made available to one crate.
 | memory limit | `resources.memory.limit` | covered, reconciled |
 | core | `placement.core` | covered, reconciled |
 | send peers | `ipc_send` | covered, reconciled |
-| privileges | `service_control`, `resource_mint`, `pci_cfg`, `cpu_clock`, `power_off`, `console_push` | **partial**: `ACQUIRE_ANY`, `INTROSPECT`, `FIRE_IRQ`, `REBOOT`, `GPIO`, `SET_CLOCK_FLOOR`, `SET_CLOCK` and `NET_DEVICE` have no key |
+| privileges | `service_control`, `resource_mint`, `pci_cfg`, `cpu_clock`, `power_off`, `console_push` | **partial**: `ACQUIRE_ANY`, `INTROSPECT`, `FIRE_IRQ`, `REBOOT`, `GPIO` and `NET_DEVICE` have no key |
 | mode | - | **missing** (`probe_mode`) |
 | hw class | `hw_device`, `hw_pci_class`, `hw_pci_bar`, `hw_pci_irq` | covered, reconciled |
 | DMA pages | - | **missing**: a `match` on the service's name inside `spawn_by_image` |

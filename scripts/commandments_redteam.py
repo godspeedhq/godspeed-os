@@ -108,8 +108,8 @@ CASES = [
 
     ("I-authorities", "a 14th kernel authority",
      lambda: edit("kernel/src/capability/mod.rs",
-                  "pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);",
-                  "pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);\n"
+                  "pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);",
+                  "pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);\n"
                   "pub const BACKDOOR_RESOURCE: ResourceId = ResourceId(14);"),
      ["kernel/src/capability/mod.rs"], []),
 

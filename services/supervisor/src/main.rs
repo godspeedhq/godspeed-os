@@ -704,10 +704,10 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     ("e1000", E1000_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
     #[cfg(feature = "examples-test")]
     ("driver-skeleton", DRIVER_SKELETON_ELF, 0, 32 * 1024 * 1024, u32::MAX, &[], 0, 0, 0),
-    // The user's interface. GPIO and SET_CLOCK_FLOOR are ARM-only in effect but the bits are
-    // arch-neutral: the kernel refuses any the supervisor cannot delegate, and on x86 the underlying
-    // grant is simply never used. SET_CLOCK_FLOOR is the NARROW right (raise the clock floor), not
-    // SET_CLOCK (step the clock) - the split exists precisely to withhold the latter. POWER_OFF, beside
+    // The user's interface. GPIO is ARM-only in effect but the bit is arch-neutral: the kernel refuses
+    // any the supervisor cannot delegate, and on x86 the underlying grant is simply never used. (It held
+    // SET_CLOCK_FLOOR as well, until that authority was found to be checked by nothing and removed,
+    // backlog/59: the clock floor is the `time` service's, kept in its own file.) POWER_OFF, beside
     // REBOOT and for the same reason: ending the session is the operator's, and the shell is how the
     // operator speaks (docs/shutdown.md). The only holder; a gate pins that.
     ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV
@@ -719,11 +719,10 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
      | godspeed_sdk::service_context::privbits::ACQUIRE_ANY
      | godspeed_sdk::service_context::privbits::REBOOT
      | godspeed_sdk::service_context::privbits::POWER_OFF
-     | godspeed_sdk::service_context::privbits::GPIO
-     | godspeed_sdk::service_context::privbits::SET_CLOCK_FLOOR, 0, 0),
+     | godspeed_sdk::service_context::privbits::GPIO, 0, 0),
     ("fs", FS_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 32 * 1024 * 1024, 1, &["block-driver", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),
-    // No `time` peer and no SET_CLOCK: the clock left net-stack on 2026-10-01 (`time` asks for its own NTP
+    // No `time` peer and no clock authority: the clock left net-stack on 2026-10-01 (`time` asks for its own NTP
     // datagram through net-stack's op 12, and net-stack never calls `time`).
     ("net-stack", NET_STACK_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV, 16 * 1024 * 1024, 1, &["nic-driver", "events"],
      godspeed_sdk::service_context::privbits::RESOURCE_MINT, 0, 0),

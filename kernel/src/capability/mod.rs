@@ -103,23 +103,11 @@ pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
 /// never ambient (the same posture as NET_DEVICE). A no-op off ARM, where disks are userspace drivers.
 pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
 
-/// Authority to set the wall clock (the SNTP-fed time-of-day). The RTC-less ARM port has no
-/// hardware clock, so `date` reads zero until a network time source sets it; setting it changes every
-/// task's view of the time of day, so it is a privileged action (§3.1), not ambient. It was granted
-/// only to `net-stack`, which ran the SNTP round-trip; the WRITE half is granted to nothing now (the
-/// supervisor's rows carry no `SET_CLOCK`), and the shell's `SET_CLOCK_FLOOR` is the READ half.
-///
-/// **NOTHING SPENDS THIS CAPABILITY ANY MORE, and that is worth knowing before you reason about it.**
-/// This said the authority is spent "via `SetClock`, validated by holdings like `reboot`". There is no
-/// such syscall: no `SyscallNumber` variant sets a clock, and no code in `syscall/` or `task/` calls
-/// any arch's `set_wall_clock`. Clock slice 3 moved the wall clock to the `time` SERVICE, and since
-/// 2026-10-01 `time` fetches and checks the network time itself - `OP_SET`, which `net-stack` used to
-/// push an SNTP result through, is retired and `net-stack` never calls `time` - so the privileged
-/// action this gates no longer passes through the kernel at all. The ResourceId is still registered and still minted from the privilege
-/// word, so it is granted and never checked - dead authority, which is the kind §26.9 says a reviewer
-/// must be able to see. Recorded as `backlog/59` rather than deleted here, because removing a
-/// ResourceId renumbers nothing but does touch the spawn path and wants re-verification.
-pub const SET_CLOCK_RESOURCE: ResourceId = ResourceId(13);
+// ResourceId 13 was SET_CLOCK_RESOURCE, the authority to set the wall clock. Nothing checked it once
+// the clock moved to the `time` service (clock slice 3, and since 2026-10-01 `time` fetches the network
+// time itself), so it was granted and never spent - dead authority 26.9 says a reviewer must be able to
+// see. Removed with its two privilege bits (backlog/59). 13 is not reused, so an old capability or log
+// line naming it can never be read as a different authority.
 
 /// Inject a test interrupt (`FireIrq`, syscall 51). Held ONLY by the control service.
 ///
@@ -213,7 +201,6 @@ pub fn init() {
     table::register_resource(NET_DEVICE_RESOURCE);
     table::register_resource(GPIO_DEVICE_RESOURCE);
     table::register_resource(USB_DISK_RESOURCE);
-    table::register_resource(SET_CLOCK_RESOURCE);
     table::register_resource(IMAGE_SPAWN_RESOURCE);
     table::register_resource(PCI_CFG_RESOURCE);
     // The device grant made renewable (12.3 amendment 2026-10-01). Registered like every other kernel

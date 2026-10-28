@@ -394,10 +394,8 @@ pub mod privbits {
     pub const RESOURCE_MINT:   u32 = 1 << 7;
     /// ARM-only in practice; the bit is arch-neutral.
     pub const GPIO:            u32 = 1 << 8;
-    /// SET_CLOCK with READ (raise the clock FLOOR), not WRITE (step the clock).
-    pub const SET_CLOCK_FLOOR: u32 = 1 << 9;
-    /// SET_CLOCK with WRITE (set the wall clock). Distinct from SET_CLOCK_FLOOR, the READ right.
-    pub const SET_CLOCK:       u32 = 1 << 10;
+    // Bits 9 and 10 (SET_CLOCK_FLOOR, SET_CLOCK) are retired with the authority nothing checked, and
+    // the kernel refuses them as unknown (backlog/59). Not reused.
     /// NET_DEVICE: move ethernet frames through an in-kernel network device (`NetFrame*`/`NetInfo`,
     /// syscalls 42-44). No port has one any more - every arch answers with a stub - and no spawn
     /// request in the tree sets this bit; the kernel still understands it.
@@ -968,7 +966,6 @@ pub const AUTHORITIES: &[(u64, &str, &str)] = &[
     (10, "net_device", "move raw ethernet frames on an in-kernel network device (none exists; granted to nothing now)"),
     (11, "gpio_device", "drive the GPIO pins"),
     (12, "usb_disk", "read and write any sector of an in-kernel USB disk (none exists; granted to nothing now)"),
-    (13, "set_clock", "set the wall clock (granted to nothing now)"),
     (14, "fire_irq", "inject a test interrupt"),
     (15, "image_spawn", "start a program from an image it supplies"),
     (16, "pci_cfg", "read and write PCI configuration space"),
@@ -3542,7 +3539,7 @@ impl ServiceContext {
         unsafe { raw_syscall(13, 17, 0, 0) }
     }
 
-    // `set_wall_clock`, `set_clock_floor` and `clock_synced_secs_ago` were REMOVED with the kernel's
+    // The wall-clock setters (set_wall_clock, set_clock_floor, clock_synced_secs_ago) were REMOVED with the kernel's
     // wall clock (clock slice 3). They called syscall 50 and query 21, which no longer mean what they
     // meant: 50 is deleted, and 21 was REUSED for `com2_byte`, so the stale reader did not merely fail -
     // it popped a byte off the operator channel. Ask the `time` service; it owns the clock now.

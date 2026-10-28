@@ -2029,7 +2029,7 @@ CHECKS = [
                         "number and the grant are different kinds of fact and pretending to reconcile "
                         "them would be the very thing this check exists to catch. Nor does it cover "
                         "the kernel-only privileges (CONSOLE_PUSH, INTROSPECT, REBOOT, GPIO, "
-                        "SET_CLOCK, NET_DEVICE) - the U15 doctrine makes the kernel their single "
+                        "NET_DEVICE) - the U15 doctrine makes the kernel their single "
                         "source and they have no contract key by design",
          probes=[
              dict(why="a contract claiming authority it is not granted must be caught",

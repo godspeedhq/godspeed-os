@@ -2628,7 +2628,6 @@ pub mod rtc {
     }
     pub fn boot_datetime() -> u64 { 0 }
     pub fn read_datetime() -> u64 { 0 }
-    pub fn set_wall_clock(_epoch: i64) -> bool { false } // no RTC on this port; the wall clock is the `time` service's (this seam has no callers on any arch)
     /// Seconds since boot, from the machine's own counter.
     ///
     /// **Returning 0 from the stub this replaces was not harmless.** The shell's `wait` paces on this
