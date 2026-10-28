@@ -396,10 +396,8 @@ pub mod privbits {
     pub const GPIO:            u32 = 1 << 8;
     // Bits 9 and 10 (SET_CLOCK_FLOOR, SET_CLOCK) are retired with the authority nothing checked, and
     // the kernel refuses them as unknown (backlog/fixed/59). Not reused.
-    /// NET_DEVICE: move ethernet frames through an in-kernel network device (`NetFrame*`/`NetInfo`,
-    /// syscalls 42-44). No port has one any more - every arch answers with a stub - and no spawn
-    /// request in the tree sets this bit; the kernel still understands it.
-    pub const NET_DEVICE:      u32 = 1 << 11;
+    // Bit 11 (NET_DEVICE) is retired with its syscalls and resource, and the kernel refuses it as
+    // unknown (backlog/21). Not reused.
     /// Read PCI configuration space through the legacy CF8/CFC ports (step D2). READ-ONLY and held
     /// by ONE service - see `docs/service-ownership.md` D2 for why the write side is not on offer.
     pub const PCI_CFG:         u32 = 1 << 12;
@@ -963,9 +961,7 @@ pub const AUTHORITIES: &[(u64, &str, &str)] = &[
     (7, "resource_mint", "mint capabilities for resources it owns, as fs does for files"),
     (8, "reboot", "reboot the machine"),
     (9, "acquire_any", "reach any service by name, not only its declared peers"),
-    (10, "net_device", "move raw ethernet frames on an in-kernel network device (none exists; granted to nothing now)"),
     (11, "gpio_device", "drive the GPIO pins"),
-    (12, "usb_disk", "read and write any sector of an in-kernel USB disk (none exists; granted to nothing now)"),
     (14, "fire_irq", "inject a test interrupt"),
     (15, "image_spawn", "start a program from an image it supplies"),
     (16, "pci_cfg", "read and write PCI configuration space"),
@@ -1027,43 +1023,9 @@ pub struct ServiceContext {
     _private: (),
 }
 
-/// The USB-disk syscalls' "device NAKed, re-ask" status.
-///
-/// The kernel claims no USB disk on any port any more (every arch's `usb_disk_sectors()` is 0, and the
-/// USB stacks are services), so the four `usb_disk_*` syscalls have no caller in the tree; kept as the
-/// record of their ABI.
-///
-/// Outside the capability-error range (-2..-7) ON PURPOSE, and this must stay in step with the kernel's
-/// `USB_DISK_BUSY` (`kernel/src/syscall/dispatch.rs`). It was originally `-2`, which is `CapNotHeld`, so
-/// a driver missing its `USB_DISK_RESOURCE` capability was indistinguishable from a busy device and got retried
-/// thousands of times before being reported as a device that "stayed busy" - a cap failure wearing an
-/// I/O failure's name.
-pub const USB_DISK_BUSY: i64 = -20;
+// USB_DISK_BUSY (-20) and USB_DISK_ABSENT (-21) were the in-kernel USB disk's statuses, removed with
+// its syscalls (46-49, backlog/21). The two codes are not reused.
 
-/// No USB disk is attached - the opposite instruction to [`USB_DISK_BUSY`], and it must stay in step with
-/// the kernel's `USB_DISK_ABSENT`. BUSY means "come back, I am working"; ABSENT means "there is nothing
-/// here, and asking again cannot change that - only a hot-plug can". A caller that retries on this waits
-/// out its entire budget against an empty socket and then reports the device as busy, which is a false
-/// statement about hardware sitting on the operator's desk.
-pub const USB_DISK_ABSENT: i64 = -21;
-
-/// Can this LBA survive the syscall ABI intact?
-///
-/// The ARM ABI gives each syscall argument exactly ONE 32-bit register (`arch/arm/CLAUDE.md`, hazard
-/// A-U1), so a wider value is silently narrowed on the way in. That matters here more than anywhere:
-/// the kernel guards `lba >= MSC_SECTORS` and then builds a READ(10)/WRITE(10) CDB, but it guards the
-/// value it RECEIVED. An LBA of 0x1_0000_0000 arrives as 0, passes the range check, and overwrites the
-/// GSFS superblock while the device, `block-driver` and `fs` all report success - a range check
-/// defeated one level above itself, and silent corruption of exactly the block the check exists to
-/// protect. On x86 the same request is rejected loudly, so the two ports would disagree about what is
-/// a valid write.
-///
-/// Rejecting it in the wrapper is the fix the ABI hazard prescribes (clamp before the syscall, or split
-/// into a register pair). Nothing legitimate is refused: capacity comes from SCSI READ CAPACITY(10),
-/// whose last-LBA field is 32 bits wide, so an LBA above `u32::MAX` is a caller bug - and it is
-/// reported as a failure rather than aliased onto a real block (Invariant 12, failures are loud).
-#[inline]
-fn lba_fits_syscall_abi(lba: u64) -> bool { lba <= u32::MAX as u64 }
 
 impl ServiceContext {
     /// A handle for the PANIC HANDLER, which has no `ctx` to borrow.
@@ -1261,7 +1223,7 @@ impl ServiceContext {
         let _ = unsafe { raw_syscall(37, cycles, 0, 0) };
     }
 
-    // `net_frame_tx`, `net_frame_rx` and `net_info` (syscalls 42-44, NET_DEVICE) were here until
+    // net_frame_tx, net_frame_rx and net_info (syscalls 42-44, NET_DEVICE) were here until
     // 2026-10-11: no port has an in-kernel network device, nothing is granted NET_DEVICE, and nothing
     // called them (`backlog/21` step 2). The syscalls themselves are the last step, a kernel change.
 
@@ -3075,67 +3037,9 @@ impl ServiceContext {
         if ret < 0 { None } else { Some(ret as u32) }
     }
 
-    /// Capacity of the in-kernel USB mass-storage device in 512-byte sectors, 0 if none is attached.
-    /// Requires the `USB_DISK_RESOURCE` capability. Syscall 46. The kernel drives no USB disk on any
-    /// port now (see [`USB_DISK_BUSY`]), so this is always 0 and the block calls below always fail.
-    pub fn usb_disk_sectors(&self) -> u64 {
-        // SAFETY: syscall(46) = UsbDiskInfo; no arguments, gated by the USB_DISK capability.
-        let ret = unsafe { raw_syscall(46, 0, 0, 0) };
-        if ret < 0 { 0 } else { ret as u64 }
-    }
-
-    /// Read the 512-byte block at `lba` from the USB mass-storage device into `dst`. Returns false if
-    /// there is no device, the LBA is past the end, or the transfer failed. Requires `USB_DISK_RESOURCE`.
-    /// Syscall 47.
-    #[must_use = "the destination buffer is NOT valid data if this is false"]
-    pub fn usb_disk_read(&self, lba: u64, dst: &mut [u8; 512]) -> bool {
-        // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes to `dst` on success,
-        // through its checked user-pointer path.
-        if !lba_fits_syscall_abi(lba) { return false; }
-        let ret = unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) };
-        ret == 0
-    }
-
-    /// Write `src` as the 512-byte block at `lba` on the USB mass-storage device. Requires `USB_DISK_RESOURCE`.
-    /// Syscall 48.
-    #[must_use = "the block did NOT reach the medium if this is false"]
-    pub fn usb_disk_write(&self, lba: u64, src: &[u8; 512]) -> bool {
-        // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src` through its
-        // checked user-pointer path.
-        if !lba_fits_syscall_abi(lba) { return false; }
-        let ret = unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) };
-        ret == 0
-    }
-
-    /// Read a block, returning the raw status so BUSY is distinguishable from FAILED: `0` ok, the
-    /// device is busy (`USB_DISK_BUSY` - re-ask, nothing is wrong), anything else a real error. The `bool` variants
-    /// above collapse those two, which is exactly the conflation that made a busy stick look broken.
-    pub fn usb_disk_read_status(&self, lba: u64, dst: &mut [u8; 512]) -> i64 {
-        // SAFETY: syscall(47) = UsbDiskRead; the kernel writes exactly 512 bytes through its checked
-        // user-pointer path.
-        if !lba_fits_syscall_abi(lba) { return -1; }
-        unsafe { raw_syscall(47, lba, dst.as_mut_ptr() as u64, 0) }
-    }
-
-    /// Write a block, returning the raw status (see `usb_disk_read_status`).
-    pub fn usb_disk_write_status(&self, lba: u64, src: &[u8; 512]) -> i64 {
-        // SAFETY: syscall(48) = UsbDiskWrite; the kernel reads exactly 512 bytes from `src`.
-        if !lba_fits_syscall_abi(lba) { return -1; }
-        unsafe { raw_syscall(48, lba, src.as_ptr() as u64, 0) }
-    }
-
-    /// Make previously written blocks durable on the USB mass-storage device (SCSI SYNCHRONIZE CACHE).
-    /// Requires `USB_DISK_RESOURCE` WRITE. Syscall 49.
-    ///
-    /// A write is only ACKNOWLEDGED when `usb_disk_write` returns - the device may still be holding the
-    /// bytes in a volatile buffer. Anything that promises durability (a format, a journal commit) has to
-    /// ask for it, and check the answer: `false` means the data is NOT known to be on the medium.
-    #[must_use = "prior writes are NOT durable if this is false"]
-    pub fn usb_disk_flush(&self) -> bool {
-        // SAFETY: syscall(49) = UsbDiskFlush; takes no arguments and touches no user memory.
-        let ret = unsafe { raw_syscall(49, 0, 0, 0) };
-        ret == 0
-    }
+    // usb_disk_sectors, usb_disk_read, usb_disk_write, their `_status` forms and usb_disk_flush
+    // (syscalls 46-49) were here: the kernel claimed no USB disk on any port, and nothing called them.
+    // Removed with the syscalls (backlog/21); a USB disk is the `dwc2` or `xhci` service's, over IPC.
 
     /// The SD/EMMC controller's base clock in Hz (0 if the platform does not report one), via
     /// InspectKernel query 20. The block driver needs it to compute its clock divider: on the BCM283x

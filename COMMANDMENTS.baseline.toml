@@ -462,9 +462,7 @@ SERVICE_CONTROL    = 6
 RESOURCE_MINT      = 7
 REBOOT             = 8
 ACQUIRE_ANY        = 9
-NET_DEVICE         = 10
 GPIO_DEVICE        = 11
-USB_DISK           = 12
 FIRE_IRQ           = 14
 # IMAGE_SPAWN - start a task from a CALLER-SUPPLIED image (`SpawnImage`, syscall 52).
 #
@@ -653,9 +651,6 @@ Sleep                    = 37
 ConsoleForeground        = 40
 Call                     = 41
 CallDeadline             = 50
-NetFrameTx               = 42
-NetFrameRx               = 43
-NetInfo                  = 44
 FireIrq                  = 51
 # What the kernel learns is a selector and a register offset - two opaque numbers. It does not learn
 # what they name: not that a bus/device/function encoding sits inside the selector, not how to walk a
@@ -708,10 +703,6 @@ PowerOff                 = 56
 # different cause. CLAUDE.md 14.5 amendment, 2026-10-17.
 Exit                     = 57
 Gpio                     = 45
-UsbDiskInfo              = 46
-UsbDiskRead              = 47
-UsbDiskWrite             = 48
-UsbDiskFlush             = 49
 # Step C (docs/service-ownership.md). The pin asks "why isn't this a service?" - and here the honest
 # answer is that it CANNOT be: loading an ELF into a fresh address space is memory isolation, which is
 # the kernel's own job (4.3, MISCIS). Nothing above the kernel can map a page.
@@ -882,7 +873,7 @@ SpawnImage               = 52
 "probe-table" = ["hw:TEST_IRQ", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 # kernel-delegatable: SUPERVISOR_DELEGATABLE in kernel/src/task/mod.rs, the ceiling on every row above - the
 # kernel refuses any privilege the supervisor cannot delegate. IMAGE_SPAWN is absent by design (14.1).
-"kernel-delegatable" = ["priv:ACQUIRE_ANY", "priv:CONSOLE_PUSH", "priv:CPU_CLOCK", "priv:FIRE_IRQ", "priv:GPIO", "priv:INTROSPECT", "priv:NET_DEVICE", "priv:PCI_CFG", "priv:POWER_OFF", "priv:REBOOT", "priv:RESOURCE_MINT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
+"kernel-delegatable" = ["priv:ACQUIRE_ANY", "priv:CONSOLE_PUSH", "priv:CPU_CLOCK", "priv:FIRE_IRQ", "priv:GPIO", "priv:INTROSPECT", "priv:PCI_CFG", "priv:POWER_OFF", "priv:REBOOT", "priv:RESOURCE_MINT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 
 # --------------------------------------------------------------------------------------------------
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by
@@ -894,7 +885,7 @@ SpawnImage               = 52
 #                                       are different kinds of fact; pretending to reconcile them
 #                                       would be the defect this check exists to catch.
 #   CONSOLE_PUSH, INTROSPECT, REBOOT,   sanctioned kernel-only grants (the U15 doctrine, see
-#   GPIO, NET_DEVICE                    kernel/src/task/mod.rs). The kernel is their single source and
+#   GPIO                                kernel/src/task/mod.rs). The kernel is their single source and
 #                                       they have no contract key by design.
 #
 # Adding a capability key to contracts/schema/service.schema.json should force a decision here:

@@ -11,7 +11,7 @@ use crate::arch::imp::context_switch::TaskContext;
 use crate::arch::imp::page_tables::{
     get_hhdm_offset, PageFlags, VirtAddr, PAGE_SIZE,
 };
-use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, NET_DEVICE_RESOURCE, GPIO_DEVICE_RESOURCE, USB_DISK_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE, DEVICE_POWER_RESOURCE, CPU_CLOCK_RESOURCE, POWER_OFF_RESOURCE};
+use crate::capability::{mint_cap, Rights, LOG_WRITE_RESOURCE, SPAWN_RESOURCE, CONSOLE_READ_RESOURCE, CONSOLE_PUSH_RESOURCE, INTROSPECT_RESOURCE, SERVICE_CONTROL_RESOURCE, RESOURCE_MINT_RESOURCE, REBOOT_RESOURCE, ACQUIRE_ANY_RESOURCE, GPIO_DEVICE_RESOURCE, FIRE_IRQ_RESOURCE, IMAGE_SPAWN_RESOURCE, PCI_CFG_RESOURCE, DEVICE_POWER_RESOURCE, CPU_CLOCK_RESOURCE, POWER_OFF_RESOURCE};
 use crate::capability::cap::ResourceId;
 use crate::capability::generation::Generation;
 use crate::ipc::endpoint::EndpointId;
@@ -1003,16 +1003,8 @@ pub mod privbits {
     // that nothing checked once the clock moved to the `time` service (clock slice 3). Removed with
     // their resource (backlog/fixed/59). The bits stay unassigned rather than reused, and `KNOWN` leaves them
     // out, so a spawner that still asks for one is refused as asking for an unknown privilege.
-    /// NET_DEVICE: move ethernet frames through the in-kernel network device (`NetFrame*`/`NetInfo`,
-    /// syscalls 42-44). HELD BY NOTHING NOW: on arm32 the USB-net device moved into the `dwc2`
-    /// SERVICE, and on aarch64 GENET moved into `nic-driver` itself, which drives the MAC through its
-    /// own register window. The syscalls are stubs, the supervisor does not hold the bit (so cannot
-    /// delegate it), and no spawn row asks for it - see `service_privileges` and `backlog/21`.
-    ///
-    /// It got a bit when `nic-driver`'s image moved to the supervisor, so that a moved service could
-    /// still receive an authority it then used. The bit stays so that a request naming it is
-    /// understood and refused by `privileges_caller_lacks`, rather than silently ignored.
-    pub const NET_DEVICE:      u32 = 1 << 11;
+    // Bit 11 was NET_DEVICE, the in-kernel network device's authority, removed with its syscalls and
+    // resource (backlog/21). Unassigned, so a request naming it is refused as an unknown privilege.
     /// PCI_CFG: read PCI configuration space through the legacy CF8/CFC ports (step D2).
     ///
     /// READ-ONLY, permanently, and the kernel enforces WHICH PORTS rather than what they mean. CF8
@@ -1033,7 +1025,7 @@ pub mod privbits {
     /// quietly ask for a privilege this kernel would ignore.
     pub const KNOWN: u32 = SPAWN | CONSOLE_PUSH | INTROSPECT | SERVICE_CONTROL
                          | FIRE_IRQ | REBOOT | ACQUIRE_ANY | RESOURCE_MINT
-                         | GPIO | NET_DEVICE | PCI_CFG | CPU_CLOCK | POWER_OFF;
+                         | GPIO | PCI_CFG | CPU_CLOCK | POWER_OFF;
 }
 
 /// Which requested privilege the CALLING task does not itself hold, if any.
@@ -1043,7 +1035,7 @@ pub mod privbits {
 pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
     use crate::capability::*;
     if requested & !privbits::KNOWN != 0 { return Some("an unknown privilege bit"); }
-    let checks: [(u32, ResourceId, &'static str); 13] = [
+    let checks: [(u32, ResourceId, &'static str); 12] = [
         (privbits::SPAWN,           SPAWN_RESOURCE,           "SPAWN"),
         (privbits::CONSOLE_PUSH,    CONSOLE_PUSH_RESOURCE,    "CONSOLE_PUSH"),
         (privbits::INTROSPECT,      INTROSPECT_RESOURCE,      "INTROSPECT"),
@@ -1053,7 +1045,6 @@ pub fn privileges_caller_lacks(requested: u32) -> Option<&'static str> {
         (privbits::ACQUIRE_ANY,     ACQUIRE_ANY_RESOURCE,     "ACQUIRE_ANY"),
         (privbits::RESOURCE_MINT,   RESOURCE_MINT_RESOURCE,   "RESOURCE_MINT"),
         (privbits::GPIO,            GPIO_DEVICE_RESOURCE,     "GPIO"),
-        (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE,      "NET_DEVICE"),
         (privbits::PCI_CFG,         PCI_CFG_RESOURCE,         "PCI_CFG"),
         (privbits::CPU_CLOCK,       CPU_CLOCK_RESOURCE,       "CPU_CLOCK"),
         (privbits::POWER_OFF,       POWER_OFF_RESOURCE,       "POWER_OFF"),
@@ -1090,7 +1081,6 @@ const SUPERVISOR_DELEGATABLE: &[(u32, crate::capability::cap::ResourceId)] = &[
     (privbits::FIRE_IRQ,        FIRE_IRQ_RESOURCE),
     (privbits::REBOOT,          REBOOT_RESOURCE),
     (privbits::GPIO,            GPIO_DEVICE_RESOURCE),
-    (privbits::NET_DEVICE,      NET_DEVICE_RESOURCE),
     (privbits::PCI_CFG,         PCI_CFG_RESOURCE),
     (privbits::CPU_CLOCK,       CPU_CLOCK_RESOURCE),
     (privbits::POWER_OFF,       POWER_OFF_RESOURCE),
@@ -1108,11 +1098,9 @@ struct Privileges {
     fire_irq:        bool, // FIRE_IRQ: inject a test interrupt (`control` only - C1-6)
     reboot:          bool, // REBOOT: hardware-reset the machine (shell `reboot` only - SEC-2)
     acquire_any:     bool, // ACQUIRE_ANY: reach ARBITRARY services by name via AcquireSendCap (§3.1)
-    net_device:      bool, // NET_DEVICE: move ethernet frames via an in-kernel net device (held by nothing now)
     pci_cfg:         bool, // PCI_CFG: read PCI config space via CF8/CFC (hw-enumerator, step D2)
     cpu_clock:       bool, // CPU_CLOCK: set the Arm cores to their minimum or maximum rate (power)
     power_off:       bool, // POWER_OFF: turn the machine off, or halt it (the shell)
-    usb_disk:        bool, // USB_DISK: read/write blocks on an in-kernel USB mass-storage device (held by nothing now)
     gpio:            bool, // GPIO_DEVICE: drive the SoC GPIO pins (ARM `gpio` shell command)
     /// IMAGE_SPAWN: start a task from a CALLER-SUPPLIED image (`SpawnImage`). The supervisor alone -
     /// see `IMAGE_SPAWN_RESOURCE` for why this is not the same authority as `spawn`, and why it is
@@ -1170,25 +1158,9 @@ fn service_privileges(name: &str) -> Privileges {
         // NEGATIVE pin - deliberately excluded so it holds no ACQUIRE_ANY (proves AcquireSendCap denies
         // a non-holder). Ordinary services get none; their AcquireSendCap is limited to declared peers.
         acquire_any: matches!(name, "supervisor"),
-        // NET_DEVICE, GPIO_DEVICE, USB_DISK and SET_CLOCK were once kernel-only BY-NAME grants here (the
-        // U15 / userspace-audit A5-U1 doctrine). None is granted by name any more: GPIO and the clock
-        // bits travel in the spawn request like every other privilege, and NET_DEVICE and USB_DISK are
-        // held by nothing (below).
-        // NOTHING HOLDS NET_DEVICE ANY MORE, for the same two reasons `usb_disk` below reads
-        // `false`, and this arm is now dead in exactly the same way that one is.
-        //
-        // (a) It named `nic-driver` alone, and `nic-driver`'s image moved to the SUPERVISOR - this
-        //     table is only the fallback for a catalogue spawn (`None => service_privileges(name)`)
-        //     and the kernel catalogue is `supervisor` alone, so the arm could not fire even if the
-        //     authority were still wanted.
-        // (b) It is not wanted. arm32 left this set when its USB-net device moved into the `dwc2`
-        //     service; aarch64 left it when GENET moved into `nic-driver` itself (CLAUDE.md §6.4,
-        //     2026-08-09) and the service began driving the MAC through its own register window. The
-        //     NetFrame syscalls 42-44 have had no caller in any service since - `backlog/21` - and
-        //     the supervisor stopped requesting the privilege in `10d3b43e`, which booted on the Pi 4
-        //     with DHCP, ARP, ping and SNTP all working. So the capability has already been absent on
-        //     hardware for a boot; this removes the dead arm rather than changing anything.
-        net_device: false,
+        // GPIO_DEVICE was once a kernel-only BY-NAME grant here (the U15 / userspace-audit A5-U1 doctrine),
+        // with NET_DEVICE, USB_DISK and SET_CLOCK; GPIO travels in the spawn request now, and the other
+        // three were removed with the in-kernel devices they gated (backlog/21, backlog/fixed/59).
         // No service in the KERNEL's catalogue holds PCI_CFG. `hw-enumerator` is a moved service -
         // the supervisor owns its image and requests this privilege in the spawn request, which the
         // kernel grants only because the supervisor itself holds a GRANT cap for it. That is step C's
@@ -1199,12 +1171,6 @@ fn service_privileges(name: &str) -> Privileges {
         cpu_clock: false,
         // POWER_OFF: the same shape - the shell's spawn request asks for it.
         power_off: false,
-        // Nothing holds USB_DISK any more. It named `block-driver` alone, and `block-driver`'s image
-        // moved to the supervisor - so this arm could not fire even if the authority were still
-        // wanted, and it is not: the driver reaches its stick through the `dwc2` / `xhci` service over
-        // IPC on both ARM ports. Left as `false` rather than deleted along with the resource and its
-        // three syscalls, which is a separate change (audit SEC-37).
-        usb_disk: false,
         //   the shell's `gpio` command drives the SoC pins (the gated `Gpio` syscall, 45).
         gpio: false, // delegated in the spawn request (step C)
     }
@@ -1582,7 +1548,6 @@ fn spawn_service_with_image(
             reboot:          bits & privbits::REBOOT          != 0,
             acquire_any:     bits & privbits::ACQUIRE_ANY     != 0,
             gpio:            bits & privbits::GPIO            != 0,
-            net_device:      bits & privbits::NET_DEVICE      != 0,
             pci_cfg:         bits & privbits::PCI_CFG         != 0,
             cpu_clock:       bits & privbits::CPU_CLOCK       != 0,
             power_off:       bits & privbits::POWER_OFF       != 0,
@@ -1590,16 +1555,6 @@ fn spawn_service_with_image(
             // images: that is exactly the widening this capability exists to close, and a wire bit
             // for it would re-open the hole one grant later.
             image_spawn:     false,
-            // USB_DISK has NO bit, and that is the finding rather than an omission. It gated
-            // `block-driver`'s reach to a USB stick through the in-kernel Bulk-Only stack - and on
-            // BOTH ARM ports that stack is gone: the driver now asks the `dwc2` / `xhci` SERVICE over
-            // IPC (`xhciblk`), which calls no `usb_disk_*` syscall at all. So the authority is
-            // vestigial, and moving `block-driver` to the supervisor dropped it rather than
-            // preserving it. That is the narrowing audit SEC-37 asked for, reached as a consequence
-            // of the move: whole-device read/write reach is no longer handed to a service that
-            // stopped using it. Deleting the syscalls themselves is a separate change with its own
-            // test, so the resource still exists and simply has no holder.
-            usb_disk:        false,
         },
         None => service_privileges(name),
     };
@@ -1843,14 +1798,6 @@ fn spawn_service_with_image(
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
-    // NET_DEVICE: move ethernet frames via an in-kernel net device (NetFrame*/NetInfo, syscalls 42-44;
-    // stubs on every port now, and nothing requests it). WHO holds it is `privs`; here we only mint it.
-    if privs.net_device {
-        let nd_cap = mint_cap(NET_DEVICE_RESOURCE, Rights::WRITE);
-        caps.insert(nd_cap)
-            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
-    }
-
     // PCI_CFG: `hw-enumerator` reads PCI configuration space (step D2). ONE syscall performs a
     // complete read - latch the selector, fetch the register - and there is no write of any kind.
     //
@@ -1905,14 +1852,6 @@ fn spawn_service_with_image(
         caps.insert(dp_cap)
             .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         crate::kprintln!("spawn[power]: '{}' may cut and restore its device's power (DEVICE_POWER)", name);
-    }
-
-    // USB_DISK: read/write an in-kernel USB stick (UsbDisk*, syscalls 46-49). There is no in-kernel USB
-    // stack on any port now and `service_privileges` grants it to nobody, so this never mints.
-    if privs.usb_disk {
-        let ud_cap = mint_cap(USB_DISK_RESOURCE, Rights::WRITE);
-        caps.insert(ud_cap)
-            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
     // GPIO_DEVICE: the shell's `gpio` command drives the SoC pins (ARM `Gpio` syscall). Minted here; WHO

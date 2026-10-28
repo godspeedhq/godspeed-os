@@ -700,7 +700,7 @@ leaving a blocked client to time out against a clean log. A net request with no 
 with an empty reply, not ignored: the client is blocked waiting, and degrading it is the rule, hanging
 it is the violation.
 
-The `net_device` grant left arm32 in the same commit. The syscalls have nothing behind them there now,
+The NET_DEVICE grant left arm32 in the same commit. The syscalls have nothing behind them there now,
 so keeping the capability would be authority the service cannot use.
 
 Known costs, recorded rather than hidden:

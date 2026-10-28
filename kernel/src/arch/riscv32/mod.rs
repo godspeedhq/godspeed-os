@@ -100,8 +100,6 @@ pub use page_tables::{read_page_table_base, write_page_table_base, invalidate_tl
 /// Non-PCI fixed-physical peripheral MMIO grant (ARM Pi path); no fixed windows on this arch stub.
 pub fn map_fixed_device(_pt: &mut page_tables::PageTable, _kind: u32) -> Option<(u64, u64)> { None }
 
-// USB-net bridge stubs: on this arch the NIC is a userspace PCIe driver, not an in-kernel USB device.
-pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // No hardware-RNG backend exposed on this arch yet (x86 RDRAND is a trivial follow-up).
 pub fn hw_random() -> Option<u32> { None }
 
@@ -133,30 +131,15 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
 pub fn board_mac_packed() -> Option<u64> { None }
 
-/// USB mass-storage block device. NO port has an in-kernel USB stack any more - `arch/arm/dwc2.rs`
-/// and `arch/aarch64/xhci.rs` were both deleted (§6.4, 2026-08-09 and 2026-08-17) - so disks are
-/// userspace drivers everywhere and this always answers "no device". The USB_DISK syscalls (46-49)
-/// are a dead ABI; nothing holds the capability (`task/mod.rs`: `usb_disk: false`).
-pub fn usb_disk_sectors() -> u64 { 0 }
-pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
-pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
-pub fn usb_disk_flush() -> bool { false }
 /// Counter ticks a core may make NO forward progress before the liveness watchdog panics. `0` = this
 /// arch cannot say (no calibrated counter rate yet), so the check stays off - see the x86 and arm
 /// implementations for what a real answer looks like.
 pub fn liveness_deadline_cycles() -> u64 { 0 }
 
-pub fn usb_disk_busy() -> bool { false }
-/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
-/// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
-/// moot; the read/write primitives already answer false.
-pub fn usb_disk_absent() -> bool { true }
 
 
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
-pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
-pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes};
 
 /// Switch to a new stack top - `sp` on this ISA. `#[inline(always)]` for the same reason as x86.

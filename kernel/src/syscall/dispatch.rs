@@ -75,15 +75,13 @@ pub enum SyscallNumber {
     /// that flaw because it dequeues the reply specifically (`call_dequeue`); it simply could not be
     /// bounded. This is `Call` with the bound, so the correct primitive is also the usable one.
     CallDeadline           = 50,
-    NetFrameTx             = 42,
-    NetFrameRx             = 43,
-    NetInfo                = 44,
+    // 42-44 were NetFrameTx, NetFrameRx and NetInfo (an in-kernel network device), and 46-49
+    // UsbDiskInfo, UsbDiskRead, UsbDiskWrite and UsbDiskFlush (an in-kernel USB disk). No port has had
+    // either device since the USB stacks and GENET became services, nothing held their capabilities,
+    // and the SDK had no caller; removed with their resources (backlog/21). The numbers are not
+    // reused, so a stale caller gets an unknown syscall, never a different one.
     FireIrq                = 51,
     Gpio                   = 45,
-    UsbDiskInfo            = 46,
-    UsbDiskRead            = 47,
-    UsbDiskWrite           = 48,
-    UsbDiskFlush           = 49,
     /// Spawn a task from an image the CALLER supplies, described by a `SpawnRequest` in its own
     /// memory (step C, `docs/service-ownership.md`). The kernel stops holding a catalogue of what
     /// each service IS; it loads what it is handed, and enforces what the request may ask for.
@@ -143,15 +141,8 @@ pub unsafe extern "C" fn syscall_handler(
         n if n == SyscallNumber::TrySend        as u64 => handle_try_send(arg0, arg1, arg2),
         n if n == SyscallNumber::Call           as u64 => handle_call(arg0, arg1, arg2),
         n if n == SyscallNumber::CallDeadline   as u64 => handle_call_deadline(arg0, arg1, arg2),
-        n if n == SyscallNumber::NetFrameTx     as u64 => handle_net_frame_tx(arg0, arg1),
-        n if n == SyscallNumber::NetFrameRx     as u64 => handle_net_frame_rx(arg0, arg1),
-        n if n == SyscallNumber::NetInfo        as u64 => handle_net_info(arg0),
         n if n == SyscallNumber::FireIrq        as u64 => handle_fire_irq(arg0),
         n if n == SyscallNumber::Gpio           as u64 => handle_gpio(arg0, arg1),
-        n if n == SyscallNumber::UsbDiskInfo    as u64 => handle_usb_disk_info(),
-        n if n == SyscallNumber::UsbDiskRead    as u64 => handle_usb_disk_read(arg0, arg1),
-        n if n == SyscallNumber::UsbDiskWrite   as u64 => handle_usb_disk_write(arg0, arg1),
-        n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
         n if n == SyscallNumber::Yield          as u64 => {
             crate::task::scheduler::yield_current();
             0
@@ -2671,54 +2662,6 @@ fn handle_pci_cfg_read(sel: u64, offset: u64) -> i64 {
     }
 }
 
-/// NetFrameTx (42): transmit a raw ethernet frame via an in-kernel network device. `arg0` = frame ptr,
-/// `arg1` = length. Gated by NET_DEVICE (validated by holdings - the args fill the ABI, no slot to pass).
-/// Returns 0 on success, -1 on error. No port has an in-kernel network device any more: every arch's
-/// `net_frame_tx` is a stub returning false, and nothing is granted NET_DEVICE (`task::service_privileges`).
-fn handle_net_frame_tx(ptr: u64, len: u64) -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    let len = len as usize;
-    if len == 0 || len > NET_FRAME_MAX { return -1; }
-    let frame = match read_user_bytes(ptr, len) { Some(b) => b, None => return -1 };
-    if crate::arch::imp::net_frame_tx(frame) { 0 } else { -1 }
-}
-
-/// NetFrameRx (43): receive one raw ethernet frame into the user buffer. `arg0` = dst ptr, `arg1` = max
-/// length. Gated by NET_DEVICE. Returns the frame length (0 if none is available), -1 on error.
-fn handle_net_frame_rx(ptr: u64, max: u64) -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    let max = (max as usize).min(NET_FRAME_MAX);
-    if max == 0 { return -1; }
-    let mut buf = [0u8; NET_FRAME_MAX];
-    // `net_frame_rx` returns bytes written into the `[..max]` slice; clamp defensively so a future buggy
-    // arch impl returning n > max can never index-panic `buf[..n]` (kernel-audit Audit 6, INFO-1).
-    let n = crate::arch::imp::net_frame_rx(&mut buf[..max]).min(max);
-    if n == 0 { return 0; }
-    if !write_user_bytes(ptr, &buf[..n]) { return -1; }
-    n as i64
-}
-
-/// NetInfo (44): write `[mac(6), link(1)]` (7 bytes) of the in-kernel net device to `arg0`. Gated by
-/// NET_DEVICE. Returns 1 if a net device is up, 0 if none (every port today), -1 on error.
-fn handle_net_info(ptr: u64) -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::NET_DEVICE_RESOURCE, Rights::WRITE) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    match crate::arch::imp::net_info() {
-        Some((mac, link)) => {
-            let mut out = [0u8; 7];
-            out[..6].copy_from_slice(&mac);
-            out[6] = if link { 1 } else { 0 };
-            if write_user_bytes(ptr, &out) { 1 } else { -1 }
-        }
-        None => 0,
-    }
-}
-
 /// Gpio (45): drive a SoC GPIO pin. `op` = 0 input / 1 output / 2 set-high / 3 set-low / 4 read; `pin` =
 /// 0..53. Gated by GPIO_DEVICE (validated by holdings - the args fill the ABI). Returns the level (0/1) for
 /// a read, 0 on success, -1 on a bad pin / unsupported arch. Only arm32 implements `gpio_op`; every
@@ -2729,97 +2672,6 @@ fn handle_gpio(op: u64, pin: u64) -> i64 {
     }
     if op > 4 || pin > 53 { return -1; } // BCM2835 has 54 GPIO lines (0..53)
     crate::arch::imp::gpio_op(op as u32, pin as u32)
-}
-
-/// One block of the USB mass-storage device. The whole storage stack is 512-byte blocks, and the
-/// `dwc2` SERVICE is what reads and writes at that size (`services/dwc2/src/msc.rs`), so this is
-/// fixed. It said the KERNEL "only claims a device whose sectors are that size" via
-/// `dwc2::probe_mass_storage`; the kernel claims no USB device on any port now - every arch's
-/// `usb_disk_sectors()` returns 0 - and that helper went with `arch/arm/dwc2.rs` in slice 5.
-const USB_DISK_BLOCK: usize = 512;
-
-/// UsbDiskInfo (46): capacity of the attached USB mass-storage device in 512-byte sectors, 0 if none.
-/// Gated by USB_DISK (validated by holdings - no slot to pass). Always 0 on every port now (see
-/// `USB_DISK_BLOCK`).
-fn handle_usb_disk_info() -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    crate::arch::imp::usb_disk_sectors() as i64
-}
-
-/// A USB-disk syscall's "the device NAKed, re-ask" answer.
-///
-/// Deliberately OUTSIDE the capability-error range (-2..-7, `cap_err_to_i64`). BUSY was first given
-/// `-2`, which is `CapNotHeld` - so a task calling these syscalls WITHOUT the `USB_DISK_RESOURCE` capability got
-/// the same answer as one whose device was merely occupied. `block-driver` believes the second reading
-/// and re-asks 6000 times before reporting "the device stayed busy, it did not fail", which is a false
-/// diagnosis of an authority failure, and `fs` then degrades storage on the strength of it (Invariant
-/// 12: a failure must name its own cause). Reachable whenever a respawned driver comes back without its
-/// cap wired - exactly the case a kill-storm produces.
-const USB_DISK_BUSY: i64 = -20;
-
-/// No device is attached at all - as opposed to one that is present and asking us to wait.
-///
-/// These are opposite instructions to the caller and were being answered with the same word. BUSY means
-/// "come back, I am working"; ABSENT means "there is nothing here, and re-asking cannot change that -
-/// only a hot-plug can". Conflated, `block-driver` did the right thing with the wrong fact: it waited out
-/// its full 6000-attempt, ~30-second budget against a socket the operator had emptied, for every block of
-/// every request, and then reported "the device stayed busy, it did not fail" - a statement that was not
-/// true of a stick sitting on the desk.
-///
-/// The conflation was structural, not a missing branch. `usb_disk_busy()` answered from the last
-/// TRANSFER's outcome - and a refusal short-circuits before any transfer, so it left whatever the
-/// previous one wrote. A stick pulled mid-command leaves a NAK there, so "absent" inherited
-/// "busy" from the transfer that was in flight when it was pulled. The state was stale rather than wrong,
-/// which is why it read as plausible (§26.4 - a derived value must reduce to a current truth).
-const USB_DISK_ABSENT: i64 = -21;
-
-/// UsbDiskRead (47): read the 512-byte block at `arg0` (LBA) into the user buffer at `arg1`.
-/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_ABSENT` if no device is attached,
-/// `USB_DISK_BUSY` if the device NAKed (re-ask), -1 on a real failure (LBA past the end, I/O error).
-fn handle_usb_disk_read(lba: u64, ptr: u64) -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    let mut buf = [0u8; USB_DISK_BLOCK];
-    // USB_DISK_BUSY (-20) = BUSY (the device NAKed; nothing is wrong, re-ask). Distinct from -1 =
-    // failed, because the two need opposite responses and collapsing them is what turned a busy stick
-    // into a "broken" one. NOT -2: that is `CapNotHeld`, and giving BUSY a cap-error code was the
-    // original bug - see the `USB_DISK_BUSY` constant, which records it.
-    if !crate::arch::imp::usb_disk_read(lba, &mut buf) {
-        // ABSENT first: it is the stronger fact. `usb_disk_busy` reads the last TRANSFER's outcome, which
-        // a refusal never updates, so asking it about a device that is not there answers from stale state.
-        if crate::arch::imp::usb_disk_absent() { return USB_DISK_ABSENT; }
-        return if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY } else { -1 };
-    }
-    if !write_user_bytes(ptr, &buf) { return -1; }
-    0
-}
-
-/// UsbDiskWrite (48): write the 512-byte block at the user buffer `arg1` to LBA `arg0`.
-/// Gated by USB_DISK. Returns 0 on success, `USB_DISK_ABSENT` if no device is attached, `USB_DISK_BUSY`
-/// if the device NAKed, -1 on a real failure.
-fn handle_usb_disk_write(lba: u64, ptr: u64) -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    let src = match read_user_bytes(ptr, USB_DISK_BLOCK) { Some(b) => b, None => return -1 };
-    if crate::arch::imp::usb_disk_write(lba, src) { 0 }
-    else if crate::arch::imp::usb_disk_absent() { USB_DISK_ABSENT }  // nothing there; re-asking cannot help
-    else if crate::arch::imp::usb_disk_busy() { USB_DISK_BUSY }   // re-ask, do not treat as a failure
-    else { -1 }
-}
-
-/// UsbDiskFlush (49): flush the device's write cache to the medium (SCSI SYNCHRONIZE CACHE).
-/// Gated by the same USB_DISK WRITE right as a write - making data durable is part of writing it,
-/// and a caller that cannot write has nothing to flush. Returns 0 on success, -1 on failure; a
-/// failure is reported, never swallowed, because the caller is about to rely on durability (§26.7).
-fn handle_usb_disk_flush() -> i64 {
-    if !scheduler::current_task_holds_resource(crate::capability::USB_DISK_RESOURCE, Rights::WRITE) {
-        return cap_err_to_i64(CapError::CapNotHeld);
-    }
-    if crate::arch::imp::usb_disk_flush() { 0 } else { -1 }
 }
 
 fn ipc_err_to_i64(e: IpcError) -> i64 {

@@ -38,10 +38,10 @@ pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     // parameter would be a register PAIR on 32-bit ARM), so each arg is TRUNCATED to u32 here. Every
     // arg the current syscalls pass - pointer, handle, length, cap slot - fits in 32 bits. The ONE
     // exceptions are values that can exceed 32 bits, and each is handled in ITS OWN WRAPPER before it
-    // reaches this truncation (userspace-audit A-U1): `recv_timeout` clamps a generic-timer tick count,
-    // and the USB-disk wrappers reject an LBA above u32::MAX rather than let it alias onto a real block
-    // (`lba_fits_syscall_abi`). This comment previously claimed the timeout was the ONE exception, which
-    // was false the moment a u64 LBA started coming through here - so before adding any syscall, check
+    // reaches this truncation (userspace-audit A-U1): `recv_timeout` clamps a generic-timer tick count.
+    // (The USB-disk wrappers rejected an LBA above u32::MAX the same way, until they went with their
+    // syscalls, backlog/21.) This comment once claimed the timeout was the ONE exception, which was
+    // false the moment a u64 LBA came through here - so before adding any syscall, check
     // whether an argument can exceed 32 bits and clamp it above, and amend this list when it can.
     // (2026-10-09) One that can and is NOT clamped: `ServiceContext::sleep` passes its cycle count
     // straight through, so a sleep longer than u32::MAX counter ticks aliases (and a count whose low

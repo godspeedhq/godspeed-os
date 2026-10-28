@@ -82,8 +82,7 @@ pub use dma::Dma;
 pub use ipc::{Message, IpcError};
 pub use mmio::{Framebuffer, Mmio};
 pub use record::{Table, Value, RecordSink, parse_predicate};
-pub use service_context::{ServiceContext, TaskStat, CapInfo, Datetime, ClockSource, ReqOutcome, DeadlineOutcome,
-                          USB_DISK_BUSY, USB_DISK_ABSENT};
+pub use service_context::{ServiceContext, TaskStat, CapInfo, Datetime, ClockSource, ReqOutcome, DeadlineOutcome};
 
 pub type Result<T> = core::result::Result<T, Error>;
 

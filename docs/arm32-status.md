@@ -51,8 +51,8 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
 - **Networking (USB-Ethernet -> net-stack):** a USB-net device is driven by the userspace **`dwc2`
   service** (DWC2 bulk frames) and reached by `nic-driver` over IPC (opcodes `0x10+` on `dwc2`'s endpoint -
   the same endpoint that serves the block protocol), which bridges to the **unchanged** `net-stack`. The
-  `NET_DEVICE` syscalls (42-44) that used to front an in-kernel USB-net device are **stubbed inert** on
-  this arch (`arch/arm/mod.rs`), because no frame passes through the kernel any more. **The device it
+  `NET_DEVICE` syscalls (42-44) that used to front an in-kernel USB-net device are **gone** (removed on
+  every port 2026-10-28, `backlog/21`), because no frame passes through the kernel any more. **The device it
   drives is the Pi 2's onboard LAN9514 (`smsc95xx`) and nothing else**: DHCP, ARP and internet ping all
   work on real hardware, with RX **client-polled**: a bulk-IN
   is kept armed, and `rx()` harvests the completed burst and re-arms it when a client asks for frames
@@ -234,7 +234,7 @@ GodspeedOS way.
   *(Note 2026-10-09: the three entries above are the 2026-07-23 state, when the USB stack was in the
   kernel. It is not any more: `arch/arm/dwc2.rs` is deleted, mass storage and the SMSC LAN9514 are driven
   by the `dwc2` SERVICE, `nic-driver` reaches it over IPC (ops `0x10+` on `dwc2`'s endpoint), and the
-  `NET_DEVICE` syscalls 42-44 are stubs that answer "no device" on this arch (see "Networking" above).
+  `NET_DEVICE` syscalls 42-44 are removed (see "Networking" above).
   The USB stick IS the `block-driver` backend now; there is no SD/EMMC backend beside it.)*
 
   *(Note 2026-10-17: the note above first said the `dwc2` service drives CDC-ECM. It does not; CDC-ECM

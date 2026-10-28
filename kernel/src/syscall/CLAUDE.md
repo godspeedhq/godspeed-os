@@ -23,7 +23,7 @@ If you are adding a syscall:
 with `CapTable::get(slot, right)`. Syscalls whose arguments fill the ABI registers
 or that take none - the introspection reads (`InspectKernel` 13 system queries,
 `TaskStat` 16, `TaskCaps` 28), `Kill` (8, both args carry the name), `Reboot` (18),
-`ResourceMint` (30), `NetFrame*`/`NetInfo` (42-44), `Gpio` (45), `UsbDisk*` (46-49),
+`ResourceMint` (30), `Gpio` (45),
 `FireIrq` (51), `PciCfgRead` (53), `DevicePower` (54), `CpuClock` (55), `PowerOff` (56), and the
 IMAGE_SPAWN half of `SpawnImage` (52) - instead validate by **holdings**:
 `scheduler::current_task_holds_resource(rid, right)` confirms the calling task

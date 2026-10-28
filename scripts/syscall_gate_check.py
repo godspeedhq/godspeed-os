@@ -159,8 +159,6 @@ ALLOW_ZERO = {
         "a sleep woken early reports success: see finding F-sleep-early-wake-0",
     ("handle_resource_mint", "let_=delegated::revoke_owned(id,owner);"):
         "cleanup after a failed copy-out; the id was just allocated by this owner",
-    ("handle_net_info", "None=>0,"):
-        "documented: 0 = no in-kernel net device (every port today)",
 }
 
 # Calls proven read-only enough to precede a gate (by reading them; reason given). Everything else
@@ -215,15 +213,8 @@ GATE_PIN = {
     "ConsoleForeground": "SLOT(READ)@CONSOLE_READ_RESOURCE",
     "Call": "SLOT(SEND)+SLOT(GRANT)+SLOT(RECV)",
     "CallDeadline": "SLOT(SEND)+SLOT(GRANT)+SLOT(RECV)",
-    "NetFrameTx": "HOLD(NET_DEVICE_RESOURCE,WRITE)",
-    "NetFrameRx": "HOLD(NET_DEVICE_RESOURCE,WRITE)",
-    "NetInfo": "HOLD(NET_DEVICE_RESOURCE,WRITE)",
     "FireIrq": "HOLD(FIRE_IRQ_RESOURCE,WRITE)",
     "Gpio": "HOLD(GPIO_DEVICE_RESOURCE,WRITE)",
-    "UsbDiskInfo": "HOLD(USB_DISK_RESOURCE,WRITE)",
-    "UsbDiskRead": "HOLD(USB_DISK_RESOURCE,WRITE)",
-    "UsbDiskWrite": "HOLD(USB_DISK_RESOURCE,WRITE)",
-    "UsbDiskFlush": "HOLD(USB_DISK_RESOURCE,WRITE)",
     "SpawnImage": "SLOT(WRITE)@SPAWN_RESOURCE+HOLD(IMAGE_SPAWN_RESOURCE,WRITE)+SLOT(GRANT)",
     "PciCfgRead": "HOLD(PCI_CFG_RESOURCE,READ)",
     "DevicePower": "HOLD(DEVICE_POWER_RESOURCE,WRITE)",
@@ -1215,9 +1206,9 @@ fn handle_reboot() -> i64 {""")]),
 """, """fn handle_kill(name_ptr: u64, name_len: u64) -> i64 {
     let _early = crate::task::kill_by_name("ping", crate::task::Cause::Killed { by: scheduler::current_task_slot() });
 """)]),
-    dict(id="M14", what="delete the UsbDiskFlush dispatcher arm (enum variant left dangling)",
+    dict(id="M14", what="delete the Gpio dispatcher arm (enum variant left dangling)",
          expect="catch", rules=["S1"],
-         edits=[("""        n if n == SyscallNumber::UsbDiskFlush   as u64 => handle_usb_disk_flush(),
+         edits=[("""        n if n == SyscallNumber::Gpio           as u64 => handle_gpio(arg0, arg1),
 """, "")]),
     dict(id="M15", what="AcquireSendCap: drop the declared-peer half, keep ACQUIRE_ANY (narrower - safe)",
          expect="fp", rules=["S9"],

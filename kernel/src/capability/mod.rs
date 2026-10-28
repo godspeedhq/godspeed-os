@@ -78,30 +78,21 @@ pub const REBOOT_RESOURCE: ResourceId = ResourceId(8);
 /// (recovery, §13/§14.2), so an ordinary service holds no ambient send authority (§3.1).
 pub const ACQUIRE_ANY_RESOURCE: ResourceId = ResourceId(9);
 
-/// Authority to move raw ethernet frames to/from the in-kernel USB-net device (the ARM DWC2 CDC-ECM
-/// bridge: `NetFrameTx`/`NetFrameRx`/`NetInfo`, syscalls 42-44). Held only by the ARM `nic-driver`, which
-/// bridges those frames to the frame IPC net-stack speaks. On non-ARM arches the NIC is a userspace PCIe
-/// driver and these syscalls return unsupported, so nothing holds this there. A frame is raw wire bytes,
-/// so - like a DMA-capable driver (§6.4) - this is real reach; it is granted explicitly, never ambient.
-///
-/// (Note 2026-10-12: the paragraph above is history. No port has an in-kernel network device - every
-/// arch's `net_frame_*` answers "no device" - nothing has been granted this since 2026-09-13, and the
-/// SDK wrappers for 42-44 were removed 2026-10-11. The id and the syscalls remain until `backlog/21`'s
-/// last step retires them.)
-pub const NET_DEVICE_RESOURCE: ResourceId = ResourceId(10);
+// ResourceId 10 was NET_DEVICE_RESOURCE, the authority to move frames through an in-kernel network
+// device (syscalls 42-44). No port has had one since the USB-net device moved into `dwc2` and GENET into
+// `nic-driver`, and nothing was granted it after 2026-09-13; removed with its syscalls (backlog/21).
+// Not reused.
 
 /// Authority to drive the SoC GPIO pins (the ARM `Gpio` syscall: set a pin's direction, drive it high/low,
 /// read its level). Real hardware reach - GPIO pins carry the UART console and the SD card, so toggling the
 /// wrong one breaks the machine; granted only to the `shell` (its `gpio` command, the operator interface).
-/// A no-op off ARM. Like REBOOT/NET_DEVICE, it is explicit authority, never ambient.
+/// A no-op off ARM. Like REBOOT, it is explicit authority, never ambient.
 pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
 
-/// Authority to read and write blocks on the in-kernel USB mass-storage device (the ARM DWC2 Bulk-Only
-/// bridge: `UsbDiskInfo`/`UsbDiskRead`/`UsbDiskWrite`, syscalls 46-48). Held only by the ARM
-/// `block-driver`, which serves those blocks to `fs` over the same block IPC protocol as any disk. This
-/// is whole-device read/write reach - a holder can rewrite any sector, so it is granted explicitly,
-/// never ambient (the same posture as NET_DEVICE). A no-op off ARM, where disks are userspace drivers.
-pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
+// ResourceId 12 was USB_DISK_RESOURCE, the authority to read and write the in-kernel USB disk
+// (syscalls 46-49). The disk is served by the `dwc2` and `xhci` SERVICES over IPC on every port, the
+// kernel claimed no device, and nothing held it (audit SEC-37); removed with its syscalls (backlog/21).
+// Not reused.
 
 // ResourceId 13 was SET_CLOCK_RESOURCE, the authority to set the wall clock. Nothing checked it once
 // the clock moved to the `time` service (clock slice 3, and since 2026-10-01 `time` fetches the network
@@ -198,9 +189,7 @@ pub fn init() {
     table::register_resource(RESOURCE_MINT_RESOURCE);
     table::register_resource(REBOOT_RESOURCE);
     table::register_resource(ACQUIRE_ANY_RESOURCE);
-    table::register_resource(NET_DEVICE_RESOURCE);
     table::register_resource(GPIO_DEVICE_RESOURCE);
-    table::register_resource(USB_DISK_RESOURCE);
     table::register_resource(IMAGE_SPAWN_RESOURCE);
     table::register_resource(PCI_CFG_RESOURCE);
     // The device grant made renewable (12.3 amendment 2026-10-01). Registered like every other kernel

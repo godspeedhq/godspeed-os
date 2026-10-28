@@ -1031,8 +1031,8 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
 /// **Pi 2 (arm32) only.** The device is the board's SMSC LAN9514 (smsc95xx) USB ethernet, driven by the
 /// `dwc2` SERVICE, so this reaches it by IPC (ops 0x10 INFO / 0x11 TX / 0x12 RX) rather than by syscall.
 ///
-/// It used to compile on aarch64 too, and carried a SECOND body - `ctx.net_info` / `net_frame_tx` /
-/// `net_frame_rx`, the NET_DEVICE syscalls - selected by `#[cfg(not(target_arch = "arm"))]` for the
+/// It used to compile on aarch64 too, and carried a SECOND body - `ctx.net_info` / net_frame_tx /
+/// net_frame_rx, the NET_DEVICE syscalls - selected by `#[cfg(not(target_arch = "arm"))]` for the
 /// Pi 4's in-kernel GENET. **That body has had no caller since GENET moved into this service**
 /// (CLAUDE.md 6.4, amendment 2026-08-09): `service_main` sends aarch64 to `genet::genet_main`, so the
 /// syscall body was compiled into every Pi 4 image and never once executed. Thirteen `#[cfg]` sites

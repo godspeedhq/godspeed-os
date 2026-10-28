@@ -24,7 +24,7 @@ Two `dwc2` paths that answered a block request `STATUS_ERR` while a disk could b
 ## SDK
 
 - **S1. Two `AUTHORITIES` descriptions describe devices that no longer exist.** `sdk/rust/src/service_context.rs`:
-  10 `net_device` "move raw ethernet frames on the ARM USB network device" and 12 `usb_disk` "read and write
+  10 net_device "move raw ethernet frames on the ARM USB network device" and 12 usb_disk "read and write
   any sector of the ARM USB disk". Both were in-kernel devices; the USB stacks are services now and nothing
   is granted either. The strings are user-facing (`caps`, `ask "who can ...?"`). Fix: reword as `set_clock`'s
   entry is, "(granted to nothing now)".

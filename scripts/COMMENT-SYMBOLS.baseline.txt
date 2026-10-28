@@ -177,10 +177,8 @@ vs_dc_enable
 yt8531_link_change_notify
 ytphy_get_delay_reg_value
 hotplug_poll                       # arch/arm/mod.rs - the in-kernel dwc2's exclusion protocol, named as history at the point a reader asks why masking was rejected
-msc_sync_cache                     # arch/arm/mod.rs - 'went with arch/arm/dwc2.rs'; the record must name what went
 process_pending                    # 3 sites, each saying in terms that it 'no longer exists' - the COM2 channel is services/control now (C1-6)
 probe_authority                    # services/probe/src/table.rs - CORRECTED: authority never was keyed by name in the kernel after step C; the name is kept naming the thing that is gone
-probe_mass_storage                 # kernel/src/syscall/dispatch.rs - CORRECTED: the kernel claims no USB device now; the name records the helper that went with arch/arm/dwc2.rs
 # --- CamelCase (types / enum variants), enabled 2026-09-26 after triaging all 21 sites --------
 AttrIndx                           # ARM MAIR_EL1 field name - the silicon's, not ours (26.14)
 DminLine                           # ARM CTR_EL0 field - ditto

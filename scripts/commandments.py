@@ -449,7 +449,7 @@ def check_kernel_authorities(check, pins):
     """Commandment I: a new KERNEL AUTHORITY is a new kernel responsibility.
 
     The syscall pin catches new kernel VERBS. This catches new kernel NOUNS: the well-known resources
-    the kernel itself mints authority over (LOG_WRITE, SPAWN, REBOOT, NET_DEVICE ...). Adding one means
+    the kernel itself mints authority over (LOG_WRITE, SPAWN, REBOOT, GPIO_DEVICE ...). Adding one means
     the kernel has taken responsibility for something new, whether or not a syscall was added with it -
     and several of these exist precisely because a syscall alone could not express the authority.
 
@@ -2028,8 +2028,8 @@ CHECKS = [
                         "vector is resolved from its DEVICE CLASS by the arch seam, so the contract's "
                         "number and the grant are different kinds of fact and pretending to reconcile "
                         "them would be the very thing this check exists to catch. Nor does it cover "
-                        "the kernel-only privileges (CONSOLE_PUSH, INTROSPECT, REBOOT, GPIO, "
-                        "NET_DEVICE) - the U15 doctrine makes the kernel their single "
+                        "the kernel-only privileges (CONSOLE_PUSH, INTROSPECT, REBOOT, "
+                        "and GPIO) - the U15 doctrine makes the kernel their single "
                         "source and they have no contract key by design",
          probes=[
              dict(why="a contract claiming authority it is not granted must be caught",

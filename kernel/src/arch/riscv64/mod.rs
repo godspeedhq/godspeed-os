@@ -1131,9 +1131,6 @@ pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u
     Some((DRIVER_MMIO_VA, 0x1000))
 }
 
-// USB-net bridge stubs: on this arch the NIC is a userspace driver (the e1000 on PCI under QEMU, the
-// SoC's `dwmac` on the VisionFive), not an in-kernel USB device.
-pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
 // ---- THE JH7110's TRUE RANDOM NUMBER GENERATOR (`hw_random`, InspectKernel query 19) ----------------
 //
 // The seam every port answers (`aarch64` with the Pi 4's RNG200). Until this, riscv64 answered `None`,
@@ -1324,14 +1321,6 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
 pub fn board_mac_packed() -> Option<u64> { None }
 
-/// USB mass-storage block device. NO port has an in-kernel USB stack any more - `arch/arm/dwc2.rs`
-/// and `arch/aarch64/xhci.rs` were both deleted (§6.4, 2026-08-09 and 2026-08-17) - so disks are
-/// userspace drivers everywhere and this always answers "no device". The USB_DISK syscalls (46-49)
-/// are a dead ABI; nothing holds the capability (`task/mod.rs`: `usb_disk: false`).
-pub fn usb_disk_sectors() -> u64 { 0 }
-pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
-pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
-pub fn usb_disk_flush() -> bool { false }
 /// How long a core may go dark before the machine says so, in ticks of the counter the scheduler
 /// stamps with.
 ///
@@ -1358,17 +1347,10 @@ pub fn liveness_deadline_cycles() -> u64 {
     boot::tsc_ticks_per_quantum().saturating_mul(QUANTA_PER_SEC * LIVENESS_SECS)
 }
 
-pub fn usb_disk_busy() -> bool { false }
-/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
-/// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
-/// moot; the read/write primitives already answer false.
-pub fn usb_disk_absent() -> bool { true }
 
 
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
-pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
-pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub use syscall_entry::{
     copy_user_to_kernel, read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes,
 };

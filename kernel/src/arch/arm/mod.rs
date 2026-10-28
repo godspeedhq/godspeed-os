@@ -33,16 +33,6 @@ pub use bootcon::fb_commit;
 // arm32 slice 5: the in-kernel HID decoder is gone with the rest of the USB stack. Keystroke decoding
 // belongs to whoever owns the keyboard, and that is the `dwc2` SERVICE now (services/dwc2/src/hid.rs).
 
-/// USB-net bridge backends, kept as STUBS that say no.
-///
-/// The syscalls above them (42-44) are arch-neutral, so they stay and only ARM's implementation leaves.
-/// (They once served aarch64's in-kernel GENET too; that driver is deleted, and every port now answers
-/// "no device" here.) On this port the kernel no longer has a network
-/// device: `nic-driver` talks to the `dwc2` service over IPC instead (slice 4b). Answering "no device"
-/// is the truth, and a caller that ignores the answer fails loudly rather than reading stale bytes.
-pub fn net_frame_tx(_frame: &[u8]) -> bool { false }
-pub fn net_frame_rx(_dst: &mut [u8]) -> usize { 0 }
-pub fn net_info() -> Option<([u8; 6], bool)> { None }
 pub mod usermode;
 pub mod loadtest;
 pub mod spawn;
@@ -1339,16 +1329,9 @@ pub fn board_mac_packed() -> Option<u64> {
 // each verified on hardware - and reaches it through an MMIO window, a DMA arena and the USB vector
 // granted at spawn.
 //
-// These backends remain as stubs that say NO rather than vanishing, because the syscalls above them are
-// arch-neutral (`net_frame_*` once also served aarch64's in-kernel GENET, since deleted; every port
-// answers "no device" now). On arm they answer "no device", which is the truth - the kernel no longer has one - and a client that ignores the answer
-// fails loudly rather than reading stale bytes.
-pub fn usb_disk_sectors() -> u64 { 0 }
-pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
-pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
-/// No in-kernel USB disk on this port (slice 5): always false. Durability is the `dwc2` SERVICE's
-/// job, reached over IPC. (`dwc2::msc_sync_cache` went with `arch/arm/dwc2.rs`.)
-pub fn usb_disk_flush() -> bool { false }
+// The stubs that stood in for it - the USB-disk and in-kernel-network hooks every port answered "no
+// device" from - went with their syscalls (backlog/21).
+
 /// No-op: this arch counts every IRQ in `irq::arm_irq_dispatch`, which sees them all.
 pub fn note_irq(_vector: u32) {}
 
@@ -1393,15 +1376,6 @@ pub fn liveness_deadline_cycles() -> u64 {
     (timer::timer_hz() as u64).saturating_mul(LIVENESS_SECS)
 }
 
-/// Did the last USB-disk transfer fail only because the device was BUSY (NAK)? Then it is not a
-/// failure at all - the caller should re-ask, with interrupts enabled in between. Always false on
-/// this port: there is no in-kernel USB disk (slice 5).
-pub fn usb_disk_busy() -> bool { false }
-/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
-/// dispatch. Slice 5 took the USB stack out of the kernel (`services/dwc2` owns the controller), so
-/// no request reaches a backend here and the question is moot; the read/write primitives already
-/// answer false.
-pub fn usb_disk_absent() -> bool { true }
 
 const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;
 const RNG_STATUS: usize = PERIPHERAL_BASE + 0x10_4004;

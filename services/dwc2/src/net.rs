@@ -1830,7 +1830,7 @@ pub fn serve(
     // the whole time.
     //
     // It is also why this worked before the driver left the kernel. `nic-driver` used to reach the
-    // device through the `net_frame_rx` SYSCALL - one call, one frame, no reply stream to misalign.
+    // device through the net_frame_rx SYSCALL - one call, one frame, no reply stream to misalign.
     // The IPC hop that replaced it introduced the failure, so the hop is where the fix belongs.
     //
     // `fs` has had exactly this and exactly this fix since the "run ls twice" desync

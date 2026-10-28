@@ -1300,20 +1300,6 @@ pub fn map_fixed_device(pt: &mut page_tables::PageTable, kind: u32) -> Option<(u
     }
 }
 
-// NO in-kernel network device on this arch, by design.
-//
-// These three hooks exist because the neutral `NET_DEVICE` syscalls (42-44) are arch-agnostic. Here
-// they are deliberately inert: the NIC is driven by the `nic-driver` SERVICE through its own register
-// window, so a frame never passes through the kernel at all. (Note 2026-10-09: this said the Pi 2's
-// hooks front an in-kernel USB-net adapter and that `nic-driver` still holds NET_DEVICE here. Neither
-// holds now: every port's hooks answer "no device", and the supervisor's spawn table no longer grants
-// NET_DEVICE - see the `console` row's neighbour in `services/supervisor/src/main.rs`.)
-//
-// Returning false/0/None is the honest answer, not a fallback: there IS no kernel network device, and
-// a service that asked would be told so rather than quietly given nothing.
-pub fn net_frame_tx(_frame: &[u8]) -> bool {
-    false
-}
 /// The BCM2711's RNG200 block.
 #[cfg(feature = "pi4")]
 const RNG200_BASE: usize = 0xFE10_4000;
@@ -1556,51 +1542,7 @@ pub fn emmc_base_clock_hz() -> u32 { 0 }
 /// No board mailbox on this architecture: the driver uses whatever the chip holds. See query 23.
 pub fn board_mac_packed() -> Option<u64> { None }
 
-/// USB mass-storage block device. NO port has an in-kernel USB stack any more - `arch/arm/dwc2.rs`
-/// and `arch/aarch64/xhci.rs` were both deleted (§6.4, 2026-08-09 and 2026-08-17) - so disks are
-/// userspace drivers everywhere and this always answers "no device". The USB_DISK syscalls (46-49)
-/// are a dead ABI; nothing holds the capability (`task/mod.rs`: `usb_disk: false`).
-/// Storage on this board is a USB stick, never the SD card.
-///
-/// The Pi 4 has a single SD slot and boots from it: firmware, kernel image, FAT partition. GSFS puts
-/// its superblock at LBA 0, exactly where that card's partition table is, so handing the card to the
-/// filesystem overwrites the boot medium. The 32-bit port established that the hard way - it corrupted
-/// two boot cards to RAW before the SD backend was withdrawn - and this board has the same topology,
-/// so it inherits the same rule rather than rediscovering it.
-///
-/// **The kernel drives no USB at all, so there is no in-kernel disk: reported, not hidden.**
-/// These four entry points exist only because the USB stack was in the kernel; hand the controller to
-/// the `xhci` SERVICE and the kernel has no way to reach a mass-storage device - nor should it.
-/// Answering 0/false makes `usb_disk_absent()` true, which is the syscall's existing "no stick plugged
-/// in" answer. (Note 2026-10-09: this once said the service was HID-only, so nothing picked the disk
-/// up. That closed the way it said it should: the `xhci` service drives mass storage too, and
-/// `block-driver` reaches the stick through it over IPC - the boot line beside the PCIe probe says so.
-/// These entry points are simply unused on this port.)
-#[cfg(feature = "pi4")]
-pub fn usb_disk_sectors() -> u64 {
-    0
-}
-#[cfg(feature = "pi4")]
-pub fn usb_disk_read(lba: u64, dst: &mut [u8]) -> bool {
-    let _ = (lba, dst); false
-}
-#[cfg(feature = "pi4")]
-pub fn usb_disk_write(lba: u64, src: &[u8]) -> bool {
-    let _ = (lba, src); false
-}
-#[cfg(feature = "pi4")]
-pub fn usb_disk_flush() -> bool {
-    false
-}
 
-#[cfg(not(feature = "pi4"))]
-pub fn usb_disk_sectors() -> u64 { 0 }
-#[cfg(not(feature = "pi4"))]
-pub fn usb_disk_read(_lba: u64, _dst: &mut [u8]) -> bool { false }
-#[cfg(not(feature = "pi4"))]
-pub fn usb_disk_write(_lba: u64, _src: &[u8]) -> bool { false }
-#[cfg(not(feature = "pi4"))]
-pub fn usb_disk_flush() -> bool { false }
 /// No-op: this arch counts every IRQ in its own dispatcher, not on the timer path.
 pub fn note_irq(_vector: u32) {}
 
@@ -1667,33 +1609,11 @@ pub fn fb_commit(
     _x: usize, _y: usize, _w: usize, _h: usize,
 ) {}
 
-#[cfg(feature = "pi4")]
-pub fn usb_disk_busy() -> bool {
-    false
-}
-#[cfg(not(feature = "pi4"))]
-pub fn usb_disk_busy() -> bool { false }
-/// Is there no USB disk attached at all? Distinct from busy - see `USB_DISK_ABSENT` in the syscall
-/// dispatch. This arch has no USB-disk backend, so a request never reaches one and the question is
-/// moot; the read/write primitives already answer false.
-#[cfg(feature = "pi4")]
-pub fn usb_disk_absent() -> bool {
-    true
-}
-#[cfg(not(feature = "pi4"))]
-pub fn usb_disk_absent() -> bool { true }
 
 
 // No GPIO on this arch (the ARM `gpio` shell command is Pi-only).
 pub fn gpio_op(_op: u32, _pin: u32) -> i64 { -1 }
-pub fn net_frame_rx(_dst: &mut [u8]) -> usize {
-    0
-}
 
-/// The station address and the live link state, for a driver service that has to report both.
-pub fn net_info() -> Option<([u8; 6], bool)> {
-    None
-}
 pub use syscall_entry::{read_cycle_counter, read_user_bytes, validate_user_ptr, write_user_bytes, copy_user_to_kernel};
 
 /// Switch to a new stack top - `sp` on AArch64. `#[inline(always)]` for the same reason as x86.
