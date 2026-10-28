@@ -3,10 +3,21 @@ name: build
 on:
   workflow_dispatch:  # paused: re-add push/pull_request when CI minutes are available
 
+# REVIVED 2026-10-28 (backlog/fixed/53). This workflow sat paused and red for five months: it built the tree
+# with its own hand-ordered `cargo build` steps and ran its own hand-kept list of fourteen checkers, and
+# both drifted from what a local build does - the supervisor came to need `pong` first, the checker
+# list fell behind `EXTRA_CHECKS`, and nothing ran it to notice. It now builds the way a developer does,
+# through `osdev build`, which orders the crates and runs every gate the local build runs (`EXTRA_CHECKS`
+# and the commandments, read from one list). A checker added there is in CI the same day, by construction.
+#
+# Proved on Ubuntu 24.04 under WSL from a fresh clone before it was committed, so dispatching it spends CI
+# minutes on a build already known to pass, not on finding the next layer.
+
 jobs:
   build:
-    name: Build and lint
-    runs-on: ubuntu-latest
+    name: Build every port and run every gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,113 +26,62 @@ jobs:
           # depth-1 checkout would turn this job red for the wrong reason.
           fetch-depth: 0
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain (rust-toolchain.toml pins the date and every target)
         run: rustup show
 
-      # PIN PYTHON. This job runs FOURTEEN `python3 scripts/...` checkers and until now took whatever
-      # the runner happened to ship - an unpinned dependency on the enforcement layer itself, where a
-      # silent version change would mean nobody knows which Python the rules were last verified
-      # against. `README.md` declares the floor as 3.8 and `scripts/python_floor_check.py` holds it
-      # mechanically, so 3.8 is what CI runs: if a script ever needs newer, that gate fails first and
-      # the floor is raised deliberately rather than discovered.
-      - name: Install Python (the declared floor - README.md Requirements)
+      # PIN PYTHON to the declared floor (README.md Requirements, held by scripts/python_floor_check.py), so
+      # the enforcement layer runs on the oldest Python it promises. `osdev` runs the checkers as `python`,
+      # which setup-python provides.
+      - name: Install Python (the declared floor)
         uses: actions/setup-python@v5
         with:
           python-version: '3.8'
 
-      # Services must be built before the kernel: kernel/build.rs embeds the supervisor's
-      # ELF via include_bytes!(env!("SVC_SUPERVISOR_ELF")) and the supervisor embeds every
-      # other service, so the binaries must exist in target/ before either crate compiles.
-      - name: Build services (bare-metal)
-        # THE SUPERVISOR EMBEDS THE OTHER SERVICES, so they must be built first. `--workspace` gives
-        # cargo no ordering guarantee between members, so a plain workspace build can reach
-        # `supervisor/build.rs` before `pong` exists and panic - which is what broke this workflow
-        # silently for months while it was paused and nothing ran it.
-        run: |
-          cargo build --target x86_64-unknown-none --workspace \
-            --exclude osdev --exclude kernel --exclude supervisor
-          cargo build --target x86_64-unknown-none -p supervisor
+      # ONE build path. `osdev build` builds the services in the order the supervisor's embedding needs,
+      # then the kernel, and runs `EXTRA_CHECKS` and the commandments (self-test first). It is what every
+      # developer runs, so it cannot be green here and red at a desk, or the other way round.
+      - name: Build x86-64 and run every gate (osdev build)
+        run: cargo run -p osdev -- build
 
-      - name: Build kernel (bare-metal)
-        run: cargo build --target x86_64-unknown-none -p kernel
+      # `rust-objcopy` turns the Arm and RISC-V kernels into flat images, and `rust-objdump` is what the
+      # stack-fit check reads every service with; both ship in cargo-binutils, a cargo install rather
+      # than a rustup component - the same step `release.yml` takes. Without it every board build stops
+      # at "STACK-FIT CHECK CANNOT RUN" (found replaying this job under WSL, 2026-10-28).
+      - name: Install cargo-binutils (rust-objcopy, rust-objdump)
+        run: cargo install cargo-binutils --locked
 
-      - name: Build osdev (host)
-        run: cargo build -p osdev
-
-      - name: Clippy services (bare-metal)
-        # Same ordering, same reason: clippy runs the build scripts.
-        run: |
-          cargo clippy --target x86_64-unknown-none --workspace \
-            --exclude osdev --exclude kernel --exclude supervisor
-          cargo clippy --target x86_64-unknown-none -p supervisor
-
-      - name: Clippy kernel (bare-metal)
-        run: cargo clippy --target x86_64-unknown-none -p kernel
-
-      - name: Clippy osdev (host)
-        run: cargo clippy -p osdev
+      # The other three ports, through the one board script (CLAUDE.md 5). Each runs the same gates first.
+      - name: Build the Raspberry Pi 2 image
+        run: python scripts/board.py pi2
+      - name: Build the Raspberry Pi 4 image
+        run: python scripts/board.py pi4
+      - name: Build the VisionFive 2 Lite image
+        run: python scripts/board.py visionfive
 
       - name: Validate service contracts
         run: cargo run -p osdev -- validate
 
-      # The self-test runs FIRST and separately: it proves the checks still fire. A weakened check
-      # reports PASS over code it stopped looking at, and only the probe corpus can tell.
-      - name: Commandment checks - self-test (is the enforcement layer intact?)
-        run: python3 scripts/commandments.py --selftest
+      # Clippy in RELEASE, after `osdev build`: the kernel `include_bytes!`-embeds the supervisor, and the
+      # supervisor embeds every service, so clippy needs the images that build produced - the release
+      # ones. A debug clippy looks for a debug supervisor nothing built (backlog/fixed/53's third layer).
+      - name: Clippy services (bare-metal)
+        run: |
+          cargo clippy --release --target x86_64-unknown-none --workspace \
+            --exclude osdev --exclude kernel --exclude supervisor
+          cargo clippy --release --target x86_64-unknown-none -p supervisor
 
-      - name: Commandment checks
-        run: python3 scripts/commandments.py
+      - name: Clippy kernel (bare-metal)
+        run: cargo clippy --release --target x86_64-unknown-none -p kernel
 
-      - name: Unsafe audit check
-        run: python3 scripts/unsafe_check.py
-
-      - name: Contract reconcile check (contract vs kernel service_config)
-        run: python3 scripts/contract_check.py
-
-      - name: Arch-boundary check (no arch-specific code in neutral layers)
-        run: python3 scripts/arch_boundary_check.py
-
-      # Silent on any branch that neither adds an arch directory nor touches exactly one (its
-      # guide cross-check still runs everywhere). On a port branch, it is the only check that
-      # can see an edit to a file `docs/porting.md` marks do-not-touch - the others all ask whether
-      # a RULE was broken, and an ordinary neutral-kernel edit breaks none of them.
-      - name: Port-scope check (a port writes arch/<isa>/ and eleven named files, nothing else)
-        run: python3 scripts/port_scope_check.py
-
-      - name: "Dash check (ASCII hyphen only, CLAUDE.md section 21)"
-        run: python3 scripts/dash_check.py
-
-      # A CRLF `extlinux.conf` boots nothing on the VisionFive while showing a perfect menu
-      # (backlog/fixed/26). CI runs on Linux, where a checkout is LF and this passes trivially - that is
-      # the point: it catches a CRLF file COMMITTED from a Windows tree before it reaches a card.
-      - name: "Line-ending check (files a bootloader reads must be LF)"
-        run: python3 scripts/line_ending_check.py
-
-      - name: Doc reference check (no doc points at a file that does not exist)
-        run: python3 scripts/doc_refs.py
-
-      - name: Fact check (a number a doc restates must match the code that owns it)
-        run: python3 scripts/facts_check.py
-
-      # The backlog index promised "this is the index" while entries 33-38 were linked from
-      # nowhere. doc_refs checks a citation resolves; this checks an ENTRY is reachable.
-      - name: Backlog check (every entry is reachable from the backlog index)
-        run: python3 scripts/backlog_check.py
-
-      - name: Site check (the hand-written pages still describe the real repository)
-        run: python3 scripts/site_check.py
-
-      # The declared Python floor must be the TRUE one. Also in osdev's EXTRA_CHECKS now, so a
-      # local build runs it too; CI carried it while that was pending.
-      - name: Python floor matches what README.md declares
-        run: python3 scripts/python_floor_check.py
+      - name: Clippy osdev (host)
+        run: cargo clippy -p osdev
 
       - name: Unit tests (kernel pure-logic)
-        run: python3 scripts/test_report.py
+        run: python scripts/test_report.py
 
   static-analysis:
     name: Static analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 

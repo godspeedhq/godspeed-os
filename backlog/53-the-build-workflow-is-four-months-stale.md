@@ -1,6 +1,8 @@
 # 53 - `build.yml` is four months stale, and fails to BUILD rather than failing to RUN
 
-**Status:** OPEN - two breakages found and one fixed; the workflow is still paused and still red.
+**Status:** OPEN only until it is dispatched - REVIVED 2026-10-28 and proved green on Ubuntu 24.04 under WSL from a fresh
+clone (option 1 below, "Revived" at the end). Still `workflow_dispatch`-only: spending the CI minutes is the operator's
+call. *Was:* OPEN - two breakages found and one fixed; the workflow is still paused and still red.
 **Found:** 2026-09-25, by dispatching it for a cosmetic reason and getting a real failure.
 
 ## What it is
@@ -79,3 +81,24 @@ it is worth the minutes at all.
 A cosmetic action produced a real failure. The trigger was wanting a green check on a commit that had
 none - and the right response to "this commit has no checks" is to leave it alone, not to find a
 workflow to run at it.
+
+## Revived, 2026-10-28
+
+Option 1, and replayed rather than dispatched: every step of the job was run on Ubuntu 24.04 under WSL - the
+runner's own OS - on a fresh `git clone`, so no CI minutes were spent finding the layers.
+
+- **The design changed, not only the steps.** The job used to build with its own hand-ordered `cargo build`
+  calls and run its own list of fourteen checkers; both drifted from the local build, which is how it broke.
+  It now runs `cargo run -p osdev -- build`, which orders the crates and runs every gate the local build runs
+  (`EXTRA_CHECKS` and the commandments, from one list), then the three board images through
+  `scripts/board.py`. A gate added to `EXTRA_CHECKS` is in CI the same day.
+- **The clippy lint named above is already gone** (`kernel_main` no longer trips it); the kernel's clippy
+  passes in release. Clippy runs in RELEASE after the build, because the kernel embeds the supervisor and
+  the supervisor every service, and the debug images it looked for were never built - the third layer.
+- **The layers the replay found, and fixed:** the board builds need `cargo-binutils` (`rust-objcopy`,
+  `rust-objdump`), installed now as `release.yml` already did; and clippy's deny-by-default
+  `absurd_extreme_comparisons` refused `wifi-driver`'s frame-dump switch (`frames <= 0`, always false),
+  rewritten as an `Option`.
+
+Replayed result: rustup, `osdev build` with every gate, Pi 2, Pi 4 and VisionFive images, `osdev validate`,
+clippy on the services, the supervisor, the kernel and `osdev`, and the unit tests - all exit 0.

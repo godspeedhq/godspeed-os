@@ -902,8 +902,11 @@ fn query_raw(
                 // The first frames used to be described here in full (`describe_frame`), which found the
                 // dataoff and header-only bugs of sections 31-33. The trace now records every frame's
                 // channel, id, command and status; the full dump is kept for a bring-up that needs it.
-                const DUMP_FRAMES: u32 = 0;
-                if frames <= DUMP_FRAMES {
+                // `None` = off; `Some(n)` dumps the first n frames. An Option rather than a count of 0, which
+                // made `frames <= DUMP_FRAMES` a comparison that is always false (clippy's deny-by-default
+                // absurd_extreme_comparisons).
+                const DUMP_FRAMES: Option<u32> = None;
+                if DUMP_FRAMES.is_some_and(|n| frames <= n) {
                     describe_frame(frames, &f, &rbuf, ctx);
                 }
                 let len = f.len;
