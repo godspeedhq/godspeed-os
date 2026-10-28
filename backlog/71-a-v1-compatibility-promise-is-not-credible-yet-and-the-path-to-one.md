@@ -4,7 +4,7 @@
 and promise no breaking changes in the future?". The answer was not yet, and why; this item is the plan.
 The bar and the order were settled 2026-10-11 (below). Built so far: the one-way ratchet and the
 SDK-dependency gate (step 2), the covered surface decided (step 1, 2026-10-26) and the surface gate (step 3,
-2026-10-28); the policy drafted (step 4, 2026-10-28, four questions open). Still to do: those
+2026-10-28); the policy drafted (step 4, 2026-10-28, two questions open). Still to do: those
 answers, and the soak (step 5).**
 
 ## Why not yet, measured rather than felt
@@ -186,8 +186,9 @@ breaking change; then v1.
    anything removed is deprecated for one release first.
    **Drafted 2026-10-28** in [`docs/compatibility.md`](../docs/compatibility.md), "The policy": the two
    settled rules written out, how a deprecation shows for each kind of item, and four questions the gate
-   raised that are the operator's (enum and struct growth and `#[non_exhaustive]`, test tools in `UTILS`,
-   `ServiceContext`, and how long "one release" is).
+   raised that were the operator's. Settled the same day: no calendar promise ("one release" is the next one,
+   whenever it comes out) and no promise about `ServiceContext`'s methods. Open: enum and struct growth and
+   `#[non_exhaustive]`, and whether the test tools in `UTILS` are covered.
 5. **Soak**: a stretch of real work - the VisionFive and Pi 2 radios are the obvious candidates - with no
    change to the covered surface, so the freeze is shown to hold rather than asserted.
 

@@ -1,7 +1,7 @@
 # Compatibility: what GodspeedOS promises not to break
 
 **Status: the covered surface is DECIDED (operator, 2026-10-26) and GATED (2026-10-28, below); the policy
-is DRAFTED (2026-10-28, below) with four questions open for the operator.** This is step 1 of the path to v1 in
+is DRAFTED (2026-10-28, below), with two questions open for the operator.** This is step 1 of the path to v1 in
 [`backlog/71`](../backlog/71-a-v1-compatibility-promise-is-not-credible-yet-and-the-path-to-one.md). No
 promise is in force yet: GodspeedOS is `v0.x`, and stays `v0.x` until the gate exists and a stretch of
 releases has held it (`backlog/71`, steps 3 to 5).
@@ -121,13 +121,15 @@ part of this is in force before v1: until then the gate records every break with
   `spawncap`, `spawnwired`, and subcommands such as `wifi debug`, `audio debug`, `fcap reuse`). The list of
   what is not covered names the test suites. *Proposal:* name these as test tools, outside the promise, and
   have the gate leave them out.
-- **Q3. `ServiceContext`'s methods stay out** (they are the SDK, which is not covered), and the gate holds
-  only the name `gs` re-exports. *Proposal:* confirm, and say in the developer guide that a program
-  written on `gs` alone is the one the promise protects.
-- **Q4. "One release" may be days.** Releases have come a few days apart. *Proposal:* one release AND at
-  least 30 days, whichever is later, so a deprecation is seen before it is acted on.
+- **Q3. `ServiceContext`'s methods: no promise is made about them.** They are the SDK, which is not covered,
+  and the gate holds only the name `gs` re-exports. Nothing more is promised unless the operator decides
+  otherwise (2026-10-28: undecided, so the default stands - no promise).
+
+**Settled 2026-10-28 (operator): no calendar promise.** "One release" in rule 3 means the next release,
+whenever it comes out - "a release comes out when a release comes out". No minimum time is promised between
+a deprecation and the removal.
 
 ## What is still to do
 
-- **The policy's open questions** above (`backlog/71` step 4), then the policy is in force from v1.
+- **The policy's two open questions** above, Q1 and Q2 (`backlog/71` step 4); then it is in force from v1.
 - **The soak** (`backlog/71` step 5): releases in which the gate never has to accept a breaking change.
