@@ -33,6 +33,20 @@ pub fn nic_vendor_device(ctx: &ServiceContext) -> u32 {
     ctx.nic_vendor_device()
 }
 
+/// Which ethernet controller is soldered to the SoC, as the kernel's boot probe found it: one of
+/// [`soc_nic`]'s constants, `soc_nic::NONE` where there is none. The answer for a MAC on no bus, which
+/// [`nic_vendor_device`] cannot give because such a MAC has no PCI identity.
+#[cfg(not(test))]
+#[inline(always)]
+pub fn soc_nic(ctx: &ServiceContext) -> u32 {
+    ctx.soc_nic()
+}
+
+/// The SoC ethernet controllers [`soc_nic`] can name.
+pub mod soc_nic {
+    pub use godspeed_sdk::service_context::soc_nic::{DWMAC, GENET, NONE};
+}
+
 /// The SD/EMMC controller's base clock in Hz, or 0 when the platform does not report one. A driver that
 /// gets 0 says so rather than guessing a divider.
 #[cfg(not(test))]

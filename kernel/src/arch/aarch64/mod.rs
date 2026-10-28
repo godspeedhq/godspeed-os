@@ -938,7 +938,7 @@ extern "C" fn boot_high() -> ! {
             // second path also has to be kept working to be worth having, and this one was not being
             // exercised. The driver is deleted, so this is the only path and cannot rot.
             //
-            // `soc_nic_present` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
+            // `soc_nic` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
             // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
             // can drive was found", which a probed-and-present GENET satisfies.
             GENET_PRESENT.store(true, core::sync::atomic::Ordering::Release);
@@ -3138,7 +3138,10 @@ pub mod rtc {
 /// The Pi 4 has GENET on the SoC. Presence is what the boot probe found - the flag it used to
 /// set was `pci::NIC_FOUND`, which put a non-PCI device into a PCI variable and is exactly the
 /// conflation step D removes.
-pub fn soc_nic_present() -> bool { GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire) }
+pub fn soc_nic() -> u32 {
+    if GENET_PRESENT.load(core::sync::atomic::Ordering::Acquire) { crate::task::soc_nic::GENET }
+    else { crate::task::soc_nic::NONE }
+}
 
 /// Is a device of this fixed kind (`task::kind`) on this board - answered by KIND, never by the name of a
 /// service (`docs/audio.md`, "No service names in the kernel"). The audio jack (`AUDIO_PWM`): the Pi 4 has
@@ -3243,7 +3246,7 @@ pub mod pci {
     pub fn xhci() -> Option<PciDevice> { find_by_class(0x0C_03_30) }
 
     /// The Pi 4 HAS PCIe and a real table - what it has NOT is a PCI ethernet controller. GENET is on the
-    /// SoC (`soc_nic_present`), so a class lookup is the right question and `None` is the right
+    /// SoC (`soc_nic`), so a class lookup is the right question and `None` is the right
     /// answer. (This comment previously said "no PCI on this port", copied from the arm32 stub where
     /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it
     /// next looking for the table that does exist twenty lines below.)

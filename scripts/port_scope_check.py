@@ -77,7 +77,7 @@ SEAM_ABOVE = {
     "services/supervisor/build.rs": "one arm per table (it sets has_xhci / has_dwc2 / has_hw_enumerator)",
     "services/supervisor/src/main.rs": "one arm IF your storage or NIC sits behind a USB host",
     "services/block-driver/build.rs": "one arm: is the disk on USB, and which service owns the host",
-    "services/nic-driver/src/main.rs": "one arm, and the guide says this is the worst one (backlog/21)",
+    "services/nic-driver/build.rs": "one arm IF the MAC is on the SoC: which backend the image carries; which RUNS is the kernel's answer (backlog/21)",
     "services/hw-enumerator/src/main.rs": "one arm IF you have PCI (backlog/25)",
     # The guide gained this row when the VisionFive's radio did (2026-10-04) and this set did not, so
     # the guide cross-check below failed on every branch - unseen, because only the paused `build.yml`

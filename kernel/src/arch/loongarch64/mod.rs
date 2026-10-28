@@ -456,7 +456,7 @@ pub mod rtc {
 // ---------------------------------------------------------------------------
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
-pub fn soc_nic_present() -> bool { false }
+pub fn soc_nic() -> u32 { crate::task::soc_nic::NONE }
 /// Is a device of this fixed kind (`task::kind`) on this board? None here: the arch answers by KIND,
 /// never by the name of a service (`docs/audio.md`, "No service names in the kernel").
 pub fn fixed_device_present(_kind: u32) -> bool { false }

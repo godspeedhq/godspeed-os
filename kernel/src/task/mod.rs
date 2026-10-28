@@ -510,7 +510,7 @@ impl HwClass {
             // Present if the bus reports one. On a port with no PCI the arch stub answers None,
             // which is the same "no NIC here" this used to get from a static nothing ever set.
             HwClass::Nic  => crate::arch::imp::pci::nic().is_some()
-                             || crate::arch::imp::soc_nic_present(),
+                             || crate::arch::imp::soc_nic() != soc_nic::NONE,
             // Not a device: the software-generated test interrupt (`FireIrq`) that IR1 delivers.
             // Always "present" because the kernel raises it itself - there is nothing to scan for.
             HwClass::TestIrq => true,
@@ -891,6 +891,19 @@ pub mod kind {
     pub const TEST_IRQ: u32 = 7;
     pub const AUDIO_PWM: u32 = 8;
     pub const WIFI_SDIO: u32 = 9;
+}
+
+/// Which ethernet controller is SOLDERED TO THE SOC, as the arch's boot probe found it - the answer to
+/// `arch::imp::soc_nic` and InspectKernel query 29. A SoC MAC is on no bus, so it has no vendor/device
+/// pair for query 14 to report; without this a driver could only infer it from the instruction set,
+/// which names the CPU and not the board (`backlog/21`). These name DEVICES, never an ISA.
+pub mod soc_nic {
+    /// None found - the machine's NIC, if any, is on a bus (query 14) or behind a USB host.
+    pub const NONE: u32 = 0;
+    /// Broadcom GENET (the Raspberry Pi 4).
+    pub const GENET: u32 = 1;
+    /// Synopsys DesignWare MAC (the StarFive JH7110 on the VisionFive 2).
+    pub const DWMAC: u32 = 2;
 }
 
 /// Resolve a spawn request's device class to the kernel's own scan results.

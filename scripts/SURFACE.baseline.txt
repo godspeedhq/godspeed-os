@@ -265,6 +265,11 @@ gs driver::device fn board_mac(_:&ServiceContext)->Option<[u8;6]>
 gs driver::device fn emmc_base_clock_hz(_:&ServiceContext)->u32
 gs driver::device fn nic_vendor_device(_:&ServiceContext)->u32
 gs driver::device fn pci_cfg_read(_:&ServiceContext,_:u32,_:u16)->Option<u32>
+gs driver::device fn soc_nic(_:&ServiceContext)->u32
+gs driver::device mod soc_nic
+gs driver::device::soc_nic use godspeed_sdk::service_context::soc_nic::DWMAC
+gs driver::device::soc_nic use godspeed_sdk::service_context::soc_nic::GENET
+gs driver::device::soc_nic use godspeed_sdk::service_context::soc_nic::NONE
 gs driver::input fn notice_shown(_:&ServiceContext)
 gs driver::input fn push(_:&ServiceContext,_:u8)
 gs driver::input fn ready(_:&ServiceContext)

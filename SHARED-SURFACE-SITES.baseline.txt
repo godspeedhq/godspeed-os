@@ -14,5 +14,4 @@
    4  sdk/rust/src/syscall.rs
    2  services/hw-enumerator/src/main.rs
    1  services/net-stack/src/main.rs
-   8  services/nic-driver/src/main.rs
-   4  services/supervisor/src/main.rs
+   3  services/supervisor/src/main.rs

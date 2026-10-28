@@ -409,6 +409,17 @@ pub mod privbits {
     pub const POWER_OFF:       u32 = 1 << 14;
 }
 
+/// Which ethernet controller is soldered to the SoC (`ServiceContext::soc_nic`, InspectKernel query 29).
+/// The kernel's `task::soc_nic`, kept in step by hand like `hwclass`. They name DEVICES, never an ISA.
+pub mod soc_nic {
+    /// None found: the machine's NIC, if any, is on a bus (query 14) or behind a USB host.
+    pub const NONE: u32 = 0;
+    /// Broadcom GENET (the Raspberry Pi 4).
+    pub const GENET: u32 = 1;
+    /// Synopsys DesignWare MAC (the StarFive JH7110 on the VisionFive 2).
+    pub const DWMAC: u32 = 2;
+}
+
 /// Device classes a spawner can name in `SpawnRequest::hw_flags`. The kernel resolves the class to
 /// what its own bus scan found - a CLASS rather than an address, because the kernel keeps a permanent
 /// physical DMA reservation per device that a respawned driver must get back.
@@ -3072,6 +3083,17 @@ impl ServiceContext {
         // SAFETY: syscall(13) = InspectKernel; query_id=14 = NIC vendor|device.
         let ret = unsafe { raw_syscall(13, 14, 0, 0) };
         if ret < 0 { 0 } else { ret as u32 }
+    }
+
+    /// Which ethernet controller is soldered to the SoC, as the kernel's boot probe found it
+    /// (InspectKernel query 29): one of [`soc_nic`]'s constants, `NONE` where there is none or the
+    /// kernel cannot say. Query 14's twin for a MAC on no bus, which has no vendor/device pair - so a
+    /// driver chooses its backend from the board rather than from the instruction set (`backlog/21`).
+    /// Ungated - task-neutral hardware info.
+    pub fn soc_nic(&self) -> u32 {
+        // SAFETY: syscall(13) = InspectKernel; query_id=29 = the SoC ethernet controller. No pointer.
+        let ret = unsafe { raw_syscall(13, 29, 0, 0) };
+        if ret < 0 { soc_nic::NONE } else { ret as u32 }
     }
 
     /// Whether the PCI scan found an xHCI USB host controller (InspectKernel query 18, ungated

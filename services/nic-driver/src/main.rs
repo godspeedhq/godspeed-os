@@ -39,20 +39,21 @@ use godspeed::driver::delay;
 use godspeed::driver::wait::{self, Budget};
 use godspeed::{ipc::Message, ServiceContext};
 use godspeed::driver::{Arena, Part, Registers};
+use godspeed::driver::device::soc_nic;
 
 /// The Pi 4's on-board GENET MAC, driven from HERE instead of from the kernel (Commandment I).
 ///
-/// Compiled on every aarch64 build so it is type-checked by the same command that builds the shipping
-/// image - a backend that only compiles under its own feature is a backend that quietly rots. Which
-/// one actually runs is decided in `service_main` by the target architecture: on aarch64 this backend
-/// is the ONLY path - the kernel drives no ethernet at all (Commandment I).
-#[cfg(target_arch = "aarch64")]
+/// Compiled into every aarch64 image (`build.rs`, `nic_genet`) so it is type-checked by the same command
+/// that builds the shipping image - a backend that only compiles under its own feature is a backend that
+/// quietly rots. Whether it RUNS is the board's answer: `service_main` takes it where the kernel's boot
+/// probe found a GENET (`soc_nic`, `backlog/21`). The kernel drives no ethernet at all (Commandment I).
+#[cfg(nic_genet)]
 mod genet;
 /// The VisionFive 2's Synopsys DesignWare MAC: identification (`dwmac.rs`) and the rings that carry
 /// frames (`dwmac_ring.rs`).
-#[cfg(target_arch = "riscv64")]
+#[cfg(nic_dwmac)]
 mod dwmac;
-#[cfg(target_arch = "riscv64")]
+#[cfg(nic_dwmac)]
 mod dwmac_ring;
 
 // Intel 82540EM register offsets (byte offsets into the BAR0 MMIO window).
@@ -991,7 +992,7 @@ const E1000_82540EM: u32 = 0x100E_8086;
 
 /// The granted register window, if the controller behind it is the e1000 this driver knows - and,
 /// when it is not, a line naming what it is instead (backlog/fixed/80 D2). It asks the DEVICE, so it needs
-/// no ISA test: only x86 reaches the e1000 path, every other port's backend having diverged first.
+/// no ISA test: a board with a SoC MAC, an RTL8168 or the Pi 2's USB ethernet has diverged before it.
 fn known_e1000(ctx: &ServiceContext, mmio: Option<Registers>) -> Option<Registers> {
     let vd = godspeed::driver::device::nic_vendor_device(&ctx);
     if mmio.is_some() && vd != E1000_82540EM {
@@ -1043,7 +1044,7 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
 /// keeping it makes the file read as "one backend, two ARM ports" when it is one backend, one board.
 /// The NET_DEVICE syscalls (42-44) now have no caller anywhere in userspace - recorded in
 /// `backlog/21`, not quietly acted on here.
-#[cfg(target_arch = "arm")]
+#[cfg(nic_usb_bridge)]
 fn kernel_net_main(ctx: ServiceContext) -> ! {
     // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls
     // via ops 4/9 under its own deadline, so this is a bounded best-effort, not a spin). ONE.
@@ -1473,64 +1474,46 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     godspeed::trace::as_name(&ctx, "nic-driver");
     ctx.log("nic-driver: starting");
 
-    // ---- WHICH MAC IS ON THIS BOARD. The one decision in this service that is still asked of the
-    // instruction set, kept in one place and labelled, rather than spread through the file.
+    // ---- WHICH MAC IS ON THIS BOARD, asked of the board and never of the instruction set.
     //
     // Every backend below takes `ServiceContext` and diverges, so this is a dispatch and nothing more;
-    // no backend is reachable from another and none of them returns. Each one is a whole MAC, so the
-    // module is gated too (the `mod` lines at the top of this file) - compiling GENET's ~1,450 lines into a RISC-V image would be dead
-    // weight in a service with a 16 MiB limit, not just dead code.
+    // no backend is reachable from another and none of them returns.
     //
-    // THE TWO HALVES OF THIS ARE NOT THE SAME KIND OF QUESTION, and the difference is the whole point:
-    //
-    //   * The x86 arm asks the DEVICE (`nic_vendor_device()`, a PCI identity the kernel discovered at
-    //     runtime). Put a third NIC in that machine and the kernel hands it to this service without a
-    //     rebuild - the shape `hw_pci_class = "020000"` in the contract exists to enable (step D). This
-    //     service then drives it only if it is one of the two it knows, and says so for anything
-    //     else (see the e1000 path below).
-    //   * The other three ask the ISA, because their MAC is on the SoC and there is nothing to ask.
-    //     A SoC MAC has no enumerable identity: no bus to scan, no vendor/device pair, and probing a
-    //     version register means reading an address that may not be a register at all on the next
-    //     board. So the ISA stands in for the board, which is the wrong axis - a second aarch64 board
-    //     with a different MAC would take the GENET arm and drive the wrong silicon.
-    //
-    // WHAT WOULD ACTUALLY CLOSE IT, recorded rather than half-started (26.7): the kernel already knows
-    // which controller its boot probe found - it is what decides whether to grant this service an MMIO
-    // window at all - and does not publish it. One InspectKernel query ("which network controller did
-    // you find") turns all three ISA arms into one runtime match, the same shape the x86 arm already
-    // has. That is a new kernel query, so it is a decision to take deliberately and not a tidy-up.
-    // `backlog/21` carries it.
-
-    // Pi 4: the GENET MAC is ours, reached through the register window and DMA arena the kernel
-    // granted this service by device kind (`hwclass::NIC` in its spawn request). No NET_DEVICE syscall is involved and the kernel drives no
-    // ethernet at all - which is the whole point (Commandment I, §4.4).
-    #[cfg(target_arch = "aarch64")]
-    genet::genet_main(ctx);
-
-    // Pi 2: the SMSC LAN9514 USB ethernet, driven by the `dwc2` SERVICE. This backend bridges the frame
-    // IPC net-stack speaks to dwc2's own IPC ops. Same request/reply contract, different transport.
-    #[cfg(target_arch = "arm")]
-    kernel_net_main(ctx);
-
-    // VisionFive 2: the on-SoC DesignWare MAC, same posture as GENET on the Pi 4 - the kernel grants
-    // the controller's window and a DMA arena by device kind and drives no ethernet itself.
-    //
-    // QEMU `virt` has PCIe, and there the kernel's NIC grant is the PCI ethernet controller it found
-    // (`arch/riscv64` prefers PCI class 0x020000 to the SoC MAC). So this arm asks the device first,
-    // exactly as the x86 arm does: an 82540EM takes the e1000 path below, anything else is the SoC
-    // MAC. Without this the dwmac backend was driven on the e1000's BAR and read zeros.
-    #[cfg(target_arch = "riscv64")]
-    if godspeed::driver::device::nic_vendor_device(&ctx) != E1000_82540EM {
-        dwmac::dwmac_main(ctx);
+    // A MAC SOLDERED TO THE SOC has no enumerable identity - no bus, no vendor/device pair - so the
+    // kernel says which one its boot probe found (`soc_nic`, InspectKernel query 29). That probe is what
+    // decided to grant this service a window at all, so the answer and the grant cannot disagree. Until
+    // 2026-10-28 this asked `target_arch` instead, which names the CPU and not the board: a second
+    // aarch64 board with a different MAC would have taken the GENET arm and driven the wrong silicon
+    // (`backlog/21`). Which backends an image CARRIES is still decided per instruction set, once, in
+    // `build.rs`, for size alone; a board whose MAC this image does not carry says so and is not driven.
+    match godspeed::driver::device::soc_nic(&ctx) {
+        // Pi 4: the GENET MAC is ours, reached through the register window and DMA arena the kernel
+        // granted by device kind (`hwclass::NIC`). The kernel drives no ethernet at all (Commandment I).
+        #[cfg(nic_genet)]
+        soc_nic::GENET => genet::genet_main(ctx),
+        // VisionFive 2: the on-SoC DesignWare MAC, the same posture as GENET. QEMU `virt` has an e1000
+        // on PCI, and there the kernel answers NONE and the PCI identity below decides.
+        #[cfg(nic_dwmac)]
+        soc_nic::DWMAC => dwmac::dwmac_main(ctx),
+        soc_nic::NONE => {}
+        other => ctx.log_fmt(format_args!(
+            "nic-driver: the kernel found SoC ethernet controller {} and this image carries no backend for it - not driven",
+            other)),
     }
 
-    // x86: ask the device. An Intel e1000 (the QEMU dev NIC) or a Realtek RTL8168 (the T630) - the
-    // kernel maps whichever one's BAR and this sorts by the PCI identity. The three SoC ports are
-    // excluded because each has already taken the call above; left in, this arm would compile as
-    // unreachable code, which is a warning today and a misleading read of the dispatch forever.
-    #[cfg(not(any(target_arch = "arm", target_arch = "aarch64", target_arch = "riscv64")))]
-    if godspeed::driver::device::nic_vendor_device(&ctx) == 0x8168_10EC {
+    // A NIC ON A BUS: ask the device. A Realtek RTL8168 (the T630, the Wyse) takes its own path; an
+    // Intel e1000 (QEMU) the one below, which drives only the part it was written against.
+    let vendor_device = godspeed::driver::device::nic_vendor_device(&ctx);
+    if vendor_device == 0x8168_10EC {
         realtek_main(ctx); // RTL8168 - a separate path that never returns
+    }
+
+    // No controller on the SoC or on a bus: the Pi 2's ethernet is the SMSC LAN9514 on its USB hub,
+    // driven by the `dwc2` SERVICE. This backend bridges the frame IPC net-stack speaks to dwc2's own
+    // ops - same request/reply contract, different transport.
+    #[cfg(nic_usb_bridge)]
+    if vendor_device == 0 {
+        kernel_net_main(ctx);
     }
 
     // --- Intel e1000 path. The kernel maps the BAR + DMA arena of whatever ethernet controller

@@ -1928,7 +1928,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // were listed until 2026-10-10 as dead entries (`backlog/fixed/80` K18), which made an AUTHORITY list
     // name two things that do not exist; an unknown query now falls on the gated side like any other,
     // and answers -1 to a holder.
-    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23 | 28)
+    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23 | 28 | 29)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {
@@ -1963,6 +1963,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
             .map_or(0, |d| d.vendor as u32 | ((d.device as u32) << 16)) as i64,
         // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
         // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
+        // 29 = which ethernet controller is SOLDERED TO THE SOC (`task::soc_nic`: 0 none, 1 GENET, 2 DWMAC).
+        // Query 14's twin for a controller on no bus, which has no vendor/device pair to report, so
+        // nic-driver chooses its backend from what the boot probe FOUND rather than from the instruction
+        // set (`backlog/21`). Task-neutral hardware info like 14, so ungated.
+        29 => crate::arch::imp::soc_nic() as i64,
         15 => crate::arch::imp::pci::nic()
             .map_or(0, |d| crate::arch::imp::pci::first_memory_bar(&d)) as i64,
         // TSC ticks per 10 ms quantum, from the boot-time CPUID calibration (boot.rs). Ungated,
@@ -1988,7 +1993,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
             // one of two the kernel had been taught, so a third card reported "no NIC" on a machine
             // that plainly had one - the kernel answering a question about the BUS with an opinion
             // about DRIVERS. Whether it can be driven is the driver's business.
-            let nic = (pci::nic().is_some() || crate::arch::imp::soc_nic_present()) as i64;
+            let nic = (pci::nic().is_some() || crate::arch::imp::soc_nic() != crate::task::soc_nic::NONE) as i64;
             x | (e << 1) | (nic << 2)
         }
         // A hardware-random u32 (the SoC RNG on the Pis, the TRNG on the VisionFive), or -1 where there is

@@ -87,7 +87,7 @@ inherits it rather than rediscovering it.
 
 ## The edges: what you will touch anyway
 
-Zero was the goal and zero is not reached: there are **54 arch-conditional sites outside `arch/`**. They
+Zero was the goal and zero is not reached: there are **47 arch-conditional sites outside `arch/`**. They
 are listed here by kind, with what each would take to close, because a number without a reason is
 just a number. The per-file counts are `SHARED-SURFACE.baseline.txt`, which the ratchet owns.
 
@@ -110,7 +110,7 @@ answered by every arch including the scaffolds.
 | `sdk/rust/src/adversarial.rs` (6) | Deliberate ring-3 faults for §22 A14/C2 - a non-canonical read and a trapping divide, which have no portable spelling. **You do not need these to boot**; see `backlog/24` for why none of them currently runs off x86 anyway. |
 | `sdk/rust/src/ipc.rs` (1) | A timeout clamp on `target_pointer_width`, not on your ISA. If you are 64-bit it does not apply; if you are 32-bit it already covers you. |
 
-### 41 in the services - where the real work is left
+### 34 in the services - where the real work is left
 
 **Read this part before you assume a booting kernel means you are done.** CLAUDE.md §4.1: *an ISA
 port is not complete when it boots. It is complete when architecture-neutral code no longer knows
@@ -121,8 +121,8 @@ that the ISA was added.*
 | `services/supervisor/build.rs` (15) | which USB host, which service images, whether PCI config space is reachable | **Add one arm to each table.** This is the designed place to answer, and it sets `has_xhci` / `has_dwc2` / `has_hw_enumerator` so `main.rs` needs nothing. |
 | `services/block-driver/build.rs` (4) | is the disk on a USB host, and which service owns it | **Add one arm.** Same shape. |
 | `services/shell/build.rs` (2) | what to call your arch in `version` | **Nothing** - it is derived from `CARGO_CFG_TARGET_ARCH`. Only add a line if your ISA needs a project-specific name, as arm32 does. |
-| `services/supervisor/src/main.rs` (4) | which peers `block-driver` and `nic-driver` need | **Add an arm** if your storage or NIC sits behind a USB host. |
-| `services/nic-driver/src/main.rs` (10) | which MAC driver to run | **Add an arm, and know that this is the worst one.** Three of the four PORTS pick their NIC by instruction set, which fails on its own terms: a different NIC on a board of the same ISA drives the wrong silicon. `backlog/21` has the fix (a kernel query reporting which controller the boot probe found) and the reason it is not done. |
+| `services/supervisor/src/main.rs` (3) | which peers `block-driver` and `nic-driver` need | **Add an arm** if your storage or NIC sits behind a USB host. |
+| `services/nic-driver/build.rs` (4) | which MAC backends this image CARRIES | **Add one arm** if your board's ethernet is soldered to the SoC: name the backend your ISA's images carry. Which one RUNS is the board's answer, not yours - `nic-driver` asks the kernel which controller its boot probe found (`soc_nic`, InspectKernel query 29), so a second board of your ISA with a different MAC is not driven as the wrong silicon. Until 2026-10-28 this was 10 sites in `main.rs` choosing the backend by instruction set (`backlog/21`). Your arch answers `soc_nic` in the seam. |
 | `services/hw-enumerator/src/main.rs` (3) | mechanism #1 or ECAM config-space selector | **Add an arm** if you have PCI. A port that is neither fails to COMPILE, which is deliberate - a wrong default would silently address the wrong registers. `backlog/25` has the clean form. |
 | `services/wifi-driver/build.rs` (2) | which SD host the board's radio sits behind (`dw_mmc` or Arasan) | **Add one arm** if your board has a radio. Same shape as the other build tables. |
 | `services/net-stack/src/main.rs` (1) | is this counter a CPU cycle count or a wall clock | **Nothing.** The default is the wall-clock floor, which is what every non-x86 port has turned out to need. If calibration fails it now says so in one line rather than surfacing as "ping feels slow" three layers away. |
@@ -167,13 +167,12 @@ godspeed/
     ├── supervisor/build.rs                 [15 ]   + ONE ARM per table. The designed place to
     │                                                 answer; it sets has_xhci / has_dwc2 /
     │                                                 has_hw_enumerator so main.rs needs nothing.
-    ├── supervisor/src/main.rs              [ 4 ]   + one arm IF your storage or NIC sits behind a
+    ├── supervisor/src/main.rs              [ 3 ]   + one arm IF your storage or NIC sits behind a
     │                                                 USB host (block-driver / nic-driver peers).
     ├── block-driver/build.rs               [ 4 ]   + one arm: is the disk on USB, and whose host.
-    ├── nic-driver/src/main.rs              [10 ]   + one arm, AND KNOW THIS IS THE WORST ONE. It
-    │                                                 picks the MAC by instruction set, so a
-    │                                                 different NIC on a board of YOUR ISA drives
-    │                                                 the wrong silicon. backlog/21 has the fix.
+    ├── nic-driver/build.rs                 [ 4 ]   + one arm IF your MAC is on the SoC: which
+    │                                                 backend your images carry. Which one RUNS
+    │                                                 is the kernel's answer (`soc_nic`, query 29).
     ├── hw-enumerator/src/main.rs           [ 3 ]   + one arm IF you have PCI. A port that is
     │                                                 neither mechanism #1 nor ECAM fails to
     │                                                 COMPILE, deliberately. backlog/25.
@@ -190,13 +189,14 @@ godspeed/
 **Legend.** `★` write it. `+` add to it, and the guide above says what. `-` do not, and if you find
 yourself doing so, that is [the rule](#adding-an-isa-the-seam-the-edges-and-the-rule).
 
-**Totals, and they are the honest ones.** 54 arch-conditional sites outside `arch/`: 2 in the neutral
-kernel and 52 above it. Of the 52, **23 are "add one arm to a build table"** - designed, expected,
-and cheap. The other 29 split into the SDK's syscall body you will write anyway (4), the seam the SDK
-is designated for (7), and 18 across FOUR service files - `nic-driver` (10), `supervisor/src/main.rs`
-(4), `hw-enumerator` (3) and `net-stack` (1). Two of those four have an open backlog entry saying what
-would close them for good: `backlog/21` for `nic-driver` and `backlog/25` for `hw-enumerator`. The
-other two do not, and that is honest rather than an omission - the supervisor's four are peer lists
+**Totals, and they are the honest ones.** 47 arch-conditional sites outside `arch/`: 2 in the neutral
+kernel and 45 above it. Of the 45, **27 are "add one arm to a build table"** - designed, expected,
+and cheap. The other 18 split into the SDK's syscall body you will write anyway (4), the seam the SDK
+is designated for (7), and 7 across THREE service files - `supervisor/src/main.rs` (3),
+`hw-enumerator` (3) and `net-stack` (1). One of those three has an open backlog entry saying what
+would close it for good: `backlog/25` for `hw-enumerator` (`nic-driver`'s, `backlog/21`, closed on
+2026-10-28 by asking the kernel which MAC is on the board). The
+other two do not, and that is honest rather than an omission - the supervisor's three are peer lists
 whose only alternative is a second copy of a fact `block-driver/build.rs` already owns, and
 `net-stack`'s one needs nothing from a porter at all.
 

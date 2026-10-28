@@ -243,17 +243,20 @@ These are the laws that bound every design choice. Any change that violates an i
 > (`shared_surface_check.py`); the neutral kernel had none.
 >
 > It does now - the same one, which is the honest shape since it is one property asked of two layers.
-> **The standing figure is 54 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 52
+> **The standing figure is 47 arch-conditional sites outside `arch/`: 2 in the neutral kernel, 45
 > above it** (46 and 44 when this was written; the rise is board facts in `services/supervisor/build.rs` and
 > `services/wifi-driver/build.rs` - the Pi 4's radio (+1), the audio drivers (+4) and, on 2026-10-04,
 > the VisionFive's radio and nic-driver's radio bridge as its own fact (+4) - blessed together that day;
 > and on 2026-10-05 one fewer, when the VisionFive gained the bridge too and the bridge fact became the
-> radio fact by derivation rather than a second test of the instruction set (-1); `docs/porting.md` has the per-file tree). It may fall freely and may not rise without a
+> radio fact by derivation rather than a second test of the instruction set (-1); then 54 until 2026-10-28,
+> when `nic-driver` stopped choosing its MAC by instruction set (-10 in its `main.rs`, +4 in a `build.rs` that
+> names only which backends an image carries) and a supervisor peer list lost one (-1); `docs/porting.md` has the per-file tree). It may fall freely and may not rise without a
 > recorded reason. What is left is listed
 > rather than implied. **The neutral kernel is down to 2**, and both are `target_pointer_width` on
 > one constant - a 32-bit address space genuinely cannot hold a 4 GiB virtual address, so the width
-> IS the question rather than an ISA standing in for one. Above the kernel, `nic-driver` picks its MAC by ISA on three
-> of four boards and needs a kernel query to stop (`backlog/21`), `hw-enumerator` packs a host-bridge
+> IS the question rather than an ISA standing in for one. Above the kernel, `nic-driver` picked its MAC by ISA on three
+> of four boards until 2026-10-28; it now asks the kernel which controller its boot probe found (InspectKernel
+> query 29, `soc_nic`, a read of a fact the kernel already held - not a responsibility; `backlog/21`). `hw-enumerator` packs a host-bridge
 > config selector that belongs in `arch/` (`backlog/25`), and the rest are the SDK's syscall seam,
 > which §18.1 designates and which is the one place the ISA is genuinely the question.
 
@@ -2256,7 +2259,14 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 and to 80 on 2026-10-17 by the amendments below, and fell to 74 on 2026-10-28, when the six uncalled USB-disk wrappers went with their syscalls (`backlog/21`). A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/21`); it rose to 79 on 2026-10-14 and to 80 on 2026-10-17 by the amendments below, and fell to 74 on 2026-10-28, when the six uncalled USB-disk wrappers went with their syscalls (`backlog/21`), and rose to 75 the same day by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+
+> **Amendment 2026-10-28 (`soc_nic`): `sdk/rust/src/service_context.rs` 74 -> 75.** One call site, `soc_nic`:
+> one `unsafe { raw_syscall(13, 29, ..) }` behind the safe `ServiceContext::soc_nic` and
+> `gs::driver::device::soc_nic`, for InspectKernel query 29 - which ethernet controller the kernel's boot probe
+> found soldered to the SoC, query 14's twin for a MAC on no bus. `nic-driver` chose its backend by instruction
+> set because nothing else could say which silicon it had been granted (`backlog/21`); it now asks the board.
+> Necessity: a service cannot reach a query any other way. Safety: integers only, no pointer.
 
 > **Amendment 2026-10-17 (`Exit`): `sdk/rust/src/service_context.rs` 79 -> 80.** One call site, `exit`: one
 > `unsafe { raw_syscall(57, ..) }` behind the safe `ServiceContext::exit` and `gs::program::exit`, for the 14.5

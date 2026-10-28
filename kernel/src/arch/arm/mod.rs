@@ -2733,7 +2733,7 @@ pub mod rtc {
 // ---------------------------------------------------------------------------
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
-pub fn soc_nic_present() -> bool { false }
+pub fn soc_nic() -> u32 { crate::task::soc_nic::NONE }
 
 /// Is a device of this fixed kind (`task::kind`) on this board? The Pi 2 has two: the DWC2 USB core
 /// and the audio jack (PWM0's two channels on GPIO 40 right and 45 left, through the board's filter).

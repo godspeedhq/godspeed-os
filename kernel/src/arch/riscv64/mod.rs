@@ -2633,7 +2633,19 @@ pub mod rtc {
 // ---------------------------------------------------------------------------
 /// Is there an ethernet controller SOLDERED TO THE SOC - one on no bus the kernel can walk?
 /// See the x86 original for why this is not a second source for `pci::nic()`.
-pub fn soc_nic_present() -> bool { false }
+///
+/// The VisionFive's DesignWare MAC, exactly when it is the controller `pci::nic()` offers: the device
+/// tree gave a window and no PCI ethernet controller was found first (QEMU `virt` has an e1000, and
+/// there the bus answers). Until 2026-10-28 this said `false` and `pci::nic()`'s fallback alone carried
+/// the SoC MAC, which left a driver no way to know WHICH silicon it was granted but the ISA
+/// (`backlog/21`).
+pub fn soc_nic() -> u32 {
+    if pci::find_by_class(0x02_00_00).is_none() && net::window() != 0 {
+        crate::task::soc_nic::DWMAC
+    } else {
+        crate::task::soc_nic::NONE
+    }
+}
 /// Is a device of this fixed kind (`task::kind`) on this board? The arch answers by KIND, never by the
 /// name of a service (`docs/audio.md`, "No service names in the kernel"). One on this port: the
 /// VisionFive's WiFi radio's SD host, where the boot census saw it answer.
