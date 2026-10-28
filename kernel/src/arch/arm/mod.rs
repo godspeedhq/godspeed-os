@@ -1330,7 +1330,7 @@ pub fn board_mac_packed() -> Option<u64> {
 // granted at spawn.
 //
 // The stubs that stood in for it - the USB-disk and in-kernel-network hooks every port answered "no
-// device" from - went with their syscalls (backlog/21).
+// device" from - went with their syscalls (backlog/fixed/21).
 
 /// No-op: this arch counts every IRQ in `irq::arm_irq_dispatch`, which sees them all.
 pub fn note_irq(_vector: u32) {}

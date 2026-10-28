@@ -785,7 +785,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // giveaway: "the grant is simply never exercised" is a sentence about a grant that should not
     // exist, not a justification for one.
     //
-    // This is step 1 of the three `backlog/21` records, in the order it prescribes: the grant first
+    // This is step 1 of the three `backlog/fixed/21` records, in the order it prescribes: the grant first
     // (one line, provable by a boot), the SDK wrappers second, syscalls 42-44 last. Steps 2 and 3 are
     // kernel and SDK surface and are NOT taken here.
     ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,

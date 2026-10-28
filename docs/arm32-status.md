@@ -52,7 +52,7 @@ The **arch-neutral half of GodspeedOS runs on ARM32** - the OS above the hardwar
   service** (DWC2 bulk frames) and reached by `nic-driver` over IPC (opcodes `0x10+` on `dwc2`'s endpoint -
   the same endpoint that serves the block protocol), which bridges to the **unchanged** `net-stack`. The
   `NET_DEVICE` syscalls (42-44) that used to front an in-kernel USB-net device are **gone** (removed on
-  every port 2026-10-28, `backlog/21`), because no frame passes through the kernel any more. **The device it
+  every port 2026-10-28, `backlog/fixed/21`), because no frame passes through the kernel any more. **The device it
   drives is the Pi 2's onboard LAN9514 (`smsc95xx`) and nothing else**: DHCP, ARP and internet ping all
   work on real hardware, with RX **client-polled**: a bulk-IN
   is kept armed, and `rx()` harvests the completed burst and re-arms it when a client asks for frames

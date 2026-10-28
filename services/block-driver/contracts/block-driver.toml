@@ -1,7 +1,7 @@
 # ARM NOTE (history, userspace-audit A6): on both ARM ports this service was once granted USB_DISK -
 # whole-device reach over an in-kernel USB mass-storage stack - by kernel name-match, invisible in this
 # file. The USB stacks became services (`dwc2`, `xhci`) that this driver reaches over IPC, the grant went,
-# and on 2026-10-28 the capability and its syscalls (46-49) were removed (`backlog/21`). What this service
+# and on 2026-10-28 the capability and its syscalls (46-49) were removed (`backlog/fixed/21`). What this service
 # holds is what the list below and its spawn request say.
 name    = "block-driver"
 version = "0.1.0"

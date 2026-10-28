@@ -397,7 +397,7 @@ pub mod privbits {
     // Bits 9 and 10 (SET_CLOCK_FLOOR, SET_CLOCK) are retired with the authority nothing checked, and
     // the kernel refuses them as unknown (backlog/fixed/59). Not reused.
     // Bit 11 (NET_DEVICE) is retired with its syscalls and resource, and the kernel refuses it as
-    // unknown (backlog/21). Not reused.
+    // unknown (backlog/fixed/21). Not reused.
     /// Read PCI configuration space through the legacy CF8/CFC ports (step D2). READ-ONLY and held
     /// by ONE service - see `docs/service-ownership.md` D2 for why the write side is not on offer.
     pub const PCI_CFG:         u32 = 1 << 12;
@@ -1041,7 +1041,7 @@ pub struct ServiceContext {
 }
 
 // USB_DISK_BUSY (-20) and USB_DISK_ABSENT (-21) were the in-kernel USB disk's statuses, removed with
-// its syscalls (46-49, backlog/21). The two codes are not reused.
+// its syscalls (46-49, backlog/fixed/21). The two codes are not reused.
 
 
 impl ServiceContext {
@@ -1242,7 +1242,7 @@ impl ServiceContext {
 
     // net_frame_tx, net_frame_rx and net_info (syscalls 42-44, NET_DEVICE) were here until
     // 2026-10-11: no port has an in-kernel network device, nothing is granted NET_DEVICE, and nothing
-    // called them (`backlog/21` step 2). The syscalls themselves are the last step, a kernel change.
+    // called them (`backlog/fixed/21` step 2). The syscalls themselves are the last step, a kernel change.
 
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {
@@ -3061,7 +3061,7 @@ impl ServiceContext {
 
     // usb_disk_sectors, usb_disk_read, usb_disk_write, their `_status` forms and usb_disk_flush
     // (syscalls 46-49) were here: the kernel claimed no USB disk on any port, and nothing called them.
-    // Removed with the syscalls (backlog/21); a USB disk is the `dwc2` or `xhci` service's, over IPC.
+    // Removed with the syscalls (backlog/fixed/21); a USB disk is the `dwc2` or `xhci` service's, over IPC.
 
     /// The SD/EMMC controller's base clock in Hz (0 if the platform does not report one), via
     /// InspectKernel query 20. The block driver needs it to compute its clock divider: on the BCM283x
@@ -3088,7 +3088,7 @@ impl ServiceContext {
     /// Which ethernet controller is soldered to the SoC, as the kernel's boot probe found it
     /// (InspectKernel query 29): one of [`soc_nic`]'s constants, `NONE` where there is none or the
     /// kernel cannot say. Query 14's twin for a MAC on no bus, which has no vendor/device pair - so a
-    /// driver chooses its backend from the board rather than from the instruction set (`backlog/21`).
+    /// driver chooses its backend from the board rather than from the instruction set (`backlog/fixed/21`).
     /// Ungated - task-neutral hardware info.
     pub fn soc_nic(&self) -> u32 {
         // SAFETY: syscall(13) = InspectKernel; query_id=29 = the SoC ethernet controller. No pointer.

@@ -34,7 +34,7 @@ fn main() {
     //                         either way (`services/xhci/src/msc.rs`), so only the name differs.
     //
     // The ISA is still what answers them, because a board has no runtime identity to ask - the same
-    // wall `backlog/21` records for the NIC, and the same answer as the supervisor's `mod board`
+    // wall `backlog/fixed/21` records for the NIC, and the same answer as the supervisor's `mod board`
     // (`a0392632`): name the fact ONCE, where a reader can see the whole mapping at a time.
     //
     // NOT A CARGO FEATURE, and the difference matters - `src/xhciblk.rs` records why the feature this

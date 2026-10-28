@@ -236,7 +236,7 @@ fn main() {
     // so they are opt-in via `pi4-demo-services` rather than always present.
     let aarch64_demo = std::env::var("CARGO_FEATURE_PI4_DEMO_SERVICES").is_ok();
     // Networking on the Pi 4: nic-driver drives the GENET MAC itself through its own register window
-    // (the NET_DEVICE syscalls it once used here are removed, `backlog/21`); net-stack
+    // (the NET_DEVICE syscalls it once used here are removed, `backlog/fixed/21`); net-stack
     // is arch-neutral and rides on nic-driver without touching hardware at all.
     // Neither needed porting - they needed BUILDING and then listing HERE. Being built is not enough:
     // a service missing from this list embeds the empty placeholder however well it compiled, and the

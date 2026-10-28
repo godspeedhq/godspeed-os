@@ -40,7 +40,7 @@ pub(crate) unsafe fn raw_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     // exceptions are values that can exceed 32 bits, and each is handled in ITS OWN WRAPPER before it
     // reaches this truncation (userspace-audit A-U1): `recv_timeout` clamps a generic-timer tick count.
     // (The USB-disk wrappers rejected an LBA above u32::MAX the same way, until they went with their
-    // syscalls, backlog/21.) This comment once claimed the timeout was the ONE exception, which was
+    // syscalls, backlog/fixed/21.) This comment once claimed the timeout was the ONE exception, which was
     // false the moment a u64 LBA came through here - so before adding any syscall, check
     // whether an argument can exceed 32 bits and clamp it above, and amend this list when it can.
     // (2026-10-09) One that can and is NOT clamped: `ServiceContext::sleep` passes its cycle count

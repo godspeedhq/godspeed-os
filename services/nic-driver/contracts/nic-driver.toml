@@ -47,7 +47,7 @@ ipc_send  = ["dwc2", "wifi-driver", "wifi-usb", "events"]
 # OFF x86 (no PCI ethernet on any of the boards), the spawn request names the device kind `NIC` instead of
 # the class code above, and the kernel resolves it per board. Note 2026-10-09: this paragraph used to say
 # the kernel grants the NET_DEVICE capability BY NAME on both ARM ports (frame syscalls 42-44); nothing
-# held NET_DEVICE after that, and on 2026-10-28 the capability and its syscalls were removed (`backlog/21`).
+# held NET_DEVICE after that, and on 2026-10-28 the capability and its syscalls were removed (`backlog/fixed/21`).
 # Per board:
 #
 # PI 2: no window and no arena. The LAN9514 is a USB device the `dwc2` SERVICE drives; this service

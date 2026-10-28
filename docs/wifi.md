@@ -3049,7 +3049,7 @@ fresh cable gets, for the same reason. Fifteen lines, one new helper, and it is 
 rather than left as a silent amendment to "unmodified".
 
 The alternative was to give the radio the cable's address (`cur_etheraddr` is settable) so the stack saw
-one link. It was not taken: the cable's address on this board is a made-up one (`backlog/21`), the radio's
+one link. It was not taken: the cable's address on this board is a made-up one (`backlog/fixed/21`), the radio's
 is burned in, and a station that borrows another interface's address to avoid telling its stack the truth
 is the silent substitution 26.4 names.
 

@@ -46,7 +46,7 @@ use godspeed::driver::device::soc_nic;
 /// Compiled into every aarch64 image (`build.rs`, `nic_genet`) so it is type-checked by the same command
 /// that builds the shipping image - a backend that only compiles under its own feature is a backend that
 /// quietly rots. Whether it RUNS is the board's answer: `service_main` takes it where the kernel's boot
-/// probe found a GENET (`soc_nic`, `backlog/21`). The kernel drives no ethernet at all (Commandment I).
+/// probe found a GENET (`soc_nic`, `backlog/fixed/21`). The kernel drives no ethernet at all (Commandment I).
 #[cfg(nic_genet)]
 mod genet;
 /// The VisionFive 2's Synopsys DesignWare MAC: identification (`dwmac.rs`) and the rings that carry
@@ -1043,7 +1043,7 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
 /// the kernel's leftover GENET code: a second path that is not exercised does not stay working, and
 /// keeping it makes the file read as "one backend, two ARM ports" when it is one backend, one board.
 /// The NET_DEVICE syscalls (42-44) now have no caller anywhere in userspace - recorded in
-/// `backlog/21`, not quietly acted on here.
+/// `backlog/fixed/21`, not quietly acted on here.
 #[cfg(nic_usb_bridge)]
 fn kernel_net_main(ctx: ServiceContext) -> ! {
     // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls
@@ -1484,7 +1484,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // decided to grant this service a window at all, so the answer and the grant cannot disagree. Until
     // 2026-10-28 this asked `target_arch` instead, which names the CPU and not the board: a second
     // aarch64 board with a different MAC would have taken the GENET arm and driven the wrong silicon
-    // (`backlog/21`). Which backends an image CARRIES is still decided per instruction set, once, in
+    // (`backlog/fixed/21`). Which backends an image CARRIES is still decided per instruction set, once, in
     // `build.rs`, for size alone; a board whose MAC this image does not carry says so and is not driven.
     match godspeed::driver::device::soc_nic(&ctx) {
         // Pi 4: the GENET MAC is ours, reached through the register window and DMA arena the kernel

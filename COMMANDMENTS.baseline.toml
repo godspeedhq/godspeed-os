@@ -250,7 +250,7 @@ service_configs = [
 # 29 (added 2026-10-28) is which ethernet controller is SOLDERED TO THE SOC (0 none, 1 GENET, 2 DWMAC):
 # query 14's twin for a MAC on no bus, which has no vendor/device pair to report. The arch's boot probe
 # already decides it - it is what grants nic-driver a window at all - and did not publish it, so the
-# driver chose its backend by instruction set, which names the CPU and not the board (backlog/21). A read
+# driver chose its backend by instruction set, which names the CPU and not the board (backlog/fixed/21). A read
 # of a fact the kernel holds, not a responsibility; ungated like 14, task-neutral hardware info.
 introspect_queries = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29]
 #

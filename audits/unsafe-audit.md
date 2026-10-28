@@ -20,7 +20,7 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/dma.rs` | 10 | permitted (§18.1 - DMA memory) |
 | `sdk/rust/src/adversarial.rs` | 10 | permitted (§18.1 - the red-team module) |
 | `sdk/rust/src/memory.rs` | 3 | permitted (§18.1 - a task's own memory, 2026-10-17 amendment) |
-| `sdk/rust/src/service_context.rs` | **75** | **grandfathered floor** (§18.5; +1 `soc_nic`, query 29, 2026-10-28 amendment, backlog/21; -6 2026-10-28, the six uncalled USB-disk wrappers with syscalls 46-49, backlog/21; +1 `exit`, 2026-10-17 amendment; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/21) |
+| `sdk/rust/src/service_context.rs` | **75** | **grandfathered floor** (§18.5; +1 `soc_nic`, query 29, 2026-10-28 amendment, backlog/fixed/21; -6 2026-10-28, the six uncalled USB-disk wrappers with syscalls 46-49, backlog/fixed/21; +1 `exit`, 2026-10-17 amendment; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/fixed/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
 **The 87 (79 + 8) are not 87 defects.** 84 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12 and moved with `power_off`, 2026-10-14; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
@@ -129,7 +129,7 @@ its own core, and AArch64's free invalidates inner-shareable for the idle core t
 | `arch/arm/mod.rs`, `arch/loongarch64/mod.rs`, `arch/riscv32/mod.rs`, `arch/s390x/mod.rs` | -1 each | **shrank**: the empty `broadcast_ipi_all_but_self` stub. |
 | `sdk/rust/src/adversarial.rs` | 8 -> 10 (+2) | **The P7 stale-translation test** (permitted module, 18.1). `Region`, a run of pages that can only be built from a successful `AllocMem`, with `stamp` (one `write_volatile` per 32-bit word) and `first_not` (one `read_volatile` per word). Sound because the constructor is the only way to make one: the pages are mapped, writable, private to the task, page-aligned, and no Rust reference points into them. It lets the `probe` service stay `unsafe`-free while P7 stamps a writer's pages and has a checker given the same addresses read them. |
 
-## 2026-10-11 - the NET_DEVICE wrappers removed (backlog/21 step 2)
+## 2026-10-11 - the NET_DEVICE wrappers removed (backlog/fixed/21 step 2)
 
 No port has an in-kernel network device, and nothing has been granted NET_DEVICE since 2026-09-13, so
 the SDK's three wrappers for syscalls 42-44 had no caller anywhere in the tree.

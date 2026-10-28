@@ -122,7 +122,7 @@ that the ISA was added.*
 | `services/block-driver/build.rs` (4) | is the disk on a USB host, and which service owns it | **Add one arm.** Same shape. |
 | `services/shell/build.rs` (2) | what to call your arch in `version` | **Nothing** - it is derived from `CARGO_CFG_TARGET_ARCH`. Only add a line if your ISA needs a project-specific name, as arm32 does. |
 | `services/supervisor/src/main.rs` (3) | which peers `block-driver` and `nic-driver` need | **Add an arm** if your storage or NIC sits behind a USB host. |
-| `services/nic-driver/build.rs` (4) | which MAC backends this image CARRIES | **Add one arm** if your board's ethernet is soldered to the SoC: name the backend your ISA's images carry. Which one RUNS is the board's answer, not yours - `nic-driver` asks the kernel which controller its boot probe found (`soc_nic`, InspectKernel query 29), so a second board of your ISA with a different MAC is not driven as the wrong silicon. Until 2026-10-28 this was 10 sites in `main.rs` choosing the backend by instruction set (`backlog/21`). Your arch answers `soc_nic` in the seam. |
+| `services/nic-driver/build.rs` (4) | which MAC backends this image CARRIES | **Add one arm** if your board's ethernet is soldered to the SoC: name the backend your ISA's images carry. Which one RUNS is the board's answer, not yours - `nic-driver` asks the kernel which controller its boot probe found (`soc_nic`, InspectKernel query 29), so a second board of your ISA with a different MAC is not driven as the wrong silicon. Until 2026-10-28 this was 10 sites in `main.rs` choosing the backend by instruction set (`backlog/fixed/21`). Your arch answers `soc_nic` in the seam. |
 | `services/hw-enumerator/src/main.rs` (3) | mechanism #1 or ECAM config-space selector | **Add an arm** if you have PCI. A port that is neither fails to COMPILE, which is deliberate - a wrong default would silently address the wrong registers. `backlog/25` has the clean form. |
 | `services/wifi-driver/build.rs` (2) | which SD host the board's radio sits behind (`dw_mmc` or Arasan) | **Add one arm** if your board has a radio. Same shape as the other build tables. |
 | `services/net-stack/src/main.rs` (1) | is this counter a CPU cycle count or a wall clock | **Nothing.** The default is the wall-clock floor, which is what every non-x86 port has turned out to need. If calibration fails it now says so in one line rather than surfacing as "ping feels slow" three layers away. |
@@ -194,7 +194,7 @@ kernel and 45 above it. Of the 45, **27 are "add one arm to a build table"** - d
 and cheap. The other 18 split into the SDK's syscall body you will write anyway (4), the seam the SDK
 is designated for (7), and 7 across THREE service files - `supervisor/src/main.rs` (3),
 `hw-enumerator` (3) and `net-stack` (1). One of those three has an open backlog entry saying what
-would close it for good: `backlog/25` for `hw-enumerator` (`nic-driver`'s, `backlog/21`, closed on
+would close it for good: `backlog/25` for `hw-enumerator` (`nic-driver`'s, `backlog/fixed/21`, closed on
 2026-10-28 by asking the kernel which MAC is on the board). The
 other two do not, and that is honest rather than an omission - the supervisor's three are peer lists
 whose only alternative is a second copy of a fact `block-driver/build.rs` already owns, and

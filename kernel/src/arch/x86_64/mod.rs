@@ -1260,7 +1260,7 @@ pub fn pci_cfg_read32(sel: u32, off: u16) -> Option<u32> {
 ///
 /// It answers WHICH one (`task::soc_nic`), not only whether, because a driver for an SoC MAC has no
 /// other way to know which silicon it was granted: there is no vendor/device pair to read
-/// (`backlog/21`). None on this port.
+/// (`backlog/fixed/21`). None on this port.
 pub fn soc_nic() -> u32 { crate::task::soc_nic::NONE }
 /// Is a device of this fixed kind (`task::kind`) on this board? None here: the arch answers by KIND,
 /// never by the name of a service (`docs/audio.md`, "No service names in the kernel").

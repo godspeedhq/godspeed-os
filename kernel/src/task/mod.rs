@@ -896,7 +896,7 @@ pub mod kind {
 /// Which ethernet controller is SOLDERED TO THE SOC, as the arch's boot probe found it - the answer to
 /// `arch::imp::soc_nic` and InspectKernel query 29. A SoC MAC is on no bus, so it has no vendor/device
 /// pair for query 14 to report; without this a driver could only infer it from the instruction set,
-/// which names the CPU and not the board (`backlog/21`). These name DEVICES, never an ISA.
+/// which names the CPU and not the board (`backlog/fixed/21`). These name DEVICES, never an ISA.
 pub mod soc_nic {
     /// None found - the machine's NIC, if any, is on a bus (query 14) or behind a USB host.
     pub const NONE: u32 = 0;
@@ -1023,7 +1023,7 @@ pub mod privbits {
     // their resource (backlog/fixed/59). The bits stay unassigned rather than reused, and `KNOWN` leaves them
     // out, so a spawner that still asks for one is refused as asking for an unknown privilege.
     // Bit 11 was NET_DEVICE, the in-kernel network device's authority, removed with its syscalls and
-    // resource (backlog/21). Unassigned, so a request naming it is refused as an unknown privilege.
+    // resource (backlog/fixed/21). Unassigned, so a request naming it is refused as an unknown privilege.
     /// PCI_CFG: read PCI configuration space through the legacy CF8/CFC ports (step D2).
     ///
     /// READ-ONLY, permanently, and the kernel enforces WHICH PORTS rather than what they mean. CF8
@@ -1179,7 +1179,7 @@ fn service_privileges(name: &str) -> Privileges {
         acquire_any: matches!(name, "supervisor"),
         // GPIO_DEVICE was once a kernel-only BY-NAME grant here (the U15 / userspace-audit A5-U1 doctrine),
         // with NET_DEVICE, USB_DISK and SET_CLOCK; GPIO travels in the spawn request now, and the other
-        // three were removed with the in-kernel devices they gated (backlog/21, backlog/fixed/59).
+        // three were removed with the in-kernel devices they gated (backlog/fixed/21, backlog/fixed/59).
         // No service in the KERNEL's catalogue holds PCI_CFG. `hw-enumerator` is a moved service -
         // the supervisor owns its image and requests this privilege in the spawn request, which the
         // kernel grants only because the supervisor itself holds a GRANT cap for it. That is step C's

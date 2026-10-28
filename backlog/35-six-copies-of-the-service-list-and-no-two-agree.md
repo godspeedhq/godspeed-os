@@ -101,7 +101,7 @@ three commands offer on the theory that they were accidents. They were not.
 
 1. **`dwc2`.** Completion is not arch-gated and the lists are compile-time constants. Gating them on
    `target_arch` would work and would be the fifth place the shell learns which board it is on,
-   which `backlog/21` and `backlog/25` are both about not doing. A device-class question the kernel
+   which `backlog/fixed/21` and `backlog/25` are both about not doing. A device-class question the kernel
    could answer is the better shape, and that is the same answer those two entries are waiting for.
 2. **`control`.** Recorded as deliberate above. If that reading is wrong it is a one-word change.
 3. **The four copies outside the shell** - the supervisor's `MANAGED` and the kernel's two by-name

@@ -80,7 +80,7 @@ pub const ACQUIRE_ANY_RESOURCE: ResourceId = ResourceId(9);
 
 // ResourceId 10 was NET_DEVICE_RESOURCE, the authority to move frames through an in-kernel network
 // device (syscalls 42-44). No port has had one since the USB-net device moved into `dwc2` and GENET into
-// `nic-driver`, and nothing was granted it after 2026-09-13; removed with its syscalls (backlog/21).
+// `nic-driver`, and nothing was granted it after 2026-09-13; removed with its syscalls (backlog/fixed/21).
 // Not reused.
 
 /// Authority to drive the SoC GPIO pins (the ARM `Gpio` syscall: set a pin's direction, drive it high/low,
@@ -91,7 +91,7 @@ pub const GPIO_DEVICE_RESOURCE: ResourceId = ResourceId(11);
 
 // ResourceId 12 was USB_DISK_RESOURCE, the authority to read and write the in-kernel USB disk
 // (syscalls 46-49). The disk is served by the `dwc2` and `xhci` SERVICES over IPC on every port, the
-// kernel claimed no device, and nothing held it (audit SEC-37); removed with its syscalls (backlog/21).
+// kernel claimed no device, and nothing held it (audit SEC-37); removed with its syscalls (backlog/fixed/21).
 // Not reused.
 
 // ResourceId 13 was SET_CLOCK_RESOURCE, the authority to set the wall clock. Nothing checked it once

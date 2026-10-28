@@ -2638,7 +2638,7 @@ pub mod rtc {
 /// tree gave a window and no PCI ethernet controller was found first (QEMU `virt` has an e1000, and
 /// there the bus answers). Until 2026-10-28 this said `false` and `pci::nic()`'s fallback alone carried
 /// the SoC MAC, which left a driver no way to know WHICH silicon it was granted but the ISA
-/// (`backlog/21`).
+/// (`backlog/fixed/21`).
 pub fn soc_nic() -> u32 {
     if pci::find_by_class(0x02_00_00).is_none() && net::window() != 0 {
         crate::task::soc_nic::DWMAC

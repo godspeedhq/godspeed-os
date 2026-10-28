@@ -12,7 +12,7 @@ fn main() {
 
     // WHICH BACKENDS THIS IMAGE CARRIES - asked of the instruction set ONCE, here, and only for image
     // size. Which one RUNS is the board's answer, read at runtime from the kernel's boot probe
-    // (`soc_nic`, InspectKernel query 29; `backlog/21`). Each SoC backend is a whole MAC - GENET is
+    // (`soc_nic`, InspectKernel query 29; `backlog/fixed/21`). Each SoC backend is a whole MAC - GENET is
     // ~1,450 lines - and compiling every one into every image would be dead weight in a service with a
     // 16 MiB limit. The PCI backends (e1000, RTL8168) are small and in every image.
     for fact in ["nic_genet", "nic_dwmac", "nic_usb_bridge"] {

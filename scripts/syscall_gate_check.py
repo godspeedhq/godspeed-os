@@ -125,7 +125,7 @@ ALLOW_UNGATED_QUERY = {
                  "audits/kernel-audit.md A8-19)",
              effects={"store", "wake", "log", "asm", "device_read", "device_write", "lock"}),
     14: dict(why="NIC vendor/device from the boot PCI scan", effects=set()),
-    29: dict(why="which SoC ethernet controller the boot probe found (backlog/21): query 14's twin for a MAC on no bus",
+    29: dict(why="which SoC ethernet controller the boot probe found (backlog/fixed/21): query 14's twin for a MAC on no bus",
              effects=set()),
     15: dict(why="NIC BAR from the boot PCI scan", effects={"device_read", "device_write", "lock"}),
     16: dict(why="TSC ticks per quantum, a calibration constant (aarch64 reads the counter frequency "

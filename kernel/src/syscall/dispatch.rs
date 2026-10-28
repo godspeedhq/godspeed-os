@@ -78,7 +78,7 @@ pub enum SyscallNumber {
     // 42-44 were NetFrameTx, NetFrameRx and NetInfo (an in-kernel network device), and 46-49
     // UsbDiskInfo, UsbDiskRead, UsbDiskWrite and UsbDiskFlush (an in-kernel USB disk). No port has had
     // either device since the USB stacks and GENET became services, nothing held their capabilities,
-    // and the SDK had no caller; removed with their resources (backlog/21). The numbers are not
+    // and the SDK had no caller; removed with their resources (backlog/fixed/21). The numbers are not
     // reused, so a stale caller gets an unknown syscall, never a different one.
     FireIrq                = 51,
     Gpio                   = 45,
@@ -1966,7 +1966,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // 29 = which ethernet controller is SOLDERED TO THE SOC (`task::soc_nic`: 0 none, 1 GENET, 2 DWMAC).
         // Query 14's twin for a controller on no bus, which has no vendor/device pair to report, so
         // nic-driver chooses its backend from what the boot probe FOUND rather than from the instruction
-        // set (`backlog/21`). Task-neutral hardware info like 14, so ungated.
+        // set (`backlog/fixed/21`). Task-neutral hardware info like 14, so ungated.
         29 => crate::arch::imp::soc_nic() as i64,
         15 => crate::arch::imp::pci::nic()
             .map_or(0, |d| crate::arch::imp::pci::first_memory_bar(&d)) as i64,
