@@ -114,12 +114,18 @@ pub fn init_percore_arenas(n: usize) {
 /// set is a kernel that can silently scribble on user memory from anywhere - the protection gone,
 /// with nothing to show for it. The guard also restores rather than clears, so nesting cannot turn
 /// it off inside an outer window that needs it.
+///
+/// **And it masks interrupts for as long as it is open** (backlog/90 D19): `SUM` is per hart, so a task
+/// preempted inside the window carried `SUM` set into whatever ran next on this hart - a task that could
+/// then touch user memory it never validated. One copy at a time, unpreemptible, closes that.
 struct SumWindow {
     was_set: bool,
+    irq: bool,
 }
 
 impl SumWindow {
     fn open() -> Self {
+        let irq = super::interrupts::local_irq_save();
         let old: u64;
         // SAFETY: an atomic read-and-set of `sstatus.SUM`, with no other effect. `csrrs` returns the
         // previous value, so nesting can be undone exactly.
@@ -130,7 +136,7 @@ impl SumWindow {
                 options(nostack)
             )
         };
-        SumWindow { was_set: old & SSTATUS_SUM != 0 }
+        SumWindow { was_set: old & SSTATUS_SUM != 0, irq }
     }
 }
 
@@ -142,6 +148,7 @@ impl Drop for SumWindow {
                 core::arch::asm!("csrc sstatus, {}", in(reg) SSTATUS_SUM, options(nostack))
             };
         }
+        super::interrupts::local_irq_restore(self.irq);
     }
 }
 

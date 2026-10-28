@@ -144,8 +144,12 @@ pub fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 // a user VA while the flag is set is a bad USER pointer, so it kills the caller (like
 // a ring-3 fault) and the system continues. The flag is set NARROWLY (never for a
 // whole syscall), so a genuine kernel bug that faults elsewhere still halts loudly.
-// IF=0 in syscall context => no same-core nesting; per-core => cross-core copies are
-// independent.
+// Per-core => cross-core copies are independent. Same-core: each guarded copy runs with
+// interrupts MASKED (`local_irq_save` around set, copy, clear). A syscall is not IF=0 throughout -
+// a copy after a blocking wait runs with interrupts on - so unmasked, a task preempted mid-copy let
+// the next task's copy on this core clear the shared flag (its own fault then halted the kernel), and
+// a task killed from another core mid-copy left the flag set, so a later genuine kernel fault on this
+// core was taken for a user copy and killed a task instead of halting (backlog/90 D19, A10-2).
 // ---------------------------------------------------------------------------
 
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -209,12 +213,14 @@ pub fn copy_user_to_kernel(src: u64, dst: *mut u8, len: usize) -> bool {
     if !validate_user_ptr(src, len) { return false; }
     let core = crate::task::scheduler::current_core_id();
     if core >= num_cores() { return false; }
+    let irq = super::interrupts::local_irq_save(); // one copy, unpreemptible (D19, header)
     USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
     // SAFETY: `[src, src+len)` is a validated user range and `len` <= one page; `dst` is supplied by
     // the caller, which owns it (the loader passes a just-allocated, HHDM-mapped frame). A fault on
     // the source does not return here - `pf_handler` kills the caller while the guard is set.
     unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst, len) };
     USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    super::interrupts::local_irq_restore(irq);
     true
 }
 
@@ -233,6 +239,7 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     // Base of this core's scratch arena slot (single-owner: only this core, inside an IF=0 syscall,
     // touches its slot - no aliasing, no same-core nesting).
     let base = USER_READ_SCRATCH.as_mut_ptr(core).cast::<u8>();
+    let irq = super::interrupts::local_irq_save(); // one copy, unpreemptible (D19, header)
     USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
     // SAFETY: `[ptr, ptr+len)` is a validated user range; `base` is this core's scratch
     // of MAX_MESSAGE_SIZE >= len bytes. If a source page is unmapped the CPL0 #PF is
@@ -240,6 +247,7 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     // never faults the kernel and never returns from the fault.
     unsafe { core::ptr::copy_nonoverlapping(ptr as *const u8, base, len) };
     USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    super::interrupts::local_irq_restore(irq);
     // SAFETY: `base` points to `len` bytes just initialised in the arena scratch slot.
     Some(unsafe { core::slice::from_raw_parts(base as *const u8, len) })
 }
@@ -251,12 +259,14 @@ pub fn write_user_bytes(dst: u64, src: &[u8]) -> bool {
     if !validate_user_ptr(dst, src.len()) { return false; }
     let core = crate::task::scheduler::current_core_id();
     if core >= num_cores() { return false; }
+    let irq = super::interrupts::local_irq_save(); // one copy, unpreemptible (D19, header)
     USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);
     // SAFETY: range validated; user-space VA disjoint from kernel. If `dst` is unmapped
     // or read-only the CPL0 #PF is caught by pf_handler (USER_COPY_ACTIVE set -> the
     // caller is killed), so this copy never halts the kernel.
     unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len()) };
     USER_COPY_ACTIVE.get(core).store(false, Ordering::SeqCst);
+    super::interrupts::local_irq_restore(irq);
     true
 }
 

@@ -235,6 +235,10 @@ pub unsafe fn probe_read32(addr: u64) -> Option<u32> {
 /// Byte-at-a-time is deliberate for now: it is obviously correct, and the fixup has to cover exactly
 /// the faulting instruction. A wider copy is a later optimisation that must keep that property.
 fn copy_from_user(dst: *mut u8, src: u64, len: usize) -> bool {
+    // One copy, unpreemptible: the fixup is per core, so a task preempted mid-copy let the next task's
+    // copy re-arm and then disarm it, and the first task's fault then halted the kernel (backlog/90 D19,
+    // A10-2's "mirror-image" case). Masked from before the fixup is armed until after it is disarmed.
+    let irq = super::interrupts::local_irq_save();
     let fixup = &FIXUP[core_index()] as *const AtomicU64;
     let ok: u64;
     // SAFETY: `src` passed the range check, and every access below is `ldtrb` - an UNPRIVILEGED load,
@@ -270,11 +274,13 @@ fn copy_from_user(dst: *mut u8, src: u64, len: usize) -> bool {
             options(nostack),
         );
     }
+    super::interrupts::local_irq_restore(irq);
     ok != 0
 }
 
 /// The actual write, one byte at a time through `sttrb`. See [`copy_from_user`].
 fn copy_to_user(dst: u64, src: *const u8, len: usize) -> bool {
+    let irq = super::interrupts::local_irq_save(); // as `copy_from_user`: one copy, unpreemptible (D19)
     let fixup = &FIXUP[core_index()] as *const AtomicU64;
     let ok: u64;
     // SAFETY: as `copy_from_user`, with the direction reversed - `sttrb` is the UNPRIVILEGED store, so
@@ -307,6 +313,7 @@ fn copy_to_user(dst: u64, src: *const u8, len: usize) -> bool {
             options(nostack),
         );
     }
+    super::interrupts::local_irq_restore(irq);
     ok != 0
 }
 
