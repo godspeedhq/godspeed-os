@@ -93,21 +93,24 @@ pub struct Host {
     pub dev: Option<Bound>,
     /// The gen last reported, `Some(None)` for "nothing bound", `None` before the first report.
     last: Option<Option<u32>>,
-    /// Bindings made, and a seed from the clock so a restarted host's gens differ from the dead one's.
+    /// Bindings made, and which life of this host this is (`ctx.instance()`), so a restarted host's
+    /// gens differ from the dead one's whatever the clock does (backlog/84 C2).
     binds: u32,
-    seed: u32,
+    instance: u32,
     report_said: bool,
 }
 
 impl Host {
     pub fn new(ctx: &ServiceContext) -> Host {
-        Host { dev: None, last: None, binds: 0, seed: wait::ticks(ctx) as u32, report_said: false }
+        Host { dev: None, last: None, binds: 0, instance: ctx.instance(), report_said: false }
     }
 
     /// The next binding's number (`usbdev::Report::gen`).
     pub fn next_gen(&mut self) -> u32 {
+        // The instance in the high 16 bits, this instance's bind count in the low 16, never 0 - the shape
+        // `godspeed_wifi::usbfn::next_gen` gives `xhci` and `dwc2`, which this host does not depend on.
         self.binds = self.binds.wrapping_add(1);
-        self.seed.rotate_left(8) ^ self.binds
+        ((self.instance & 0xFFFF) << 16) | (self.binds & 0xFFFF).max(1)
     }
 
     /// The bound device left: forgotten, and said.

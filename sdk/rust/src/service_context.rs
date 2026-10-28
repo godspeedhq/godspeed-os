@@ -819,6 +819,12 @@ struct ServiceContextData {
     /// told which one it was given.
     irq_count:          u32,      // 0 = no interrupt granted
     irqs:               [u8; 4],  // the granted vectors; only the first `irq_count` are meaningful
+    /// Which life of this service this is: the kernel's restart count for its name at this spawn - 0
+    /// the first time, one more after each death (the kernel's `ServiceContextData::instance`).
+    /// It only rises within a boot and survives the supervisor's restarts, so a service can make a
+    /// number no earlier instance of itself made (a USB host's binding gen, backlog/84 C2). The task
+    /// learns its own count and nothing about any other. Last, so no earlier field moves.
+    instance:           u32,
 }
 
 // The kernel writes this struct and the SDK reads it, from two crates, with no shared definition -
@@ -828,7 +834,7 @@ struct ServiceContextData {
 // Pinned by SIZE in both crates. It does not prove field ORDER, but it catches the mistake that
 // actually happens - an append on one side only - and it fails at compile time in the crate that
 // drifted rather than at boot in a service that reads garbage.
-const SERVICE_CONTEXT_DATA_SIZE: usize = 952;   // 320 + irq_count(4) + irqs[4] (D1b); then each of the 6 send-peer names 24 -> 128 bytes (2026-10-18), +624
+const SERVICE_CONTEXT_DATA_SIZE: usize = 952;   // 320 + irq_count(4) + irqs[4] (D1b); then each of the 6 send-peer names 24 -> 128 bytes (2026-10-18), +624; then instance(4), which took the 4 bytes of tail padding, so the size held (2026-10-28)
 const _: () = assert!(
     core::mem::size_of::<ServiceContextData>() == SERVICE_CONTEXT_DATA_SIZE,
     "ServiceContextData changed size: update BOTH kernel/src/task/mod.rs and      sdk/rust/src/service_context.rs, then update SERVICE_CONTEXT_DATA_SIZE in both"
@@ -1350,6 +1356,11 @@ impl ServiceContext {
 
     /// Return the probe mode written by the kernel at spawn (0 for all production services).
     pub fn probe_mode(&self) -> u32 { Self::ctx().probe_mode }
+
+    /// Which life of this service this is: 0 the first time it started this boot, one more after each
+    /// death (the kernel's restart count for its name, written at spawn). It only rises within a boot,
+    /// including across the supervisor's own restarts, so it names an instance no earlier one shared.
+    pub fn instance(&self) -> u32 { Self::ctx().instance }
 
     /// The REPLY mailbox: `(recv, grant)` for the endpoint that exists only to receive replies, or
     /// `None` on a task that has none (then the caller uses the shared endpoint, as before).

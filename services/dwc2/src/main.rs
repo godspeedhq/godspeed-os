@@ -293,7 +293,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Chosen while the IN-KERNEL driver still owned the `dwc2:` prefix and printed heavily - hub
     // ports, MSC capacity, FUA - so the two could be told apart on one serial console. That driver is
     // deleted (CLAUDE.md 6.4, 2026-08-17); the prefix stays because logs and tests match on it.
-    ctx.log("dwc2-svc: starting - USB host (hub, keyboard, storage, ethernet)");
+    // Which life of this host this is: the high half of every binding gen it gives (backlog/84 C2).
+    ctx.log_fmt(format_args!("dwc2-svc: starting - USB host (hub, keyboard, storage, ethernet), instance {}", ctx.instance()));
 
     // The two hardware grants, reported rather than assumed. A driver that cannot reach its
     // registers is not a degraded driver, it is not a driver at all, and the boot log should say
@@ -354,8 +355,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     let mut radio: Option<rtl::Radio> = None;
     let mut radio_port: u8 = 0;
     // The gen of the dongle's last bind on this host (`usbfn::next_gen`): the report's generation
-    // (`usbdev`) and `OP_INFO`'s: different from the last bind, and from a restarted host's where the
-    // counter is calibrated and running (`usbfn::next_gen` says where it is not).
+    // (`usbdev`) and `OP_INFO`'s: different from the last bind, and from any earlier instance's, because
+    // it carries this instance's number (`ctx.instance()`).
     let mut radio_binds: u32 = 0;
     // The replugs its driver asked for, and when the last was (`REPLUG_MAX`).
     let mut radio_replugs: u32 = 0;
@@ -508,13 +509,13 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                                                 // Bound whether or not the reads answered - the
                                                 // driver asks again and says what it got.
                                                 radio_port = p;
-                                                radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                                radio_binds = godspeed_wifi::usbfn::next_gen(ctx.instance(), radio_binds);
                                                 radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if radio.is_none() && rtl::vendor_specific(&ctx, &m, &d, &dt) {
                                                 // Any other vendor-specific device, for a driver package that names it:
                                                 // bound as the dongle is, and reported; the supervisor decides its driver.
                                                 radio_port = p;
-                                                radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                                radio_binds = godspeed_wifi::usbfn::next_gen(ctx.instance(), radio_binds);
                                                 radio = Some(rtl::bind(&ctx, &m, &d, &dt, dvid, dpid, radio_binds));
                                             } else if let Some(mut dk) = msc::bind(&ctx, &m, &d, &dt, dsplt) {
                                                 // Prove the bulk path the way the kernel driver did:
@@ -828,14 +829,14 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                             {
                                 if hvid == rtl::VID && hpid == rtl::PID {
                                     // The radio, plugged in after boot: bound as at boot, and said.
-                                    radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                    radio_binds = godspeed_wifi::usbfn::next_gen(ctx.instance(), radio_binds);
                                     radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
                                     notify(&ctx, format_args!("usb: WiFi dongle connected (port {})", port));
                                     radio_port = port;
                                     rtl::announce(&ctx, radio.as_ref());
                                 } else if radio.is_none() && rtl::vendor_specific(&ctx, &m, &d, &dt) {
                                     // Another vendor-specific device, plugged in after boot: bound for a driver of its own.
-                                    radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                                    radio_binds = godspeed_wifi::usbfn::next_gen(ctx.instance(), radio_binds);
                                     radio = Some(rtl::bind(&ctx, &m, &d, &dt, hvid, hpid, radio_binds));
                                     notify(&ctx, format_args!("usb: USB device {:04x}:{:04x} connected (port {})", hvid, hpid, port));
                                     radio_port = port;
@@ -926,7 +927,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                     port, radio_replugs, REPLUG_MAX));
                 match hub_target.and_then(|ht| hub::enumerate_downstream(&ctx, &m, &d, &ht, port, &mut addr)) {
                     Some((v, p, _, dt, _)) if v == rtl::VID && p == rtl::PID => {
-                        radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+                        radio_binds = godspeed_wifi::usbfn::next_gen(ctx.instance(), radio_binds);
                         let mut r = rtl::bind(&ctx, &m, &d, &dt, v, p, radio_binds);
                         r.replug_allowed = radio_replugs < REPLUG_MAX;
                         radio = Some(r);

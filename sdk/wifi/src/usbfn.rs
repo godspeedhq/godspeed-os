@@ -35,15 +35,16 @@ pub use godspeed_sdk::usbfn::INFO_GEN_AT;
 /// Where the optional part of an `OP_INFO` answer starts.
 pub use godspeed_sdk::usbfn::INFO_WHERE_AT;
 
-/// The gen for a new binding, given the host's `gs::driver::wait::counter_ms` now and the gen it gave last:
-/// the counter, so a restarted host does not repeat a gen its previous instance gave (a count from 1 did, on
-/// every restart), and otherwise one more than the last this instance gave, so two binds in one millisecond
-/// still differ. Never 0, which a report reads as absent. Across a restart this holds only where the counter
-/// is calibrated and running: an uncalibrated one reads 0, so each instance counts from 1 again; the low 32
-/// bits wrap every ~49.7 days (`backlog/84` C2).
-pub fn next_gen(now_ms: u64, last: u32) -> u32 {
-    let t = now_ms as u32;
-    if t > last { t } else { last.wrapping_add(1).max(1) }
+/// The gen for a new binding, given which life of the host this is (`ServiceContext::instance`, the kernel's
+/// restart count for its name) and the gen this instance gave last (0 before its first): the instance in the
+/// high 16 bits and one more than the last bind's count in the low 16. So a restarted host never repeats a gen
+/// an earlier instance gave - its instance differs - whatever its clock does; the counter it used before
+/// could not promise that where it was uncalibrated, and wrapped every ~49.7 days (backlog/84 C2). Never 0,
+/// which a report reads as absent: the low half is at least 1. The bounds, stated: 65,536 instances a boot
+/// before the high half wraps, and 65,535 binds in one instance before its low half does.
+pub fn next_gen(instance: u32, last: u32) -> u32 {
+    let low = ((last & 0xFFFF) + 1) & 0xFFFF;
+    ((instance & 0xFFFF) << 16) | low.max(1)
 }
 /// `[op, setup(8), data out...]` -> `[op, status, data in...]`. One control transfer to the bound radio: the
 /// 8-byte setup packet as USB defines it; for an OUT transfer the data follows it, `wLength` bytes; for an

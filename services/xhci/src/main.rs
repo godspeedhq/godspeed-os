@@ -3871,7 +3871,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
     gs::trace::as_name(&ctx, "xhci");
-    ctx.log("xhci: driver starting");
+    // Which life of this host this is: the high half of every binding gen it gives (backlog/84 C2).
+    ctx.log_fmt(format_args!("xhci: driver starting (instance {})", ctx.instance()));
 
     // Both grants through `gs::driver` (`docs/driver-library.md` step 3), the arena laid out by name in
     // `lay_out` and reached only through its parts.
@@ -4488,7 +4489,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         // A gen this instance's successor cannot repeat (`usbfn::next_gen`): a count from 1 started over on
         // every restart, so `wifi-usb` could not tell a fresh binding from the one it was serving.
         if let Some(r) = radio.as_mut() {
-            radio_binds = godspeed_wifi::usbfn::next_gen(gs::driver::wait::counter_ms(&ctx), radio_binds);
+            radio_binds = godspeed_wifi::usbfn::next_gen(ctx.instance(), radio_binds);
             r.gen = radio_binds;
         }
         let radio_now = radio.as_ref().map(|r| r.ids);

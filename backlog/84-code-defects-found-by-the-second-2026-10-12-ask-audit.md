@@ -1,6 +1,6 @@
 # 84. Code defects found by the second 2026-10-12 `feat/ask` documentation audit
 
-**Status: OPEN for C2 only, 2026-10-13.** C1, C3, S1-S6 and A1 are FIXED in code on `feat/ask`
+**Status: OPEN for C2's cards only - C2 FIX BUILT 2026-10-28**, QEMU-verified (below, "C2 built"); awaiting the boards that run `xhci`, `dwc2` and `ehci`. *Was:* OPEN for C2 only, 2026-10-13. C1, C3, S1-S6 and A1 are FIXED in code on `feat/ask`
 (2026-10-13), each noted below; verified by the host tests (C1 has a test that fails under the old
 arithmetic), `ask`'s 41 host tests and `osdev test shell` 272/0 in QEMU. C2 needs a decision: where a
 gen that no restart can repeat comes from on a machine whose counter is uncalibrated.
@@ -83,3 +83,24 @@ as for `backlog/fixed/80` and `backlog/fixed/82`. The defects it found in the un
 ## Next step
 
 C1 first: it brings back, after ten days, a defect hardware already found.
+
+## C2 built, 2026-10-28
+
+The gen's high half is now **which life of the host this is**: the kernel's restart count for its name,
+written into the task's own context page at spawn (`ServiceContextData::instance`, read as
+`ctx.instance()`), beside `probe_mode` and `core_id`. It only rises within a boot and survives the
+supervisor's own restarts, so a restarted host never repeats an earlier instance's gen, whatever its
+clock does. The low half is that instance's bind count. Never 0. Bounds, in `usbfn::next_gen`: 65,536
+instances a boot, 65,535 binds an instance.
+
+**Why the kernel holds it and not the supervisor, against the first plan.** The supervisor cannot answer
+"which life is this" without either giving every USB host a capability to send it commands (it accepts
+`RESTART`, so that widens authority) or racing a spawn whose count does not exist yet. The kernel already
+keeps the count (per name, bumped at each death, shown to INTROSPECT holders by `TaskStat`); the task
+learns its own and nothing about any other. No syscall, no query, no authority, and MISCIS unchanged: it
+is the scheduler's record of the task, told to the task, as `core_id` is. The field took the context
+page's four bytes of tail padding, so the layout's size did not change and an older binary reads 0 there.
+
+QEMU riscv64 `virt` with a stick: `xhci: driver starting (instance 0)`, then 1 and 2 across two kills,
+the stick bound each time; then 1, a supervisor kill and respawn, then **2** - the count kept rising
+across the supervisor's restart. `osdev test driver-packages` 36/0 (bindings through `xhci` and `ehci`).

@@ -188,6 +188,12 @@ static NAME_RESTART: SpinLock<NameRestartTable> = SpinLock::new(NameRestartTable
 /// bumped - reads 0. READ-ONLY: the increment happens at death and only for the restartable set, so
 /// re-running a transient command (observe-*, greet, ...) is NOT a restart ("RESTARTS = it blew up,
 /// not it was legitimately closed").
+/// `next_restart_count` for the spawn path, which writes it into the new task's context
+/// (`ServiceContextData::instance`): which life of `name` the task about to start is.
+pub(crate) fn restart_count_of(name: &str) -> u64 {
+    next_restart_count(name)
+}
+
 fn next_restart_count(name: &str) -> u64 {
     if name.is_empty() {
         return 0;

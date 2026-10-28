@@ -65,7 +65,8 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // ten unnamed services all collide into one row and their counters interleave. Observed as a
     // single `msgs.received 1920` belonging to nobody.
     gs::trace::as_name(&ctx, "ehci");
-    ctx.log("ehci: driver starting");
+    // Which life of this host this is: the high half of every binding gen it gives (backlog/84 C2).
+    ctx.log_fmt(format_args!("ehci: driver starting (instance {})", ctx.instance()));
 
     let mmio = match godspeed::driver::registers(&ctx) {
         Some(m) => m,
