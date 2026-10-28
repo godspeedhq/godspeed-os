@@ -9965,7 +9965,7 @@ fn cmd_wait(ctx: &ShellCtx, arg: &str) -> Result<(), ShellError> {
 
 /// One look at the console for `q`, `Q` or Esc; any other key is KEPT for the prompt rather than dropped,
 /// so a command typed ahead during `wait` or between `repeat`'s runs is still there afterwards
-/// (`backlog/84` S3). It reads the console itself, not the type-ahead buffer: a key it kept would
+/// (`backlog/fixed/84` S3). It reads the console itself, not the type-ahead buffer: a key it kept would
 /// otherwise be the next thing it read, on every look.
 fn quit_key_or_keep(ctx: &ShellCtx) -> bool {
     match ctx.inner.try_console_read() {
@@ -10054,7 +10054,7 @@ fn cmd_repeat(ctx: &ShellCtx, cwd: &mut Cwd, rest: &str, depth: u8, out: &mut Ou
             None => out.line_fmt(ctx, format_args!("repeat {}: {}", ran, cmd)),
         }
         // Into the caller's output, so a function capture, `$(f)`, holds the runs and the verdict as it
-        // would any other command's (`backlog/84` S2). Refusals above still go to the console.
+        // would any other command's (`backlog/fixed/84` S2). Refusals above still go to the console.
         if execute(ctx, cmd.as_bytes(), cwd, Ok(()), depth + 1, out).is_err() {
             failed += 1;
         }
@@ -15493,7 +15493,7 @@ fn build_ask_table(ctx: &ShellCtx, question: &str) -> Option<Table> {
     match Table::decode(cap.bytes()) {
         Ok(t) => Some(t),
         // The decoder's reason ("bad magic") is about the wire format, which is not what the operator
-        // needs. What they need is who ended it, and the drain says (`backlog/84` S5): `ask` itself, the
+        // needs. What they need is who ended it, and the drain says (`backlog/fixed/84` S5): `ask` itself, the
         // shell's wait running out, or an answer bigger than the shell holds.
         Err(_) => {
             let empty = cap.bytes().is_empty();
@@ -19036,7 +19036,7 @@ fn report(ctx: &ServiceContext, prefix: &str, name: &str) {
 const LIST_MAX: usize = 16;
 /// The most names `kill all-services` holds: room for the supervisor's `MANAGED` set (18 today) with
 /// headroom, plus the supervisor and the shell. A set that outgrows it is REFUSED before anything is killed,
-/// rather than reset in part (`backlog/84` S4).
+/// rather than reset in part (`backlog/fixed/84` S4).
 const ALL_SERVICES_MAX: usize = 34;
 
 /// Run `one` for every item of a comma list, in order, and say how it went.
@@ -19180,7 +19180,7 @@ fn drain_service(ctx: &ShellCtx, svc: &str, input: Option<&[u8]>, out: &mut Cap)
 
 /// How a [`drain_service_with`] ended. Each way but `Eot` has already been said on the console; the
 /// caller needs it to say the rest truthfully - `ask` used to report "stopped" for a `q` and for the
-/// shell's own timeout alike (`backlog/84` S5).
+/// shell's own timeout alike (`backlog/fixed/84` S5).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Drained {
     /// The stage sent its end of output.
@@ -21507,7 +21507,7 @@ fn fs_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
                     gs::io::println(ctx, "fs: no reply for this request - the storage protocol is out of step");
                     return ReqOutcome::Timeout;
                 }
-                // Says `[q] quit` if it lingers, as the first wait did (`backlog/84` S6).
+                // Says `[q] quit` if it lingers, as the first wait did (`backlog/fixed/84` S6).
                 outcome = recv_quittable(ctx, left, &core::cell::Cell::new(false), &|b| ctx.keep_key(b));
             }
             other => return other,
@@ -21575,7 +21575,7 @@ fn fs_raw(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> Option<Message> {
     // Every one of those is a command the operator runs precisely when storage is misbehaving, which
     // is exactly when `fs` is most likely to be slow or restarting. The `q` half is fixed here; recovery
     // from a restart still waits for the next `fs_request`.
-    // With the `[q] quit` notice, as every wait that takes time has (`backlog/84` S6).
+    // With the `[q] quit` notice, as every wait that takes time has (`backlog/fixed/84` S6).
     let first = ask_with_quit_notice(ctx, "fs", &msg, max_secs);
     match fs_take_tagged(ctx, tag, first, max_secs) {
         ReqOutcome::Reply(r) => Some(r),
@@ -21653,7 +21653,7 @@ fn fs_request(ctx: &ShellCtx, op: u8, path: &[u8], data: &[u8]) -> Option<Messag
     // exit" budget the interactive path used, and it bounds the wait for a REPLACEMENT reply after
     // discarding an overtaken one. Still ABORTABLE, so `q` remains an EARLY exit while `fs` is merely
     // slow - it is no longer the only exit.
-    // With the `[q] quit` notice (`backlog/84` S6); `q` before it is typing ahead, kept for the prompt.
+    // With the `[q] quit` notice (`backlog/fixed/84` S6); `q` before it is typing ahead, kept for the prompt.
     let first = ask_with_quit_notice(ctx, "fs", &msg, secs);
     if matches!(first, ReqOutcome::Aborted) {
         return None; // the user pressed q - that is an answer, not a failure to retry
@@ -21801,7 +21801,7 @@ fn ns_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
                 let spent = gs::task::epoch_secs_monotonic(ctx).saturating_sub(t0);
                 let left = max_secs.saturating_sub(spent);
                 if left <= 0 { return ReqOutcome::Timeout; }
-                // Says `[q] quit` if it lingers, as the first wait did (`backlog/84` S6).
+                // Says `[q] quit` if it lingers, as the first wait did (`backlog/fixed/84` S6).
                 outcome = recv_quittable(ctx, left, &core::cell::Cell::new(false), &|b| ctx.keep_key(b));
             }
             other => return other,
@@ -21817,7 +21817,7 @@ fn ns_take_tagged(ctx: &ShellCtx, tag: u8, first: ReqOutcome, max_secs: i64) -> 
 fn ns_abortable(ctx: &ShellCtx, body: &[u8], max_secs: i64) -> ReqOutcome {
     let mut buf = [0u8; 4096];
     let (n, tag) = ns_build(ctx, body, &mut buf, max_secs);
-    // With the `[q] quit` notice (`backlog/84` S6).
+    // With the `[q] quit` notice (`backlog/fixed/84` S6).
     let first = ask_with_quit_notice(ctx, "net-stack", &Message::from_bytes(&buf[..n]), max_secs);
     match ns_take_tagged(ctx, tag, first, max_secs) {
         ReqOutcome::Timeout if gs::cap::reacquire(ctx, "net-stack") => {

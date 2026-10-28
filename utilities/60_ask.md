@@ -116,7 +116,7 @@ for the answer, so a dead source ends one line ("did not answer") and never the
 command.
 
 That wait is quittable and says so: once 2 s pass with nothing from `ask`, the shell prints `[q] quit`,
-and `q` ends it (conventions rule 10). If the answer is not whole, the shell says who ended it (`backlog/84` S5):
+and `q` ends it (conventions rule 10). If the answer is not whole, the shell says who ended it (`backlog/fixed/84` S5):
 
 - `q`: only `pipe: aborted`, since the operator knows why it stopped;
 - the shell's 25 s bound: `ask: no answer - nothing came for ~25s, so the shell ended ask`, or `ask: the

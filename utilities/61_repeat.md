@@ -48,15 +48,15 @@ count goes in one: `repeat count 4 <command>`.
   serve a script nor read a count.
 - **Each run is a script line.** The command runs one level down (`execute` at depth + 1), so `run`,
   `selfcheck` and the library scripts are refused inside it, and the refusal names `repeat` (it named only
-  scripts until `backlog/84` S1). Full-screen views (`help`, `docs`) print instead of opening, because a
+  scripts until `backlog/fixed/84` S1). Full-screen views (`help`, `docs`) print instead of opening, because a
   view waiting for a key would stop the runs.
 - **Its output is the caller's.** The announcements, each run's output and the verdict go where the
   command's output was sent: the screen at the prompt, the variable when it runs in a function whose
-  output is captured, `$(f)` (`backlog/84` S2). A refusal of its own options still goes to the screen.
+  output is captured, `$(f)` (`backlog/fixed/84` S2). A refusal of its own options still goes to the screen.
   `$(repeat ...)` itself is refused, since a capture takes a producer, and `run ... save <path>` saves
   only the run's report, for `repeat` as for every command.
 - **Keys typed while it runs are kept.** Between runs, and during its pause, a key that is not `q` is kept
-  for the prompt rather than dropped, so a command typed ahead is still there when it ends (`backlog/84`
+  for the prompt rather than dropped, so a command typed ahead is still there when it ends (`backlog/fixed/84`
   S3).
 - **No screen clearing.** Clearing was there to make `watch` a live view; repeating is not that. For a live
   view of the system, `observe`.

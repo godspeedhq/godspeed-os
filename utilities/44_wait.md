@@ -40,7 +40,7 @@ hour-plus wait at the prompt is a typo, not a plan (§26.6 bounded).
   (`pause_quittable`), so the core is free for the wait and `q` still answers at once. It used to
   call `yield_now`, which kept an otherwise idle core busy (`backlog/fixed/80` H21).
 - **Other keys are kept.** A key that is not `q`, `Q` or Esc is kept for the prompt, so a command
-  typed during the wait is still there when it ends. They were dropped until `backlog/84` S3.
+  typed during the wait is still there when it ends. They were dropped until `backlog/fixed/84` S3.
 
 ## 4. Commandment VIII note (read this before imitating)
 

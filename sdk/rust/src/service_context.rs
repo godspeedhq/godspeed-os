@@ -822,7 +822,7 @@ struct ServiceContextData {
     /// Which life of this service this is: the kernel's restart count for its name at this spawn - 0
     /// the first time, one more after each death (the kernel's `ServiceContextData::instance`).
     /// It only rises within a boot and survives the supervisor's restarts, so a service can make a
-    /// number no earlier instance of itself made (a USB host's binding gen, backlog/84 C2). The task
+    /// number no earlier instance of itself made (a USB host's binding gen, backlog/fixed/84 C2). The task
     /// learns its own count and nothing about any other. Last, so no earlier field moves.
     instance:           u32,
 }

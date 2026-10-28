@@ -110,7 +110,7 @@ pub(crate) fn paced_looks(budget_us: u64, pace_us: u64) -> u32 {
 /// Microseconds in `ticks` at `per_10ms` ticks per 10 ms. 0 when uncalibrated, which is "unknown".
 ///
 /// Divided before it is multiplied, so it is exact for any `ticks`: multiplying first saturated at about
-/// 1.8e15 ticks, about 10 days on a 2 GHz TSC, and `counter_ms` then stopped advancing (`backlog/84` C1).
+/// 1.8e15 ticks, about 10 days on a 2 GHz TSC, and `counter_ms` then stopped advancing (`backlog/fixed/84` C1).
 /// The remainder's product cannot overflow, because the remainder is below `per_10ms` and no counter
 /// runs at 1.8e17 ticks per second.
 pub(crate) fn us_for(per_10ms: u64, ticks: u64) -> u64 {
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn elapsed_does_not_stop_after_ten_days() {
-        // backlog/84 C1: a 2 GHz TSC at 2e15 ticks (about 11.6 days) is 1e12 us. Multiplying first
+        // backlog/fixed/84 C1: a 2 GHz TSC at 2e15 ticks (about 11.6 days) is 1e12 us. Multiplying first
         // saturated at about 1.8e15 ticks and froze `counter_ms` from then on.
         assert_eq!(us_for(20_000_000, 2_000_000_000_000_000), 1_000_000_000_000);
         assert!(us_for(20_000_000, 2_000_000_000_000_001) >= us_for(20_000_000, 2_000_000_000_000_000));

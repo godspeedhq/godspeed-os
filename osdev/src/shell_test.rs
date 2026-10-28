@@ -3756,7 +3756,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
         None => { println!("files-test: FAIL - gsh let timeout"); fail += 2; }
     }
-    // `repeat` writes to its CALLER's output (backlog/84 S2): in a function whose output is captured,
+    // `repeat` writes to its CALLER's output (backlog/fixed/84 S2): in a function whose output is captured,
     // `$(f)`, its runs and verdict land in the variable, as `echo`'s do in the cf tests below. It wrote
     // to the console before, so the variable held none of them. (`$(repeat ...)` itself is refused - a
     // capture takes a producer - and `run ... save` saves only the run's report, for every command.)
@@ -3768,7 +3768,7 @@ pub fn run_files(image_path: &Path, persist_path: &str, smp: u32) {
         }
         None => { println!("files-test: FAIL - repeat capture timeout"); fail += 2; }
     }
-    // A refusal inside `repeat` names `repeat`, not only scripts (backlog/84 S1).
+    // A refusal inside `repeat` names `repeat`, not only scripts (backlog/fixed/84 S1).
     match run!(b"repeat count 1 run /gsh_a.gsh\r", 12) {
         Some(r) => check!(r.contains("neither can `repeat`"), "repeat: a nested run's refusal names repeat"),
         None => { println!("files-test: FAIL - repeat nested run timeout"); fail += 1; }

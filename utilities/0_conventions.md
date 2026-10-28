@@ -171,7 +171,7 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
     the request waits that used plain `request_with_reply_abortable` (`fs_request`, `fs_raw` -
     `drives`, `drives flash`, `reset`, `label` - and `ns_abortable`) go through
     `ask_with_quit_notice`, and the re-waits after an overtaken reply (`fs_take_tagged`,
-    `ns_take_tagged`) through `recv_quittable` (`backlog/84` S6). Not yet covered: the fs handles
+    `ns_take_tagged`) through `recv_quittable` (`backlog/fixed/84` S6). Not yet covered: the fs handles
     listed in the note above - covered since 2026-10-13, `backlog/fixed/89`.)*
 
     *(Note 2026-10-13: and the radio's and audio driver's asks. `wifi_ask` and `audio_ask` - every

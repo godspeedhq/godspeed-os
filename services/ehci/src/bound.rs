@@ -94,7 +94,7 @@ pub struct Host {
     /// The gen last reported, `Some(None)` for "nothing bound", `None` before the first report.
     last: Option<Option<u32>>,
     /// Bindings made, and which life of this host this is (`ctx.instance()`), so a restarted host's
-    /// gens differ from the dead one's whatever the clock does (backlog/84 C2).
+    /// gens differ from the dead one's whatever the clock does (backlog/fixed/84 C2).
     binds: u32,
     instance: u32,
     report_said: bool,

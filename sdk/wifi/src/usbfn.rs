@@ -39,7 +39,7 @@ pub use godspeed_sdk::usbfn::INFO_WHERE_AT;
 /// restart count for its name) and the gen this instance gave last (0 before its first): the instance in the
 /// high 16 bits and one more than the last bind's count in the low 16. So a restarted host never repeats a gen
 /// an earlier instance gave - its instance differs - whatever its clock does; the counter it used before
-/// could not promise that where it was uncalibrated, and wrapped every ~49.7 days (backlog/84 C2). Never 0,
+/// could not promise that where it was uncalibrated, and wrapped every ~49.7 days (backlog/fixed/84 C2). Never 0,
 /// which a report reads as absent: the low half is at least 1. The bounds, stated: 65,536 instances a boot
 /// before the high half wraps, and 65,535 binds in one instance before its low half does.
 pub fn next_gen(instance: u32, last: u32) -> u32 {

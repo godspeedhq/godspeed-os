@@ -293,7 +293,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
     // Chosen while the IN-KERNEL driver still owned the `dwc2:` prefix and printed heavily - hub
     // ports, MSC capacity, FUA - so the two could be told apart on one serial console. That driver is
     // deleted (CLAUDE.md 6.4, 2026-08-17); the prefix stays because logs and tests match on it.
-    // Which life of this host this is: the high half of every binding gen it gives (backlog/84 C2).
+    // Which life of this host this is: the high half of every binding gen it gives (backlog/fixed/84 C2).
     ctx.log_fmt(format_args!("dwc2-svc: starting - USB host (hub, keyboard, storage, ethernet), instance {}", ctx.instance()));
 
     // The two hardware grants, reported rather than assumed. A driver that cannot reach its
@@ -686,7 +686,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
                 let mut drained = 0u32;
                 loop {
                     // Bounded BEFORE taking, as the two drains below are: what is not taken stays
-                    // queued for the next pass (`backlog/84` C3).
+                    // queued for the next pass (`backlog/fixed/84` C3).
                     if drained >= MSG_DRAIN_MAX {
                         ctx.log("dwc2-svc: no-disk drain hit its bound - a sender is enqueuing as fast as we retire");
                         break;
