@@ -1,7 +1,7 @@
 # Compatibility: what GodspeedOS promises not to break
 
-**Status: the covered surface is DECIDED (operator, 2026-10-26); the gate that holds it and the written
-policy are not built yet.** This is step 1 of the path to v1 in
+**Status: the covered surface is DECIDED (operator, 2026-10-26) and GATED (2026-10-28, below); the written
+policy is not built yet.** This is step 1 of the path to v1 in
 [`backlog/71`](../backlog/71-a-v1-compatibility-promise-is-not-credible-yet-and-the-path-to-one.md). No
 promise is in force yet: GodspeedOS is `v0.x`, and stays `v0.x` until the gate exists and a stretch of
 releases has held it (`backlog/71`, steps 3 to 5).
@@ -39,10 +39,51 @@ These change when the system needs them to, and are named so nobody mistakes the
 - **A utility's human-readable output**: wording, layout and colour. Only its record fields are covered.
 - **The test suites and the enforcement scripts.**
 
+## How it is held
+
+[`scripts/surface_check.py`](../scripts/surface_check.py) runs on every build (`osdev build` and the board
+builds) and compares what the source defines with the snapshot,
+[`scripts/SURFACE.baseline.txt`](../scripts/SURFACE.baseline.txt), one line per promise:
+
+| What | Read from | One line per |
+|---|---|---|
+| `gs` and `gs::driver` | `stdlib/rust/src`, walked from `lib.rs` through the public modules | function signature (parameter names ignored), type and derive, public field, variant, trait item, method, trait implementation, constant, re-export |
+| SDK items `gs` re-exports | the SDK file each comes from | the same, under the `gs` module that exports it (`gs::record::Table`'s methods) |
+| utilities | `UTILS` and `SUBCMD_FIRST` in the shell | utility name, and each word a utility takes first |
+| record fields | every literal `Table::new(&[..])`, and `godspeed`'s report columns | column, keyed by the function that builds the table |
+| the contract schema | `contracts/schema/service.schema.json` | key, type, allowed value, required key, narrowing constraint (pattern, bounds, `additionalProperties: false`) |
+
+- **Growth** - a line the source produces that the snapshot lacks - fails until it is recorded with
+  `python scripts/surface_check.py --bless`. The promise allows it; the snapshot records it so that the item
+  is held from then on.
+- **A removal or a change** - a snapshot line the source no longer produces - fails. A changed signature
+  shows as the old line gone and the new one present. `--bless` refuses it.
+  `python scripts/surface_check.py --accept-break "<reason>"` records it, dated, with its reason, in
+  `scripts/SURFACE-BREAKS.txt`, and moves the snapshot. Before v1 that is how the surface still moves;
+  after v1 the policy below says when a break is allowed at all.
+- **The contract schema runs the other way for narrowing**: a new required key, or a new or tighter
+  constraint, is the break (a contract that validated stops validating), and dropping one is growth.
+- **It tests itself**: 20 mutants of the real sources (a renamed function, a dropped `Copy`, a removed
+  column, a new required key, a parameter only renamed, an SDK method `gs` does not re-export) run on every
+  build in memory, and each must be reported as what it is.
+
+**What it does not hold**, so nobody mistakes the gate for more than it is:
+
+- **Meaning.** A function that keeps its signature and changes what it does passes. The identity, shell
+  and `selfcheck` suites hold behaviour.
+- **The `gsh` language** has no table to read; its keywords are tests inside the interpreter. It is held by
+  the scripts the `selfcheck` corpus and `osdev test shell` run.
+- **The on-disk formats**: GSFS0008 by `osdev test fs-compat` and its feature masks; the WiFi key store and
+  the layout by their own suites. **The package format** is in the godspeed-cli repository. **The platform
+  file** by `scripts/platform_file.py`.
+- **`ServiceContext`'s methods.** `gs` re-exports `ServiceContext` as the handle every program is given, and
+  the gate holds that name; its methods are the raw system calls, which are the SDK, and are not covered.
+- **Adding a variant to an enum, or a public field to a struct,** is recorded as growth. In Rust it can break
+  a caller that matches every variant or builds the struct by its fields. Whether that is allowed is the
+  policy's to say.
+
 ## What is still to do
 
-- **The gate** (`backlog/71` step 3): a checked-in snapshot of the covered surface, and a checker on the build
-  path that fails when something in it is removed or changed, so a breaking change needs a recorded reason.
 - **The policy** (`backlog/71` step 4): the exceptions, such as security and soundness fixes, and how a
   removal is deprecated first.
 - **The soak** (`backlog/71` step 5): releases in which the gate never has to accept a breaking change.

@@ -2,8 +2,9 @@
 
 **Status: OPEN - a decision recorded 2026-10-02, from the operator's question "can I safely release a v1
 and promise no breaking changes in the future?". The answer was not yet, and why; this item is the plan.
-The bar and the order were settled 2026-10-11 (below). Built so far: the one-way ratchet (step 3, half),
-every service on `gs` (step 2, all but the driver gap).**
+The bar and the order were settled 2026-10-11 (below). Built so far: the one-way ratchet and the
+SDK-dependency gate (step 2), the covered surface decided (step 1, 2026-10-26) and the surface gate (step 3,
+2026-10-28). Still to do: the policy (step 4) and the soak (step 5).**
 
 ## Why not yet, measured rather than felt
 
@@ -171,7 +172,15 @@ breaking change; then v1.
    CHANGED rather than added. A breaking change then needs a recorded reason, the way an amendment does.
    **Begun 2026-10-05 for the "one way" half:** `scripts/one_way_check.py` ratchets each crate's raw-SDK
    calls that `gs` already covers (1138 across 28 crates at the start, a new crate held to zero), so the
-   reshape in step 2 can only move forward. The snapshot of the public `gs` surface is still to build.
+   reshape in step 2 can only move forward.
+   **Built 2026-10-28:** `scripts/surface_check.py`, on the build path, holds `scripts/SURFACE.baseline.txt` -
+   1085 lines: the public `gs` items (`gs::driver` included, and the SDK items `gs` re-exports, such as
+   `Table`), the utility names and subcommands, the record columns each producer builds, and the contract
+   schema's keys, types, values and constraints. Growth is recorded with `--bless`; a removal or a change
+   fails until `--accept-break "<reason>"` records it, dated, in `scripts/SURFACE-BREAKS.txt`. It runs 20
+   mutants of the real sources on every build, so a gate that stopped seeing is caught. What it cannot see -
+   meaning, the gsh language, `ServiceContext`'s methods - is listed in its header and in
+   `docs/compatibility.md`.
 4. **Write the compatibility policy down**, with its exceptions: security and soundness fixes may break;
    anything removed is deprecated for one release first.
 5. **Soak**: a stretch of real work - the VisionFive and Pi 2 radios are the obvious candidates - with no

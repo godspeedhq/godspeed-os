@@ -1,0 +1,1088 @@
+# The covered surface (docs/compatibility.md), as `scripts/surface_check.py` reads it. GENERATED - do not edit by hand.
+# Growth: `python scripts/surface_check.py --bless`. A removal or change: `--accept-break "<reason>"`, recorded in
+# scripts/SURFACE-BREAKS.txt. backlog/71 step 3.
+contract constraint $ additionalProperties=false
+contract constraint $.capabilities additionalProperties=false
+contract constraint $.capabilities.hw_dma pattern="^[0-9]+(KiB|MiB)$"
+contract constraint $.capabilities.hw_interrupt[] maximum=255
+contract constraint $.capabilities.hw_interrupt[] minimum=0
+contract constraint $.capabilities.hw_mmio[] pattern="^0x[0-9a-fA-F]+\\+0x[0-9a-fA-F]+$"
+contract constraint $.capabilities.hw_pci_bar maximum=5
+contract constraint $.capabilities.hw_pci_bar minimum=0
+contract constraint $.capabilities.hw_pci_class pattern="^[0-9a-fA-F]{6}$"
+contract constraint $.capabilities.hw_pio[] pattern="^0x[0-9a-fA-F]+\\+0x[0-9a-fA-F]+$"
+contract constraint $.capabilities.hw_usb pattern="^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$"
+contract constraint $.capabilities.ipc_receive[] pattern="^[a-z][a-z0-9-]*$"
+contract constraint $.capabilities.ipc_send[] pattern="^[a-z][a-z0-9-]*(/[a-z][a-z0-9-]*)?$"
+contract constraint $.name pattern="^[a-z][a-z0-9-]*$"
+contract constraint $.placement additionalProperties=false
+contract constraint $.placement.core maximum=15
+contract constraint $.placement.core minimum=0
+contract constraint $.resources additionalProperties=false
+contract constraint $.resources.memory additionalProperties=false
+contract constraint $.resources.memory.limit pattern="^\\d+(KiB|MiB|GiB)$"
+contract constraint $.resources.memory.request pattern="^\\d+(KiB|MiB|GiB)$"
+contract constraint $.version pattern="^\\d+\\.\\d+\\.\\d+$"
+contract key $.capabilities
+contract key $.capabilities.console_push
+contract key $.capabilities.cpu_clock
+contract key $.capabilities.handover
+contract key $.capabilities.hw_device
+contract key $.capabilities.hw_dma
+contract key $.capabilities.hw_interrupt
+contract key $.capabilities.hw_mmio
+contract key $.capabilities.hw_pci_bar
+contract key $.capabilities.hw_pci_class
+contract key $.capabilities.hw_pci_irq
+contract key $.capabilities.hw_pio
+contract key $.capabilities.hw_usb
+contract key $.capabilities.ipc_receive
+contract key $.capabilities.ipc_send
+contract key $.capabilities.log_write
+contract key $.capabilities.pci_cfg
+contract key $.capabilities.power_off
+contract key $.capabilities.resource_mint
+contract key $.capabilities.service_control
+contract key $.capabilities.spawn
+contract key $.name
+contract key $.placement
+contract key $.placement.core
+contract key $.resources
+contract key $.resources.memory
+contract key $.resources.memory.limit
+contract key $.resources.memory.request
+contract key $.version
+contract required $.capabilities
+contract required $.name
+contract required $.resources
+contract required $.resources.memory
+contract required $.resources.memory.limit
+contract required $.resources.memory.request
+contract required $.version
+contract type $ object
+contract type $.capabilities object
+contract type $.capabilities.console_push boolean
+contract type $.capabilities.cpu_clock boolean
+contract type $.capabilities.handover boolean
+contract type $.capabilities.hw_device string
+contract type $.capabilities.hw_dma string
+contract type $.capabilities.hw_interrupt array
+contract type $.capabilities.hw_interrupt[] integer
+contract type $.capabilities.hw_mmio array
+contract type $.capabilities.hw_mmio[] string
+contract type $.capabilities.hw_pci_bar integer
+contract type $.capabilities.hw_pci_bar string
+contract type $.capabilities.hw_pci_class string
+contract type $.capabilities.hw_pci_irq boolean
+contract type $.capabilities.hw_pio array
+contract type $.capabilities.hw_pio[] string
+contract type $.capabilities.hw_usb string
+contract type $.capabilities.ipc_receive array
+contract type $.capabilities.ipc_receive[] string
+contract type $.capabilities.ipc_send array
+contract type $.capabilities.ipc_send[] string
+contract type $.capabilities.log_write boolean
+contract type $.capabilities.pci_cfg boolean
+contract type $.capabilities.power_off boolean
+contract type $.capabilities.resource_mint boolean
+contract type $.capabilities.service_control boolean
+contract type $.capabilities.spawn array
+contract type $.capabilities.spawn[] string
+contract type $.name string
+contract type $.placement object
+contract type $.placement.core integer
+contract type $.resources object
+contract type $.resources.memory object
+contract type $.resources.memory.limit string
+contract type $.resources.memory.request string
+contract type $.version string
+contract value $.capabilities.hw_device "ahci"
+contract value $.capabilities.hw_device "audio_pwm"
+contract value $.capabilities.hw_device "dwc2"
+contract value $.capabilities.hw_device "ehci"
+contract value $.capabilities.hw_device "framebuffer"
+contract value $.capabilities.hw_device "nic"
+contract value $.capabilities.hw_device "test-irq"
+contract value $.capabilities.hw_device "wifi_sdio"
+contract value $.capabilities.hw_device "xhci"
+contract value $.capabilities.hw_pci_bar "auto"
+gs addr field Ipv4.0: [u8;4]
+gs addr method Ipv4::fn parse(_:&str)->Option<Ipv4>
+gs addr struct Ipv4 derive(Clone,Copy,Debug,Eq,PartialEq)
+gs app method App::fn clear(&self)
+gs app method App::fn close(self,_:u32)->!
+gs app method App::fn key(&self)->Option<u8>
+gs app method App::fn open(_:&'c ServiceContext)->App<'c>
+gs app method App::fn print(&self,_:&str)
+gs app method App::fn print_fmt(&self,_:core::fmt::Arguments)
+gs app method App::fn println(&self,_:&str)
+gs app method App::fn wait_key(&self)->u8
+gs app struct App<'c>
+gs call const DEFAULT_SECS: i64
+gs call const NOTICE_AFTER_SECS: i64
+gs call fn request(_:&ServiceContext,_:&str,_:&Message)->Result<Message,Error>
+gs call fn request_once(_:&ServiceContext,_:&str,_:&Message,_:i64)->Result<Message,Error>
+gs call fn request_watched(_:&ServiceContext,_:&str,_:&Message,_:i64,_:&dyn Watch)->Result<Message,Error>
+gs call fn request_watched_sifted(_:&ServiceContext,_:&str,_:&Message,_:i64,_:&dyn Watch,_:&mut dyn FnMut(&Message)->bool)->Result<Message,Error>
+gs call fn request_within(_:&ServiceContext,_:&str,_:&Message,_:i64)->Result<Message,Error>
+gs call fn request_within_notice(_:&ServiceContext,_:&str,_:&Message,_:i64,_:Option<&dyn Fn()>,_:Option<&dyn Fn(u8)>)->Result<Message,Error>
+gs call trait Watch
+gs call trait-item Watch::fn active(&self)->bool
+gs call trait-item Watch::fn keep(&self,_:u8)
+gs call trait-item Watch::fn notice(&self)
+gs call trait-item Watch::fn notice_due_in(&self)->i64
+gs call trait-item Watch::fn quit(&self)
+gs call trait-item Watch::fn stopped(&self)->bool
+gs cap const APPEND: u8
+gs cap const GRANT: u8
+gs cap const READ: u8
+gs cap const WRITE: u8
+gs cap fn acquire(_:&ServiceContext,_:&str)->Result<Cap,Error>
+gs cap fn acquire_grantable(_:&ServiceContext,_:&str)->Result<Cap,Error>
+gs cap fn duplicate(_:&ServiceContext,_:Cap)->Result<Cap,Error>
+gs cap fn reacquire(_:&ServiceContext,_:&str)->bool
+gs cap fn remove(_:&ServiceContext,_:Cap)
+gs cap fn self_grant(_:&ServiceContext)->Result<Cap,Error>
+gs cap impl impl From<CapHandle>for Cap
+gs cap method Cap::fn handle(self)->CapHandle
+gs cap struct Cap derive(Clone,Copy,Debug,Eq,PartialEq)
+gs crate mod addr
+gs crate mod app
+gs crate mod call
+gs crate mod cap
+gs crate mod driver
+gs crate mod error
+gs crate mod file
+gs crate mod fs
+gs crate mod handover
+gs crate mod io
+gs crate mod ipc
+gs crate mod memory
+gs crate mod net
+gs crate mod prelude
+gs crate mod program
+gs crate mod record
+gs crate mod resource
+gs crate mod task
+gs crate mod trace
+gs crate use error::Error
+gs crate use godspeed_sdk::service_context::ServiceContext
+gs driver mod arena
+gs driver mod bus
+gs driver mod delay
+gs driver mod device
+gs driver mod input
+gs driver mod irq
+gs driver mod power
+gs driver mod registers
+gs driver mod wait
+gs driver use arena::Arena
+gs driver use arena::Layout
+gs driver use arena::Part
+gs driver use arena::arena
+gs driver use registers::Registers
+gs driver use registers::registers
+gs driver::arena enum Why derive(Clone,Copy,Debug,Eq,PartialEq)
+gs driver::arena field NoRoom.align:usize
+gs driver::arena field NoRoom.arena:usize
+gs driver::arena field NoRoom.len:usize
+gs driver::arena field NoRoom.name:&'static str
+gs driver::arena field NoRoom.used:usize
+gs driver::arena field NoRoom.why:Why
+gs driver::arena fn arena(_:&ServiceContext)->Option<Arena>
+gs driver::arena fn place(_:u64,_:usize,_:usize,_:&'static str,_:usize,_:usize)->Result<usize,NoRoom>
+gs driver::arena impl impl fmt::Display for NoRoom
+gs driver::arena method Arena::fn layout(self)->Layout
+gs driver::arena method Arena::fn len(&self)->usize
+gs driver::arena method Arena::fn phys_at(&self,_:usize)->u64
+gs driver::arena method Arena::fn read16(&self,_:usize)->u16
+gs driver::arena method Arena::fn read32(&self,_:usize)->u32
+gs driver::arena method Arena::fn read64(&self,_:usize)->u64
+gs driver::arena method Arena::fn read8(&self,_:usize)->u8
+gs driver::arena method Arena::fn write16(&self,_:usize,_:u16)
+gs driver::arena method Arena::fn write32(&self,_:usize,_:u32)
+gs driver::arena method Arena::fn write64(&self,_:usize,_:u64)
+gs driver::arena method Arena::fn write8(&self,_:usize,_:u8)
+gs driver::arena method Arena::fn zero(&self)
+gs driver::arena method Layout::fn len(&self)->usize
+gs driver::arena method Layout::fn take(&mut self,_:&'static str,_:usize,_:usize)->Result<Part,NoRoom>
+gs driver::arena method Layout::fn used(&self)->usize
+gs driver::arena method Part::fn len(&self)->usize
+gs driver::arena method Part::fn name(&self)->&'static str
+gs driver::arena method Part::fn offset(&self)->usize
+gs driver::arena method Part::fn phys(&self)->u64
+gs driver::arena method Part::fn phys_at(&self,_:usize)->u64
+gs driver::arena method Part::fn read16(&self,_:usize)->u16
+gs driver::arena method Part::fn read32(&self,_:usize)->u32
+gs driver::arena method Part::fn read64(&self,_:usize)->u64
+gs driver::arena method Part::fn read8(&self,_:usize)->u8
+gs driver::arena method Part::fn write16(&self,_:usize,_:u16)
+gs driver::arena method Part::fn write32(&self,_:usize,_:u32)
+gs driver::arena method Part::fn write64(&self,_:usize,_:u64)
+gs driver::arena method Part::fn write8(&self,_:usize,_:u8)
+gs driver::arena method Part::fn zero(&self)
+gs driver::arena struct Arena
+gs driver::arena struct Layout
+gs driver::arena struct NoRoom derive(Clone,Copy,Debug,Eq,PartialEq)
+gs driver::arena struct Part derive(Clone,Copy)
+gs driver::arena use granted::*
+gs driver::arena variant Why::Alignment
+gs driver::arena variant Why::Empty
+gs driver::arena variant Why::Full
+gs driver::bus enum UsbError derive(Clone,Copy,Debug,Eq,PartialEq)
+gs driver::bus field Bound.gen:u32
+gs driver::bus field Bound.pid:u16
+gs driver::bus field Bound.vid:u16
+gs driver::bus field Place.hub:u8
+gs driver::bus field Place.in_addr:u8
+gs driver::bus field Place.in_mps:u16
+gs driver::bus field Place.n_out:u8
+gs driver::bus field Place.outs:[u8;4]
+gs driver::bus field Place.root:u8
+gs driver::bus field Place.slot:u8
+gs driver::bus method UsbDevice::fn bulk_in(&self,_:&mut[u8])->Result<usize,UsbError>
+gs driver::bus method UsbDevice::fn bulk_out(&self,_:u8,_:&[u8])->Result<(),UsbError>
+gs driver::bus method UsbDevice::fn control_in(&self,_:[u8;8],_:&mut[u8])->Result<usize,UsbError>
+gs driver::bus method UsbDevice::fn control_out(&self,_:[u8;8],_:&[u8])->Result<(),UsbError>
+gs driver::bus method UsbDevice::fn control_out_once(&self,_:[u8;8],_:&[u8])->Result<(),UsbError>
+gs driver::bus method UsbDevice::fn granted(_:&'a ServiceContext)->Option<UsbDevice<'a>>
+gs driver::bus method UsbDevice::fn host(&self)->&'static str
+gs driver::bus method UsbDevice::fn info(&self)->Result<Bound,UsbError>
+gs driver::bus method UsbDevice::fn place(&self)->Option<Place>
+gs driver::bus method UsbDevice::fn replug(&self)->Result<(),UsbError>
+gs driver::bus method UsbError::fn as_str(&self)->&'static str
+gs driver::bus struct Bound derive(Clone,Copy,Debug,Eq,PartialEq)
+gs driver::bus struct Place derive(Clone,Copy,Debug,Eq,PartialEq)
+gs driver::bus struct UsbDevice<'a>
+gs driver::bus use godspeed_sdk::usbfn as wire
+gs driver::bus variant UsbError::BadRequest
+gs driver::bus variant UsbError::Failed
+gs driver::bus variant UsbError::Host(crate::Error)
+gs driver::bus variant UsbError::NoDevice
+gs driver::delay fn hold(_:&ServiceContext,_:Budget)
+gs driver::delay fn hold_parked(_:&ServiceContext,_:Budget)
+gs driver::device fn board_mac(_:&ServiceContext)->Option<[u8;6]>
+gs driver::device fn emmc_base_clock_hz(_:&ServiceContext)->u32
+gs driver::device fn nic_vendor_device(_:&ServiceContext)->u32
+gs driver::device fn pci_cfg_read(_:&ServiceContext,_:u32,_:u16)->Option<u32>
+gs driver::input fn notice_shown(_:&ServiceContext)
+gs driver::input fn push(_:&ServiceContext,_:u8)
+gs driver::input fn ready(_:&ServiceContext)
+gs driver::irq enum Woke
+gs driver::irq method Irq::fn granted(_:&ServiceContext)->Self
+gs driver::irq method Irq::fn rearm(&self,_:&ServiceContext)
+gs driver::irq method Irq::fn routed(&self)->bool
+gs driver::irq method Irq::fn seen(&self)->u64
+gs driver::irq method Irq::fn take(&self,_:&ServiceContext)->Option<Woke>
+gs driver::irq method Irq::fn vector(&self)->Option<u8>
+gs driver::irq method Irq::fn wait(&self,_:&ServiceContext,_:Budget)->Woke
+gs driver::irq struct Irq
+gs driver::irq variant Woke::Interrupt
+gs driver::irq variant Woke::Request(Message)
+gs driver::irq variant Woke::Timeout
+gs driver::power fn set(_:&ServiceContext,_:bool)->bool
+gs driver::registers fn registers(_:&ServiceContext)->Option<Registers>
+gs driver::registers method Registers::fn len(&self)->usize
+gs driver::registers method Registers::fn read16(&self,_:usize)->u16
+gs driver::registers method Registers::fn read32(&self,_:usize)->u32
+gs driver::registers method Registers::fn read64(&self,_:usize)->u64
+gs driver::registers method Registers::fn read8(&self,_:usize)->u8
+gs driver::registers method Registers::fn write16(&self,_:usize,_:u16)
+gs driver::registers method Registers::fn write32(&self,_:usize,_:u32)
+gs driver::registers method Registers::fn write64(&self,_:usize,_:u64)
+gs driver::registers method Registers::fn write8(&self,_:usize,_:u8)
+gs driver::registers struct Registers derive(Clone,Copy)
+gs driver::wait const UNCALIBRATED_POLLS: u32
+gs driver::wait fn calibrated(_:&ServiceContext)->bool
+gs driver::wait fn counter_ms(_:&ServiceContext)->u64
+gs driver::wait fn ticks(_:&ServiceContext)->u64
+gs driver::wait fn ticks_per_10ms(_:&ServiceContext)->u64
+gs driver::wait fn until(_:&ServiceContext,_:Budget,_:impl FnMut()->bool)->Result<u64,TimedOut>
+gs driver::wait fn until_paced(_:&ServiceContext,_:Budget,_:Budget,_:impl FnMut()->bool)->Result<u64,TimedOut>
+gs driver::wait method Budget::const fn as_us(self)->u64
+gs driver::wait method Budget::const fn ms(_:u64)->Self
+gs driver::wait method Budget::const fn us(_:u64)->Self
+gs driver::wait method Deadline::fn elapsed_us(&self)->u64
+gs driver::wait method Deadline::fn expired(&mut self)->bool
+gs driver::wait method Deadline::fn paced(_:&'a ServiceContext,_:Budget,_:Budget)->Self
+gs driver::wait method Deadline::fn pause(&self)
+gs driver::wait method Deadline::fn start(_:&'a ServiceContext,_:Budget)->Self
+gs driver::wait method Since::fn elapsed_ms(&self,_:&ServiceContext)->u64
+gs driver::wait method Since::fn elapsed_ticks(&self,_:&ServiceContext)->u64
+gs driver::wait method Since::fn elapsed_us(&self,_:&ServiceContext)->u64
+gs driver::wait method Since::fn now(_:&ServiceContext)->Self
+gs driver::wait method Since::fn passed(&self,_:&ServiceContext,_:Budget)->bool
+gs driver::wait struct Budget derive(Clone,Copy,Debug,Eq,PartialEq)
+gs driver::wait struct Deadline<'a>
+gs driver::wait struct Since derive(Clone,Copy)
+gs driver::wait struct TimedOut derive(Clone,Copy,Debug,Eq,PartialEq)
+gs error enum Error derive(Clone,Copy,Debug,Eq,PartialEq)
+gs error method Error::fn as_str(self)->&'static str
+gs error method Error::fn retry_is_safe(self)->bool
+gs error method Error::fn service_answered(self)->bool
+gs error variant Error::BufferTooSmall
+gs error variant Error::Busy
+gs error variant Error::Cancelled
+gs error variant Error::Damaged
+gs error variant Error::Failed
+gs error variant Error::Foreign
+gs error variant Error::InvalidInput
+gs error variant Error::Malformed
+gs error variant Error::NoFilesystem
+gs error variant Error::NotFound
+gs error variant Error::OutcomeUnknown
+gs error variant Error::PeerDied
+gs error variant Error::PermissionDenied
+gs error variant Error::Revoked
+gs error variant Error::Unavailable
+gs error variant Error::Unreachable
+gs file const HELD_MAX: usize
+gs file const IO_CHUNK: usize
+gs file impl impl<'f,'a:'f>Drop for File<'f,'a>
+gs file method File::fn close(mut self)->Result<(),Error>
+gs file method File::fn read_at(&mut self,_:u64,_:&mut[u8])->Result<usize,Error>
+gs file method File::fn rights(&self)->u8
+gs file method File::fn size(&mut self)->Result<u64,Error>
+gs file method File::fn take_held(&mut self)->Option<Message>
+gs file method File::fn write_at(&mut self,_:u64,_:&[u8])->Result<(),Error>
+gs file struct File<'f,'a:'f>
+gs fs const DIR_PAGE_MAX: u16
+gs fs const IO_CHUNK: usize
+gs fs const PATH_MAX: usize
+gs fs const REASON_MAX: usize
+gs fs const SWEEP_SECS: i64
+gs fs field Check.bad:u32
+gs fs field Check.dirs:u32
+gs fs field Check.files:u32
+gs fs field Check.free:u64
+gs fs field Check.free_before:u64
+gs fs field Check.used:u64
+gs fs field DirEntry.is_dir:bool
+gs fs field DirEntry.mtime:u32
+gs fs field DirEntry.name:&'n[u8]
+gs fs field DirEntry.sealed:bool
+gs fs field DirEntry.size:u64
+gs fs field Drive.capacity_sectors:u64
+gs fs field Drive.mounted:bool
+gs fs field Drive.total_blocks:u64
+gs fs field Drive.used_blocks:u64
+gs fs field Listing.complete:bool
+gs fs field Listing.visited:usize
+gs fs field Scrub.bad:u32
+gs fs field Scrub.dirs:u32
+gs fs field Scrub.files:u32
+gs fs field Scrub.scanned:u64
+gs fs field Stat.is_dir:bool
+gs fs field Stat.size:u64
+gs fs method DirEntry::fn name_str(&self)->Option<&'n str>
+gs fs method Drive::fn label(&self)->&[u8]
+gs fs method Fs::fn check(&mut self)->Result<Check,Error>
+gs fs method Fs::fn create_dir(&mut self,_:impl AsRef<[u8]>)->Result<(),Error>
+gs fs method Fs::fn create_dir_all(&mut self,_:impl AsRef<[u8]>)->Result<(),Error>
+gs fs method Fs::fn create_sized(&mut self,_:impl AsRef<[u8]>,_:u64)->Result<(),Error>
+gs fs method Fs::fn delete(&mut self,_:impl AsRef<[u8]>)->Result<(),Error>
+gs fs method Fs::fn delete_all(&mut self,_:impl AsRef<[u8]>)->Result<(),Error>
+gs fs method Fs::fn drive(&mut self)->Result<Drive,Error>
+gs fs method Fs::fn exists(&mut self,_:impl AsRef<[u8]>)->Result<bool,Error>
+gs fs method Fs::fn from_tag(_:&'a ServiceContext,_:u8)->Fs<'a>
+gs fs method Fs::fn keeping(mut self,_:&'a dyn Fn(u8))->Fs<'a>
+gs fs method Fs::fn list_dir<F>(&mut self,_:impl AsRef<[u8]>,_:F)->Result<Listing,Error>where F:FnMut(DirEntry<'_>)->bool
+gs fs method Fs::fn move_to(&mut self,_:impl AsRef<[u8]>,_:impl AsRef<[u8]>)->Result<(),Error>
+gs fs method Fs::fn new(_:&'a ServiceContext)->Fs<'a>
+gs fs method Fs::fn noticing(mut self,_:&'a dyn Fn())->Fs<'a>
+gs fs method Fs::fn open<'f>(&'f mut self,_:impl AsRef<[u8]>,_:u8)->Result<crate::file::File<'f,'a>,Error>
+gs fs method Fs::fn patience_secs(mut self,_:i64)->Fs<'a>
+gs fs method Fs::fn quiesce(&mut self)->Result<bool,Error>
+gs fs method Fs::fn read_at(&mut self,_:impl AsRef<[u8]>,_:u64,_:&mut[u8])->Result<usize,Error>
+gs fs method Fs::fn read_into(&mut self,_:impl AsRef<[u8]>,_:&mut[u8])->Result<usize,Error>
+gs fs method Fs::fn reason(&self)->&str
+gs fs method Fs::fn rename(&mut self,_:impl AsRef<[u8]>,_:impl AsRef<[u8]>)->Result<(),Error>
+gs fs method Fs::fn resume(&mut self)->Result<(),Error>
+gs fs method Fs::fn scrub(&mut self)->Result<Scrub,Error>
+gs fs method Fs::fn seal(&mut self,_:impl AsRef<[u8]>)->Result<(),Error>
+gs fs method Fs::fn stat(&mut self,_:impl AsRef<[u8]>)->Result<Stat,Error>
+gs fs method Fs::fn tag(&self)->u8
+gs fs method Fs::fn watching(mut self,_:&'a dyn call::Watch)->Fs<'a>
+gs fs method Fs::fn with_notice(_:&'a ServiceContext,_:&'a dyn Fn())->Fs<'a>
+gs fs method Fs::fn write(&mut self,_:impl AsRef<[u8]>,_:&[u8])->Result<(),Error>
+gs fs method Fs::fn write_at(&mut self,_:impl AsRef<[u8]>,_:u64,_:&[u8])->Result<(),Error>
+gs fs struct Check derive(Clone,Copy,Debug,Eq,PartialEq)
+gs fs struct DirEntry<'n> derive(Clone,Copy,Debug,Eq,PartialEq)
+gs fs struct Drive derive(Clone,Copy,Debug,Eq,PartialEq)
+gs fs struct Fs<'a>
+gs fs struct Listing derive(Clone,Copy,Debug,Eq,PartialEq)
+gs fs struct Scrub derive(Clone,Copy,Debug,Eq,PartialEq)
+gs fs struct Stat derive(Clone,Copy,Debug,Eq,PartialEq)
+gs handover const EARLY_MAX: usize
+gs handover const KEYED: u32
+gs handover const KEY_MASK: u32
+gs handover const OFFER: &[u8;8]
+gs handover const STATE: &[u8;8]
+gs handover const STATE_MAX: usize
+gs handover const SUCCESSOR: u32
+gs handover const TAKE_SECS: i64
+gs handover const WRONG_MAX: u32
+gs handover const fn mode(_:u32,_:bool)->u32
+gs handover field TakeOver.early:[Option<Message>;EARLY_MAX]
+gs handover field TakeOver.state:&'b[u8]
+gs handover method Handover::fn hand_over(&self,_:Offer,_:&[u8],_:impl FnMut(Message))->!
+gs handover method Handover::fn is_successor(&self)->bool
+gs handover method Handover::fn new(_:&'c ServiceContext)->Handover<'c>
+gs handover method Handover::fn offer(&mut self,_:&Message)->Option<Offer>
+gs handover method Handover::fn take_over<'b>(&mut self,_:&'b mut[u8;STATE_MAX])->Option<TakeOver<'b>>
+gs handover struct Handover<'c>
+gs handover struct Offer derive(Clone,Copy)
+gs handover struct TakeOver<'b>
+gs io fn print(_:&ServiceContext,_:&str)
+gs io fn print_fmt(_:&ServiceContext,_:core::fmt::Arguments)
+gs io fn println(_:&ServiceContext,_:&str)
+gs io fn println_fmt(_:&ServiceContext,_:core::fmt::Arguments)
+gs io fn report(_:&ServiceContext,_:&str,_:crate::Error)
+gs io mod keys
+gs io::keys const CTRL_ALT_DEL_SIGNAL: u8
+gs io::keys const MUTE_TOGGLE_SIGNAL: u8
+gs io::keys const NOTICE_SIGNAL: u8
+gs io::keys const VOLUME_DOWN_SIGNAL: u8
+gs io::keys const VOLUME_UP_SIGNAL: u8
+gs io::keys use godspeed_sdk::hid::CTRL_ALT_DEL_SIGNAL
+gs io::keys use godspeed_sdk::hid::MUTE_TOGGLE_SIGNAL
+gs io::keys use godspeed_sdk::hid::NOTICE_SIGNAL
+gs io::keys use godspeed_sdk::hid::VOLUME_DOWN_SIGNAL
+gs io::keys use godspeed_sdk::hid::VOLUME_UP_SIGNAL
+gs ipc const MAX_BYTES: usize
+gs ipc field Message.cap_count:usize
+gs ipc field Message.caps:[Option<CapHandle>;4]
+gs ipc field Message.payload:[u8;MAX_PAYLOAD]
+gs ipc field Message.payload_len:usize
+gs ipc fn park(_:&ServiceContext)->!
+gs ipc fn peer(_:&ServiceContext,_:&str)->Option<Cap>
+gs ipc fn peer_at(_:&ServiceContext,_:usize)->Option<Cap>
+gs ipc fn recv(_:&ServiceContext)->Message
+gs ipc fn recv_within(_:&ServiceContext,_:i64)->Option<Message>
+gs ipc fn recv_within_ms(_:&ServiceContext,_:u64)->Option<Message>
+gs ipc fn reply(_:&ServiceContext,_:Cap,_:&Message)->Result<(),Error>
+gs ipc fn send(_:&ServiceContext,_:&str,_:&Message)->Result<(),Error>
+gs ipc fn send_granting(_:&ServiceContext,_:Cap,_:Cap,_:&Message)->Result<(),Error>
+gs ipc fn send_to(_:&ServiceContext,_:Cap,_:&Message)->Result<(),Error>
+gs ipc fn take_sent_cap(_:&ServiceContext)->Option<Cap>
+gs ipc fn try_recv(_:&ServiceContext)->Option<Message>
+gs ipc fn try_send(_:&ServiceContext,_:&str,_:&Message)->Result<(),Error>
+gs ipc fn try_send_to(_:&ServiceContext,_:Cap,_:&Message)->Result<(),Error>
+gs ipc method Message::fn from_bytes(_:&[u8])->Self
+gs ipc method Message::fn payload_bytes(&self)->&[u8]
+gs ipc mod exact
+gs ipc struct Message
+gs ipc use godspeed_sdk::ipc::Message
+gs ipc::exact enum CapError derive(Clone,Copy,Debug,Eq,PartialEq)
+gs ipc::exact enum IpcError derive(Clone,Copy,Debug,Eq,PartialEq)
+gs ipc::exact fn send(_:&ServiceContext,_:&str,_:&Message)->Result<(),IpcError>
+gs ipc::exact fn send_granting(_:&ServiceContext,_:Cap,_:Cap,_:&Message)->Result<(),IpcError>
+gs ipc::exact fn send_to(_:&ServiceContext,_:Cap,_:&Message)->Result<(),IpcError>
+gs ipc::exact fn try_send(_:&ServiceContext,_:&str,_:&Message)->Result<(),IpcError>
+gs ipc::exact fn try_send_to(_:&ServiceContext,_:Cap,_:&Message)->Result<(),IpcError>
+gs ipc::exact use godspeed_sdk::capability::CapError
+gs ipc::exact use godspeed_sdk::ipc::IpcError
+gs ipc::exact variant CapError::CapInsufficientRights
+gs ipc::exact variant CapError::CapNotGrantable
+gs ipc::exact variant CapError::CapNotHeld
+gs ipc::exact variant CapError::CapRevoked
+gs ipc::exact variant CapError::CapWrongScope
+gs ipc::exact variant CapError::EndpointDead
+gs ipc::exact variant IpcError::CapError(crate::capability::CapError)
+gs ipc::exact variant IpcError::EndpointDead
+gs ipc::exact variant IpcError::MessageTooLarge
+gs ipc::exact variant IpcError::QueueFull
+gs ipc::exact variant IpcError::ReplyDead
+gs ipc::exact variant IpcError::Unknown(i64)
+gs memory method Region::fn alloc(_:&ServiceContext,_:usize)->Result<Region,AllocError>
+gs memory method Region::fn bytes(&self)->&[u8]
+gs memory method Region::fn bytes_mut(&mut self)->&mut[u8]
+gs memory method Region::fn is_empty(&self)->bool
+gs memory method Region::fn len(&self)->usize
+gs memory method Region::fn words_mut(&mut self)->&mut[u32]
+gs memory struct Region
+gs memory use godspeed_sdk::memory::Region
+gs net const NET_SECS: i64
+gs net const SOCKET_SECS: i64
+gs net const TCP_SECS: i64
+gs net field Status.dns:Ipv4
+gs net field Status.gateway:Ipv4
+gs net field Status.gateway_mac:[u8;6]
+gs net field Status.gateway_resolved:bool
+gs net field Status.ip:Ipv4
+gs net field Status.leased:bool
+gs net field Status.ping_ok:bool
+gs net impl impl<'c,'n:'c,'a:'n>Drop for Conn<'c,'n,'a>
+gs net impl impl<'n,'a:'n>Drop for Listener<'n,'a>
+gs net impl impl<'n,'a:'n>Drop for Socket<'n,'a>
+gs net impl impl<'n,'a:'n>Drop for Stream<'n,'a>
+gs net method Conn::fn close(mut self)->Result<(),Error>
+gs net method Conn::fn is_closed(&self)->bool
+gs net method Conn::fn recv(&mut self,_:&mut[u8])->Result<usize,Error>
+gs net method Conn::fn send(&mut self,_:&[u8])->Result<usize,Error>
+gs net method Listener::fn accept(&mut self)->Result<Option<Conn<'_,'n,'a>>,Error>
+gs net method Listener::fn close(mut self)->Result<(),Error>
+gs net method Listener::fn take_held(&mut self)->Option<Message>
+gs net method Net::fn arp(&mut self,_:Ipv4)->Result<Option<[u8;6]>,Error>
+gs net method Net::fn connect<'n>(&'n mut self,_:Ipv4,_:u16)->Result<Stream<'n,'a>,Error>
+gs net method Net::fn keeping(mut self,_:&'a dyn Fn(u8))->Net<'a>
+gs net method Net::fn listen<'n>(&'n mut self,_:u16)->Result<Listener<'n,'a>,Error>
+gs net method Net::fn new(_:&'a ServiceContext)->Net<'a>
+gs net method Net::fn ping(&mut self,_:Ipv4)->Result<bool,Error>
+gs net method Net::fn renew(&mut self)->Result<(),Error>
+gs net method Net::fn resolve(&mut self,_:&str)->Result<Ipv4,Error>
+gs net method Net::fn socket<'n>(&'n mut self)->Result<Socket<'n,'a>,Error>
+gs net method Net::fn status(&mut self)->Result<Status,Error>
+gs net method Net::fn tcp(&mut self,_:Ipv4,_:u16,_:&[u8],_:&mut[u8])->Result<usize,Error>
+gs net method Net::fn watching(mut self,_:&'a dyn call::Watch)->Net<'a>
+gs net method Net::fn with_notice(_:&'a ServiceContext,_:&'a dyn Fn())->Net<'a>
+gs net method Socket::fn send_to(&mut self,_:Ipv4,_:u16,_:&[u8],_:&mut[u8])->Result<usize,Error>
+gs net method Socket::fn take_held(&mut self)->Option<Message>
+gs net method Status::fn usable(&self)->bool
+gs net method Stream::fn close(mut self)->Result<(),Error>
+gs net method Stream::fn recv(&mut self,_:&mut[u8])->Result<usize,Error>
+gs net method Stream::fn send(&mut self,_:&[u8])->Result<usize,Error>
+gs net method Stream::fn take_held(&mut self)->Option<Message>
+gs net struct Conn<'c,'n:'c,'a:'n>
+gs net struct Listener<'n,'a:'n>
+gs net struct Net<'a>
+gs net struct Socket<'n,'a:'n>
+gs net struct Status derive(Clone,Copy,Debug,Eq,PartialEq)
+gs net struct Stream<'n,'a:'n>
+gs net use crate::addr::Ipv4
+gs prelude use crate::error::Error
+gs prelude use crate::file::File
+gs prelude use crate::fs::Fs
+gs prelude use crate::io
+gs prelude use crate::net::Net
+gs prelude use godspeed_sdk::service_context::ServiceContext
+gs program const ARGS_MAX: usize
+gs program const ARGS_SECS: i64
+gs program const EOT: u8
+gs program fn args<'b>(_:&ServiceContext,_:&'b mut[u8;ARGS_MAX])->&'b str
+gs program fn exit(_:&ServiceContext,_:u32)->!
+gs program fn mode(_:&ServiceContext)->u32
+gs program impl impl fmt::Write for Output<'_>
+gs program method Output::fn finish(mut self,_:u32)->!
+gs program method Output::fn flush(&mut self)
+gs program method Output::fn new(_:&'c ServiceContext)->Output<'c>
+gs program struct Output<'c>
+gs record const REC_ARENA: usize
+gs record const REC_COL_NAME: usize
+gs record const REC_MAX_COLS: usize
+gs record const REC_MAX_ROWS: usize
+gs record const REC_WIRE_MAGIC: &[u8;4]
+gs record enum AggErr derive(Clone,Copy)
+gs record enum AggOp derive(Clone,Copy)
+gs record enum Value derive(Clone,Copy)
+gs record fn parse_predicate(_:&str)->Option<(&str,&str,&str)>
+gs record method Table::fn add_col(&mut self,_:&[u8])->Option<usize>
+gs record method Table::fn add_row(&mut self,_:&[Value])
+gs record method Table::fn aggregate(&self,_:&str,_:AggOp)->Result<i128,AggErr>
+gs record method Table::fn cell_bytes(&self,_:usize,_:usize)->&[u8]
+gs record method Table::fn cell_int(&self,_:usize,_:usize)->Option<u64>
+gs record method Table::fn col_name(&self,_:usize)->&[u8]
+gs record method Table::fn decode(_:&[u8])->Result<Table,&'static str>
+gs record method Table::fn encode(&self,_:&mut impl RecordSink)
+gs record method Table::fn filter(&mut self,_:&str,_:&str,_:&str)->bool
+gs record method Table::fn from_json(_:&[u8])->Result<Table,&'static str>
+gs record method Table::fn grid_header(&self,_:&mut impl RecordSink,_:&[usize;REC_MAX_COLS])
+gs record method Table::fn grid_row(&self,_:&mut impl RecordSink,_:usize,_:&[usize;REC_MAX_COLS])
+gs record method Table::fn grid_widths(&self)->[usize;REC_MAX_COLS]
+gs record method Table::fn intern(&mut self,_:&[u8])->Value
+gs record method Table::fn ncols(&self)->usize
+gs record method Table::fn new(_:&[&str])->Self
+gs record method Table::fn nrows(&self)->usize
+gs record method Table::fn overflow(&self)->bool
+gs record method Table::fn select(&mut self,_:&[&str])->bool
+gs record method Table::fn sort(&mut self,_:&str,_:bool)->bool
+gs record method Table::fn to_grid(&self,_:&mut impl RecordSink)
+gs record method Table::fn to_json(&self,_:&mut impl RecordSink)
+gs record method Table::fn to_yaml(&self,_:&mut impl RecordSink)
+gs record struct Table
+gs record trait RecordSink
+gs record trait-item RecordSink::fn put(&mut self,_:&[u8])
+gs record use godspeed_sdk::record::AggErr
+gs record use godspeed_sdk::record::AggOp
+gs record use godspeed_sdk::record::REC_ARENA
+gs record use godspeed_sdk::record::REC_COL_NAME
+gs record use godspeed_sdk::record::REC_MAX_COLS
+gs record use godspeed_sdk::record::REC_MAX_ROWS
+gs record use godspeed_sdk::record::REC_WIRE_MAGIC
+gs record use godspeed_sdk::record::RecordSink
+gs record use godspeed_sdk::record::Table
+gs record use godspeed_sdk::record::Value
+gs record use godspeed_sdk::record::parse_predicate
+gs record variant AggErr::NoColumn
+gs record variant AggErr::NonNumeric
+gs record variant AggOp::Avg
+gs record variant AggOp::Max
+gs record variant AggOp::Min
+gs record variant AggOp::Sum
+gs record variant Value::Empty
+gs record variant Value::Int(u64)
+gs record variant Value::Signed(i64)
+gs record variant Value::Str{off:u32,len:u32}
+gs resource const HELD_MAX: usize
+gs resource fn last_badge(_:&ServiceContext)->Option<(u64,u8)>
+gs resource fn mint(_:&ServiceContext,_:u8)->Result<(u64,Cap),Error>
+gs resource fn revoke(_:&ServiceContext,_:u64)->bool
+gs task const AUTHORITIES: &[(u64,&str,&str)]
+gs task enum ClockSource derive(Clone,Copy,Eq,PartialEq)
+gs task field Datetime.day:u8
+gs task field Datetime.hour:u8
+gs task field Datetime.minute:u8
+gs task field Datetime.month:u8
+gs task field Datetime.second:u8
+gs task field Datetime.year:u16
+gs task fn clock_is_set(_:&ServiceContext)->bool
+gs task fn clock_source(_:&ServiceContext)->ClockSource
+gs task fn core_id(_:&ServiceContext)->u32
+gs task fn datetime(_:&ServiceContext)->Datetime
+gs task fn epoch_secs_monotonic(_:&ServiceContext)->i64
+gs task fn hw_random(_:&ServiceContext)->Option<u32>
+gs task fn sleep_ms(_:&ServiceContext,_:u64)
+gs task fn sleep_quantum(_:&ServiceContext)
+gs task fn sleep_ticks(_:&ServiceContext,_:u64)
+gs task fn sleep_us(_:&ServiceContext,_:u64)
+gs task fn uptime_secs(_:&ServiceContext)->i64
+gs task fn wall_clock(_:&ServiceContext)->Option<(i64,ClockSource)>
+gs task fn yield_now(_:&ServiceContext)
+gs task method Datetime::fn epoch_secs(&self)->i64
+gs task method Datetime::fn from_epoch_secs(_:i64)->Datetime
+gs task method Datetime::fn weekday(&self)->u8
+gs task struct Datetime derive(Clone,Copy,Eq,PartialEq)
+gs task use godspeed_sdk::service_context::AUTHORITIES
+gs task use godspeed_sdk::service_context::ClockSource
+gs task use godspeed_sdk::service_context::Datetime
+gs task variant ClockSource::Floor
+gs task variant ClockSource::Ntp
+gs task variant ClockSource::Rtc
+gs task variant ClockSource::Unset
+gs trace const SINK: &str
+gs trace enum Outcome derive(Clone,Copy,Debug,Eq,PartialEq)
+gs trace field Status.capacity:u64
+gs trace field Status.dropped:u64
+gs trace field Status.recorded:u64
+gs trace fn as_name(_:&ServiceContext,_:&str)
+gs trace fn events(_:&ServiceContext,_:usize)->Result<Table,Error>
+gs trace fn logs(_:&ServiceContext)->Result<Table,Error>
+gs trace fn metric(_:&ServiceContext,_:&str,_:u64)
+gs trace fn metrics(_:&ServiceContext)->Result<Table,Error>
+gs trace fn status(_:&ServiceContext)->Result<Status,Error>
+gs trace method Outcome::fn is_failure(self)->bool
+gs trace struct Status derive(Clone,Copy,Debug,Eq,PartialEq)
+gs trace variant Outcome::Aborted
+gs trace variant Outcome::PeerLost
+gs trace variant Outcome::QueueFull
+gs trace variant Outcome::Reply
+gs trace variant Outcome::Request
+gs trace variant Outcome::Timeout
+gs trace variant Outcome::Unknown
+record examples/roster/src/main.rs:service_main name
+record examples/roster/src/main.rs:service_main role
+record examples/roster/src/main.rs:service_main seat
+record services/ask/src/main.rs:send_answer label
+record services/ask/src/main.rs:send_answer rule
+record services/ask/src/main.rs:send_answer source
+record services/ask/src/main.rs:send_answer text
+record services/godspeed-pm/src/chain.rs:show key
+record services/godspeed-pm/src/chain.rs:show note
+record services/godspeed-pm/src/chain.rs:show value
+record services/godspeed-pm/src/download.rs:run key
+record services/godspeed-pm/src/download.rs:run note
+record services/godspeed-pm/src/download.rs:run value
+record services/godspeed-pm/src/install.rs:install key
+record services/godspeed-pm/src/install.rs:install note
+record services/godspeed-pm/src/install.rs:install value
+record services/godspeed-pm/src/install.rs:list package
+record services/godspeed-pm/src/install.rs:list state
+record services/godspeed-pm/src/install.rs:list version
+record services/godspeed-pm/src/install.rs:plan asks
+record services/godspeed-pm/src/install.rs:plan kind
+record services/godspeed-pm/src/install.rs:plan package
+record services/godspeed-pm/src/install.rs:plan state
+record services/godspeed-pm/src/install.rs:plan version
+record services/godspeed-pm/src/install.rs:requests gives
+record services/godspeed-pm/src/install.rs:requests note
+record services/godspeed-pm/src/install.rs:requests peer
+record services/godspeed-pm/src/install.rs:uninstall key
+record services/godspeed-pm/src/install.rs:uninstall note
+record services/godspeed-pm/src/install.rs:uninstall value
+record services/godspeed-pm/src/keys.rs:add key
+record services/godspeed-pm/src/keys.rs:add note
+record services/godspeed-pm/src/keys.rs:add value
+record services/godspeed-pm/src/keys.rs:remove key
+record services/godspeed-pm/src/keys.rs:remove note
+record services/godspeed-pm/src/keys.rs:remove value
+record services/godspeed-pm/src/main.rs:fail item
+record services/godspeed-pm/src/main.rs:fail note
+record services/godspeed-pm/src/main.rs:fail value
+record services/godspeed-pm/src/main.rs:service_main item
+record services/godspeed-pm/src/main.rs:service_main note
+record services/godspeed-pm/src/main.rs:service_main value
+record services/godspeed-pm/src/packages.rs:cleanup package
+record services/godspeed-pm/src/packages.rs:cleanup size
+record services/godspeed-pm/src/packages.rs:cleanup version
+record services/godspeed-pm/src/packages.rs:cleanup why
+record services/godspeed-pm/src/packages.rs:info key
+record services/godspeed-pm/src/packages.rs:info note
+record services/godspeed-pm/src/packages.rs:info value
+record services/godspeed-pm/src/packages.rs:keep key
+record services/godspeed-pm/src/packages.rs:keep note
+record services/godspeed-pm/src/packages.rs:keep value
+record services/godspeed-pm/src/packages.rs:keep_local key
+record services/godspeed-pm/src/packages.rs:keep_local note
+record services/godspeed-pm/src/packages.rs:keep_local value
+record services/godspeed-pm/src/packages.rs:list_fetched from
+record services/godspeed-pm/src/packages.rs:list_fetched package
+record services/godspeed-pm/src/packages.rs:list_fetched size
+record services/godspeed-pm/src/packages.rs:list_fetched state
+record services/godspeed-pm/src/packages.rs:list_fetched version
+record services/godspeed-pm/src/packages.rs:resolve key
+record services/godspeed-pm/src/packages.rs:resolve note
+record services/godspeed-pm/src/packages.rs:resolve value
+record services/godspeed-pm/src/packages.rs:search description
+record services/godspeed-pm/src/packages.rs:search latest
+record services/godspeed-pm/src/packages.rs:search package
+record services/godspeed-pm/src/packages.rs:updates have
+record services/godspeed-pm/src/packages.rs:updates latest
+record services/godspeed-pm/src/packages.rs:updates package
+record services/godspeed-pm/src/packages.rs:updates status
+record services/godspeed-pm/src/packages.rs:verify detail
+record services/godspeed-pm/src/packages.rs:verify package
+record services/godspeed-pm/src/packages.rs:verify status
+record services/godspeed-pm/src/packages.rs:verify version
+record services/godspeed-pm/src/packages.rs:versions by
+record services/godspeed-pm/src/packages.rs:versions published
+record services/godspeed-pm/src/packages.rs:versions state
+record services/godspeed-pm/src/packages.rs:versions version
+record services/shell/src/main.rs:build_audio_hardware_table device
+record services/shell/src/main.rs:build_audio_hardware_table driver
+record services/shell/src/main.rs:build_audio_hardware_table in_use
+record services/shell/src/main.rs:build_audio_hardware_table kind
+record services/shell/src/main.rs:build_audio_hardware_table made_by
+record services/shell/src/main.rs:build_audio_hardware_table state
+record services/shell/src/main.rs:build_audio_outputs_table in_use
+record services/shell/src/main.rs:build_audio_outputs_table output
+record services/shell/src/main.rs:build_audio_outputs_table plugged
+record services/shell/src/main.rs:build_caps_table resource
+record services/shell/src/main.rs:build_caps_table rights
+record services/shell/src/main.rs:build_deps_table calls
+record services/shell/src/main.rs:build_deps_table depth
+record services/shell/src/main.rs:build_deps_table failed
+record services/shell/src/main.rs:build_deps_table grant
+record services/shell/src/main.rs:build_deps_table ops
+record services/shell/src/main.rs:build_deps_table parent
+record services/shell/src/main.rs:build_deps_table peer
+record services/shell/src/main.rs:build_dir_table name
+record services/shell/src/main.rs:build_dir_table sealed
+record services/shell/src/main.rs:build_dir_table size
+record services/shell/src/main.rs:build_dir_table type
+record services/shell/src/main.rs:build_drives_table free_mib
+record services/shell/src/main.rs:build_drives_table index
+record services/shell/src/main.rs:build_drives_table label
+record services/shell/src/main.rs:build_drives_table size_mib
+record services/shell/src/main.rs:build_drives_table status
+record services/shell/src/main.rs:build_endpoints_table endpoint
+record services/shell/src/main.rs:build_endpoints_table name
+record services/shell/src/main.rs:build_endpoints_table queue
+record services/shell/src/main.rs:build_endpoints_table slot
+record services/shell/src/main.rs:build_endpoints_table state
+record services/shell/src/main.rs:build_events_log_table owner
+record services/shell/src/main.rs:build_events_log_table text
+record services/shell/src/main.rs:build_find_table name
+record services/shell/src/main.rs:build_find_table path
+record services/shell/src/main.rs:build_find_table size
+record services/shell/src/main.rs:build_find_table type
+record services/shell/src/main.rs:build_hardware_table detail
+record services/shell/src/main.rs:build_hardware_table device
+record services/shell/src/main.rs:build_hardware_table driver
+record services/shell/src/main.rs:build_hardware_table kind
+record services/shell/src/main.rs:build_hardware_table section
+record services/shell/src/main.rs:build_hardware_table state
+record services/shell/src/main.rs:build_hw_compare change
+record services/shell/src/main.rs:build_hw_compare device
+record services/shell/src/main.rs:build_hw_compare now
+record services/shell/src/main.rs:build_hw_compare was
+record services/shell/src/main.rs:build_hw_events detail
+record services/shell/src/main.rs:build_hw_events device
+record services/shell/src/main.rs:build_hw_events event
+record services/shell/src/main.rs:build_hw_events time
+record services/shell/src/main.rs:build_hw_firmware chip
+record services/shell/src/main.rs:build_hw_firmware device
+record services/shell/src/main.rs:build_hw_firmware driver
+record services/shell/src/main.rs:build_hw_firmware firmware
+record services/shell/src/main.rs:build_hw_interrupts_table device
+record services/shell/src/main.rs:build_hw_interrupts_table driver
+record services/shell/src/main.rs:build_hw_interrupts_table route
+record services/shell/src/main.rs:build_hw_problems detail
+record services/shell/src/main.rs:build_hw_problems device
+record services/shell/src/main.rs:build_hw_problems problem
+record services/shell/src/main.rs:build_hw_problems severity
+record services/shell/src/main.rs:build_hw_tree device
+record services/shell/src/main.rs:build_hw_tree driver
+record services/shell/src/main.rs:build_hw_tree kind
+record services/shell/src/main.rs:build_hw_tree parent
+record services/shell/src/main.rs:build_jobs_table command
+record services/shell/src/main.rs:build_jobs_table copied
+record services/shell/src/main.rs:build_jobs_table dst
+record services/shell/src/main.rs:build_jobs_table job
+record services/shell/src/main.rs:build_jobs_table percent
+record services/shell/src/main.rs:build_jobs_table src
+record services/shell/src/main.rs:build_jobs_table state
+record services/shell/src/main.rs:build_jobs_table total
+record services/shell/src/main.rs:build_observe_table core
+record services/shell/src/main.rs:build_observe_table mem
+record services/shell/src/main.rs:build_observe_table name
+record services/shell/src/main.rs:build_observe_table queue
+record services/shell/src/main.rs:build_observe_table restarts
+record services/shell/src/main.rs:build_observe_table slot
+record services/shell/src/main.rs:build_observe_table state
+record services/shell/src/main.rs:build_observe_table ticks
+record services/shell/src/main.rs:build_persist_status_table capacity_kib
+record services/shell/src/main.rs:build_persist_status_table covers
+record services/shell/src/main.rs:build_persist_status_table kib_day
+record services/shell/src/main.rs:build_persist_status_table lines
+record services/shell/src/main.rs:build_persist_status_table lost
+record services/shell/src/main.rs:build_persist_status_table path
+record services/shell/src/main.rs:build_persist_status_table rotations
+record services/shell/src/main.rs:build_persist_status_table state
+record services/shell/src/main.rs:build_status_table core
+record services/shell/src/main.rs:build_status_table mem
+record services/shell/src/main.rs:build_status_table name
+record services/shell/src/main.rs:build_status_table queue
+record services/shell/src/main.rs:build_status_table restarts
+record services/shell/src/main.rs:build_status_table slot
+record services/shell/src/main.rs:build_status_table state
+record services/shell/src/main.rs:build_trace_metrics_table age_s
+record services/shell/src/main.rs:build_trace_metrics_table metric
+record services/shell/src/main.rs:build_trace_metrics_table owner
+record services/shell/src/main.rs:build_trace_metrics_table value
+record services/shell/src/main.rs:build_trace_table caller
+record services/shell/src/main.rs:build_trace_table op
+record services/shell/src/main.rs:build_trace_table outcome
+record services/shell/src/main.rs:build_trace_table peer
+record services/shell/src/main.rs:build_trace_table sec
+record services/shell/src/main.rs:build_trace_table seq
+record services/shell/src/main.rs:build_uptime_table seconds
+record services/shell/src/main.rs:build_uptime_table uptime
+record services/shell/src/main.rs:build_wifi_hardware_table bus
+record services/shell/src/main.rs:build_wifi_hardware_table chip
+record services/shell/src/main.rs:build_wifi_hardware_table in_use
+record services/shell/src/main.rs:build_wifi_hardware_table network
+record services/shell/src/main.rs:build_wifi_hardware_table radio
+record services/shell/src/main.rs:build_wifi_hardware_table state
+record services/shell/src/main.rs:build_wifi_table band
+record services/shell/src/main.rs:build_wifi_table dbm
+record services/shell/src/main.rs:build_wifi_table network
+record services/shell/src/main.rs:build_wifi_table note
+record services/shell/src/main.rs:build_wifi_table security
+record services/shell/src/main.rs:build_wifi_table signal
+record services/shell/src/main.rs:trace_blocked awaiting
+record services/shell/src/main.rs:trace_blocked blocked
+record services/shell/src/main.rs:trace_blocked held_by
+record services/shell/src/main.rs:trace_blocked name
+record services/shell/src/main.rs:trace_blocked slot
+record services/shell/src/main.rs:trace_endpoint_holders holder
+record services/shell/src/main.rs:trace_endpoint_holders rights
+record services/shell/src/main.rs:trace_endpoint_holders slot
+record stdlib/rust/src/trace.rs:events caller
+record stdlib/rust/src/trace.rs:events op
+record stdlib/rust/src/trace.rs:events outcome
+record stdlib/rust/src/trace.rs:events peer
+record stdlib/rust/src/trace.rs:events sec
+record stdlib/rust/src/trace.rs:events seq
+record stdlib/rust/src/trace.rs:logs owner
+record stdlib/rust/src/trace.rs:logs text
+record stdlib/rust/src/trace.rs:metrics age_s
+record stdlib/rust/src/trace.rs:metrics metric
+record stdlib/rust/src/trace.rs:metrics owner
+record stdlib/rust/src/trace.rs:metrics value
+util name about
+util name ask
+util name assert
+util name audio
+util name avg
+util name background
+util name caps
+util name cd
+util name chaos
+util name churn
+util name clear
+util name copy
+util name cores
+util name count
+util name date
+util name delete
+util name dir
+util name docs
+util name download
+util name drives
+util name echo
+util name edit
+util name events
+util name fcap
+util name find
+util name first
+util name fmt
+util name foreground
+util name from
+util name godspeed
+util name gpio
+util name hardware
+util name help
+util name home
+util name input
+util name jobs
+util name kill
+util name last
+util name match
+util name max
+util name mem
+util name min
+util name mkdir
+util name move
+util name net
+util name observe
+util name paginate
+util name ping
+util name pwd
+util name random
+util name read
+util name reboot
+util name rename
+util name repeat
+util name restart
+util name result
+util name roster
+util name run
+util name scrollback
+util name seal
+util name select
+util name selfcheck
+util name serve
+util name shutdown
+util name sock
+util name sort
+util name spawn
+util name spawncap
+util name spawnwired
+util name status
+util name sum
+util name tcp
+util name to
+util name trace
+util name tree
+util name uptime
+util name version
+util name wait
+util name whatis
+util name where
+util name wifi
+util name write
+util sub ask evidence
+util sub audio debug
+util sub audio hardware
+util sub audio info
+util sub audio mute
+util sub audio off
+util sub audio on
+util sub audio output
+util sub audio outputs
+util sub audio play
+util sub audio status
+util sub audio system
+util sub audio tone
+util sub audio unmute
+util sub audio volume
+util sub busiest mem
+util sub busiest queue
+util sub busiest restarts
+util sub chaos flood-storm
+util sub chaos kill-storm
+util sub chaos link-flap
+util sub chaos max-carnage
+util sub chaos mem-pressure
+util sub chaos spawn-storm
+util sub churn reset
+util sub churn tear
+util sub churn verify
+util sub cores ticks
+util sub date epoch
+util sub date sync
+util sub dir bytes
+util sub drives check
+util sub drives flash
+util sub drives label
+util sub drives reset
+util sub drives scrub
+util sub events failures
+util sub events ipc
+util sub events log
+util sub events metrics
+util sub events persist
+util sub events status
+util sub fcap gsreuse
+util sub fcap reuse
+util sub from json
+util sub godspeed check
+util sub godspeed cleanup
+util sub godspeed config
+util sub godspeed fetch
+util sub godspeed info
+util sub godspeed inspect
+util sub godspeed install
+util sub godspeed list
+util sub godspeed plan
+util sub godspeed registry
+util sub godspeed remove
+util sub godspeed resolve
+util sub godspeed search
+util sub godspeed trust
+util sub godspeed uninstall
+util sub godspeed upgrade
+util sub godspeed verify
+util sub hardware compare
+util sub hardware cpu
+util sub hardware display
+util sub hardware events
+util sub hardware firmware
+util sub hardware interrupts
+util sub hardware memory
+util sub hardware pci
+util sub hardware problems
+util sub hardware report
+util sub hardware soc
+util sub hardware tree
+util sub hardware usb
+util sub hardware why
+util sub match except
+util sub net arp
+util sub net dns
+util sub net lease
+util sub net renew
+util sub net scan
+util sub net stats
+util sub observe now
+util sub sort reverse
+util sub to json
+util sub to yaml
+util sub trace blocked
+util sub trace chain
+util sub trace deps
+util sub trace endpoint
+util sub trace endpoints
+util sub wifi debug
+util sub wifi forget
+util sub wifi hardware
+util sub wifi info
+util sub wifi join
+util sub wifi leave
+util sub wifi list
+util sub wifi radio
+util sub wifi scan
+util sub wifi status
+util sub wifi stored
+util sub write append
+util sub write prepend

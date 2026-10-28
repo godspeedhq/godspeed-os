@@ -548,6 +548,11 @@ const EXTRA_CHECKS: &[&str] = &[
     // named exceptions in scripts/SDK-DEPENDENCY.baseline.txt may, each with its reason; a new crate is on `gs`
     // alone, and the list only shrinks.
     "scripts/sdk_dependency_check.py",
+    // ...and the promise itself (backlog/71 step 3, docs/compatibility.md): the covered surface - the public `gs`
+    // and `gs::driver` items, the utility names, subcommands and record columns, and the contract schema - is
+    // held against `scripts/SURFACE.baseline.txt`. Growth is recorded with `--bless`; a removal or change fails
+    // until it is recorded, with its reason, by `--accept-break`. Runs its own 20 mutants every time (~2 s).
+    "scripts/surface_check.py",
     // ...and the other direction: an ordinary service that needs an SDK item `gs` has no route for. It
     // was on NO build path and had been failing on `main` (10 against a baseline of 8) since the audio
     // and radio drivers arrived, because its driver list is hand-kept. Found by the 2026-10-09 audit;
