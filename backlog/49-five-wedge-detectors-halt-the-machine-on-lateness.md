@@ -166,6 +166,36 @@ The guard was reverted. So on this host the respawn sits close enough to the all
 the switch path can decide whether it passes - which makes this entry the gate on judging ANY change to the
 switch path with `osdev test shell` (`backlog/94`).
 
+## Measured, 2026-10-28: the respawn is NOT the 7.8 s with interrupts off
+
+The paragraph above (2026-10-27) concluded that "interrupts were off on core 0 for about 7.8 s while the kernel
+loaded the supervisor's image". Measured, that is wrong. Every supervisor respawn now logs how long it took, in the
+watchdog's own units, and how many interrupts core 0 took meanwhile (`poll_supervisor_respawn`, `kernel: supervisor
+respawn #N took ...`). In `osdev test shell` on x86 QEMU, eight respawns:
+
+```text
+kernel: supervisor respawn #1 took 152058794 counter ticks (19/1000 of the watchdog's 7775053200), core 0 took 6 interrupt(s) meanwhile
+kernel: supervisor respawn #2 took 93412450 counter ticks (12/1000 of the watchdog's 7775053200), core 0 took 4 interrupt(s) meanwhile
+...
+kernel: supervisor respawn #8 took 110751678 counter ticks (14/1000 of the watchdog's 7775053200), core 0 took 4 interrupt(s) meanwhile
+```
+
+About 40 ms each, 1.2% to 2.1% of the allowance, with core 0 taking its tick throughout. So a respawn that runs to
+completion is nowhere near the watchdog, and the wedges are something else. Two facts every sighting shares now read
+differently:
+
+- **1.002x is when the watchdog first LOOKS, not how late the core was.** Another core checks on its own tick, so
+  a core that stopped for good is reported at just over 1x. Every QEMU sighting at 1.0002x to 1.0033x is therefore
+  consistent with a core that NEVER came back - a real stall - and not with one that was slightly late. The
+  "lateness" reading this entry was opened on does not fit them.
+- **Core 0 was running `shell`, not the spawn, with 0 interrupts and 0 halts.** The spawn is preemptible and
+  round-robins with ready tasks (`timer_tick_from_irq`), so after "takes back a reply mailbox" the shell had the
+  core, and from then on core 0 took no interrupt at all: either interrupts stayed masked (a kernel path on the
+  shell's behalf that spins with IF=0) or its one-shot TSC-deadline timer was never re-armed. Which one is not
+  known; the next step is to make the wedge report say whether the stalled core's timer was armed.
+
+The kill path's cross-core wait (`backlog/fixed/48`) is not it: it skips the calling core and is bounded.
+
 ## On hardware: the T630, twice in one day, each right after a supervisor respawn (2026-10-25)
 
 Both on `feat/driver-packages`, in `chaos max-carnage all-services 1000`, with the WiFi dongle on `xhci`.

@@ -2578,10 +2578,24 @@ pub fn poll_supervisor_respawn() {
     // directly; on a transient failure, log LOUD (§26.7) and RE-ARM PENDING so the next Core-0 tick
     // retries. The supervisor's footprint is constant and just-reclaimed, so a retry succeeds the moment
     // the pressure eases. (Only the BOOT-time spawn_supervisor keeps its fatal panic - §22 Test 1B.)
-    match spawn_service_with_image(
+    // How long the respawn took, and whether this core took its tick while it ran (backlog/49): the
+    // liveness watchdog has stopped the machine during a respawn several times in QEMU, with core 0
+    // reporting 0 timer interrupts for the whole allowance. Measured on every respawn rather than
+    // reasoned about, in the watchdog's own units, so the margin is in the log when it matters.
+    let t0 = crate::arch::imp::read_cycle_counter();
+    let (irqs0, _) = crate::arch::imp::core_irq_debug(0);
+    let spawned = spawn_service_with_image(
         "supervisor", crate::loader::ImageSource::Kernel(SUPERVISOR_ELF), 0, true, &[], 0, false,
         64 * 1024 * 1024, &[], false, None, None, 0, None, false,
-    ) {
+    );
+    let took = crate::arch::imp::read_cycle_counter().wrapping_sub(t0);
+    let (irqs1, _) = crate::arch::imp::core_irq_debug(0);
+    let allowed = crate::arch::imp::liveness_deadline_cycles();
+    crate::kprintln!(
+        "kernel: supervisor respawn #{} took {} counter ticks ({}/1000 of the watchdog's {}), core 0 took {} interrupt(s) meanwhile",
+        n, took, if allowed > 0 { took.saturating_mul(1000) / allowed } else { 0 }, allowed,
+        irqs1.wrapping_sub(irqs0));
+    match spawned {
         Ok(_) => crate::kprintln!("task: supervisor spawned on core 0"),
         Err(e) => {
             crate::kprintln!(
