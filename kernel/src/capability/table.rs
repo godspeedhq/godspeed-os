@@ -204,8 +204,11 @@ impl GlobalResourceTable {
         // the introspection reads, the device syscalls, SpawnImage's IMAGE_SPAWN) validates those WITHOUT a
         // generation check, which is sound only while they stay un-revocable. Revocable ids are always >= 100 (endpoints) or in the delegated band. This
         // pins the invariant, so a future change that makes a gated resource revocable fails loudly
-        // in test/debug rather than silently letting a revoked holder keep passing the gate.
-        debug_assert!(id.0 >= 100,
+        // rather than silently letting a revoked holder keep passing the gate. An `assert!`, in RELEASE
+        // too (backlog/90 E6): it was a `debug_assert!`, so the images that run on hardware carried no
+        // guard at all, and a bump here would be corrupted capability state, which 6.2 says halts every
+        // core. One integer compare, on a path that runs only at a resource's death or revocation.
+        assert!(id.0 >= 100,
             "SEC-11: bump_generation on stable gate resource {} would break holds_resource gen-safety", id.0);
         let i = id.0 as usize;
         if i < DIRECT_CAP {
