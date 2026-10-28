@@ -1,6 +1,11 @@
 # 76. The Pi 2's hardware RNG fails its first read after boot, and its output is now fed to crypto
 
-**Status: OPEN - FIX BUILT 2026-10-28 (`470a9184`): the RNG starts at boot and the wait is bounded by time; awaiting the Pi 2 card (the first join after boot should no longer print the weaker-nonce line).** *Was:* OPEN - found 2026-10-06 on the USB WiFi dongle's R5c card (`docs/wifi-usb.md` 13). A kernel change,
+**Status: CLOSED 2026-10-28.** Built in `470a9184` (the RNG started at boot, its wait bounded by time,
+and named a cryptographic source) and carded on the Pi 2 on `02a9d3ed`: the first WPA2 join after boot
+sent message 2 of the handshake 14 ms after message 1, with no "NO HARDWARE RNG ... hashed from the cycle
+counter" line, and joined. It used to wait about 650 ms and fall back.
+
+**Previous status: OPEN - FIX BUILT 2026-10-28 (`470a9184`): the RNG starts at boot and the wait is bounded by time; awaiting the Pi 2 card (the first join after boot should no longer print the weaker-nonce line).** *Was:* OPEN - found 2026-10-06 on the USB WiFi dongle's R5c card (`docs/wifi-usb.md` 13). A kernel change,
 so not made without the operator's go-ahead and a QEMU boot first.**
 
 ## What was seen

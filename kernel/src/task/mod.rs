@@ -1001,7 +1001,7 @@ pub mod privbits {
     pub const GPIO:            u32 = 1 << 8;
     // Bits 9 and 10 were SET_CLOCK_FLOOR and SET_CLOCK, the two strengths of a wall-clock authority
     // that nothing checked once the clock moved to the `time` service (clock slice 3). Removed with
-    // their resource (backlog/59). The bits stay unassigned rather than reused, and `KNOWN` leaves them
+    // their resource (backlog/fixed/59). The bits stay unassigned rather than reused, and `KNOWN` leaves them
     // out, so a spawner that still asks for one is refused as asking for an unknown privilege.
     /// NET_DEVICE: move ethernet frames through the in-kernel network device (`NetFrame*`/`NetInfo`,
     /// syscalls 42-44). HELD BY NOTHING NOW: on arm32 the USB-net device moved into the `dwc2`

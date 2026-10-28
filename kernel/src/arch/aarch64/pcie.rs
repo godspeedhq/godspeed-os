@@ -226,7 +226,7 @@ fn cfg_write(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
 /// when it cannot be told: no root complex, the bridge's own header (bus 0), a bus the bridge does not
 /// forward, an I/O BAR, or a BAR the device does not implement.
 ///
-/// x86's `pci::bar_len` on this root complex's index/data pair (backlog/85): with the device's memory
+/// x86's `pci::bar_len` on this root complex's index/data pair (backlog/fixed/85): with the device's memory
 /// decode off, write all ones to the BAR, read back the mask of the address bits it implements, then put
 /// the BAR and the decode back. The whole sequence is ONE hold of `CFG_LOCK`, with the index latched once,
 /// so a capability holder's `cfg_read_gated` on another core never sees the BAR holding the mask. Only

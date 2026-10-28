@@ -707,7 +707,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // The user's interface. GPIO is ARM-only in effect but the bit is arch-neutral: the kernel refuses
     // any the supervisor cannot delegate, and on x86 the underlying grant is simply never used. (It held
     // SET_CLOCK_FLOOR as well, until that authority was found to be checked by nothing and removed,
-    // backlog/59: the clock floor is the `time` service's, kept in its own file.) POWER_OFF, beside
+    // backlog/fixed/59: the clock floor is the `time` service's, kept in its own file.) POWER_OFF, beside
     // REBOOT and for the same reason: ending the session is the operator's, and the shell is how the
     // operator speaks (docs/shutdown.md). The only holder; a gate pins that.
     ("shell", SHELL_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV

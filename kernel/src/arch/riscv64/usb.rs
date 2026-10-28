@@ -199,7 +199,7 @@ pub fn window() -> u64 {
 /// How long that window is, as the device tree's `reg` says, or zero if it did not say. This
 /// controller is on the SoC, not a bus, so its size is the tree's to give rather than a BAR's to
 /// measure; it is what `pci::bar_len` answers for it, so the `xhci` grant is the controller and no more
-/// (backlog/85).
+/// (backlog/fixed/85).
 pub fn window_len() -> u64 {
     XHCI_LEN.load(Ordering::Relaxed)
 }

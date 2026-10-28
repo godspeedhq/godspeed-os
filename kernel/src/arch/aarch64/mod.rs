@@ -3202,7 +3202,7 @@ pub mod rtc {
     /// The packed hardware wall-clock datetime (query 11): 0, because the Pi 4 has no RTC. The wall clock
     /// on this board is the `time` service's, from the network. The kernel's network-set anchor, and the
     /// function that wrote it, had no caller after clock slice 3 and went with the dead
-    /// authority that gated it (backlog/59).
+    /// authority that gated it (backlog/fixed/59).
     pub fn read_datetime() -> u64 { 0 }
     /// Seconds since the Unix epoch - or, on a board with no clock, seconds since boot.
     ///
@@ -3334,7 +3334,7 @@ pub mod pci {
 
     /// The length of memory BAR `ix` of `d`, in bytes, or 0 when it cannot be told - then the spawn maps
     /// the fixed 64 KiB window and says so. Measured by `pcie::bar_len`, the standard probe on this root
-    /// complex's config pair, so the window a driver is granted is its device's BAR (backlog/85, as x86's
+    /// complex's config pair, so the window a driver is granted is its device's BAR (backlog/fixed/85, as x86's
     /// since backlog/fixed/80 K1).
     pub fn bar_len(d: &PciDevice, ix: usize) -> u64 {
         use core::sync::atomic::Ordering;

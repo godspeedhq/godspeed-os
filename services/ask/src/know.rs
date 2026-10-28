@@ -230,7 +230,7 @@ fn find_service(buf: &[u8], ws: &[(usize, usize)], n: usize, known: &[&str]) -> 
 /// authority's own name. Resource ids are the kernel's fixed set (`godspeed_sdk::service_context::AUTHORITIES`,
 /// re-exported as `gs::task::AUTHORITIES`, which `main.rs` hands in as `Facts::authorities`); a word missing here is answered "which authority?",
 /// never guessed. No clock words: the kernel has no clock authority (its last one was removed,
-/// backlog/59), and the clock is the `time` service's, so "who can set the clock?" is not the kernel's to answer.
+/// backlog/fixed/59), and the clock is the `time` service's, so "who can set the clock?" is not the kernel's to answer.
 const CAN_WORDS: &[(&str, u64)] = &[
     ("log", 1), ("logs", 1),
     ("spawn", 2), ("start", 2), ("launch", 2),

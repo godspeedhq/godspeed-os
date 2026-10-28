@@ -852,7 +852,7 @@ resent message 1 in the gap, and the handshake completed on the resend. The seco
 answered in 31 ms. The cause is in the kernel, not the radio: the Pi 2's `hw_random` turns the RNG on at
 its first call and then waits an iteration count shorter than the RNG's warm-up, so the first read after
 boot always comes back empty. Its comment also says its output is "not fed to crypto", which the shared
-supplicant now does. That is `backlog/76`, a kernel change left for the operator's go-ahead.
+supplicant now does. That is `backlog/fixed/76`, a kernel change left for the operator's go-ahead.
 
 ## 14. R6 (2026-10-06): data both ways - DHCP and ping over the dongle - hardware-verified on the Pi 2
 

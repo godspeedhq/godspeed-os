@@ -395,7 +395,7 @@ pub mod privbits {
     /// ARM-only in practice; the bit is arch-neutral.
     pub const GPIO:            u32 = 1 << 8;
     // Bits 9 and 10 (SET_CLOCK_FLOOR, SET_CLOCK) are retired with the authority nothing checked, and
-    // the kernel refuses them as unknown (backlog/59). Not reused.
+    // the kernel refuses them as unknown (backlog/fixed/59). Not reused.
     /// NET_DEVICE: move ethernet frames through an in-kernel network device (`NetFrame*`/`NetInfo`,
     /// syscalls 42-44). No port has one any more - every arch answers with a stub - and no spawn
     /// request in the tree sets this bit; the kernel still understands it.

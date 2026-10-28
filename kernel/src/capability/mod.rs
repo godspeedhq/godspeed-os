@@ -106,7 +106,7 @@ pub const USB_DISK_RESOURCE: ResourceId = ResourceId(12);
 // ResourceId 13 was SET_CLOCK_RESOURCE, the authority to set the wall clock. Nothing checked it once
 // the clock moved to the `time` service (clock slice 3, and since 2026-10-01 `time` fetches the network
 // time itself), so it was granted and never spent - dead authority 26.9 says a reviewer must be able to
-// see. Removed with its two privilege bits (backlog/59). 13 is not reused, so an old capability or log
+// see. Removed with its two privilege bits (backlog/fixed/59). 13 is not reused, so an old capability or log
 // line naming it can never be read as a different authority.
 
 /// Inject a test interrupt (`FireIrq`, syscall 51). Held ONLY by the control service.

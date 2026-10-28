@@ -710,7 +710,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
                         let parent = (be32(ranges, 1) << 32) | be32(ranges, 2);
                         // The controller's ranges are otg, xhci, dev - the second is the host half.
                         xhci = parent + be32(reg, 2);
-                        // ...and its size, the cell after it: what the `xhci` grant is (backlog/85).
+                        // ...and its size, the cell after it: what the `xhci` grant is (backlog/fixed/85).
                         if reg.len() >= 16 {
                             xhci_len = be32(reg, 3);
                         }
@@ -3309,7 +3309,7 @@ pub mod pci {
 
     /// The length of memory BAR `ix` of `d`, in bytes, or 0 when it cannot be told (no ECAM window, an
     /// I/O BAR, or one the device does not implement) - then the spawn maps the fixed 64 KiB window and
-    /// says so. A device not on a bus has no BAR; the SoC `xhci` answers the size its tree node gives. The standard probe, x86's `pci::bar_len` on ECAM (backlog/85): with memory decode off,
+    /// says so. A device not on a bus has no BAR; the SoC `xhci` answers the size its tree node gives. The standard probe, x86's `pci::bar_len` on ECAM (backlog/fixed/85): with memory decode off,
     /// write all ones to the BAR, read back the mask of the address bits it implements, then put the BAR
     /// and the decode back, all under `BAR_PROBE_LOCK`. Only the command half of the command/status dword
     /// is written back, because the status half is write-1-to-clear. Called at grant time, for the device

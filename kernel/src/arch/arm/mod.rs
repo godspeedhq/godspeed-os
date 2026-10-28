@@ -977,7 +977,7 @@ extern "C" fn arm_boot_main() -> ! {
     sd_route_to_emmc();
     timer::init();
     // Start the RNG's warm-up now, so it has finished long before a service asks for a word: the first
-    // WPA2 handshake after boot used to find it still warming and fall back (backlog/76).
+    // WPA2 handshake after boot used to find it still warming and fall back (backlog/fixed/76).
     rng_start();
     const TICK_HZ: u32 = 100; // 10 ms quantum, matching CLAUDE.md section 9.1
     if irq::start_tick(TICK_HZ) {
@@ -1427,7 +1427,7 @@ fn rng_enable_locked() {
     }
 }
 
-/// Start the RNG at boot (backlog/76). Its warm-up of `0x40000` cycles takes longer than the old wait
+/// Start the RNG at boot (backlog/fixed/76). Its warm-up of `0x40000` cycles takes longer than the old wait
 /// bound gave a caller - the first WPA2 join after boot found no word and hashed its nonce from the cycle
 /// counter instead - so it is started here, once, and is ready by the time any service runs.
 fn rng_start() {
@@ -2738,7 +2738,7 @@ pub mod rtc {
     /// The packed hardware wall-clock datetime (query 11): 0, because the Pi 2 has no RTC. The wall clock
     /// on this board is the `time` service's, from the network. The kernel's network-set anchor, and the
     /// function that wrote it, had no caller after clock slice 3 and went with the dead
-    /// authority that gated it (backlog/59).
+    /// authority that gated it (backlog/fixed/59).
     pub fn read_datetime() -> u64 { 0 }
     /// Monotonic seconds since boot, from the generic timer (the Pi 2 has no wall-clock RTC, so this is
     /// NOT a real epoch - but it advances, which is all its callers need: bounding deadline waits and

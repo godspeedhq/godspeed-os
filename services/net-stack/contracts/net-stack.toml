@@ -26,7 +26,7 @@ ipc_receive = ["net-stack"]
 # asks for RESOURCE_MINT (CLAUDE.md 13.6) - this line declares it, the request is what grants it.
 resource_mint = true
 # NO CLOCK AUTHORITY (2026-10-01). This service used to be spawned with SET_CLOCK, for an SNTP exchange it
-# no longer runs and a syscall that never existed (`backlog/59`). The supervisor no longer asks for it.
+# no longer runs and a syscall that never existed (`backlog/fixed/59`). The supervisor no longer asks for it.
 
 [placement]
 # Core 1 on every port, as a PREFERENCE: the supervisor's spawn row for this service asks for core 1, and
