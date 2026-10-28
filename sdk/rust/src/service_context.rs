@@ -1962,7 +1962,7 @@ impl ServiceContext {
     /// - a client request carries a reply cap, a driver reply does not.
     ///
     /// Everything else matches [`Self::request_with_reply_deadline_outcome`] exactly, including the
-    /// reply-cap reclaim on a failed send (a delivered request's cap is the peer's - backlog/67) and the warning attached to `Timeout`: the request was
+    /// reply-cap reclaim on a failed send (a delivered request's cap is the peer's - backlog/fixed/67) and the warning attached to `Timeout`: the request was
     /// SENT, so a late reply is still coming and re-sending desyncs the protocol.
     #[inline]
     pub fn request_with_reply_deadline_sifted(
@@ -2015,7 +2015,7 @@ impl ServiceContext {
                 // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
                 // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
                 // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
-                // into a dead cap (backlog/67). The peer removes the cap after answering.
+                // into a dead cap (backlog/fixed/67). The peer removes the cap after answering.
                 self.trace_out(peer, op, crate::trace::KIND_TIMEOUT);
                 return None;
             }
@@ -2152,7 +2152,7 @@ impl ServiceContext {
                 // embedded reply cap may not have been transferred, so reclaim it. Safe when the kernel
                 // DID move it out: a Call receives nothing but its own reply, so no other cap can have
                 // been inserted into the emptied slot, and removing an empty slot does nothing. (The
-                // send-then-recv paths cannot say that, and do not reclaim - backlog/67.) Without this, a
+                // send-then-recv paths cannot say that, and do not reclaim - backlog/fixed/67.) Without this, a
                 // storm of failed calls would leak reply caps until the table fills and every request
                 // returns None.
                 self.remove_cap(reply_cap);
@@ -2252,7 +2252,7 @@ impl ServiceContext {
         match crate::ipc::call_deadline_into(target, reply_cap, recv, &msg.payload_bytes()[..n],
                                              &mut buf, secs) {
             Ok(Some(len)) => Ok(Some(crate::ipc::Message::from_bytes(&buf[..len]))),
-            // Delivered, deadline passed: the reply cap is the peer's now (backlog/67).
+            // Delivered, deadline passed: the reply cap is the peer's now (backlog/fixed/67).
             Ok(None)      => Ok(None),
             Err(e)        => { self.remove_cap(reply_cap); Err(e) }
         }
@@ -2307,7 +2307,7 @@ impl ServiceContext {
         let secs = deadline_secs(max_secs);
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
         // The kernel consumes the reply cap on a delivered call - and `Ok(None)` is a delivered call
-        // whose deadline passed, so it is the peer's then too (backlog/67). On a failed send it is ours
+        // whose deadline passed, so it is the peer's then too (backlog/fixed/67). On a failed send it is ours
         // to reclaim, or the slot leaks one per failed request (§8.5, the three checks).
         match out {
             Ok(Some(n)) => DeadlineOutcomeInto::Reply(n),
@@ -2329,7 +2329,7 @@ impl ServiceContext {
     /// The by-value path costs 4 KiB for the request `Message`, 4 KiB for the reply `Message`, and
     /// 4 KiB again at every wrapper that forwards it. This costs none of that: the caller owns both
     /// buffers, and only a length is returned. Drains abandoned replies from the reply mailbox first
-    /// (`drain_stale_replies`), and reclaims the reply cap only when the send failed (§8.5, backlog/67).
+    /// (`drain_stale_replies`), and reclaims the reply cap only when the send failed (§8.5, backlog/fixed/67).
     ///
     /// **This used to be send + `recv_timeout_into`, and that was wrong in a way that cost days.**
     /// `recv_timeout_into` takes whatever is next on the endpoint, and a service that SERVES clients on
@@ -2375,7 +2375,7 @@ impl ServiceContext {
         let secs = deadline_secs(max_secs);
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
         // The kernel consumes the reply cap on a delivered call - and `Ok(None)` is a delivered call
-        // whose deadline passed, so it is the peer's then too (backlog/67). On a failed send it is ours
+        // whose deadline passed, so it is the peer's then too (backlog/fixed/67). On a failed send it is ours
         // to reclaim, or the slot leaks one per failed request (§8.5, the three checks).
         match out {
             Ok(Some(n)) => Some(n),
@@ -2528,7 +2528,7 @@ impl ServiceContext {
                 // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
                 // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
                 // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
-                // into a dead cap (backlog/67). The peer removes the cap after answering.
+                // into a dead cap (backlog/fixed/67). The peer removes the cap after answering.
                 let _ = recv;
                 return None;
             }
@@ -2580,7 +2580,7 @@ impl ServiceContext {
                 // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
                 // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
                 // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
-                // into a dead cap (backlog/67). The peer removes the cap after answering.
+                // into a dead cap (backlog/fixed/67). The peer removes the cap after answering.
                 let _ = recv;
                 return None;
             }
@@ -2619,7 +2619,7 @@ impl ServiceContext {
                 // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
                 // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
                 // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
-                // into a dead cap (backlog/67). The peer removes the cap after answering.
+                // into a dead cap (backlog/fixed/67). The peer removes the cap after answering.
                 // CALLER BEWARE: the request was already SENT, so the peer will reply into our endpoint
                 // whether we are listening or not. Leaving the reply cap alone does not remove that message
                 // from the queue - the NEXT `try_recv` on this endpoint may return the ABANDONED reply
@@ -2676,7 +2676,7 @@ impl ServiceContext {
                 // NOT RECLAIMED: the send succeeded, so the kernel moved the reply cap to the peer and emptied
                 // this slot - and the first cap this task RECEIVED since went into it. Removing "the reply
                 // cap" here destroyed that one: a client's reply cap stashed mid-wait, so its answer went
-                // into a dead cap (backlog/67). The peer removes the cap after answering.
+                // into a dead cap (backlog/fixed/67). The peer removes the cap after answering.
                 // Same caveat as the unsifted twin: the request WAS sent, so the peer answers whether
                 // or not anyone is still listening, and that answer will arrive later. A caller that
                 // times out must expect to meet it - here, `mine` will simply be asked about it and
@@ -2737,7 +2737,7 @@ impl ServiceContext {
                 //
                 // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
                 // fcap - and the abort and timeout paths below are no different: the send DID deliver
-                // there too, so the slot is not ours either, and they leave it alone (backlog/67).
+                // there too, so the slot is not ours either, and they leave it alone (backlog/fixed/67).
                 return ReqOutcome::Reply(r);
             }
             while let Some(b) = self.try_console_read() {
@@ -2814,7 +2814,7 @@ impl ServiceContext {
                 //
                 // A remove-by-stale-index can bite ANY request whose reply carries a cap, not just
                 // fcap - and the abort and timeout paths below are no different: the send DID deliver
-                // there too, so the slot is not ours either, and they leave it alone (backlog/67).
+                // there too, so the slot is not ours either, and they leave it alone (backlog/fixed/67).
                 //
                 // Asked at the moment of arrival, so a cap the message carries is still pending for
                 // `mine` to take; `false` hands the message to the caller and the wait goes on.
@@ -2849,7 +2849,7 @@ impl ServiceContext {
     /// [`Self::request_with_reply_abortable`] (which does its own send) does not fit. This is the wait
     /// half of the abortable request, factored out: a peer that received our invocation but died before
     /// replying, or a filter that wedges mid-stream, can no longer hang us (Commandment VIII - wait on
-    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it only when the send failed (backlog/67), not on every
+    /// truth *including failure*). The caller owns any reply cap it derived and reclaims it only when the send failed (backlog/fixed/67), not on every
     /// outcome. A service with no console foreground never sees input, so this degrades to a plain
     /// deadline wait. Does NOT drain a stale reply first - a caller that can be re-entered after an
     /// abort should `while self.try_recv().is_some() {}` before it sends (as the request variants do).

@@ -22713,7 +22713,7 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
     // it, and §8.5 removes an embedded cap from the sender's table), so removing it here removes
     // whatever the kernel has since placed in that slot - which is how the file cap was being deleted.
     // That holds on EVERY outcome below, an abort or a timeout included: they are waits after a
-    // delivered invoke, not sends that failed. Only the failed invoke above reclaims (backlog/67).
+    // delivered invoke, not sends that failed. Only the failed invoke above reclaims (backlog/fixed/67).
     let outcome = recv_quittable(ctx, FILTER_WAIT_SECS, &core::cell::Cell::new(false), &|_| {});
     match outcome {
         ReqOutcome::Reply(m) => {

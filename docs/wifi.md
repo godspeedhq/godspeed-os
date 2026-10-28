@@ -4033,7 +4033,7 @@ wait (`request_with_reply_keyhint_sifted`), for the join and the power verbs.
 **QEMU** (`raspi4b`, a test-only driver answering `wifi status` 8 s late): the first request timed out and
 was owed, the second was held back with the `not sent` line, the third cleared the late answer by its tag
 (`1 of them late radio answers`) and was sent. **On the card** (boot 2026-10-02): every wifi verb as before,
-`chaos max-carnage` 50 rounds recovered, and none of the `reply cap is dead` lines `backlog/67` left.
+`chaos max-carnage` 50 rounds recovered, and none of the `reply cap is dead` lines `backlog/fixed/67` left.
 
 **The reports pipe.** `utilities/56_wifi.md` section 3 said `wifi list | count` worked; the shell refused
 it, because `wifi` was never on its list of pipe producers. It is now, for the REPORT verbs - `list`,
