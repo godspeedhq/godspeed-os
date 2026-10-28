@@ -2,7 +2,7 @@
 
 **Severity:** low today, structural. Nothing is broken on any of the five machines (four ports); what
 is recorded here is an axis that is wrong and a kernel surface that is now unused.
-**Status: OPEN for item 1 only.** Item 2 is DONE 2026-10-28: syscalls 42-44 are removed with NET_DEVICE (ResourceId 10, privilege bit 11), and USB_DISK's 46-49 (ResourceId 12) with them - the same dead shape, recorded as audit SEC-37 - from the kernel, every arch's seam (125 members, from 134) and the SDK (its floor 80 -> 74). QEMU on every port; cards owed. Item 1 needs a new kernel query and is untouched. *Was:* Item 2's
+**Status: OPEN for item 1 only.** Item 2 is DONE 2026-10-28: syscalls 42-44 are removed with NET_DEVICE (ResourceId 10, privilege bit 11), and USB_DISK's 46-49 (ResourceId 12) with them - the same dead shape, recorded as audit SEC-37 - from the kernel, every arch's seam (125 members, from 134) and the SDK (its floor 80 -> 74). QEMU on every port; hardware-confirmed 2026-10-28 on all five boards at `1d569c22` (Wyse, T630, Pi 2, Pi 4, VisionFive: selfcheck 673/673/670/679/679, 0 failed; kill-storm of the USB host 10/10 on each). Item 1 needs a new kernel query and is untouched. *Was:* Item 2's
 first step - stop GRANTING NET_DEVICE - landed on `portability-hardening` and is hardware-confirmed; its
 second - the SDK wrappers - went on 2026-10-11 (`feat/ask`). The syscalls themselves remain.
 
