@@ -3355,10 +3355,28 @@ pub mod pci {
     /// it is true; here it was not, and a false statement in a comment is a trap for whoever reads it
     /// next looking for the table that does exist twenty lines below.)
     pub fn nic() -> Option<PciDevice> { None }
-    /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
-    /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
-    /// backlog/fixed/80 K1).
-    pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
+    /// Sized BAR lengths, [device][bar] by table index; 0 = not sized yet. A BAR's size is fixed by the
+    /// device, so it is measured once, on the first grant, and reused by every respawn.
+    static DEV_BAR_LEN: [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) }; MAX_DEVICES * 6];
+
+    /// The length of memory BAR `ix` of `d`, in bytes, or 0 when it cannot be told - then the spawn maps
+    /// the fixed 64 KiB window and says so. Measured by `pcie::bar_len`, the standard probe on this root
+    /// complex's config pair, so the window a driver is granted is its device's BAR (backlog/85, as x86's
+    /// since backlog/fixed/80 K1).
+    pub fn bar_len(d: &PciDevice, ix: usize) -> u64 {
+        use core::sync::atomic::Ordering;
+        if ix >= 6 || d.index >= MAX_DEVICES || d.bar[ix] == 0 { return 0; }
+        let slot = &DEV_BAR_LEN[d.index * 6 + ix];
+        let known = slot.load(Ordering::Relaxed);
+        if known != 0 { return known; }
+        // Only the `pi4` build has a root complex to ask; any other aarch64 build keeps the fixed window.
+        #[cfg(feature = "pi4")]
+        let len = super::pcie::bar_len(d.bdf, ix);
+        #[cfg(not(feature = "pi4"))]
+        let len = 0;
+        slot.store(len, Ordering::Relaxed);
+        len
+    }
     pub fn first_memory_bar(_d: &PciDevice) -> u64 { 0 }
 
     // ---- The generic device table (step D1). See `arch/x86_64/pci.rs` for the real one.

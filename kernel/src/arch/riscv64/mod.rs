@@ -702,6 +702,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
                 v
             };
             let mut xhci = 0u64;
+            let mut xhci_len = 0u64;
             if let Some(ranges) = tree.find_compatible_prop("starfive,jh7110-usb", "ranges") {
                 if let Some(reg) = tree.find_compatible_prop("cdns,usb3", "reg") {
                     if ranges.len() >= 16 && reg.len() >= 12 {
@@ -709,6 +710,10 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
                         let parent = (be32(ranges, 1) << 32) | be32(ranges, 2);
                         // The controller's ranges are otg, xhci, dev - the second is the host half.
                         xhci = parent + be32(reg, 2);
+                        // ...and its size, the cell after it: what the `xhci` grant is (backlog/85).
+                        if reg.len() >= 16 {
+                            xhci_len = be32(reg, 3);
+                        }
                     }
                 }
             }
@@ -717,7 +722,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
                 .find_compatible("starfive,jh7110-usb-phy", &[], &mut w10)
                 .map(|r| r.base)
                 .unwrap_or(0);
-            usb::set_bases(crg, stg_syscon, xhci, sys.unwrap_or(0), syscon.unwrap_or(0), phy);
+            usb::set_bases(crg, stg_syscon, xhci, xhci_len, sys.unwrap_or(0), syscon.unwrap_or(0), phy);
             let mut w11: [Option<u32>; 0] = [];
             if let Some(reg) = tree.find_compatible("starfive,jh7110-sys-pinctrl", &[], &mut w11) {
                 usb::set_pinctrl_base(reg.base);
@@ -3129,6 +3134,8 @@ pub mod pci {
         let bus = (sel >> 20) & 0xff;
         let dev = (sel >> 15) & 0x1f;
         let func = (sel >> 12) & 0x7;
+        // Never in the middle of a BAR probe, which would read its size mask as the BAR.
+        let _g = BAR_PROBE_LOCK.lock();
         cfg_read32((bus << 8) | (dev << 3) | func, off & 0xfff)
     }
 
@@ -3291,15 +3298,70 @@ pub mod pci {
         })
     }
 
+    /// Sized BAR lengths, [device][bar] by table index; 0 = not sized yet. A BAR's size is fixed by the
+    /// device, so it is measured once, on the first grant, and reused by every respawn.
+    static DEV_BAR_LEN: [AtomicU64; MAX_DEVICES * 6] = [const { AtomicU64::new(0) }; MAX_DEVICES * 6];
+
+    /// Held across a BAR probe, and by `cfg_read_gated`. ECAM needs no lock for an ordinary access - the
+    /// address IS the selector - but a probe leaves the BAR holding a size mask for a moment, and a
+    /// capability holder's read in that moment would report the mask as the BAR. x86 and the Pi 4 get
+    /// this exclusion from their config-pair locks; here it is this one.
+    static BAR_PROBE_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+
+    /// The length of memory BAR `ix` of `d`, in bytes, or 0 when it cannot be told (no ECAM window, an
+    /// I/O BAR, or one the device does not implement) - then the spawn maps the fixed 64 KiB window and
+    /// says so. A device not on a bus has no BAR; the SoC `xhci` answers the size its tree node gives. The standard probe, x86's `pci::bar_len` on ECAM (backlog/85): with memory decode off,
+    /// write all ones to the BAR, read back the mask of the address bits it implements, then put the BAR
+    /// and the decode back, all under `BAR_PROBE_LOCK`. Only the command half of the command/status dword
+    /// is written back, because the status half is write-1-to-clear. Called at grant time, for the device
+    /// being granted, which nothing else is driving.
+    pub fn bar_len(d: &PciDevice, ix: usize) -> u64 {
+        if ix >= 6 || d.index >= MAX_DEVICES || d.bar[ix] == 0 { return 0; }
+        // Not on a bus (`xhci()`'s and `nic()`'s SoC fallbacks, `bdf` 0xFFFF): there is no BAR to probe.
+        // The SoC `xhci` has the size the device tree gave it; anything else keeps the fixed window.
+        if d.bdf == 0xFFFF {
+            let w = super::usb::window();
+            return if w != 0 && d.bar[ix] == w { super::usb::window_len() } else { 0 };
+        }
+        let slot = &DEV_BAR_LEN[d.index * 6 + ix];
+        let known = slot.load(Ordering::Relaxed);
+        if known != 0 { return known; }
+        let off = 0x10 + ix as u16 * 4;
+        let probe = {
+            let _g = BAR_PROBE_LOCK.lock();
+            (|| {
+                let cmd = cfg_read32(d.bdf, 0x04)? & 0xFFFF;
+                cfg_write32(d.bdf, 0x04, cmd & !0x2); // memory decode off while the BAR holds a mask
+                let lo = cfg_read32(d.bdf, off)?;
+                cfg_write32(d.bdf, off, 0xFFFF_FFFF);
+                let lo_mask = cfg_read32(d.bdf, off)?;
+                cfg_write32(d.bdf, off, lo);
+                let is64 = lo & 0x6 == 0x4 && ix < 5;
+                let mut hi_mask = 0xFFFF_FFFF;
+                if is64 {
+                    let hi = cfg_read32(d.bdf, off + 4)?;
+                    cfg_write32(d.bdf, off + 4, 0xFFFF_FFFF);
+                    hi_mask = cfg_read32(d.bdf, off + 4)?;
+                    cfg_write32(d.bdf, off + 4, hi);
+                }
+                cfg_write32(d.bdf, 0x04, cmd);
+                Some((lo_mask, hi_mask, is64))
+            })()
+        };
+        let Some((lo_mask, hi_mask, is64)) = probe else { return 0 };
+        if lo_mask & 0x1 != 0 { return 0; } // an I/O BAR: not a memory window
+        if lo_mask & 0xFFFF_FFF0 == 0 && (!is64 || hi_mask == 0) { return 0; }
+        let mask = ((hi_mask as u64) << 32) | (lo_mask & 0xFFFF_FFF0) as u64;
+        let len = (!mask).wrapping_add(1);
+        slot.store(len, Ordering::Relaxed);
+        len
+    }
+
     /// The first MEMORY BAR, with its flag bits removed and a 64-bit BAR joined to its upper half.
     ///
     /// A BAR's low bits are type flags, not address: bit 0 selects I/O versus memory, bits 2:1 give
     /// the width. Returning the raw register would hand a driver an address a few bytes off, which
     /// maps and then fails in a way that looks like a broken device.
-    /// The length of memory BAR `ix`, or 0 when it is not measured - the case on this port: the spawn
-    /// then maps the fixed 64 KiB window it always has, and says so (x86's `pci::bar_len` sizes it;
-    /// backlog/fixed/80 K1).
-    pub fn bar_len(_d: &PciDevice, _ix: usize) -> u64 { 0 }
     pub fn first_memory_bar(d: &PciDevice) -> u64 {
         let mut i = 0;
         while i < 6 {

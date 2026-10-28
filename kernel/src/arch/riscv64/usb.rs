@@ -132,6 +132,8 @@ static PINCTRL_BASE: AtomicU64 = AtomicU64::new(0);
 static STGCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static STG_SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
 static XHCI_BASE: AtomicU64 = AtomicU64::new(0);
+/// The xHCI window's length, from the same tree node (`window_len`).
+static XHCI_LEN: AtomicU64 = AtomicU64::new(0);
 static SYSCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static SYS_SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
 static PHY_BASE: AtomicU64 = AtomicU64::new(0);
@@ -172,10 +174,12 @@ fn configure_pins() {
     p_str("riscv64: usb - port power and the usb2/3 switch driven\n");
 }
 
-pub(super) fn set_bases(stgcrg: u64, syscon: u64, xhci: u64, syscrg: u64, sys_syscon: u64, phy: u64) {
+pub(super) fn set_bases(stgcrg: u64, syscon: u64, xhci: u64, xhci_len: u64, syscrg: u64, sys_syscon: u64,
+                        phy: u64) {
     STGCRG_BASE.store(stgcrg, Ordering::Relaxed);
     STG_SYSCON_BASE.store(syscon, Ordering::Relaxed);
     XHCI_BASE.store(xhci, Ordering::Relaxed);
+    XHCI_LEN.store(xhci_len, Ordering::Relaxed);
     SYSCRG_BASE.store(syscrg, Ordering::Relaxed);
     SYS_SYSCON_BASE.store(sys_syscon, Ordering::Relaxed);
     PHY_BASE.store(phy, Ordering::Relaxed);
@@ -190,6 +194,14 @@ pub(super) fn set_bases(stgcrg: u64, syscon: u64, xhci: u64, syscrg: u64, sys_sy
 /// distinction the display stage learned the expensive way.
 pub fn window() -> u64 {
     XHCI_BASE.load(Ordering::Relaxed)
+}
+
+/// How long that window is, as the device tree's `reg` says, or zero if it did not say. This
+/// controller is on the SoC, not a bus, so its size is the tree's to give rather than a BAR's to
+/// measure; it is what `pci::bar_len` answers for it, so the `xhci` grant is the controller and no more
+/// (backlog/85).
+pub fn window_len() -> u64 {
+    XHCI_LEN.load(Ordering::Relaxed)
 }
 
 /// Bring the USB block up far enough that its xHCI half answers, and say whether it did.

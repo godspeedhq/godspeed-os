@@ -222,6 +222,50 @@ fn cfg_write(bus: u8, dev: u8, func: u8, off: u16, val: u32) {
     wr(EXT_CFG_DATA + (off as u64 & 0xFFF), val);
 }
 
+/// The length of memory BAR `ix` of the device at `bdf` (`bus << 8 | dev << 3 | func`), in bytes, or 0
+/// when it cannot be told: no root complex, the bridge's own header (bus 0), a bus the bridge does not
+/// forward, an I/O BAR, or a BAR the device does not implement.
+///
+/// x86's `pci::bar_len` on this root complex's index/data pair (backlog/85): with the device's memory
+/// decode off, write all ones to the BAR, read back the mask of the address bits it implements, then put
+/// the BAR and the decode back. The whole sequence is ONE hold of `CFG_LOCK`, with the index latched once,
+/// so a capability holder's `cfg_read_gated` on another core never sees the BAR holding the mask. Only
+/// the command half of the command/status dword is written back, because the status half is
+/// write-1-to-clear. Called at grant time for the device being granted, which nothing else is driving.
+pub fn bar_len(bdf: u32, ix: usize) -> u64 {
+    let (bus, dev, func) = ((bdf >> 8) & 0xFF, (bdf >> 3) & 0x1F, bdf & 0x07);
+    if ix >= 6 || bus == 0 || bus > SUBORDINATE_BUS
+        || !RC_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
+        return 0;
+    }
+    let idx = (bus << 20) | (dev << 15) | (func << 12);
+    let off = 0x10 + ix as u64 * 4;
+    let (lo_mask, hi_mask, is64) = {
+        let _g = CFG_LOCK.lock();
+        wr(EXT_CFG_INDEX, idx);
+        let cmd = rd(EXT_CFG_DATA + 0x04) & 0xFFFF;
+        wr(EXT_CFG_DATA + 0x04, cmd & !0x2); // memory decode off while the BAR holds a mask
+        let lo = rd(EXT_CFG_DATA + off);
+        wr(EXT_CFG_DATA + off, 0xFFFF_FFFF);
+        let lo_mask = rd(EXT_CFG_DATA + off);
+        wr(EXT_CFG_DATA + off, lo);
+        let is64 = lo & 0x6 == 0x4 && ix < 5;
+        let mut hi_mask = 0xFFFF_FFFF;
+        if is64 {
+            let hi = rd(EXT_CFG_DATA + off + 4);
+            wr(EXT_CFG_DATA + off + 4, 0xFFFF_FFFF);
+            hi_mask = rd(EXT_CFG_DATA + off + 4);
+            wr(EXT_CFG_DATA + off + 4, hi);
+        }
+        wr(EXT_CFG_DATA + 0x04, cmd);
+        (lo_mask, hi_mask, is64)
+    };
+    if lo_mask & 0x1 != 0 { return 0; } // an I/O BAR: not a memory window
+    if lo_mask & 0xFFFF_FFF0 == 0 && (!is64 || hi_mask == 0) { return 0; }
+    let mask = ((hi_mask as u64) << 32) | (lo_mask & 0xFFFF_FFF0) as u64;
+    (!mask).wrapping_add(1)
+}
+
 // --- Bring-up ---------------------------------------------------------------------------------
 
 /// Bring the root complex up and return the first VIA xHCI controller found behind it.
