@@ -4,9 +4,10 @@
 `spawn[mmio]: 'xhci' BAR 0x600000000 ... 4096 bytes, the BAR's own size` (the VL805, where it had 64 KiB),
 and the VisionFive's 65536 bytes - from its device-tree `reg`, because that `xhci` is the JH7110's own
 Cadence controller and not on PCIe at all, which this entry had wrong. USB worked inside both windows,
-and QEMU `virt` showed the probe across three `xhci` respawns. Left as it was, and said here so it is
-not mistaken for covered: the VisionFive's `nic-driver` (its SoC Ethernet, also off-bus) keeps the fixed
-window, and its spawn line says so.
+and QEMU `virt` showed the probe across three `xhci` respawns. The VisionFive's `nic-driver` (its SoC
+Ethernet, also off-bus) kept the fixed window at first; on 2026-10-28, later, it too is sized from its
+device-tree `reg` (`net::window_len`), built and QEMU-checked on `virt` for the PCI path, its VisionFive card
+owed.
 
 **Previous status: OPEN - FIX BUILT 2026-10-28 (`cee3dca0`), QEMU-verified on riscv64 `virt` (`xhci` 16384 bytes, e1000 131072, each the BAR), awaiting the Pi 4 and VisionFive cards.** The VisionFive's `xhci` turned out NOT to be PCIe: it is the JH7110's Cadence controller, sized from its device-tree `reg`. *Was:* OPEN, 2026-10-13. Moved out of `backlog/fixed/80` (K1) when that entry was closed, because
 it was the one part of K1 left open and was recorded only there.

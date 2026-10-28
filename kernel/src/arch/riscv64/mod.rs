@@ -759,10 +759,10 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
                 .map(|r| r.base)
                 .unwrap_or(0);
             let mut w13: [Option<u32>; 0] = [];
-            let mac = tree
+            let (mac, mac_len) = tree
                 .find_compatible("starfive,jh7110-dwmac", &[], &mut w13)
-                .map(|r| r.base)
-                .unwrap_or(0);
+                .map(|r| (r.base, r.size))
+                .unwrap_or((0, 0));
             // The system controller again, looked up here rather than carried down from the display
             // block that found it first: this stage runs whether or not that one did, and a base
             // borrowed across an `if` it does not control is a base that is zero on the day the
@@ -772,7 +772,7 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
                 .find_compatible("starfive,jh7110-sys-syscon", &[], &mut w14)
                 .map(|r| r.base)
                 .unwrap_or(0);
-            net::set_bases(aon, sys.unwrap_or(0), mac, net_syscon);
+            net::set_bases(aon, sys.unwrap_or(0), mac, mac_len, net_syscon);
             net::init();
         }
 
@@ -3299,10 +3299,12 @@ pub mod pci {
     pub fn bar_len(d: &PciDevice, ix: usize) -> u64 {
         if ix >= 6 || d.index >= MAX_DEVICES || d.bar[ix] == 0 { return 0; }
         // Not on a bus (`xhci()`'s and `nic()`'s SoC fallbacks, `bdf` 0xFFFF): there is no BAR to probe.
-        // The SoC `xhci` has the size the device tree gave it; anything else keeps the fixed window.
+        // Each has the size its device-tree node gave it; anything else keeps the fixed window.
         if d.bdf == 0xFFFF {
-            let w = super::usb::window();
-            return if w != 0 && d.bar[ix] == w { super::usb::window_len() } else { 0 };
+            let (usb, mac) = (super::usb::window(), super::net::window());
+            return if usb != 0 && d.bar[ix] == usb { super::usb::window_len() }
+                   else if mac != 0 && d.bar[ix] == mac { super::net::window_len() }
+                   else { 0 };
         }
         let slot = &DEV_BAR_LEN[d.index * 6 + ix];
         let known = slot.load(Ordering::Relaxed);

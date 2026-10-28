@@ -154,12 +154,15 @@ const PHY_INTF_SEL_RGMII: u32 = 1;
 static AONCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static SYSCRG_BASE: AtomicU64 = AtomicU64::new(0);
 static MAC_BASE: AtomicU64 = AtomicU64::new(0);
+/// The MAC window's length, from the same device-tree node (`window_len`).
+static MAC_LEN: AtomicU64 = AtomicU64::new(0);
 static SYSCON_BASE: AtomicU64 = AtomicU64::new(0);
 
-pub(super) fn set_bases(aoncrg: u64, syscrg: u64, mac: u64, syscon: u64) {
+pub(super) fn set_bases(aoncrg: u64, syscrg: u64, mac: u64, mac_len: u64, syscon: u64) {
     AONCRG_BASE.store(aoncrg, Ordering::Relaxed);
     SYSCRG_BASE.store(syscrg, Ordering::Relaxed);
     MAC_BASE.store(mac, Ordering::Relaxed);
+    MAC_LEN.store(mac_len, Ordering::Relaxed);
     SYSCON_BASE.store(syscon, Ordering::Relaxed);
 }
 
@@ -170,6 +173,13 @@ pub(super) fn set_bases(aoncrg: u64, syscrg: u64, mac: u64, syscon: u64) {
 /// nothing.
 pub fn window() -> u64 {
     MAC_BASE.load(Ordering::Relaxed)
+}
+
+/// How long that window is, as the device tree's `reg` says, or zero if it did not say. The MAC is on the
+/// SoC, not a bus, so its size is the tree's to give; it is what `pci::bar_len` answers for it, so the
+/// `nic-driver` grant is the MAC and no more (backlog/fixed/85, its `xhci` twin `usb::window_len`).
+pub fn window_len() -> u64 {
+    MAC_LEN.load(Ordering::Relaxed)
 }
 
 /// Bring the ethernet MAC up far enough to answer, and say whether it did.
