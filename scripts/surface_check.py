@@ -64,6 +64,12 @@ SHELL = os.path.join(ROOT, "services", "shell", "src", "main.rs")
 SCHEMA = os.path.join(ROOT, "contracts", "schema", "service.schema.json")
 # Where a record producer can live: the shell, the standard library, and a service that sends records.
 RECORD_TOPS = ("services", "stdlib", "examples")
+# Test and debug tools: utilities that exist to exercise or inspect the system, outside the promise like the
+# test suites (docs/compatibility.md, "What is not covered"; operator 2026-10-28). They answer `help` like any
+# utility; they may change or go without a recorded break. A NEW one is added here deliberately, with the doc.
+TEST_TOOLS = ("chaos", "churn", "fcap", "spawncap", "spawnwired")
+# ...and the subcommands of a covered utility that are its debug view rather than its job (`wifi debug`).
+TEST_WORDS = ("debug",)
 # A record's columns, written literally: a `Table`, or `godspeed`'s answer table (`Rows`, `.columns`).
 RECORD_SITE = re.compile(r"(?:Table::new|Rows::new|\.columns)\(&\[([^\]]*)\]\)")
 # Schema keywords that NARROW what validates: a new one, or a changed value, can refuse a contract that passed.
@@ -358,6 +364,10 @@ class Reader:
             line = f"{k} {name}{gens}"
             if derives:
                 line += " derive(" + ",".join(derives) + ")"
+            # `non_exhaustive` is what makes a new field growth rather than a break for a caller outside gs
+            # (docs/compatibility.md Q1), so losing it is a change like losing a derive.
+            if any("non_exhaustive" in a for a in attrs):
+                line += " non_exhaustive"
             self.add(mod, tag + line)
             if tuple_fields is not None:
                 for idx, f in enumerate(split_top(tuple_fields)):
@@ -575,7 +585,8 @@ def util_lines(src):
         problems.append("services/shell/src/main.rs: no `UTILS` list")
     else:
         for name in re.findall(r'"([^"]+)"', utils):
-            lines.add(f"util name {name}")
+            if name not in TEST_TOOLS:
+                lines.add(f"util name {name}")
     sub = const_list(src, "SUBCMD_FIRST")
     if sub is None:
         problems.append("services/shell/src/main.rs: no `SUBCMD_FIRST` table")
@@ -590,7 +601,8 @@ def util_lines(src):
                     problems.append(f"services/shell/src/main.rs: SUBCMD_FIRST `{m.group(1)}` names "
                                     f"`{m.group(2)}`, which is not a list here")
             for w in words:
-                lines.add(f"util sub {m.group(1)} {w}")
+                if m.group(1) not in TEST_TOOLS and w not in TEST_WORDS:
+                    lines.add(f"util sub {m.group(1)} {w}")
     return lines, problems
 
 
@@ -747,6 +759,8 @@ MUTANTS = [
     ("a derive dropped (Copy)", "stdlib/rust/src/addr.rs", "#[derive(Copy, Clone, PartialEq, Eq, Debug)]",
      "#[derive(Clone, PartialEq, Eq, Debug)]", "break"),
     ("a public field made private", "stdlib/rust/src/fs.rs", "pub is_dir: bool", "is_dir: bool", "break"),
+    ("#[non_exhaustive] removed from a returned struct", "stdlib/rust/src/fs.rs",
+     "#[non_exhaustive]\npub struct Stat {", "pub struct Stat {", "break"),
     ("an Error variant removed", "stdlib/rust/src/error.rs", "    Busy,", "", "break"),
     ("gs::driver: a wait signature changed", "stdlib/rust/src/driver/wait.rs",
      "pub fn until(ctx: &ServiceContext, budget: Budget,", "pub fn until(ctx: &ServiceContext, budget: u64,", "break"),

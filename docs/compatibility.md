@@ -1,7 +1,7 @@
 # Compatibility: what GodspeedOS promises not to break
 
 **Status: the covered surface is DECIDED (operator, 2026-10-26) and GATED (2026-10-28, below); the policy
-is DRAFTED (2026-10-28, below), with two questions open for the operator.** This is step 1 of the path to v1 in
+is DECIDED (2026-10-28, below).** It takes effect at v1. This is step 1 of the path to v1 in
 [`backlog/71`](../backlog/71-a-v1-compatibility-promise-is-not-credible-yet-and-the-path-to-one.md). No
 promise is in force yet: GodspeedOS is `v0.x`, and stays `v0.x` until the gate exists and a stretch of
 releases has held it (`backlog/71`, steps 3 to 5).
@@ -38,6 +38,9 @@ These change when the system needs them to, and are named so nobody mistakes the
 - **The kernel**, its queries (`InspectKernel` numbers) and its log text.
 - **A utility's human-readable output**: wording, layout and colour. Only its record fields are covered.
 - **The test suites and the enforcement scripts.**
+- **The test and debug tools** (operator, 2026-10-28): `chaos`, `churn`, `fcap`, `spawncap`, `spawnwired`, and
+  every utility's `debug` subcommand (`wifi debug`, `audio debug`). They exist to exercise or inspect the
+  system. They answer `help` like any utility, and may change or go without a recorded break.
 
 ## How it is held
 
@@ -63,7 +66,7 @@ builds) and compares what the source defines with the snapshot,
   after v1 the policy below says when a break is allowed at all.
 - **The contract schema runs the other way for narrowing**: a new required key, or a new or tighter
   constraint, is the break (a contract that validated stops validating), and dropping one is growth.
-- **It tests itself**: 20 mutants of the real sources (a renamed function, a dropped `Copy`, a removed
+- **It tests itself**: mutants of the real sources (a renamed function, a dropped `Copy`, a removed
   column, a new required key, a parameter only renamed, an SDK method `gs` does not re-export) run on every
   build in memory, and each must be reported as what it is.
 
@@ -78,16 +81,16 @@ builds) and compares what the source defines with the snapshot,
   file** by `scripts/platform_file.py`.
 - **`ServiceContext`'s methods.** `gs` re-exports `ServiceContext` as the handle every program is given, and
   the gate holds that name; its methods are the raw system calls, which are the SDK, and are not covered.
-- **Adding a variant to an enum, or a public field to a struct,** is recorded as growth. In Rust it can break
-  a caller that matches every variant or builds the struct by its fields. Whether that is allowed is the
-  policy's to say.
+- **Adding a variant to an enum, or a public field to a struct,** is recorded as growth. That is only true
+  for a caller outside `gs` when the type is `#[non_exhaustive]` (Q1, below); the gate records the attribute,
+  so losing it is a break. A type without it should not grow.
 
 ## The policy
 
-**Status: DRAFTED 2026-10-28, not yet approved.** The two rules `backlog/71` settled (security and soundness
-fixes may break; anything else removed is deprecated for one release first) are written out below. The
-questions the gate raised that are the operator's to answer are listed after them, each with a proposal. No
-part of this is in force before v1: until then the gate records every break with its reason and allows it.
+**Status: DECIDED 2026-10-28 (operator).** The two rules `backlog/71` settled (security and soundness fixes
+may break; anything else removed is deprecated for one release first) are written out below, then the four
+questions the gate raised and how each was answered. None of it is in force before v1: until then the gate
+records every break with its reason and allows it.
 
 ### From v1
 
@@ -108,28 +111,23 @@ part of this is in force before v1: until then the gate records every break with
 4. **The version says which happened.** A `v1.x` release only grows the surface or makes the removals above.
    A break that is neither a security or soundness fix nor a finished deprecation is `v2`.
 
-### Open questions, with proposals
+### The four questions, answered 2026-10-28
 
-- **Q1. A new enum variant or a new public field is recorded as growth, but Rust can break on it.** A caller
-  that matches every variant of `gs::Error`, or builds `gs::fs::Stat` by its fields, stops compiling when one
-  is added. *Proposal:* before v1, mark the public enums meant to grow (`Error`, `gs::trace::Outcome`,
-  `gs::driver::bus::UsbError`) and the structs `gs` hands back (`Stat`, `Check`, `Scrub`, `Drive`,
-  `DirEntry`, `Listing`, `gs::net::Status`) `#[non_exhaustive]`, so adding one really is growth; the gate
-  then records `non_exhaustive` and treats removing it as a break. Doing that before v1 is itself a break,
-  which is the reason to do it now.
-- **Q2. The gate holds every utility in `UTILS`, test and debug tools included** (`chaos`, `churn`, `fcap`,
-  `spawncap`, `spawnwired`, and subcommands such as `wifi debug`, `audio debug`, `fcap reuse`). The list of
-  what is not covered names the test suites. *Proposal:* name these as test tools, outside the promise, and
-  have the gate leave them out.
-- **Q3. `ServiceContext`'s methods: no promise is made about them.** They are the SDK, which is not covered,
-  and the gate holds only the name `gs` re-exports. Nothing more is promised unless the operator decides
-  otherwise (2026-10-28: undecided, so the default stands - no promise).
-
-**Settled 2026-10-28 (operator): no calendar promise.** "One release" in rule 3 means the next release,
-whenever it comes out - "a release comes out when a release comes out". No minimum time is promised between
-a deprecation and the removal.
+- **Q1. A new variant or field is growth only for a `#[non_exhaustive]` type. Yes, done.** A caller outside
+  `gs` that matches every variant of an enum, or builds a struct by its fields, stops compiling when one is
+  added. So the enums meant to grow (`gs::Error`, `gs::trace::Outcome`, `gs::driver::bus::UsbError`) and the
+  structs `gs` hands back (`gs::fs::Stat`, `Check`, `Scrub`, `Drive`, `DirEntry`, `Listing`,
+  `gs::net::Status`) are `#[non_exhaustive]`, and the gate holds the attribute. A caller matches with a
+  catch-all arm (`wifi-usb` was the one that needed it) and reads fields rather than building the struct.
+  Done before v1 because it is itself a break; recorded in `scripts/SURFACE-BREAKS.txt`.
+- **Q2. The test and debug tools are outside the promise. Yes, done:** listed under "What is not covered",
+  and left out by the gate (`TEST_TOOLS` and `TEST_WORDS` in `scripts/surface_check.py`). A new one is added
+  there deliberately, with this document.
+- **Q3. No promise about `ServiceContext`'s methods.** They are the SDK; the gate holds only the name `gs`
+  re-exports.
+- **Q4. No calendar promise.** "One release" in rule 3 means the next release, whenever it comes out - "a
+  release comes out when a release comes out". No time is promised between a deprecation and the removal.
 
 ## What is still to do
 
-- **The policy's two open questions** above, Q1 and Q2 (`backlog/71` step 4); then it is in force from v1.
 - **The soak** (`backlog/71` step 5): releases in which the gate never has to accept a breaking change.

@@ -215,6 +215,7 @@ pub fn status(ctx: &ServiceContext) -> Result<Status, Error> {
 
 /// How an exchange ENDED. One row per exchange, so this is its whole story.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum Outcome {
     /// A request went out.
     Request,

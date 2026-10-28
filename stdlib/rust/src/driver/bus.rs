@@ -31,6 +31,7 @@ const SYNC_MAX: u32 = 8;
 
 /// Why a transfer did not happen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum UsbError {
     /// The host has no device bound for this driver: unplugged, or not enumerated yet.
     NoDevice,

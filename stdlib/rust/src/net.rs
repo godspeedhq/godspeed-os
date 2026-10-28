@@ -127,6 +127,7 @@ pub const TCP_SECS: i64 = 20;
 /// A snapshot, not a subscription: `net-stack` re-reads the link when asked, so a cable pulled since
 /// the last call shows up on the next one rather than being cached into a comfortable lie.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct Status {
     /// Our address. All zeroes means unconfigured.
     pub ip: Ipv4,

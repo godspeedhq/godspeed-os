@@ -410,7 +410,7 @@ os/
                          #   `gs` + `gs::driver` items, utility names, subcommands and record columns, and the
                          #   contract schema, against SURFACE.baseline.txt. Growth is recorded (`--bless`); a
                          #   removal or change fails until `--accept-break "<reason>"` logs it in
-                         #   SURFACE-BREAKS.txt. Runs its own 20 mutants every time
+                         #   SURFACE-BREAKS.txt. Runs its own mutants every time
     quit_wait_check.py   #   NO SILENT WAIT in the shell, which observes every command: each wait reads
                          #   the command's watch or says on the line above why it cannot trap anyone
                          #   (`// quit-ok:`), and those exceptions may fall, not rise (backlog/fixed/89)

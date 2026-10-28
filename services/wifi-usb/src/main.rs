@@ -81,6 +81,8 @@ pub(crate) fn said(e: UsbError) -> &'static str {
         UsbError::Failed => "the transfer did not complete",
         UsbError::BadRequest => "the host refused the request as malformed",
         UsbError::Host(e) => e.as_str(),
+        // `UsbError` is `#[non_exhaustive]` (docs/compatibility.md): a reason added later says itself.
+        other => other.as_str(),
     }
 }
 

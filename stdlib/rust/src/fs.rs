@@ -56,6 +56,7 @@ pub const SWEEP_SECS: i64 = 120;
 
 /// What [`Fs::check`] repaired, and what it found.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct Check {
     /// Files reachable from the root.
     pub files: u32,
@@ -74,6 +75,7 @@ pub struct Check {
 
 /// What [`Fs::scrub`] found. Read-only: it changes nothing on disk.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct Scrub {
     /// Files reachable from the root.
     pub files: u32,
@@ -87,6 +89,7 @@ pub struct Scrub {
 
 /// What [`Fs::drive`] reports about the storage `fs` serves.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct Drive {
     /// The device's size in 512-byte sectors, as `fs` re-derives it from the block driver on each ask.
     /// ZERO means there is no storage device at all - not a device of size zero.
@@ -181,6 +184,7 @@ pub const DIR_PAGE_MAX: u16 = 512;
 /// `visited` cannot be read without seeing `complete`, and that is the whole point of it being a
 /// struct: a partial listing that reads as a full one is the failure this type exists to prevent.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct Listing {
     /// How many entries the closure was shown.
     pub visited: usize,
@@ -197,6 +201,7 @@ pub struct Listing {
 /// promised otherwise would be lying about the filesystem it reads. [`DirEntry::name_str`] is the
 /// convenience for the ordinary case.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct DirEntry<'n> {
     /// The entry's name within its directory. Never contains a `/`.
     pub name: &'n [u8],
@@ -267,6 +272,7 @@ pub struct Fs<'a> {
 
 /// What [`stat`](Fs::stat) found.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub struct Stat {
     /// Size in bytes. Zero for a directory.
     pub size: u64,

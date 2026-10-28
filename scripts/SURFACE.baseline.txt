@@ -229,7 +229,7 @@ gs driver::arena use granted::*
 gs driver::arena variant Why::Alignment
 gs driver::arena variant Why::Empty
 gs driver::arena variant Why::Full
-gs driver::bus enum UsbError derive(Clone,Copy,Debug,Eq,PartialEq)
+gs driver::bus enum UsbError derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
 gs driver::bus field Bound.gen:u32
 gs driver::bus field Bound.pid:u16
 gs driver::bus field Bound.vid:u16
@@ -316,7 +316,7 @@ gs driver::wait struct Budget derive(Clone,Copy,Debug,Eq,PartialEq)
 gs driver::wait struct Deadline<'a>
 gs driver::wait struct Since derive(Clone,Copy)
 gs driver::wait struct TimedOut derive(Clone,Copy,Debug,Eq,PartialEq)
-gs error enum Error derive(Clone,Copy,Debug,Eq,PartialEq)
+gs error enum Error derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
 gs error method Error::fn as_str(self)->&'static str
 gs error method Error::fn retry_is_safe(self)->bool
 gs error method Error::fn service_answered(self)->bool
@@ -406,13 +406,13 @@ gs fs method Fs::fn watching(mut self,_:&'a dyn call::Watch)->Fs<'a>
 gs fs method Fs::fn with_notice(_:&'a ServiceContext,_:&'a dyn Fn())->Fs<'a>
 gs fs method Fs::fn write(&mut self,_:impl AsRef<[u8]>,_:&[u8])->Result<(),Error>
 gs fs method Fs::fn write_at(&mut self,_:impl AsRef<[u8]>,_:u64,_:&[u8])->Result<(),Error>
-gs fs struct Check derive(Clone,Copy,Debug,Eq,PartialEq)
-gs fs struct DirEntry<'n> derive(Clone,Copy,Debug,Eq,PartialEq)
-gs fs struct Drive derive(Clone,Copy,Debug,Eq,PartialEq)
+gs fs struct Check derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
+gs fs struct DirEntry<'n> derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
+gs fs struct Drive derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
 gs fs struct Fs<'a>
-gs fs struct Listing derive(Clone,Copy,Debug,Eq,PartialEq)
-gs fs struct Scrub derive(Clone,Copy,Debug,Eq,PartialEq)
-gs fs struct Stat derive(Clone,Copy,Debug,Eq,PartialEq)
+gs fs struct Listing derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
+gs fs struct Scrub derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
+gs fs struct Stat derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
 gs handover const EARLY_MAX: usize
 gs handover const KEYED: u32
 gs handover const KEY_MASK: u32
@@ -547,7 +547,7 @@ gs net struct Conn<'c,'n:'c,'a:'n>
 gs net struct Listener<'n,'a:'n>
 gs net struct Net<'a>
 gs net struct Socket<'n,'a:'n>
-gs net struct Status derive(Clone,Copy,Debug,Eq,PartialEq)
+gs net struct Status derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
 gs net struct Stream<'n,'a:'n>
 gs net use crate::addr::Ipv4
 gs prelude use crate::error::Error
@@ -660,7 +660,7 @@ gs task variant ClockSource::Ntp
 gs task variant ClockSource::Rtc
 gs task variant ClockSource::Unset
 gs trace const SINK: &str
-gs trace enum Outcome derive(Clone,Copy,Debug,Eq,PartialEq)
+gs trace enum Outcome derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
 gs trace field Status.capacity:u64
 gs trace field Status.dropped:u64
 gs trace field Status.recorded:u64
@@ -907,8 +907,6 @@ util name avg
 util name background
 util name caps
 util name cd
-util name chaos
-util name churn
 util name clear
 util name copy
 util name cores
@@ -922,7 +920,6 @@ util name drives
 util name echo
 util name edit
 util name events
-util name fcap
 util name find
 util name first
 util name fmt
@@ -966,8 +963,6 @@ util name shutdown
 util name sock
 util name sort
 util name spawn
-util name spawncap
-util name spawnwired
 util name status
 util name sum
 util name tcp
@@ -982,7 +977,6 @@ util name where
 util name wifi
 util name write
 util sub ask evidence
-util sub audio debug
 util sub audio hardware
 util sub audio info
 util sub audio mute
@@ -999,15 +993,6 @@ util sub audio volume
 util sub busiest mem
 util sub busiest queue
 util sub busiest restarts
-util sub chaos flood-storm
-util sub chaos kill-storm
-util sub chaos link-flap
-util sub chaos max-carnage
-util sub chaos mem-pressure
-util sub chaos spawn-storm
-util sub churn reset
-util sub churn tear
-util sub churn verify
 util sub cores ticks
 util sub date epoch
 util sub date sync
@@ -1023,8 +1008,6 @@ util sub events log
 util sub events metrics
 util sub events persist
 util sub events status
-util sub fcap gsreuse
-util sub fcap reuse
 util sub from json
 util sub godspeed check
 util sub godspeed cleanup
@@ -1073,7 +1056,6 @@ util sub trace chain
 util sub trace deps
 util sub trace endpoint
 util sub trace endpoints
-util sub wifi debug
 util sub wifi forget
 util sub wifi hardware
 util sub wifi info

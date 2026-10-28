@@ -220,6 +220,8 @@ impl<'l> Dongle<'l> {
             UsbError::BadRequest => "the host has no such bulk OUT, or refused the transfer as malformed",
             UsbError::Failed => "the device or the bus did not take it",
             UsbError::Host(e) => e.as_str(),
+            // `UsbError` is `#[non_exhaustive]` (docs/compatibility.md): a reason added later says itself.
+            other => other.as_str(),
         })
     }
 

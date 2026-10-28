@@ -4,8 +4,8 @@
 and promise no breaking changes in the future?". The answer was not yet, and why; this item is the plan.
 The bar and the order were settled 2026-10-11 (below). Built so far: the one-way ratchet and the
 SDK-dependency gate (step 2), the covered surface decided (step 1, 2026-10-26) and the surface gate (step 3,
-2026-10-28); the policy drafted (step 4, 2026-10-28, two questions open). Still to do: those
-answers, and the soak (step 5).**
+2026-10-28); the policy decided (step 4, 2026-10-28). Still to do: the soak (step 5), which the operator
+starts.**
 
 ## Why not yet, measured rather than felt
 
@@ -175,11 +175,11 @@ breaking change; then v1.
    calls that `gs` already covers (1138 across 28 crates at the start, a new crate held to zero), so the
    reshape in step 2 can only move forward.
    **Built 2026-10-28:** `scripts/surface_check.py`, on the build path, holds `scripts/SURFACE.baseline.txt` -
-   1085 lines: the public `gs` items (`gs::driver` included, and the SDK items `gs` re-exports, such as
+   1085 lines when it was built: the public `gs` items (`gs::driver` included, and the SDK items `gs` re-exports, such as
    `Table`), the utility names and subcommands, the record columns each producer builds, and the contract
    schema's keys, types, values and constraints. Growth is recorded with `--bless`; a removal or a change
-   fails until `--accept-break "<reason>"` records it, dated, in `scripts/SURFACE-BREAKS.txt`. It runs 20
-   mutants of the real sources on every build, so a gate that stopped seeing is caught. What it cannot see -
+   fails until `--accept-break "<reason>"` records it, dated, in `scripts/SURFACE-BREAKS.txt`. It runs
+   its own mutants of the real sources on every build, so a gate that stopped seeing is caught. What it cannot see -
    meaning, the gsh language, `ServiceContext`'s methods - is listed in its header and in
    `docs/compatibility.md`.
 4. **Write the compatibility policy down**, with its exceptions: security and soundness fixes may break;
@@ -187,8 +187,9 @@ breaking change; then v1.
    **Drafted 2026-10-28** in [`docs/compatibility.md`](../docs/compatibility.md), "The policy": the two
    settled rules written out, how a deprecation shows for each kind of item, and four questions the gate
    raised that were the operator's. Settled the same day: no calendar promise ("one release" is the next one,
-   whenever it comes out) and no promise about `ServiceContext`'s methods. Open: enum and struct growth and
-   `#[non_exhaustive]`, and whether the test tools in `UTILS` are covered.
+   whenever it comes out) and no promise about `ServiceContext`'s methods. Then, the same day: the growable enums
+   and returned structs made `#[non_exhaustive]`, and the test and debug tools taken out of the promise -
+   both recorded in `scripts/SURFACE-BREAKS.txt`. Step 4 is done.
 5. **Soak**: a stretch of real work - the VisionFive and Pi 2 radios are the obvious candidates - with no
    change to the covered surface, so the freeze is shown to hold rather than asserted.
 

@@ -42,6 +42,7 @@
 /// Deliberately small. Each variant exists because a caller would do something DIFFERENT about it;
 /// a distinction nobody would act on belongs in a log line, not in a type.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum Error {
     // ---- the service answered, and said no -------------------------------------------------
     /// No such file or directory. The service is healthy; the path is not there.

@@ -1,0 +1,44 @@
+# Every removal or change to the covered surface, with its reason. Appended by
+# `scripts/surface_check.py --accept-break`; never edited (docs/compatibility.md).
+
+## 2026-10-28: test and debug tools taken out of the promise (operator, 2026-10-28, docs/compatibility.md Q2): chaos, churn, fcap, spawncap, spawnwired, and every utility's debug subcommand
+- util name chaos
+- util name churn
+- util name fcap
+- util name spawncap
+- util name spawnwired
+- util sub audio debug
+- util sub chaos flood-storm
+- util sub chaos kill-storm
+- util sub chaos link-flap
+- util sub chaos max-carnage
+- util sub chaos mem-pressure
+- util sub chaos spawn-storm
+- util sub churn reset
+- util sub churn tear
+- util sub churn verify
+- util sub fcap gsreuse
+- util sub fcap reuse
+- util sub wifi debug
+
+## 2026-10-28: #[non_exhaustive] on the enums gs means to grow and the structs it hands back (operator, 2026-10-28, docs/compatibility.md Q1), so a new variant or field is growth for a caller outside gs
+- gs driver::bus enum UsbError derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs error enum Error derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs fs struct Check derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs fs struct DirEntry<'n> derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs fs struct Drive derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs fs struct Listing derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs fs struct Scrub derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs fs struct Stat derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs net struct Status derive(Clone,Copy,Debug,Eq,PartialEq)
+- gs trace enum Outcome derive(Clone,Copy,Debug,Eq,PartialEq)
++ gs driver::bus enum UsbError derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs error enum Error derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs fs struct Check derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs fs struct DirEntry<'n> derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs fs struct Drive derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs fs struct Listing derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs fs struct Scrub derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs fs struct Stat derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs net struct Status derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
++ gs trace enum Outcome derive(Clone,Copy,Debug,Eq,PartialEq) non_exhaustive
