@@ -317,10 +317,31 @@ pub fn cycles_to_us(cycles: u64) -> u64 {
     cycles.saturating_mul(10_000) / q
 }
 
-/// Called by x86's wake IPI stub before `timer_tick_from_irq`; empty unless `wake-trace` is built.
+/// Called by x86's wake IPI stub before `timer_tick_from_irq`. A wake is not a tick (backlog/90 D12), so it
+/// marks the entry as one; it also counts the wake when `wake-trace` is built.
 pub extern "C" fn wake_ipi_taken() {
+    next_entry_is_not_a_tick();
     #[cfg(feature = "wake-trace")]
     wake_trace::note_taken(current_core_id());
+}
+
+/// Per core: is the entry about to run `timer_tick_from_irq` something OTHER than this core's periodic
+/// timer? Set by the arch just before such an entry and taken (cleared) at the top of the handler.
+///
+/// backlog/90 D12: the tick clock (`MONOTONIC_TICKS`) advanced on EVERY core-0 entry to the handler,
+/// whatever caused it, so a wake IPI on x86 or a sub-tick wake on arm32 counted as 10 ms that had not
+/// passed - at a thousand cross-core wakes a second a `shutdown 10m` fell due in under a minute, and every
+/// sleep, `recv_timeout` and CallDeadline ran short with it. Such an entry still reschedules (that is why it
+/// enters here); it does not advance the clock, scan the deadlines, or re-arm a one-shot timer, which on
+/// x86's TSC-deadline mode would push the core's next real tick back.
+static ENTRY_NOT_A_TICK: PerCore<AtomicBool> = PerCore::new();
+
+/// Mark this core's next `timer_tick_from_irq` entry as not a timer tick (see `ENTRY_NOT_A_TICK`).
+/// For an arch's non-timer entries; a no-op before the per-core state exists.
+pub extern "C" fn next_entry_is_not_a_tick() {
+    if ENTRY_NOT_A_TICK.initialised() {
+        ENTRY_NOT_A_TICK.get(current_core_id()).store(true, Ordering::Relaxed);
+    }
 }
 
 /// WAKE TRACE - feature `wake-trace`, OFF by default, a diagnostic for `backlog/93`.
@@ -1014,6 +1035,7 @@ pub fn init_arenas(n: usize) {
     CORE_DEAD_CTX.init_with(n, |_| ZERO_CTX);
     CORE_SCHED_CTX.init_with(n, |_| ZERO_CTX);
     CORE_CURRENT.init_with(n, |_| AtomicUsize::new(IDLE));
+    ENTRY_NOT_A_TICK.init_with(n, |_| AtomicBool::new(false));
     CORE_ACTIVE_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_TOTAL_TICKS.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
     CORE_LAST_TICK_TSC.init_with(n, |_| CachePaddedU64(AtomicU64::new(0)));
@@ -1869,6 +1891,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
     // own dispatcher; on x86 there is no such funnel, so the timer path stamps it here (vector 32).
     crate::arch::imp::note_irq(32);
     let cid = current_core_id();
+    // Is this the core's periodic timer, or another entry that only reschedules (backlog/90 D12)? Taken
+    // here, once, so a mark never outlives the entry it was set for.
+    let a_tick = !(ENTRY_NOT_A_TICK.initialised() && ENTRY_NOT_A_TICK.get(cid).swap(false, Ordering::Relaxed));
     // Re-entry proves the previous switch completed: this core is off whatever it was
     // leaving, so release that claim. See `CORE_LEAVING`.
     core_finished_leaving(cid);
@@ -1897,7 +1922,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // In periodic mode this is a no-op (TSC_DEADLINE_MODE stays false).
         // SAFETY: IF=0; ring-0; TSC_DEADLINE_MODE=true implies TSC-Deadline
         // was verified at init_local_apic time and TSC_TICKS_PER_QUANTUM > 0.
-        if crate::arch::imp::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
+        // Only on a real tick: re-arming on a wake would push this core's next tick back (D12).
+        if a_tick && crate::arch::imp::boot::TSC_DEADLINE_MODE.load(Ordering::Relaxed) {
             crate::arch::imp::boot::rearm_tsc_deadline();
         }
 
@@ -1915,8 +1941,11 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             crate::arch::imp::uart_rx_poll();
             // Advance the BSP tick clock + wake any task whose recv_timeout deadline elapsed
             // (§12 timed-wait). BSP-driven because the BSP ticks reliably while APs idle; the
-            // wake is tick-clocked so it's valid cross-core. See scan_timed_wakes.
-            scan_timed_wakes();
+            // wake is tick-clocked so it's valid cross-core. See scan_timed_wakes. Only on a real tick: a
+            // wake or sub-tick entry is not 10 ms of time (backlog/90 D12).
+            if a_tick {
+                scan_timed_wakes();
+            }
             #[cfg(feature = "wake-trace")]
             wake_trace::maybe_report(monotonic_ticks());
         }

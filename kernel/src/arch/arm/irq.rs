@@ -620,6 +620,11 @@ pub(super) extern "C" fn arm_irq_dispatch(frame_sp: u32) -> u32 {
                 // so we return `frame_sp` unchanged and `stub_irq`'s `mov sp, r0` is a no-op. The SAME
                 // stub serves both paths (below): the demo scheduler returns a DIFFERENT frame to adopt;
                 // the neutral one swaps in place. Runs with IRQs masked (IRQ-mode entry set CPSR.I).
+                // A sub-tick wake shares this path but is not 10 ms of time: say so, so the neutral tick
+                // clock does not advance for it (backlog/90 D12).
+                if source & IRQ_PHYS_TIMER == 0 {
+                    crate::task::scheduler::next_entry_is_not_a_tick();
+                }
                 // SAFETY: `timer_tick_from_irq` is the neutral preemption entry; on ARM it is reached
                 // only from this masked IRQ handler running on the interrupted task's kernel stack.
                 unsafe { crate::task::scheduler::timer_tick_from_irq(0, 0, 0); }
