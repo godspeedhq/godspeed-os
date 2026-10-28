@@ -42,6 +42,20 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-10-28 - the Pi 2's RNG starts at boot (backlog/76, feat/v1-groundwork)
+
+`hw_random` enabled the BCM2835 RNG on its first call and then waited two million register reads for a
+word - about 650 ms, shorter than the RNG's warm-up, so the first call after boot always failed and the
+first WPA2 handshake hashed its nonce from the cycle counter. The enable now runs at boot (`rng_start`,
+after `timer::init`), so the warm-up is over before any service asks, and the wait is bounded by time on
+the generic timer. The one block that did both is split, so the enable can run from two places.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/arm/mod.rs` | 54 -> 55 (+1) | `rng_enable_locked`: the two volatile writes of the one-time enable (`RNG_STATUS` = the warm-up count, then `RNG_CTRL` = 1), moved out of `hw_random`'s block so `rng_start` can do them at boot. Same registers in the Device-mapped peripheral window, once (an atomic swap), and only under `RNG_LOCK`, which both callers hold. `hw_random`'s block keeps the status reads and the data pop. |
+
+---
+
 ## 2026-10-26 - the riscv64 PLIC: a PCI device's interrupt reaches its driver (feat/riscv-virt-e1000)
 
 riscv64 had no interrupt controller, so a driver package that asked for its PCI device's interrupt was
@@ -2774,7 +2788,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 17 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 54 | permitted |
+| arch/arm/mod.rs | 55 | permitted |
 | arch/loongarch64/mod.rs | 24 | permitted |
 | arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |

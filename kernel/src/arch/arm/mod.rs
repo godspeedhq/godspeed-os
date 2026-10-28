@@ -976,6 +976,9 @@ extern "C" fn arm_boot_main() -> ! {
     // above which must run caches-off.
     sd_route_to_emmc();
     timer::init();
+    // Start the RNG's warm-up now, so it has finished long before a service asks for a word: the first
+    // WPA2 handshake after boot used to find it still warming and fall back (backlog/76).
+    rng_start();
     const TICK_HZ: u32 = 100; // 10 ms quantum, matching CLAUDE.md section 9.1
     if irq::start_tick(TICK_HZ) {
         irq::selftest(TICK_HZ);
@@ -1400,37 +1403,66 @@ pub fn usb_disk_busy() -> bool { false }
 /// answer false.
 pub fn usb_disk_absent() -> bool { true }
 
-/// A hardware-random u32 from the BCM2835 SoC RNG, or None if it never produced (absent/wedged - loud, not
-/// a fallback). Ungated (InspectKernel query 19); the `random` shell utility consumes it, and so does the
-/// WPA2 supplicant's SNonce (`sdk/wifi/src/supplicant.rs`, `snonce`, for `wifi-usb` on this board).
-///
-/// The enable, the "word available" check and the pop are ONE critical section under `RNG_LOCK`
-/// (backlog/fixed/80 K28). Unlocked, two cores asking at once could both see one word available and both read
-/// DATA - one getting the word and the other a stale or empty one - and a second caller could read before
-/// the first had finished the one-time enable. A nonce must not be either. `lock_irq`, because a
-/// preempted holder on this core would otherwise leave the next task here spinning on it; the hold is a
-/// word's wait, microseconds, and bounded below in every case.
-pub fn hw_random() -> Option<u32> {
-    use core::sync::atomic::{AtomicBool, Ordering};
-    const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;
-    const RNG_STATUS: usize = PERIPHERAL_BASE + 0x10_4004;
-    const RNG_DATA:   usize = PERIPHERAL_BASE + 0x10_4008;
-    static INIT: AtomicBool = AtomicBool::new(false);
-    static RNG_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
-    let _one = RNG_LOCK.lock_irq();
-    // SAFETY: the BCM2835 RNG registers are in the already-Device-mapped peripheral window; volatile
-    // 32-bit accesses. One-time enable (a warm-up count, then CTRL=1); read once a word is available.
-    // `RNG_LOCK` is held, so no other core is between the check and the pop.
-    unsafe {
-        if !INIT.swap(true, Ordering::Relaxed) {
+const RNG_CTRL:   usize = PERIPHERAL_BASE + 0x10_4000;
+const RNG_STATUS: usize = PERIPHERAL_BASE + 0x10_4004;
+const RNG_DATA:   usize = PERIPHERAL_BASE + 0x10_4008;
+/// Whether the RNG has been enabled (its warm-up count written, then CTRL set). Once, under `RNG_LOCK`.
+static RNG_INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The RNG's one critical section: the enable, the "word available" check and the pop (backlog/fixed/80 K28).
+static RNG_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
+/// How long `hw_random` waits for a word. After the warm-up a word is ready in microseconds; this bound is
+/// what an RNG that never produces costs a caller, with interrupts off.
+const RNG_WAIT_MS: u64 = 20;
+
+/// Enable the RNG if it is not yet: a warm-up count, then CTRL=1. Caller holds `RNG_LOCK`.
+fn rng_enable_locked() {
+    use core::sync::atomic::Ordering;
+    if !RNG_INIT.swap(true, Ordering::Relaxed) {
+        // SAFETY: the BCM2835 RNG registers are in the already-Device-mapped peripheral window; volatile
+        // 32-bit writes, done once, under `RNG_LOCK`.
+        unsafe {
             (RNG_STATUS as *mut u32).write_volatile(0x40000);        // warm-up cycles before the first read
             (RNG_CTRL as *mut u32).write_volatile(1);                // enable
         }
-        // Status bits [31:24] = words available. Bounded so an absent/wedged RNG reports None, not a hang.
+    }
+}
+
+/// Start the RNG at boot (backlog/76). Its warm-up of `0x40000` cycles takes longer than the old wait
+/// bound gave a caller - the first WPA2 join after boot found no word and hashed its nonce from the cycle
+/// counter instead - so it is started here, once, and is ready by the time any service runs.
+fn rng_start() {
+    let _one = RNG_LOCK.lock_irq();
+    rng_enable_locked();
+}
+
+/// A hardware-random u32 from the BCM2835 SoC RNG, or None if it produced nothing inside `RNG_WAIT_MS`
+/// (absent or wedged - loud, not a fallback). Ungated (InspectKernel query 19).
+///
+/// **A cryptographic source.** The WPA2 supplicant's SNonce comes from here (`sdk/wifi/src/supplicant.rs`,
+/// `snonce`, for `wifi-usb` on this board), as does the `random` shell utility. So the enable, the "word
+/// available" check and the pop are ONE critical section under `RNG_LOCK`: unlocked, two cores asking at
+/// once could both see one word available and both read DATA, and a nonce must not be stale or shared.
+/// `lock_irq`, because a preempted holder on this core would leave the next task here spinning on it.
+///
+/// The wait is bounded by TIME on the generic timer (a count is not a duration, CLAUDE.md 26.6): the old
+/// bound of two million register reads came to about 650 ms, shorter than the warm-up, so it failed the
+/// first read after boot by construction. With the RNG started at boot (`rng_start`) a word is ready in
+/// microseconds and `RNG_WAIT_MS` is only what a dead RNG costs. If the timer is dead (no frequency), the
+/// old count bound stands in.
+pub fn hw_random() -> Option<u32> {
+    let _one = RNG_LOCK.lock_irq();
+    rng_enable_locked(); // already done at boot; here only if a caller beat `rng_start`
+    let hz = timer::timer_hz() as u64;
+    let deadline = timer::cntpct().saturating_add(hz.saturating_mul(RNG_WAIT_MS) / 1000);
+    // SAFETY: the BCM2835 RNG registers are in the already-Device-mapped peripheral window; volatile
+    // 32-bit reads. `RNG_LOCK` is held, so no other core is between the check and the pop.
+    unsafe {
+        // Status bits [31:24] = words available.
         let mut n = 0u32;
         while ((RNG_STATUS as *const u32).read_volatile() >> 24) == 0 {
             n += 1;
-            if n > 2_000_000 { return None; }
+            if hz != 0 { if timer::cntpct() >= deadline { return None; } }
+            else if n > 2_000_000 { return None; }
         }
         Some((RNG_DATA as *const u32).read_volatile())
     }
