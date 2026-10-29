@@ -855,7 +855,7 @@ pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
     // whose meaning changes are the guards, which nothing touches.
     unsafe {
         let saved: u32;
-        core::arch::asm!("mrs {s}, cpsr", "cpsid if", s = out(reg) saved, options(nomem, nostack));
+        core::arch::asm!("mrs {s}, cpsr", "cpsid if", s = out(reg) saved, options(nostack));
         for (n, i) in (first..=last).enumerate() {
             let e = l1.add(i).read_volatile();
             if e & 0b11 != 0b10 {

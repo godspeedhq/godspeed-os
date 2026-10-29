@@ -1649,7 +1649,7 @@ pub fn park_core_forever() -> ! {
     // SAFETY: masking DAIF and halting is always valid at EL1, and this never returns, so no state is
     // left inconsistent by the mask.
     unsafe {
-        core::arch::asm!("msr daifset, #0xf", options(nomem, nostack));
+        core::arch::asm!("msr daifset, #0xf", options(nostack));
         loop { core::arch::asm!("wfi", options(nomem, nostack)); }
     }
 }
@@ -2979,12 +2979,14 @@ pub mod interrupts {
     #[cfg(feature = "pi4")]
     pub fn enable_interrupts() {
         // SAFETY: unmasking IRQs at EL1 is architecturally always valid.
-        unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("msr daifclr, #2", options(nostack)) };
     }
     #[cfg(feature = "pi4")]
     pub fn disable_interrupts() {
+        // NOT `nomem`, on purpose: masking interrupts is what protects the memory a critical section
+        // touches, so the compiler must not move those accesses across it (backlog/90 D28).
         // SAFETY: masking IRQs at EL1 is architecturally always valid.
-        unsafe { core::arch::asm!("msr daifset, #2", options(nomem, nostack)) };
+        unsafe { core::arch::asm!("msr daifset, #2", options(nostack)) };
     }
     /// Returns whether IRQs were ENABLED, matching the neutral `local_irq_restore(was_enabled)`
     /// contract. Note the inversion: `DAIF.I` set means masked, so "enabled" is the bit being clear.

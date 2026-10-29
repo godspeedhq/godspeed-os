@@ -495,7 +495,7 @@ pub fn halt_all_cores() -> ! {
     // core still halts below.
     unsafe { boot::broadcast_nmi_all_but_self() };
     // SAFETY: panic path - we want to stop all execution permanently.
-    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    unsafe { core::arch::asm!("cli", options(nostack)) };
     loop {
         // SAFETY: hlt with IF=0 is safe; we never exit this loop.
         unsafe { core::arch::asm!("hlt", options(nostack, nomem)) };
@@ -538,7 +538,7 @@ pub fn hardware_reset() -> ! {
     }
 
     // SAFETY: CLI so no ISR interferes with the reset port writes on this core.
-    unsafe { core::arch::asm!("cli", options(nostack, nomem)) };
+    unsafe { core::arch::asm!("cli", options(nostack)) };
 
     // SAFETY: all of these are architectural reset mechanisms; each either resets the
     // platform (ending execution) or is harmless if the platform ignores it.

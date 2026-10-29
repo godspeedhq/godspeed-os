@@ -93,5 +93,5 @@ pub fn start(hz: u64) -> u64 {
 /// a detail that reliably costs an hour when the controller looks perfect and no interrupt arrives.
 pub fn unmask_irqs() {
     // SAFETY: clearing PSTATE.I permits IRQ delivery; the vectors are installed by this point.
-    unsafe { core::arch::asm!("msr daifclr, #2", options(nomem, nostack)) };
+    unsafe { core::arch::asm!("msr daifclr, #2", options(nostack)) };
 }

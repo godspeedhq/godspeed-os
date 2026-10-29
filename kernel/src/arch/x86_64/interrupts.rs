@@ -392,14 +392,17 @@ pub unsafe fn dispatch_irq(irq: u8) {
 #[inline]
 pub fn enable_interrupts() {
     // SAFETY: STI is always safe to execute in ring-0; caller controls timing.
-    unsafe { core::arch::asm!("sti", options(nostack, nomem)) }
+    unsafe { core::arch::asm!("sti", options(nostack)) }
 }
 
 /// Disable hardware interrupts on the current core.
 #[inline]
 pub fn disable_interrupts() {
+    // NOT `nomem`, on purpose: masking interrupts is what protects the memory a critical section touches,
+    // so the compiler must not move those accesses across it (backlog/90 D28). It has no memory effect
+    // of its own; the option would have told the compiler more than that.
     // SAFETY: CLI is always safe to execute in ring-0.
-    unsafe { core::arch::asm!("cli", options(nostack, nomem)) }
+    unsafe { core::arch::asm!("cli", options(nostack)) }
 }
 
 /// Disable interrupts on the local core and return whether they were previously enabled - the portable
@@ -408,10 +411,11 @@ pub fn disable_interrupts() {
 #[inline(always)]
 pub fn local_irq_save() -> bool {
     let rflags: u64;
-    // SAFETY: reading RFLAGS + CLI are local-core operations with no memory effects.
+    // SAFETY: reading RFLAGS + CLI are local-core operations with no memory effects. The CLI is still a
+    // compiler barrier (no `nomem`): see `disable_interrupts`.
     unsafe {
         core::arch::asm!("pushfq; pop {}", out(reg) rflags, options(nostack));
-        core::arch::asm!("cli", options(nomem, nostack));
+        core::arch::asm!("cli", options(nostack));
     }
     (rflags & (1 << 9)) != 0
 }
@@ -485,13 +489,13 @@ pub fn wait_for_interrupt() {
         // interrupt delivery (an interrupt cannot fire in the 1-instruction
         // window after STI), so there is no lost-wakeup race.
         // SAFETY: STI then HLT in ring-0; HLT wakes on any interrupt.
-        unsafe { core::arch::asm!("sti; hlt", options(nostack, nomem)) }
+        unsafe { core::arch::asm!("sti; hlt", options(nostack)) }
     } else {
         // No ARAT: HLT/PAUSE let firmware power-gate the LAPIC, dropping timer
         // ticks and IPIs (observed on Goldmont+). Spin with STI only - keeps the
         // core hot but the scheduler correct.
         // SAFETY: STI is always safe in ring-0; no other instructions follow.
-        unsafe { core::arch::asm!("sti", options(nostack, nomem)) }
+        unsafe { core::arch::asm!("sti", options(nostack)) }
     }
 }
 

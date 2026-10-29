@@ -176,7 +176,7 @@ pub fn power_off() -> &'static str {
     };
     // SAFETY: interrupts off on this core so nothing runs between the writes below; the machine is going
     // down either way, and the caller halts every core if it does not.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    unsafe { core::arch::asm!("cli", options(nostack)) };
     // A machine booted in legacy mode has SCI_EN clear and ignores SLP_EN until ACPI is enabled through
     // SMI_CMD. Bounded: a firmware that never sets SCI_EN gets the write anyway.
     if inw(s5.pm1a_cnt) & SCI_EN == 0 && s5.smi_cmd != 0 && s5.acpi_enable != 0 {

@@ -413,13 +413,13 @@ pub fn enable_interrupts() {
     // SAFETY: `cpsie i` clears the CPSR I bit. Safe here because the vector table is installed, the
     // IRQ mode has its own stack (`exceptions::install`), and a handler exists for the only source
     // that can fire - so an interrupt now has somewhere well-defined to go.
-    unsafe { core::arch::asm!("cpsie i", options(nomem, nostack)) }
+    unsafe { core::arch::asm!("cpsie i", options(nostack)) }
 }
 
 /// Mask IRQs on this core (`CPSR.I = 1`).
 pub fn disable_interrupts() {
     // SAFETY: `cpsid i` sets the CPSR I bit; masking interrupts is always architecturally valid.
-    unsafe { core::arch::asm!("cpsid i", options(nomem, nostack)) }
+    unsafe { core::arch::asm!("cpsid i", options(nostack)) }
 }
 
 /// The Rust side of the IRQ vector. Called from `stub_irq` with caller-saved registers already

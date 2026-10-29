@@ -1165,7 +1165,7 @@ pub fn park_core_forever() -> ! {
     // SAFETY: `cpsid if` masks IRQ and FIQ in CPSR, and `wfi` halts until an unmasked event; both are
     // always valid in a privileged mode, and this never returns, so nothing is left inconsistent.
     unsafe {
-        core::arch::asm!("cpsid if", options(nomem, nostack));
+        core::arch::asm!("cpsid if", options(nostack));
         loop { core::arch::asm!("wfi", options(nomem, nostack)); }
     }
 }
@@ -2573,13 +2573,16 @@ pub mod interrupts {
     /// deadlock against the interrupted holder - exactly the hang the first service spawn hit.
     pub fn enable_interrupts() {
         // SAFETY: clearing CPSR.I is always valid; the vector table and handlers are installed.
-        unsafe { core::arch::asm!("cpsie i", options(nomem, nostack)) }
+        unsafe { core::arch::asm!("cpsie i", options(nostack)) }
     }
 
     /// Mask IRQs (`cpsid i`).
     pub fn disable_interrupts() {
+        // NOT `nomem`, on purpose: masking interrupts is what protects the memory a critical section touches,
+        // so the compiler must not move those accesses across it (backlog/90 D28). It has no memory effect
+        // of its own; the option would have told the compiler more than that.
         // SAFETY: setting CPSR.I is always architecturally valid.
-        unsafe { core::arch::asm!("cpsid i", options(nomem, nostack)) }
+        unsafe { core::arch::asm!("cpsid i", options(nostack)) }
     }
 
     /// Save the current IRQ-enable state and mask. Returns true if IRQs *were* enabled (so the paired
@@ -2589,7 +2592,7 @@ pub mod interrupts {
         // SAFETY: reading CPSR is side-effect-free; masking IRQs is always valid.
         unsafe {
             core::arch::asm!("mrs {c}, cpsr", c = out(reg) cpsr, options(nomem, nostack));
-            core::arch::asm!("cpsid i", options(nomem, nostack));
+            core::arch::asm!("cpsid i", options(nostack));
         }
         cpsr & 0x80 == 0 // I bit (7) clear == IRQs were enabled
     }
@@ -2598,7 +2601,7 @@ pub mod interrupts {
     pub fn local_irq_restore(was_enabled: bool) {
         if was_enabled {
             // SAFETY: clearing CPSR.I; only done when the saved state had IRQs enabled.
-            unsafe { core::arch::asm!("cpsie i", options(nomem, nostack)) }
+            unsafe { core::arch::asm!("cpsie i", options(nostack)) }
         }
     }
 
@@ -2668,7 +2671,7 @@ pub mod interrupts {
         // aside from itself. Both were individually rate-limited to ~1 s and both yielded to storage,
         // so idle stayed cheap.
         // SAFETY: unmasking IRQs is always valid (vectors + handlers installed); WFI then waits for one.
-        unsafe { core::arch::asm!("cpsie i", "wfi", options(nomem, nostack)) }
+        unsafe { core::arch::asm!("cpsie i", "wfi", options(nostack)) }
     }
 
 /// May the idle loop MASK interrupts, re-check for runnable work, and then halt - relying on the

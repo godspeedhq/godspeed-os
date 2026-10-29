@@ -199,6 +199,14 @@ differently:
 
 The kill path's cross-core wait (`backlog/fixed/48`) is not it: it skips the calling core and is bounded.
 
+**Once more, 2026-10-29, the same shape** (`osdev test shell`, 255 passed, behind it): at the supervisor's second
+respawn, right after "takes back a reply mailbox", core 0 running `shell` (slot 9), 1.0006x the allowance, 0 timer
+interrupts and 0 halts since its last stamp. On a tree carrying `backlog/90` D28 (the interrupt mask and unmask
+`asm!` no longer `nomem`), which touches exactly the masking this question turns on, so the run was repeated: three
+more passed 276/0 with no wedge. One in four with the change, none in the three earlier runs that day without it,
+and the earlier sightings predate it - not a difference this many runs can show either way, and recorded here so
+the next count includes it.
+
 ## On hardware: the T630, twice in one day, each right after a supervisor respawn (2026-10-25)
 
 Both on `feat/driver-packages`, in `chaos max-carnage all-services 1000`, with the WiFi dongle on `xhci`.

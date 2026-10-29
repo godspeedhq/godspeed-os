@@ -2,7 +2,7 @@
 
 **Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19; under way since 2026-10-26 on `feat/v1-groundwork`, with Kani, Creusot and Verus as layer C's tools, run in CI (Next step).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
 the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
-enforcement-layer defects are listed below; since 2026-10-26 D1, D2, D3, D5, D6, D12, D13, D16, D19, D22, D23, D26, D29, the id and IRQ halves of D15 and the placement half of
+enforcement-layer defects are listed below; since 2026-10-26 D1, D2, D3, D5, D6, D12, D13, D16, D19, D22, D23, D26, D29, the `nomem` part of D28, the id and IRQ halves of D15 and the placement half of
 D17 are fixed, and E1 to E6 are repaired apart from the parts each row names as open. Of the four executable
 prototypes, C4 is landed (`scripts/syscall_gate_check.py`); the other three are outside the tree. The brief, as recorded on 2026-10-15, follows; only its list of checker
 names was spelled out in full, because `scripts/doc_symbols_check.py` could not resolve the short forms.
@@ -198,7 +198,7 @@ catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere
 | D23 | low | x86: ungated query 21 pops the COM2 operator stream; queries 11 and 17 race on the CMOS index port, a candidate for the T630 "4383d" misread. **The CMOS half is FIXED** (`80f2bb49`, one reader of the index/data pair at a time; `syscall_gate_check.py` now records the lock as the queries' declared effect); **the COM2 pop FIXED 2026-10-29:** query 21 is INTROSPECT-gated, which `control` holds (other INTROSPECT holders can still read it, recorded) | `dispatch.rs:1900`, `arch/x86_64/rtc.rs:41-55` |
 | D25 | low | a cap minted on a dead record validates at the capability layer; no-resurrection rests on spawn order | `capability/table.rs:59-70`, `:261-265` |
 | D27 | low | results that do not reflect outcomes (SpawnImage error after success, AllocMem leak KNOWN A10-15, stub successes, arch-divergent codes). **Two items closed 2026-10-29:** TaskCaps answers -1 for an empty slot and 0 for a task holding nothing on every port (arm32 answered 0 for both, the others -1); and the 33-to-64-byte names were already fixed by `0e914ae5` (names hold 128 bytes everywhere, the SpawnImage bound). The rest stands | `syscall/dispatch.rs:1144-1179` |
-| D28 | low | serial output under hot locks; panic path not re-entrant; `nomem` interrupt-mask asm | `ipc/routing.rs:776-779` |
+| D28 | low | serial output under hot locks; panic path not re-entrant; `nomem` interrupt-mask asm. **The `nomem` part FIXED 2026-10-29:** the interrupt mask and unmask `asm!` on x86, arm32 and aarch64 (riscv64 never had it) are compiler barriers now, 21 sites; KVM A/B five a side, no significant change (B2 and B7 lean slower 18 of 25). Open: serial lines under hot locks, the panic path's RING lock, an unknown LAPIC id mapped to core 0, ARMv7's Ready store ordering | `ipc/routing.rs:776-779` |
 | D29 | low | KNOWN A5-10: the loader never bounds `p_vaddr`; on x86 that reaches the shared kernel half. **FIXED 2026-10-29:** a segment whose first or last page fails the arch's `validate_user_ptr` (the user ceiling the syscall path already uses, on every arch) is refused, and `p_vaddr + p_memsz` is checked for wrap | `loader.rs:262-332` |
 
 ### D1 fixed, 2026-10-27 (with D3's blocked-sender half)
