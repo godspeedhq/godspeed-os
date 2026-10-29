@@ -45,7 +45,11 @@ impl CapTable {
             .and_then(|s| s.as_ref())
             .ok_or(CapError::CapNotHeld)?;
 
-        let record = match GLOBAL_RESOURCES.lock_irq().get_record(cap.resource_id) {
+        // Bound first, so the guard drops at the end of THIS statement. As the match's scrutinee it lived
+        // for the whole match, and the not-found line below was printed holding the global capability
+        // lock that every syscall's lookup takes (backlog/90 D28).
+        let found = GLOBAL_RESOURCES.lock_irq().get_record(cap.resource_id);
+        let record = match found {
             Some(r) => r,
             None => {
                 if cap.resource_id.0 >= 100 {
