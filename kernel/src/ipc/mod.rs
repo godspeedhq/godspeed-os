@@ -33,6 +33,10 @@ struct EndpointIdFreeList {
     ids: [u64; FREE_ID_CAP],
     len: usize,
 }
+// Taken with `lock_irq`, both sides: the supervisor respawn allocates from core 0's scheduler loop with
+// interrupts ON, so a tick inside the hold could switch to a task that is then killed on core 0 with
+// interrupts off, and its kill path would spin on a lock whose holder can only resume on that core - a
+// wedge the spin watchdog ends in a panic (backlog/90 D16).
 static FREE_IDS: SpinLock<EndpointIdFreeList> =
     SpinLock::new(EndpointIdFreeList { ids: [0; FREE_ID_CAP], len: 0 });
 
@@ -44,7 +48,7 @@ static FREE_IDS: SpinLock<EndpointIdFreeList> =
 /// advance; the delegated-band guard remains the loud backstop (invariant 12).
 pub fn alloc_endpoint_id() -> EndpointId {
     {
-        let mut fl = FREE_IDS.lock();
+        let mut fl = FREE_IDS.lock_irq();
         let n = fl.len;
         if n > 0 {
             let id = fl.ids[n - 1];
@@ -71,7 +75,7 @@ pub fn free_endpoint_id(id: EndpointId) {
     if id.0 < 100 || id.0 >= crate::capability::delegated::DELEGATED_BASE {
         return;
     }
-    let mut fl = FREE_IDS.lock();
+    let mut fl = FREE_IDS.lock_irq();
     let n = fl.len;
     if n < FREE_ID_CAP {
         fl.ids[n] = id.0;
