@@ -54,7 +54,7 @@ ipc_send  = ["dwc2", "wifi-driver", "wifi-usb", "events"]
 # reaches it over IPC (the `dwc2` peer above).
 #
 # PI 4: the GENET driver lives in THIS service (`src/genet.rs`), not in the kernel, so the authority takes
-# the x86 shape: a fixed MMIO window (physical 0xFD58_0000, 64 KiB, reached via `ctx.mmio()`) plus a
+# the x86 shape: a fixed MMIO window (physical 0xFD58_0000, 64 KiB, reached via `godspeed::driver::registers`) plus a
 # 64 KiB DMA arena, granted at spawn by device kind and only when the kernel's boot probe found a
 # controller. The kernel's own GENET code is discovery ONLY (`arch/aarch64/genet.rs` reads one revision
 # register and writes none); there is no in-kernel driver left to fall back to, which is deliberate - a

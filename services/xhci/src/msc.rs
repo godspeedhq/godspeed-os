@@ -1015,8 +1015,9 @@ pub fn parse_msc(dma: &Part, buf_off: usize, buf_len: usize) -> Option<MscInfo> 
 // This is what makes the userspace disk REACHABLE. Reading sectors is useless if nothing can ask
 // for one, and until this the only way to reach a USB disk was the four `usb_disk_*` syscalls -
 // which existed solely to expose the IN-KERNEL stack. Serving the block protocol here is what let
-// that stack be deleted. (Note 2026-10-09: the syscalls remain as a dead ABI whose arch side answers
-// "no disk", and nothing holds their capability - `arch/aarch64/mod.rs`, usb_disk_sectors.)
+// that stack be deleted. (Note 2026-10-09: the syscalls stayed as a dead ABI whose arch side answered
+// "no disk", with nothing holding their capability, until 2026-10-28, when the capability and the
+// syscalls were removed - `backlog/fixed/21`.)
 //
 // The wire protocol is EXACTLY the one `block-driver` already speaks to `fs`, deliberately: `fs`
 // does not learn that its disk moved out of the kernel, and `block-driver` translates nothing. The

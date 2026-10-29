@@ -1,7 +1,9 @@
 # 49 - five wedge detectors halt the machine on LATENESS, and cannot tell it from a fault
 
 **Opened:** 2026-09-24
-**Status:** OPEN - one instance PROVEN (`backlog/fixed/48`), the class audited, no fix attempted.
+**Status:** OPEN - one instance PROVEN (`backlog/fixed/48`) and fixed, the TLB-shootdown bound deleted with its
+shootdown, and the spinlock and frame-allocator bounds moved from spins to time (2026-10-28, `99095070`); the two
+scheduler bounds remain, neither reads the stuck core's interrupt count, and a T630 perf card is owed for the lock change.
 *(2026-10-09: the PROVEN instance is fixed - `backlog/fixed/48` closed 2026-09-25 by deleting the kill-path
 panic. The other four were not re-checked for this note.)*
 **Raised by:** the operator, ruling on `backlog/fixed/48`: *"Nothing above the kernel should have influence
@@ -63,7 +65,8 @@ machine on the inference.**
 | `smp/spinlock.rs` | ~~spins~~ **FIXED 2026-10-28**: the watchdog's allowance in counter ticks, and only when the SAME hold lasted it (each lock counts its releases beside its held flag, so a waiter sees contention as the count changing and opens another window, at most 4). Perf under WSL2 + KVM, ten runs before and six after, interleaved: every median inside the before runs' spread; B2 cross-core p50 the one leaning slower (46 of 60 pairings, not significant at 5%) and the instrument's own floor ~10%, so a T630 perf card is owed before the cost is called nil | a lock holder releasing |
 | `memory/allocator.rs` | ~~spins~~ **FIXED 2026-10-28**, the same `smp::spinlock::Wait` | the frame-allocator lock holder releasing - its old message named "preempted holder" as a cause |
 
-Three of the five are bounded by a SPIN COUNT, which is the shape this project has already learned
+Three of the five were bounded by a SPIN COUNT (none is now: the shootdown's went with it, and the spinlock and
+allocator are bounded by time since 2026-10-28), which is the shape this project has already learned
 is not a bound on anything: a count means a different wall time on every machine, and a spinning core
 burns iterations fastest exactly when the core it waits on is getting no CPU at all.
 
@@ -93,7 +96,7 @@ So the fix is not "spin forever" and not "panic". It is the third option each of
    task's frames is a cheap price for the invariant that only the kernel is unkillable. This works for
    the kill path and the allocator; it does NOT work for a TLB shootdown, where a half-completed
    unmap cannot be abandoned - that one needs (1).
-3. **Bound by time, not by spins.** Three of the five count iterations. Even with (1) in place, a
+3. **Bound by time, not by spins.** Three of the five counted iterations (done 2026-10-28 for the two still standing). Even with (1) in place, a
    count will fire at a different point on every machine and every emulator.
 
 ## What is NOT claimed here

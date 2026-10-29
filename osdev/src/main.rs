@@ -533,7 +533,9 @@ const EXTRA_CHECKS: &[&str] = &[
     "scripts/subcmd_help_check.py",
     // A driver's WIRE FORMAT tested on the host. A service builds only for its target, so a
     // `#[cfg(test)]` module in one never runs; this compiles each listed dependency-free file with
-    // `rustc --test` and runs it, so a wrong byte offset fails a build instead of costing a flash.
+    // `rustc --test` and runs it, so a wrong byte offset fails a build instead of costing a flash. It
+    // also runs the kernel's own host tests (`cargo test -p kernel --lib`) and `tests/host-ipc`
+    // (backlog/90 E3, E4), which ran on no automatic path before.
     "scripts/host_test_check.py",
     // The ratchet on arch-conditional code above the kernel (CLAUDE.md 4.1, the standing figure in SHARED-SURFACE.baseline.txt). It ran
     // only in `release.yml`, on a tag, so a rise was caught at release or never: `804f317c` asked

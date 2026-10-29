@@ -776,7 +776,7 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // it is used" - and it had not been used for a month. The Pi 4's GENET moved into `nic-driver`
     // itself in 2026-08 (CLAUDE.md 6.4), so the service drives the MAC through its own register
     // window and calls no NetFrame syscall; arm32 reaches frames by IPC to `dwc2`; x86 and riscv64
-    // never had it. The kernel's own aarch64 file says so in as many words: "`nic-driver` still holds
+    // never had it. The kernel's own aarch64 file said so in as many words: "`nic-driver` still holds
     // the NET_DEVICE capability and simply does not use it on this port."
     //
     // A capability granted to nobody's benefit is not free. It is standing authority to move ethernet
@@ -786,8 +786,9 @@ const IMAGES: &[(&str, &[u8], u32, u64, u32, &[&str], u32, u32, u32)] = &[
     // exist, not a justification for one.
     //
     // This is step 1 of the three `backlog/fixed/21` records, in the order it prescribes: the grant first
-    // (one line, provable by a boot), the SDK wrappers second, syscalls 42-44 last. Steps 2 and 3 are
-    // kernel and SDK surface and are NOT taken here.
+    // (one line, provable by a boot), the SDK wrappers second, syscalls 42-44 last. Steps 2 and 3 were
+    // kernel and SDK surface and were not taken here; both are done, and on 2026-10-28 the capability
+    // and its syscalls were removed.
     ("nic-driver", NIC_DRIVER_ELF, godspeed_sdk::service_context::SPAWN_FLAG_REQ_RECV,
      16 * 1024 * 1024, 1, board::NIC_PEERS, 0, 0,
      // x86: named by the bus. 0x020000 is class 0x02 network, subclass 0x00 ethernet - the class

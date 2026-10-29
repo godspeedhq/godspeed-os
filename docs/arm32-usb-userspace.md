@@ -34,7 +34,7 @@ A port should check whether the branch exists before conceding that the hardware
 | **1** | Route the USB IRQ to userspace *when a service has registered for it*; real mask/unmask on the BCM2835 legacy controller | ✅ `58eb4610` - hardware-verified inert (selfcheck 350/0 + 351/0, chaos 50 rounds, no panics) |
 | **2** | A skeleton `dwc2` service holding MMIO + DMA + `hw_irqs = [0x29]`, which does nothing but prove the interrupt ARRIVES in userspace | ✅ **PROVEN on hardware 2026-08-12** - see below |
 | **3** | Port the driver: `dwc2.rs` -> the service, through the SDK's safe `Mmio`/`Dma` wrappers so the service carries no `unsafe` (§18.2) | ✅ done - slices below, all hardware-verified |
-| **4** | Retire `NET_DEVICE` (syscalls 42-44) and the `usb_disk_*` syscalls - they exist only because the driver is in-kernel. `nic-driver` and `block-driver` then talk to `dwc2` over IPC, exactly as on the Pi 4 | ✅ both clients moved to IPC; the arm backends behind those syscalls answer "no device", so the dispatch arms survive as inert stubs rather than being deleted |
+| **4** | Retire `NET_DEVICE` (syscalls 42-44) and the `usb_disk_*` syscalls - they exist only because the driver is in-kernel. `nic-driver` and `block-driver` then talk to `dwc2` over IPC, exactly as on the Pi 4 | ✅ both clients moved to IPC; the arm backends behind those syscalls answered "no device" and the dispatch arms survived as inert stubs until 2026-10-28, when the syscalls were removed from the kernel, every arch and the SDK (`backlog/fixed/21`) |
 
 **Phase 2 is deliberately a skeleton.** It is the point where the fallback stops being taken, so the
 first boot after it is the one where USB either works from userspace or does not work at all. Proving
@@ -700,8 +700,8 @@ leaving a blocked client to time out against a clean log. A net request with no 
 with an empty reply, not ignored: the client is blocked waiting, and degrading it is the rule, hanging
 it is the violation.
 
-The NET_DEVICE grant left arm32 in the same commit. The syscalls have nothing behind them there now,
-so keeping the capability would be authority the service cannot use.
+The NET_DEVICE grant left arm32 in the same commit. The syscalls had nothing behind them there (they
+were removed outright on 2026-10-28, `backlog/fixed/21`), so keeping the capability would be authority the service cannot use.
 
 Known costs, recorded rather than hidden:
 

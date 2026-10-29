@@ -236,8 +236,9 @@ pub fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
     if len > crate::ipc::message::MAX_MESSAGE_SIZE { return None; }
     let core = crate::task::scheduler::current_core_id();
     if core >= num_cores() { return None; }
-    // Base of this core's scratch arena slot (single-owner: only this core, inside an IF=0 syscall,
-    // touches its slot - no aliasing, no same-core nesting).
+    // Base of this core's scratch arena slot (single-owner: only this core touches its slot, and the
+    // copy below runs masked, so no same-core nesting; the returned slice lives only until the next
+    // read or reschedule on this core, as the doc comment above says).
     let base = USER_READ_SCRATCH.as_mut_ptr(core).cast::<u8>();
     let irq = super::interrupts::local_irq_save(); // one copy, unpreemptible (D19, header)
     USER_COPY_ACTIVE.get(core).store(true, Ordering::SeqCst);

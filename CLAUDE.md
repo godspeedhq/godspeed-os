@@ -414,6 +414,14 @@ os/
                          #   contract schema, against SURFACE.baseline.txt. Growth is recorded (`--bless`); a
                          #   removal or change fails until `--accept-break "<reason>"` logs it in
                          #   SURFACE-BREAKS.txt. Runs its own mutants every time
+    syscall_gate_check.py #  every dispatch arm is GATED by a recognised capability check, or ungated BY
+                         #   RECORD with its reason; each arm's gate is pinned, and its mutants run every
+                         #   time (backlog/90 C4). commandments.py pins names and numbers, never a handler
+    host_test_check.py   #   the host-side tests: drivers' wire-format files, `cargo test -p kernel --lib`,
+                         #   and `tests/host-ipc` (the real routing and naming code, its fixed defects kept
+                         #   as regressions) - on every build (backlog/90 E3, E4)
+    mutants_check.py     #   the kernel's mutation survivors are a ratchet (`kernel/mutants-survivors.txt`);
+                         #   ~50 min, so it runs in `mutation.yml`, not the build (backlog/90 E3)
     quit_wait_check.py   #   NO SILENT WAIT in the shell, which observes every command: each wait reads
                          #   the command's watch or says on the line above why it cannot trap anyone
                          #   (`// quit-ok:`), and those exceptions may fall, not rise (backlog/fixed/89)
@@ -2259,7 +2267,7 @@ liveness bug, not UB) does **not** justify an `unsafe fn`; make it a safe `fn` w
 documented contract, like `memory::init` / `smp::init`. Worked example: the H4
 kstack-guard / W^X hardening (2026-06-08) was structured so its page-table `unsafe`
 lives in `arch/` and the boot call sites are safe `fn`s - `main.rs` and `task/mod.rs`
-stayed at their floors with **no amendment needed**. Four amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/fixed/21`); it rose to 79 on 2026-10-14 and to 80 on 2026-10-17 by the amendments below, and fell to 74 on 2026-10-28, when the six uncalled USB-disk wrappers went with their syscalls (`backlog/fixed/21`), and rose to 75 the same day by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
+stayed at their floors with **no amendment needed**. Seven amendments to the grandfathered floors stand; the `service_context.rs` floor fell to 83 after the first two (2026-10-04, a dead call site removed) and the boot record took it back to 84; it fell to 80 on 2026-10-10, when the four spawn-by-name syscalls (7, 19, 38, 39) were retired with their SDK wrappers (`backlog/fixed/80` K14), and to 77 on 2026-10-11, when the three uncalled NET_DEVICE wrappers went (`backlog/fixed/21`); it rose to 79 on 2026-10-14 and to 80 on 2026-10-17 by the amendments below, and fell to 74 on 2026-10-28, when the six uncalled USB-disk wrappers went with their syscalls (`backlog/fixed/21`), and rose to 75 the same day by the amendment below. A fall needs no amendment, so this line only keeps the figure current (`audits/unsafe-audit.md`):
 
 > **Amendment 2026-10-28 (`soc_nic`): `sdk/rust/src/service_context.rs` 74 -> 75.** One call site, `soc_nic`:
 > one `unsafe { raw_syscall(13, 29, ..) }` behind the safe `ServiceContext::soc_nic` and

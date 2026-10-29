@@ -3,7 +3,7 @@ name: build
 on:
   workflow_dispatch:  # paused: re-add push/pull_request when CI minutes are available
 
-# REVIVED 2026-10-28 (backlog/fixed/53). This workflow sat paused and red for five months: it built the tree
+# REVIVED 2026-10-28 (backlog/53, open until it is dispatched). This workflow sat paused and red for five months: it built the tree
 # with its own hand-ordered `cargo build` steps and ran its own hand-kept list of fourteen checkers, and
 # both drifted from what a local build does - the supervisor came to need `pong` first, the checker
 # list fell behind `EXTRA_CHECKS`, and nothing ran it to notice. It now builds the way a developer does,
@@ -106,8 +106,9 @@ jobs:
           MIRIFLAGS: -Zmiri-disable-isolation
           # Miri is ~100-1000x slower than native. Set cases to 1 per
           # property - enough for UB detection. The full 256 cases run in
-          # `cargo test -p kernel --lib`, which this workflow does not run:
-          # scripts/host_test_check.py runs it on every osdev build (backlog/90 E3).
+          # `cargo test -p kernel --lib`, which this job does not run: the
+          # build job's `osdev build` runs it through scripts/host_test_check.py,
+          # as every osdev build does (backlog/90 E3).
           PROPTEST_CASES: 1
         run: cargo miri test -p kernel --lib
 

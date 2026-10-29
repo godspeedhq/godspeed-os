@@ -3303,7 +3303,7 @@ pub mod pci {
 
     /// The length of memory BAR `ix` of `d`, in bytes, or 0 when it cannot be told (no ECAM window, an
     /// I/O BAR, or one the device does not implement) - then the spawn maps the fixed 64 KiB window and
-    /// says so. A device not on a bus has no BAR; the SoC `xhci` answers the size its tree node gives. The standard probe, x86's `pci::bar_len` on ECAM (backlog/fixed/85): with memory decode off,
+    /// says so. A device not on a bus has no BAR; the SoC `xhci` and MAC answer the size their tree nodes give. The standard probe, x86's `pci::bar_len` on ECAM (backlog/fixed/85): with memory decode off,
     /// write all ones to the BAR, read back the mask of the address bits it implements, then put the BAR
     /// and the decode back, all under `BAR_PROBE_LOCK`. Only the command half of the command/status dword
     /// is written back, because the status half is write-1-to-clear. Called at grant time, for the device

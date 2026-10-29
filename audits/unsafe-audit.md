@@ -23,7 +23,7 @@ checks the file matches source". `backlog/fixed/18` recorded the gap; this close
 | `sdk/rust/src/service_context.rs` | **75** | **grandfathered floor** (§18.5; +1 `soc_nic`, query 29, 2026-10-28 amendment, backlog/fixed/21; -6 2026-10-28, the six uncalled USB-disk wrappers with syscalls 46-49, backlog/fixed/21; +1 `exit`, 2026-10-17 amendment; +2 `power_off_call` and `power_off_pending`, 2026-10-14 amendment - the query 28 site is `power_pending` since 2026-10-15, and the reboot wrappers ride `power_off_call`, so `reboot` on the deadline added none; +1 `device_power` and +1 `cpu_clock`, both by 2026-10-01 amendments; -1 2026-10-04, the dead `cache_send_slot` removed; +1 `boot_record_query`, 2026-10-08 amendment; -4 2026-10-10, the four retired spawn-by-name syscalls, backlog/fixed/80 K14; -3 2026-10-11, the dead NET_DEVICE wrappers, backlog/fixed/21) |
 | `sdk/rust/src/ipc.rs` | **8** | **grandfathered floor** (§18.5) |
 
-**The 87 (79 + 8) are not 87 defects.** 84 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12 and moved with `power_off`, 2026-10-14; this read "92" and "88" from an earlier floor and was not moved with it). `raw_syscall`
+**The 83 (75 + 8) are not 83 defects.** 80 of them are `unsafe { raw_syscall(..) }` CALL SITES (counted 2026-10-12, moved with `power_off`, 2026-10-14, and recounted 2026-10-29 after the USB-disk wrappers left and `soc_nic` arrived; this read "87 (79 + 8)" and "84" until then, after the floor had moved to 80 and then 75). `raw_syscall`
 is an `unsafe fn` because it issues the trap instruction, so every caller must open a block - and
 these two files *are* the wrapper layer whose whole purpose is to keep services `unsafe`-free. That
 worked: `services/` is at **zero**. The isolation simply stopped one layer short of itself.
@@ -32,7 +32,7 @@ The remaining 3 are genuinely different and are the ones to look at first: two b
 blocks (the `SEND_CAP_CACHE` walks) and one raw-pointer deref (`&*(SERVICE_CTX_ADDR as *const ServiceContextData)`).
 
 **The real fix, recorded rather than done:** give `raw_syscall` a SAFE wrapper. The kernel validates
-every user pointer, so passing integers to a validating callee is sound, and ~82 of these would
+every user pointer, so passing integers to a validating callee is sound, and ~80 of these would
 collapse to nothing - taking the SDK to roughly the 35 lines §18.1 actually sanctions. It is an SDK
 redesign on every service's call path and wants hardware validation, so it is written down here
 instead of attempted in the same change that made it visible (§26.7).

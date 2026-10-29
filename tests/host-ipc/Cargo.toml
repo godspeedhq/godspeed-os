@@ -2,9 +2,10 @@
 #
 # kernel/src/lib.rs host-tests MODELS of routing and naming (`routing_model.rs`, `names_model.rs`), so
 # the code the kernel runs was tested by nothing off the board. This crate compiles the real
-# kernel/src/ipc/{routing,queue,message,endpoint}.rs, kernel/src/capability/{cap,generation,rights}.rs and
+# kernel/src/ipc/{routing,queue,message,endpoint,names}.rs, kernel/src/capability/{cap,generation,rights}.rs and
 # kernel/src/smp/spinlock.rs by `#[path]`, with the smallest stubs for what they import: the arch seam's
-# interrupt save/restore, `task::scheduler::MAX_TASKS`, and a `kprintln!` that prints nothing. Nothing
+# interrupt save/restore and the lock wait's clock (which gives no bound, so the spin count decides),
+# `task::scheduler::MAX_TASKS`, `task::PEER_NAME_BYTES`, and a `kprintln!` that prints nothing. Nothing
 # under kernel/ is modified. Each tests/*.rs is its own process, so routing's global statics start empty
 # for every scenario.
 #

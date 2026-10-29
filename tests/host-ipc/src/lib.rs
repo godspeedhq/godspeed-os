@@ -37,13 +37,16 @@ pub mod ipc;
 // Helpers shared by the scenarios. They model ONLY what the dispatcher does with routing's return
 // values (dispatch.rs build_message stamps sender_ep; a returned slot is a task to wake). They do
 // not model the scheduler; where a scenario needs the scheduler, it says so.
+//
+// The `file.rs:NNN` citations in the scenarios are to the tree at 537e6861, where the 2026-10-16 audit
+// wrote them and each FAILED; the code has moved since, so read them there, or follow the name.
 // ---------------------------------------------------------------------------------------------
 
 use capability::generation::Generation;
 use ipc::endpoint::EndpointId;
 use ipc::message::Message;
 
-/// A message as `build_message` (dispatch.rs:717-743) would build it: payload + sender_ep stamped
+/// A message as `build_message` (dispatch.rs) would build it: payload + sender_ep stamped
 /// with the sending task's primary endpoint id.
 pub fn msg(tag: u8, sender_ep: u64) -> Message {
     let mut m = Message::new(&[tag]).unwrap();

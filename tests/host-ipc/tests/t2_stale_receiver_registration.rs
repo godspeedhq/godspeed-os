@@ -34,12 +34,14 @@ fn t2b_no_spurious_wake_reaches_a_blocking_send() {
     routing::register(et, 0, g(1));
     routing::register(ex, 0, g(1));
     for i in 0..QUEUE_DEPTH { routing::enqueue(ex, msg(i as u8, 300), g(1), None).unwrap(); }
-    // 1. T (slot 21) try_recv's its own endpoint: stale registration.
+    // 1. T (slot 21) try_recv's its own endpoint. This left a stale registration until the fix; now
+    //    try_recv dequeues with None and registers nothing.
     let _ = routing::dequeue(et, g(1), None);
     // 2. T does a BLOCKING send of M1 to the full ex: recorded blocked sender, blocks BlockedOnSend.
     assert!(matches!(routing::enqueue(ex, msg(0xE1, 221), g(1), Some(21)), Err(IpcError::QueueFull)));
-    // 3. A client sends to et: routing returns slot 21 to wake. [scheduler, modelled] wake_by_slot(21, 0):
-    //    BlockedOnSend -> Ready, TASK_WAKEUP_ERR=0; handle_send returns 0: T is told M1 was sent.
+    // 3. A client sends to et: routing must name no slot to wake. Before the fix it named slot 21, and
+    //    [scheduler, modelled] wake_by_slot(21, 0) moved T BlockedOnSend -> Ready with TASK_WAKEUP_ERR=0,
+    //    so handle_send returned 0 and T was told M1 was sent while it was still pending.
     let w = routing::enqueue(et, msg(0x02, 500), g(1), None).unwrap();
     assert_eq!(w, None, "no wake for T: it is not receiving on et, it is blocked sending to ex");
     // 4. ex's owner drains: M1 is delivered, and T is woken for it, once.

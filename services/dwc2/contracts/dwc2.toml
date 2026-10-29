@@ -7,8 +7,8 @@
 # Its real authority is wider than this file can express: a fixed MMIO window and DMA arena granted at
 # spawn by device kind (`hwclass::DWC2`), and CONSOLE_PUSH to deliver keystrokes - both carried in the
 # supervisor's spawn request (CLAUDE.md 13.6), not contract capabilities. (Note 2026-10-09: this said
-# USB_DISK too, and called these kernel by-name grants (C4-1); nothing holds USB_DISK now, and the
-# kernel grants no service anything by name.)
+# USB_DISK too, and called these kernel by-name grants (C4-1); USB_DISK was removed on 2026-10-28
+# (`backlog/fixed/21`), and the kernel grants no service anything by name.)
 name    = "dwc2"
 version = "0.1.0"
 

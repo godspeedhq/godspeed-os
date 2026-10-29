@@ -965,8 +965,8 @@ pub struct CapInfo {
 ///
 /// One table for everything that names them - the shell's `caps` and `ask "who can reboot?"` - so what a
 /// service is observed to HOLD reads the same everywhere, and in the words its contract DECLARES
-/// (`pci_cfg = true`). The ids are `kernel/src/capability/mod.rs`'s `*_RESOURCE`; anything above 18 is an
-/// IPC endpoint. A resource added there and not here would be shown as an endpoint, which names the
+/// (`pci_cfg = true`). The ids are `kernel/src/capability/mod.rs`'s `*_RESOURCE` (10, 12 and 13 are
+/// retired and never reused); IPC endpoints start at 100. A resource added there and not here would be shown as an endpoint, which names the
 /// wrong kind of thing (26.9), so the two move together.
 pub const AUTHORITIES: &[(u64, &str, &str)] = &[
     (1, "log_write", "write to the kernel log and serial"),
@@ -1242,7 +1242,8 @@ impl ServiceContext {
 
     // net_frame_tx, net_frame_rx and net_info (syscalls 42-44, NET_DEVICE) were here until
     // 2026-10-11: no port has an in-kernel network device, nothing is granted NET_DEVICE, and nothing
-    // called them (`backlog/fixed/21` step 2). The syscalls themselves are the last step, a kernel change.
+    // called them (`backlog/fixed/21` step 2). The syscalls themselves went later, in the kernel
+    // (`backlog/fixed/21`'s last step).
 
     /// Block until a message arrives; returns the error instead of looping silently.
     pub fn recv_result(&self) -> Result<Message, crate::ipc::IpcError> {

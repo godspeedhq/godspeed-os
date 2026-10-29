@@ -1919,8 +1919,9 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // self-state (0 = own alloc bytes, 13 = do I own the console foreground), the cycle counter (3),
     // and task-neutral board/transport facts that disclose nobody's state: the input-ready flag (10),
     // the RTC and timing reads (11, 12, 16, 17), NIC identity and BAR, driver-presence bits, a hardware random word, the
-    // EMMC base clock, one byte off the COM2 operator channel and the board MAC (14, 15, 18, 19, 20,
-    // 21, 23). And one that IS system-wide, deliberately: 28, the seconds left on a pending power-off,
+    // EMMC base clock, one byte off the COM2 operator channel, the board MAC and which ethernet controller
+    // is on the SoC (14, 15, 18, 19, 20, 21, 23, 29). And one that IS system-wide, deliberately: 28, the
+    // seconds left on a pending power-off or reboot and which it is,
     // ungated so a pending shutdown can never be hidden (`docs/shutdown.md` 6). Every other query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (docs/introspection-capability.md).
     //
@@ -1961,13 +1962,13 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
         // nic-driver reads it to know which chip it drives (e1000 vs RTL8168). Networking Phase 4.
         14 => crate::arch::imp::pci::nic()
             .map_or(0, |d| d.vendor as u32 | ((d.device as u32) << 16)) as i64,
-        // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
-        // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
         // 29 = which ethernet controller is SOLDERED TO THE SOC (`task::soc_nic`: 0 none, 1 GENET, 2 DWMAC).
         // Query 14's twin for a controller on no bus, which has no vendor/device pair to report, so
         // nic-driver chooses its backend from what the boot probe FOUND rather than from the instruction
         // set (`backlog/fixed/21`). Task-neutral hardware info like 14, so ungated.
         29 => crate::arch::imp::soc_nic() as i64,
+        // NIC MMIO base (the register-space BAR the PCI scan chose), 0 if none. Ungated hardware fact;
+        // a diagnostic for the driver (which BAR did the memory-BAR scan pick). Networking Phase 4.
         15 => crate::arch::imp::pci::nic()
             .map_or(0, |d| crate::arch::imp::pci::first_memory_bar(&d)) as i64,
         // TSC ticks per 10 ms quantum, from the boot-time CPUID calibration (boot.rs). Ungated,
@@ -2495,7 +2496,8 @@ fn handle_reboot() -> i64 {
 }
 
 
-/// Largest ethernet frame the USB-net bridge moves (matches nic-driver's FRAME_MAX).
+/// Largest ethernet frame the removed NetFrameTx/NetFrameRx syscalls (42-44) moved; nothing reads it
+/// now that they are gone (backlog/fixed/21).
 const NET_FRAME_MAX: usize = 1600;
 
 // ---------------------------------------------------------------------------

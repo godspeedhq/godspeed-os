@@ -183,17 +183,17 @@ impl NameRestartTable {
 
 static NAME_RESTART: SpinLock<NameRestartTable> = SpinLock::new(NameRestartTable::new());
 
-/// Restart count to stamp on a (re)spawn of `name`: the value accrued by `bump_name_restart` at this
-/// service's prior DEATHS. A name that never died - including every transient utility, which is never
-/// bumped - reads 0. READ-ONLY: the increment happens at death and only for the restartable set, so
-/// re-running a transient command (observe-*, greet, ...) is NOT a restart ("RESTARTS = it blew up,
-/// not it was legitimately closed").
 /// `next_restart_count` for the spawn path, which writes it into the new task's context
 /// (`ServiceContextData::instance`): which life of `name` the task about to start is.
 pub(crate) fn restart_count_of(name: &str) -> u64 {
     next_restart_count(name)
 }
 
+/// Restart count to stamp on a (re)spawn of `name`: the value accrued by `bump_name_restart` at this
+/// service's prior DEATHS. A name that never died - including every transient utility, which is never
+/// bumped - reads 0. READ-ONLY: the increment happens at death and only for the restartable set, so
+/// re-running a transient command (observe-*, greet, ...) is NOT a restart ("RESTARTS = it blew up,
+/// not it was legitimately closed").
 fn next_restart_count(name: &str) -> u64 {
     if name.is_empty() {
         return 0;
@@ -1321,8 +1321,6 @@ pub fn current_task_holds_resource(
     }
 }
 
-/// Return the current task's own recv endpoint id, if it has one. Used by `ResourceMint`/
-/// `ResourceRevoke` (§7.10) to record/check the owner of a delegated resource.
 /// The generation of the current task's endpoint (0 if it has none), as recorded at spawn.
 pub fn current_task_endpoint_gen() -> u32 {
     let cid = current_core_id();
@@ -1334,6 +1332,9 @@ pub fn current_task_endpoint_gen() -> u32 {
     }
 }
 
+/// Return the current task's own recv endpoint id, if it has one. Used by `ResourceMint`/
+/// `ResourceRevoke` (§7.10) to record/check the owner of a delegated resource, and by the send path
+/// to stamp `sender_ep` (`build_message`).
 pub fn current_task_endpoint() -> Option<EndpointId> {
     let cid = current_core_id();
     let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);

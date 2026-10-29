@@ -1654,6 +1654,10 @@ consequence rather than as a task. `NET_DEVICE` went the other way and did get a
 `nic-driver` genuinely uses it for the Pi 4's GENET. The test for the two was the same question:
 does the service still call the syscall?
 
+*(Note 2026-10-28: both are gone now. `nic-driver` stopped calling the `NET_DEVICE` syscalls, and
+the resource, its privilege bit and syscalls 42-44 were removed from the kernel with `USB_DISK`'s 46-49
+(`backlog/fixed/21`).)*
+
 ---
 
 ## 10. Open items

@@ -47,8 +47,10 @@ supervisor (8.9):
 The **binding generation** names one bind on that host. `usbfn::OP_INFO` returns it as well (built
 2026-10-12, `2e3c4052`), so the started driver - and a driver comparing after any re-enumeration - can tell
 "the same dongle, still bound" from "the same kind of dongle, bound again" (a replug, or a host re-scan that
-reset it). It is taken from the machine's counter (`usbfn::next_gen`), so a restarted host does not repeat
-its previous instance's, where that counter is calibrated and running. Before it, on `xhci` a
+reset it). Since 2026-10-28 its high 16 bits are the host's instance - the kernel's restart count for its name,
+`ServiceContext::instance` - and its low 16 that instance's bind count (`usbfn::next_gen`), so a restarted
+host never repeats its previous instance's, whatever its clock does (it was taken from the machine's counter
+until then, which could not promise that where the counter was uncalibrated; `backlog/fixed/84` C2). Before it, on `xhci` a
 re-enumeration of the same dongle read as unchanged (`docs/wifi-usb.md` 25).
 
 Supervisor to host, for the reconcile: `ASK` (`usbdev::ASK`, one byte, no reply capability). The host

@@ -2,8 +2,9 @@
 
 **Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19; under way since 2026-10-26 on `feat/v1-groundwork`, with Kani, Creusot and Verus as layer C's tools, run in CI (Next step).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
 the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
-enforcement-layer defects are listed below, NOT fixed; four executable prototypes exist outside the tree
-and are NOT landed. Both wait on the operator. The brief, as recorded on 2026-10-15, follows; only its list of checker
+enforcement-layer defects are listed below; since 2026-10-26 D1, D2, D3, D5, D12, D19 and the CMOS half of
+D23 are fixed, and E1 to E6 are repaired apart from the parts each row names as open. Of the four executable
+prototypes, C4 is landed (`scripts/syscall_gate_check.py`); the other three are outside the tree. The brief, as recorded on 2026-10-15, follows; only its list of checker
 names was spelled out in full, because `scripts/doc_symbols_check.py` could not resolve the short forms.
 
 ## The brief
@@ -480,15 +481,17 @@ review; claiming that green CI proves correctness.
 ## Next step
 
 **Under way since 2026-10-26, on `feat/v1-groundwork`** (the operator: "Let's use this branch to do backlog 90").
-Order step 1, restoring trust in the enforcement layer, started there: **E1 is fixed.** Next in it: E2 to E6,
-then `cargo test -p kernel --lib` into the `osdev` gate. C4 (the syscall gate check) is landed. Neither is a
-kernel change.
+Order step 1, restoring trust in the enforcement layer, is done there: E1 to E6 are repaired (apart from what
+each row leaves open), `cargo test -p kernel --lib` and `tests/host-ipc` run on every build
+(`scripts/host_test_check.py`), and C4 (the syscall gate check) is landed. Of section 13's fixes, D2, D1 and D12
+are done (with D3, D5 and D19).
 
-Then, as before: the fixes in section 13's order (D8, D7, D2, D1, D12, D10), each one change per flash, QEMU
+Then, as before: the rest of section 13's order (D8, D7, D10), each one change per flash, QEMU
 first; and layer C (above): **Kani** first on the capability files C1 already drives, then `routing.rs` once the
 `kernel/src/lib.rs` seam exists, then **Creusot** on the pure functions; **Verus** only when a mechanism needs it.
 All of it in a pinned CI job on Linux runners, required on pull requests touching `kernel/`, with a container
-image for running it locally (WSL on Windows). Neither the job nor the image exists yet.
+image for running it locally (WSL on Windows). The job exists for Kani (`.github/workflows/verify.yml`, on a pull
+request touching the capability code, `smp/spinlock.rs` or `tests/kani`; not yet required); the image does not.
 
 **What the scheduler fixes need first.** D7, D8, D10 and D11 change the task-switch path, and on 2026-10-26
 `osdev test shell` could not judge a change there: in QEMU a supervisor respawn sits at the liveness watchdog's

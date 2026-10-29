@@ -28,7 +28,7 @@ These functions in `arch::x86_64` expose hardware operations as a safe API. If y
 |------------------------------|---------------|
 | `disable_interrupts()`       | `cli` |
 | `enable_interrupts()`        | `sti` |
-| `wait_for_interrupt()`       | **Two behaviours, chosen at boot by `IDLE_CAN_HALT`:** `sti; hlt` where a halted core is guaranteed to wake (AMD; Intel with the package C-state limit applied; or ARAT in periodic mode), else `sti` only - no C-state hint, because on Goldmont+ both `hlt` and `pause` let firmware power-gate the LAPIC and drop ticks/IPIs. **A caller must arm a wake before it halts** - see below. |
+| `wait_for_interrupt()`       | **Two behaviours, chosen at boot by `IDLE_CAN_HALT`:** `sti; hlt` where a halted core is guaranteed to wake (AMD; Intel with the package C-state limit applied, or under a hypervisor, where the limit is skipped because a guest's package C-states are the host's and KVM does not emulate MSR 0xE2; or ARAT in periodic mode), else `sti` only - no C-state hint, because on Goldmont+ both `hlt` and `pause` let firmware power-gate the LAPIC and drop ticks/IPIs. **A caller must arm a wake before it halts** - see below. |
 | `validate_user_ptr(ptr, len)`| Range check: ptr..ptr+len must be below `USER_END` (0x0000_8000_0000_0000) |
 | `read_user_bytes(ptr, len)`  | Validated `from_raw_parts` into user VA |
 | `write_user_bytes(dst, src)` | Validated `copy_nonoverlapping` to user VA |

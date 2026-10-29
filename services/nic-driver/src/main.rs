@@ -1035,15 +1035,15 @@ fn serve_status(ctx: &ServiceContext, sreply: &[u8]) -> ! {
 /// It used to compile on aarch64 too, and carried a SECOND body - `ctx.net_info` / net_frame_tx /
 /// net_frame_rx, the NET_DEVICE syscalls - selected by `#[cfg(not(target_arch = "arm"))]` for the
 /// Pi 4's in-kernel GENET. **That body has had no caller since GENET moved into this service**
-/// (CLAUDE.md 6.4, amendment 2026-08-09): `service_main` sends aarch64 to `genet::genet_main`, so the
+/// (CLAUDE.md 6.4, amendment 2026-08-09): `service_main` sends the Pi 4 to `genet::genet_main`, so the
 /// syscall body was compiled into every Pi 4 image and never once executed. Thirteen `#[cfg]` sites
 /// in this function existed to choose between a live path and a dead one.
 ///
 /// It is deleted rather than kept for symmetry, for the reason this driver's own contract gives about
 /// the kernel's leftover GENET code: a second path that is not exercised does not stay working, and
 /// keeping it makes the file read as "one backend, two ARM ports" when it is one backend, one board.
-/// The NET_DEVICE syscalls (42-44) now have no caller anywhere in userspace - recorded in
-/// `backlog/fixed/21`, not quietly acted on here.
+/// That left the NET_DEVICE syscalls (42-44) with no caller anywhere in userspace, and on 2026-10-28
+/// the capability and its syscalls were removed (`backlog/fixed/21`).
 #[cfg(nic_usb_bridge)]
 fn kernel_net_main(ctx: ServiceContext) -> ! {
     // How many bulk-IN polls to try when a request wants a received frame (net-stack also re-polls
@@ -1615,9 +1615,9 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         m.write32(REG_RCTL, RCTL_VALUE);
         ctx.log("nic-driver: serving the frame interface");
     } else {
-        // No riscv64 arm here. `dwmac::dwmac_main` diverges, so nothing below the backend selector
-        // is reachable on that port: the riscv64 message this used to carry could never print, while
-        // reading as a description of the state of a port. A message nobody can observe is worse than
+        // No dwmac arm here. `dwmac::dwmac_main` diverges, so nothing below the backend selector
+        // is reachable on a board whose MAC is the DWMAC: the riscv64 message this used to carry could
+        // never print there, while reading as a description of the state of a port. A message nobody can observe is worse than
         // no message, because it is evidence of a path that is not taken.
         ctx.log("nic-driver: no Intel e1000 mapped (absent, or a different NIC) - serving empty replies");
     }

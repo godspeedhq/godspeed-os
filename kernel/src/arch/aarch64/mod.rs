@@ -938,7 +938,8 @@ extern "C" fn boot_high() -> ! {
             // second path also has to be kept working to be worth having, and this one was not being
             // exercised. The driver is deleted, so this is the only path and cannot rot.
             //
-            // `soc_nic` is what gates the DMA arena (`HwClass::needs_dma`), and it is set HERE
+            // `GENET_PRESENT`, which `soc_nic` reads, is what gates the DMA arena (`HwClass::needs_dma`
+            // through `found()`), and it is set HERE
             // rather than after a bring-up that no longer happens. Its meaning is "a NIC this port
             // can drive was found", which a probed-and-present GENET satisfies.
             GENET_PRESENT.store(true, core::sync::atomic::Ordering::Release);
@@ -3130,7 +3131,7 @@ pub mod rtc {
     /// stand still and `date epoch` report a negative year-0 timestamp: a machine that had been up for
     /// twenty minutes insisted it had been up for none. Seconds-since-boot is not the wall clock, but it
     /// is MONOTONIC and it is true, which is what everything measuring a duration actually needs. The
-    /// wall clock arrives with SNTP, as it did on the Pi 2, and needs the network first.
+    /// wall clock is the `time` service's, from the network, as on the Pi 2.
     pub fn now_epoch_monotonic() -> i64 { super::timer::secs_since_boot() }
 }
 

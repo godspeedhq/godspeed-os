@@ -4903,8 +4903,8 @@ fn u64_at(b: &[u8], off: usize) -> u64 {
 }
 
 /// One single-block transfer: big enough for a one-block write REQUEST (tag + op + lba + block) as well as
-/// the largest reply (tag + status + block). A run (`OP_WRITE_BLOCKS`) is larger, and the bounded call
-/// carries it in `BLK_CALL_MAX`.
+/// the largest single-block reply (tag + status + block). A run (`OP_WRITE_BLOCKS` out, `OP_READ_BLOCKS`
+/// back) is larger, and the bounded call carries it in `BLK_CALL_MAX`.
 ///
 /// One constant, used by both the buffer and this struct. They were two separate expressions - 514
 /// here and 514 at the call site, against a 522-byte write request - and sizing them independently is
@@ -4926,8 +4926,10 @@ pub const BLK_XFER_MAX: usize = 1 + 9 + BLOCK;
 const BLK_REPLY_MAX: usize = 1024;
 /// The buffer the bounded call carries a REQUEST out in, as well as the reply back: it must hold the largest
 /// request, a run of `WRITE_RUN_MAX` blocks (`block_write_run`, 1 + 10 + 7 x 512 = 3,595 bytes), and is a power
-/// of two for the reason above. Lives only in `block_rpc`'s frame; the reply is copied out into a
-/// `BlockReply` of `BLK_REPLY_MAX`, so the larger buffer is not carried back through every caller. Without it
+/// of two for the reason above, and the largest reply, a read run (`block_read_run`, 2 + 7 x 512 = 3,586 bytes).
+/// Lives in the frame of `block_rpc` or `block_read_run`, which hand it to `block_rpc_into`; `block_rpc`
+/// copies the reply out into a `BlockReply` of `BLK_REPLY_MAX`, so the larger buffer is not carried back
+/// through every caller, and `block_read_run` reads its run from it directly. Without it
 /// the SDK refused every run as too large before it left (`MessageTooLarge`), seen first as "NO usable reply".
 const BLK_CALL_MAX: usize = 4096;
 const _: () = assert!(BLK_CALL_MAX >= 1 + 10 + WRITE_RUN_MAX * BLOCK && BLK_CALL_MAX.is_power_of_two(),

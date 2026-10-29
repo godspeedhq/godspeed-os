@@ -47,8 +47,9 @@ pub const CLOCK_MAX_PLAUSIBLE: i64 = 4_102_444_800;
 
 /// The inverse of `epoch_secs`: Unix epoch seconds -> a `read_datetime`-packed value (same LSB-first
 /// layout: sec[6] min[6] hour[5] day[5] month[4] year[12]). Howard Hinnant's civil_from_days, so it is
-/// leap-year correct and round-trips `epoch_secs` exactly. Used by a settable wall clock (the RTC-less
-/// ARM port sets it from SNTP) so `date` can display a real time. Pure math, host-testable.
+/// leap-year correct and round-trips `epoch_secs` exactly. It served the RTC-less ARM ports' network-set
+/// wall clock, which went with its setter (backlog/fixed/59); nothing in the kernel calls it now, only
+/// the tests below. Pure math, host-testable.
 pub fn packed_from_epoch(epoch: i64) -> u64 {
     let days = epoch.div_euclid(86_400);
     let rem = epoch.rem_euclid(86_400);

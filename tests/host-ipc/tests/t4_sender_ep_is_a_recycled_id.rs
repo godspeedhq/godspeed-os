@@ -21,7 +21,7 @@ fn t4a_late_reply_of_dead_incarnation_is_accepted_by_call_to_respawn() {
     routing::enqueue(rc, reply(0x01 /*answer to request #1*/, 160, 5), g(6), None).unwrap();
     // S is killed and respawned at the same id (LIFO reuse) with a new generation.
     routing::kill_endpoint(s);
-    let _ = routing::take_call_waiter(s); // the kill path wakes C spuriously here (see t5)
+    let _ = routing::take_call_waiter(s); // C's record is still here: this model skips do_call's withdraw on timeout (t5's `timed_out`)
     assert!(routing::try_register(s, 0, g(9)));
     // C makes request #2 to the NEW S; before the new S has seen it, C looks for its reply.
     let r = routing::call_dequeue(rc, g(6), s, g(9), 40);

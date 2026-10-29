@@ -79,7 +79,7 @@ reading only your own state, or a hardware clock, does not.*
 | `InspectKernel` 3 | the cycle counter - a hardware clock, not anyone's state |
 | `InspectKernel` 13 | whether the CALLER owns the console foreground - caller-specific, like 0 |
 | `InspectKernel` 10, 11, 12, 16, 17 | board-neutral timing: input-ready, the RTC now/boot reads, TSC-per-quantum, deglitched monotonic seconds |
-| `InspectKernel` 14, 15, 18, 19, 20, 21, 23 | board facts and transport: NIC identity and BAR, driver-presence bits, a hardware random word, the EMMC base clock, one byte off the COM2 operator channel, the board's own MAC |
+| `InspectKernel` 14, 15, 18, 19, 20, 21, 23, 29 | board facts and transport: NIC identity and BAR, driver-presence bits, a hardware random word, the EMMC base clock, one byte off the COM2 operator channel, the board's own MAC, which ethernet controller is soldered to the SoC |
 | `InspectKernel` 28 | the pending power-off or reboot - system-wide, but ungated deliberately so a pending shutdown can never be hidden (`docs/shutdown.md` 6) |
 
 Queries 9 and 22 were deleted (console geometry moved to the `console` service, clock provenance to

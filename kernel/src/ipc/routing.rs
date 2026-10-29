@@ -250,7 +250,7 @@ static TABLE: SpinLock<[RoutingEntry; MAX_ENDPOINTS]> = SpinLock::ZEROED;
 /// endpoint later dies, `take_call_waiter` finds the caller and the kill path wakes it with
 /// `ReplyDead` - exactly as `kill_endpoint` returns a blocked *sender* to wake with `EndpointDead`.
 ///
-/// Race-freedom mirrors the blocked-sender records (no new lock): every read and write below happens while the
+/// Race-freedom needs no lock of its own: every read and write below happens while the
 /// `TABLE` lock is held, so registration (`call_dequeue`) and the death scan (`take_call_waiter`) are
 /// mutually exclusive and ordered with `kill_endpoint`'s liveness bump. A registration only happens
 /// after observing the target **alive** under the lock; once `kill_endpoint` has marked it dead, a
@@ -908,8 +908,9 @@ static QUEUED_LOST: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new
 
 /// Mark the endpoint dead: bump generation, drain queue, return blocked slots.
 ///
-/// Returns `(blocked_receiver_slot, blocked_sender_slot)` - the caller must
-/// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`. Callers
+/// Returns `(blocked_receiver_slot, oldest_blocked_sender_slot)` - the caller must
+/// wake both (if `Some`) with `EndpointDead` via `scheduler::wake_by_slot`, then
+/// drain every other blocked sender with `take_blocked_sender` the same way. Callers
 /// blocked in a `Call` awaiting this endpoint are NOT returned here: the kill path
 /// drains them separately with `take_call_waiter` and wakes them with `ReplyDead`.
 pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {

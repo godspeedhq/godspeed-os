@@ -104,9 +104,9 @@ QEMU, and hardware is checked by hand-run "cards" (section 4.2).
 
 | Area | Question | Evidence today | Not yet covered |
 |---|---|---|---|
-| Kernel boundary | What does the kernel do? | MISCIS (`CLAUDE.md` 4.3), `scripts/commandments.py` and its red-team probes (`scripts/commandments_redteam.py`), the surface baseline | Ops within a syscall are not counted |
+| Kernel boundary | What does the kernel do? | MISCIS (`CLAUDE.md` 4.3), `scripts/commandments.py` and its red-team probes (`scripts/commandments_redteam.py`), the surface baseline; every syscall arm gated or ungated by record (`scripts/syscall_gate_check.py`) | Ops within a syscall are not counted |
 | Memory isolation | Can a task reach memory outside its grant? | Identity Test 7, property P4 and P7, adversarial A3, A10, A14 and A15 (`osdev/src/validator.rs`) | No hardware run of these suites |
-| Capabilities | Can a task obtain or use rights it was not given? | Identity Tests 2, 3, 5, 9 and 14; property P1, P3 and P9; adversarial A1, A2, A4, A5, A9, A11 to A13 | Restart against revocation is covered for files (Test 14), not as a general property |
+| Capabilities | Can a task obtain or use rights it was not given? | Identity Tests 2, 3, 5, 9 and 14; property P1, P3 and P9; adversarial A1, A2, A4, A5, A9, A11 to A13; bounded Kani proofs of the capability files (`tests/kani`) and their host tests on every build | Restart against revocation is covered for files (Test 14), not as a general property |
 | IPC | Are messages and queues bounded and validated? | Queue depth 16 (`CLAUDE.md` 8.5); property P6 and P10; fuzz F5 and F6; Test 4; `osdev test reply-dead` | |
 | Scheduling | Can a task starve others? | Test 8; adversarial A8; perf B3 and B10 | No latency bound is claimed or measured under load |
 | Recovery | What happens when a component dies? | Tests 11, 13 and 15; `chaos` (kill, flood, memory and spawn storms, max-carnage) in QEMU and on all five boards | Recovery is observed, not proved; storms are bounded runs |
@@ -174,7 +174,7 @@ isolation; supervisor restart and authority recovery; and the `unsafe` code the 
 
 Methods that fit: manual adversarial review, fuzzing, property-based tests, targeted static analysis,
 boundary-condition tests, fault injection, and model checking or formal reasoning for narrowly scoped invariants.
-**No formal verification has been done.** Chaos testing shows observed outcomes; it is not an analysis of a
+**Formal verification is limited to bounded model checking of the capability code** (Kani, `tests/kani`: rights only narrow, a cap validates exactly when its generation and right match, a generation bump invalidates every older cap, the table's lookup after a revoke or a death), each proof holding within its stated bound; nothing beyond that has been formally verified. Chaos testing shows observed outcomes; it is not an analysis of a
 security boundary, and nothing here claims it is.
 
 Security findings go privately through `SECURITY.md`; fixed ones are recorded in `audits/security-audit.md`.
@@ -274,8 +274,8 @@ where there is no IOMMU; the repeatability of release cards.
 GodspeedOS is experimental software (`CLAUDE.md` 2.2). These stay explicit until stronger evidence exists:
 
 - Passing tests does not prove the absence of vulnerabilities.
-- Isolation depends on the correctness of the kernel's mechanisms, which have not been formally verified or
-  independently reviewed.
+- Isolation depends on the correctness of the kernel's mechanisms, which have not been independently reviewed,
+  and of which only narrow properties of the capability code are formally checked (bounded, `tests/kani`).
 - On the Pis and the VisionFive no IOMMU confines DMA, so a compromised DMA-capable driver has kernel-equivalent
   reach; on x86, two drivers are confined (`CLAUDE.md` 6.4).
 - A restart does not preserve interrupted work.
@@ -286,7 +286,8 @@ GodspeedOS is experimental software (`CLAUDE.md` 2.2). These stay explicit until
 - No built-in service image is signed; only installed packages are (section 8, C).
 - The test suites run in QEMU only, and the hardware logs are not published (section 4.2).
 - AI-assisted code needs the same review and verification as any other.
-- No independent security review or formal verification has been performed. Neither will be claimed until it has.
+- No independent security review has been performed, and formal verification covers only the bounded capability
+  proofs above. Neither more will be claimed until it has been done.
 
 The aim is failures that are containable, diagnosable and recoverable where possible, not a claim that they cannot
 happen.

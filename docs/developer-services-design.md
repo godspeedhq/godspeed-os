@@ -69,7 +69,8 @@ is exactly the "CLI needs a private interface" signal the CLI's contract says to
 
 Section 4 has the table. The short form: of the nine columns of an `IMAGES` row, the contract covers
 four (memory limit, core, send peers, device class) and part of a fifth (privileges). The receive
-endpoint, eight of the fifteen privilege bits, `probe_mode`, `dma_pages`, and whether the supervisor
+endpoint, six of the twelve privilege bits (eight of fifteen until 2026-10-28, when the two clock bits and
+`NET_DEVICE`'s were retired, `backlog/fixed/59` and `backlog/fixed/21`), `probe_mode`, `dma_pages`, and whether the supervisor
 restarts the service exist only in supervisor source. So a row cannot be generated from a contract
 today even if we wanted to.
 

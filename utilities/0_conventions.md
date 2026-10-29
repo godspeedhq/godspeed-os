@@ -26,7 +26,8 @@ Each utility has its own numbered doc in this folder (`1_observe.md`,
    place, `sub_help` in `services/shell/src/main.rs` - a command with its own per-word help (`events`,
    `trace`, `chaos`) is reached from there by a delegating arm, so `<util> <word> help` has exactly one
    answer whichever way the words arrive. `scripts/subcmd_help_check.py` reads `SUBCMD_FIRST` and
-   `sub_help` and fails on any word Tab offers that answers nothing; it runs on every build.
+   `sub_help` and fails on any word Tab offers that answers nothing, and (since 2026-10-28) on any first
+   word a utility's help rows name that Tab does not offer; it runs on every build.
 3. **`help` is the word - the only form. No flags, no synonyms.** There is exactly
    one way to ask for help: the word `help`. No `-h`, no `--help`, no hidden
    aliases. A tolerated-but-undocumented synonym would itself be a hidden, unsaid
@@ -329,7 +330,7 @@ checkers that enforce it.
 
 | Site | What it gives you | What fails if you miss it |
 |---|---|---|
-| `SUBCMD_FIRST` | tab completion of the first argument | rule 9; Tab falls through to a directory listing |
+| `SUBCMD_FIRST` | tab completion of the first argument | rule 9; Tab falls through to a directory listing, and `subcmd_help_check.py` fails on a word the help rows name |
 | `SUBCMD_SECOND` | completion one level deeper, where the surface has one | rule 9, silently |
 | `NO_PATH_CMDS` | Tab offers keywords, not paths, where no argument is a path | a path menu for a keyword position |
 | `UTILS` | the `<util> help` / `<util> version` intercept | rules 1 and 5 |

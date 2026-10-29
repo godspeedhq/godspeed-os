@@ -885,14 +885,15 @@ SpawnImage               = 52
 # Commandment IV - which contract capability key corresponds to which privilege bit. Read by
 # `IV-contract-authority`, which reconciles what a contract CLAIMS against what is actually granted.
 #
-# Only these four are reconcilable, and the omissions are deliberate:
+# Only the five below are reconciled, and the omissions are deliberate:
 #   hw_mmio / hw_pci_* / hw_interrupt   a driver's vector and BARs are resolved from its DEVICE CLASS
 #                                       by the arch seam at spawn. The contract's number and the grant
 #                                       are different kinds of fact; pretending to reconcile them
 #                                       would be the defect this check exists to catch.
-#   CONSOLE_PUSH, INTROSPECT, REBOOT,   sanctioned kernel-only grants (the U15 doctrine, see
-#   GPIO                                kernel/src/task/mod.rs). The kernel is their single source and
-#                                       they have no contract key by design.
+#   INTROSPECT, REBOOT, GPIO            no contract key: they ride the supervisor's spawn request (13.6).
+#                                       They were once kernel-only BY-NAME grants (the U15 doctrine,
+#                                       kernel/src/task/mod.rs records it); none is by name now.
+#   console_push                        a schema key, not reconciled yet: see contract_not_reconciled.
 #
 # Adding a capability key to contracts/schema/service.schema.json should force a decision here:
 # reconcilable, or deliberately not, with the reason written down.

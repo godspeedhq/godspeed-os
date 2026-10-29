@@ -14,8 +14,10 @@ nothing for the other checkers to account for - one file, one compiler invocatio
 THE LIST IS EXPLICIT for the reason `EXTRA_CHECKS` is: adding a file is a decision, not a side effect of
 a directory listing. A listed file that is missing is a failure, not a skip.
 
-Exit: 0 if every listed file compiles and every test in it passes, and `cargo test -p kernel --lib`
-passes, 1 otherwise.
+It then runs the kernel's own host tests (`cargo test -p kernel --lib`) and `tests/host-ipc` (`host_ipc`).
+
+Exit: 0 if every listed file compiles and every test in it passes, `cargo test -p kernel --lib` passes,
+and `tests/host-ipc` passes with every `#[ignore]`d defect reproduction still failing; 1 otherwise.
 """
 import os
 import re

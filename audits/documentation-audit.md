@@ -2073,3 +2073,85 @@ own, the code checked by `osdev test driver-packages`.
   the host that has the device anyway (`UsbState::host_of`), which only matters for a driver wired to two hosts. The
   audit's check against the code read the host name and missed what `present` already required.
 - Open still: 4, 6, 8, 9, 10 and 11.
+
+## Audit 26 - documents and code comments, `feat/v1-groundwork` since it left `main` (2026-10-29)
+
+Scope: everything `feat/v1-groundwork` changed since `7c0c9499` (69 commits, 206 files: the gates of backlog/90 and
+71, the host tests and Kani, the IPC defects D1-D19, the retired syscalls of backlog/21 and 59, `soc_nic`, read runs,
+the time-bounded lock wait, the KVM fix), then every document and comment elsewhere those changes made false. Read in
+three parts - comments in `kernel/`, `sdk/`, `tests/` and `stdlib/`; comments everywhere else; documents - by three
+independent readers, each finding checked against the code before it was taken. Comments and documents only: every
+changed line in a source file was checked to be comment or docstring text.
+
+**Result.** 44 files corrected, and 11 code findings recorded, not fixed.
+
+**In the constitution:**
+- `CLAUDE.md` 5: `syscall_gate_check.py`, `host_test_check.py` and `mutants_check.py` were missing from the list of
+  checkers.
+- `CLAUDE.md` 18.5: "Four amendments to the grandfathered floors stand" - seven do.
+
+**In documents:**
+- `kernel/src/syscall/CLAUDE.md`: the removed syscalls lacked 42-44 and 46-49; `inspect_kernel` lacked query 29.
+- `docs/CLAUDE.md`: `porting.md` 54 arch-conditional sites (47); `observability.md` 27 queries, 16 ungated (28, 17);
+  `ENGINEERING_ASSURANCE.md` "no formal verification".
+- `docs/observability.md`, `docs/introspection-capability.md`: the query counts and the ungated table lacked 29.
+- `docs/ENGINEERING_ASSURANCE.md`, `docs/verification-road-map.md`: no formal verification, item 9 deferred - the
+  bounded Kani proofs of `capability/` exist.
+- `docs/arm32-usb-userspace.md`, `docs/service-ownership.md` 9.3: the USB-disk and NET_DEVICE syscalls as inert
+  stubs or live bits; they are removed.
+- `docs/developer-services-design.md` 1.3: eight of fifteen privilege bits - six of twelve.
+- `docs/usb-device-drivers.md`, `docs/wifi-usb.md`: a binding's gen from the clock counter - its high half is the
+  host's instance since `3fb9f2c7`.
+- `kernel/src/arch/x86_64/CLAUDE.md`: MSR 0xE2 is not touched under a hypervisor (`b0a67fc6`).
+- `utilities/0_conventions.md`: `subcmd_help_check.py` also fails when Tab does not offer a word a help row names.
+- `audits/unsafe-audit.md`: the SDK call-site prose was 87 (79 + 8) and 84; it is 83 (75 + 8) and 80.
+- `backlog/49`, `27`, `53`, `90` and `backlog/README.md`: status lines and index rows that predated the fixes made on
+  this branch (the lock wait bounded by time, `duration_cycles`' notice, the revived workflow, D1-D19 and E1-E6).
+
+**In code comments:**
+- `kernel/src/syscall/dispatch.rs`: the ungated queries lacked 29 and called 28 a power-off only; query 15's comment
+  sat above the `29` arm; `NET_FRAME_MAX` described a bridge whose syscalls are gone.
+- `kernel/src/task/scheduler.rs`: two new functions had taken their neighbours' doc comments.
+- `kernel/src/ipc/routing.rs`: the call-await race-freedom note predated `PENDING`; `kill_endpoint` returned
+  "blocked_sender_slot".
+- `kernel/src/arch/aarch64/mod.rs`, `riscv64/mod.rs`, `x86_64/syscall_entry.rs`, `kernel/src/clock.rs`: `soc_nic` "set
+  here" (it is a function of `GENET_PRESENT`), the wall clock from a kernel SNTP anchor that is gone, `bar_len`'s
+  answers, an IF=0 syscall, `packed_from_epoch`'s removed caller.
+- `sdk/rust/src/service_context.rs`: the NetFrame note and `AUTHORITIES`' "anything above 18 is an endpoint".
+- `tests/host-ipc`: `Cargo.toml`'s file and stub lists; a stale `dispatch.rs` line citation, and a note that the
+  scenarios cite `537e6861`; t2b, t4 and t6 described the bug as present where they assert the fix.
+- `services/nic-driver`, `services/supervisor`, `services/xhci/src/msc.rs`, the `nic-driver` and `dwc2` contracts:
+  the NET_DEVICE and USB-disk syscalls as dead ABI or steps not taken; `genet_main` chosen by instruction set; no
+  riscv64 arm (QEMU virt runs the e1000); the Pi 4 window via `ctx.mmio()`.
+- `services/shell/src/main.rs`: `FS_FSCK_SECS` blamed CPU in `fs` under investigation - it was block I/O, since
+  fixed by read runs; `check` also walks the free bitmap.
+- `services/fs/src/main.rs`: `BLK_XFER_MAX` and `BLK_CALL_MAX` predated read runs.
+- `COMMANDMENTS.baseline.toml` IV: "only these four" (five), and the U15 kernel-only grants, which ride the spawn
+  request now.
+- `scripts/host_test_check.py`, `scripts/surface_check.py`, `osdev/src/main.rs`: what each runs and reads.
+- `.github/workflows/build.yml`: the Miri step's "this workflow does not run" (the build job does); "backlog/fixed/53"
+  for an entry still open.
+
+**Code findings, recorded and not fixed (an audit changes no code):**
+1. `tests/kani` does not compile since `99095070`: `spinlock.rs`'s `Wait::look` calls
+   `arch::imp::liveness_deadline_cycles` and `read_cycle_counter`, and the Kani crate's arch seam stubs only the
+   interrupt mask. `verify.yml` runs on any change to `spinlock.rs`.
+2. Backlog number 94 is used twice (`backlog/94`, `backlog/fixed/94`), and `backlog_check.py` keys duplicates by
+   folder, so it cannot see it.
+3. `scripts/commandments.py`, IV-contract-authority's `does_not_prove` string: the same U15 claim corrected in the
+   baseline's comment above.
+4. `kernel/src/syscall/dispatch.rs`: `NET_FRAME_MAX` is dead code.
+5. `kernel/src/clock.rs`: `packed_from_epoch` has no caller but its tests.
+6. `sdk/rust/src/service_context.rs` `AUTHORITIES`: no row for 19 (`power_off`), so `caps` shows the shell's
+   POWER_OFF as an endpoint; the `pci_cfg` row says read and write of a read-only privilege. Predates the branch.
+7. `tests/host-ipc`: several test names (t3, t4a, t4b, t5a, t5b) name the bug where the test asserts the fix.
+8. `kernel/mutants-survivors.txt` may list survivors this branch's new tests kill (for example `packed_from_epoch`'s
+   `|` to `^`); only a mutants run settles it.
+9. `services/block-driver/src/sdhci.rs` has no `OP_READ_BLOCKS` arm. Latent: the backend is not compiled in.
+10. `kernel/src/syscall/CLAUDE.md`'s "the first thing validates the capability, no exceptions" - Yield, Park and Exit
+    take none, by design (14.5). Predates the branch; a wording question for the operator.
+11. Left alone as ratified text: Appendix C.2's note says `InspectKernel` has 25 queries (28 now), and section 5's
+    "WHERE THESE RUN" calls `build.yml` paused (it is still `workflow_dispatch`-only, and builds green).
+
+**Gates:** every documentation checker green (dash, refs, symbols, index, facts, line refs, commands, comment
+symbols, foreign words, site, backlog, line endings, unsafe), `commandments.py` 22/22.

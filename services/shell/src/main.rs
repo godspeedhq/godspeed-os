@@ -21543,9 +21543,11 @@ const FS_TREE_SECS:   i64 = 120;  // recursive delete - bounded by how much ther
 ///
 /// 60 -> 180 (2026-10-27), on MEASUREMENT this time: the Pi 2's `drives check` took 76 s twice running
 /// (`fs: op 27 took 75953945 us, 176 block ops, 0% of it inside them`) and 46 s on a quieter run, so 60
-/// failed a healthy check. The time is CPU in `fs`, not the device - 0% of it inside block ops - which is
-/// being investigated separately; this bound is for the walk as it is today, with room for a slower
-/// stick, and the command stays q-abortable, so the operator is never held for the whole of it.
+/// failed a healthy check. That "0%" was the meter, not the walk: `check` and `scrub` read through
+/// functions the block-op count did not see, and most of the time was block I/O - the whole free bitmap
+/// read and then zeroed, one block per round trip (`fs`'s `data_read_m` and `check`, since reading in
+/// runs and zeroing only what is set). This bound is for the walk as it is today, with room for a
+/// slower stick, and the command stays q-abortable, so the operator is never held for the whole of it.
 const FS_FSCK_SECS:   i64 = 180;
 /// Format and reset DO rewrite the volume, and are the one thing here that legitimately takes
 /// minutes on a 15 GiB stick.
@@ -21957,7 +21959,7 @@ fn ask_with_quit_notice(ctx: &ShellCtx, peer: &str, msg: &Message, max_secs: i64
 fn fs_op_q(ctx: &ShellCtx, op: u8) -> ReqOutcome {
     const HINT_SECS: i64 = 2;    // must equal gs::call::NOTICE_AFTER_SECS, which decides when `[q] quit` prints (asserted below)
     const _: () = assert!(HINT_SECS == gs::call::NOTICE_AFTER_SECS); // the notice `gs` gives
-    const MAX_SECS:  i64 = FS_FSCK_SECS; // check/scrub walk the TREE, not the volume - a real bound
+    const MAX_SECS:  i64 = FS_FSCK_SECS; // check/scrub walk the TREE (check also the free bitmap), not every block - a real bound
     let tag = next_fs_tag(ctx);
     let msg = Message::from_bytes(&[tag, op]);
     drain_stale_fs_replies(ctx);

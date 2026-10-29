@@ -13,9 +13,12 @@ WHAT IT READS, each from the source that defines it rather than from a list kept
            with their signatures, types with their public fields and variants, traits with their items,
            inherent methods, trait implementations, constants and re-exports. Walked from `lib.rs` through
            the `pub mod`s, as a user of the crate reaches them.
-  util     the utility names (`UTILS` in the shell) and the words each takes first (`SUBCMD_FIRST`).
-  record   the record columns each producer emits: every `Table::new(&[..])` with literal columns, in the
-           shell, the standard library and the record services, keyed by the function that builds it.
+  util     the utility names (`UTILS` in the shell) and the words each takes first (`SUBCMD_FIRST`), less
+           the test and debug tools (`TEST_TOOLS`) and debug subcommands (`TEST_WORDS`), which the promise
+           does not cover.
+  record   the record columns each producer emits: every `Table::new(&[..])`, `Rows::new(&[..])` or
+           `.columns(&[..])` with literal columns, in the shell, the standard library and the record
+           services (not in a `#[cfg(test)]` item), keyed by the function that builds it.
   contract every key the contract schema accepts, its type, its allowed values, and which keys are required.
 
 THE RULE, per line of the snapshot:
@@ -26,6 +29,8 @@ THE RULE, per line of the snapshot:
     unnoticed the day after it was added;
   - `contract required` runs the other way: a NEW required key is the break (a contract that validated
     yesterday stops validating), and dropping one is growth.
+
+A plain run also runs the checker's own mutants (`MUTANTS`), quietly; `--selftest` runs them alone, verbose.
 
 THE TWO COMMANDS:
   --bless                    record growth. Refuses while anything is removed or changed, so it cannot be

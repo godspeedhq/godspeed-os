@@ -27,7 +27,7 @@ The list is in priority order for a solo developer. Each item compounds with the
 6. [Subsystem-level property tests](#6-subsystem-level-property-tests) ✅
 7. [Long-running soak](#7-long-running-soak) - *deferred pending hardware*
 8. [External documentation pass](#8-external-documentation-pass) - *deferred*
-9. [Formal subset analysis](#9-formal-subset-analysis) - *deferred*
+9. [Formal subset analysis](#9-formal-subset-analysis) - *under way: bounded Kani proofs of the capability code (`tests/kani`, `backlog/90`)*
 
 ---
 
@@ -292,7 +292,9 @@ Properties to assert with `proptest` (single-threaded model first, then a concur
 
 ## 8. External Documentation Pass
 
-> **Status:** Deferred (2026-05-16).
+> **Status:** Deferred (2026-05-16). *Under way since 2026-10-27 (`backlog/90`, layer C): `tests/kani` holds bounded
+> Kani proofs of the real capability files (`capability/{cap,generation,rights,table}.rs`), run by
+> `.github/workflows/verify.yml`; the module this section asks for is `capability/`.*
 
 **Intent.** Write the kernel down for someone who has never seen it. Force every invariant out of your head and onto the page.
 
@@ -318,7 +320,9 @@ Properties to assert with `proptest` (single-threaded model first, then a concur
 
 ## 9. Formal Subset Analysis
 
-> **Status:** Deferred (2026-05-16).
+> **Status:** Deferred (2026-05-16). *Under way since 2026-10-27 (`backlog/90`, layer C): `tests/kani` holds bounded
+> Kani proofs of the real capability files (`capability/{cap,generation,rights,table}.rs`), run by
+> `.github/workflows/verify.yml`; the module this section asks for is `capability/`.*
 
 **Intent.** Pick one small kernel module and prove its invariants formally, not behaviorally. **Not the whole kernel. One module.**
 

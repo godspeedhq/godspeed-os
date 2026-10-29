@@ -5,7 +5,7 @@
 **Severity:** correctness, latent. Nothing is known to be broken on the five machines; what is
 recorded is a shape that turns a three-second wait into no wait at all, silently, and then reports a
 different cause.
-**Status: OPEN.** The fix is Rust in the SDK, so it is recorded rather than made.
+*Was (before 2026-10-28):* OPEN. The fix is Rust in the SDK, so it is recorded rather than made.
 
 ## The shape
 
