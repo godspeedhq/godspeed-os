@@ -93,6 +93,11 @@ impl Band {
     }
 }
 
+/// **Every hold masks interrupts (`lock_irq`).** `release_owner` runs on the kill path, which can run
+/// with interrupts masked on a core whose preempted task was inside `ResourceMint`, `ResourceInvoke` or
+/// `ResourceRevoke` holding this lock: a plain hold there is a core that spins on its own preempted
+/// holder forever - `FREE_IDS`' wedge (backlog/90 D16), found again here when the audit asked for the
+/// other locks on that path to be looked at.
 static BAND: SpinLock<Band> = SpinLock::new(Band::new());
 
 /// True if `id` falls in the delegated band (an O(1) range check - the discriminator
@@ -131,7 +136,7 @@ pub fn narrow_embedded_for_receiver(cap: super::cap::Capability) -> super::cap::
 /// and return its `ResourceId`. `None` if the band is full (loud failure at the caller).
 /// Generation is monotonic across reuse (ABA-safe, see module docs).
 pub fn allocate(owner: OwnerId) -> Option<ResourceId> {
-    let slot = BAND.lock().claim(owner)?;
+    let slot = BAND.lock_irq().claim(owner)?;
     let id = id_of(slot);
     match get_resource_generation(id) {
         Some(g) => register_resource_at_gen(id, g.bump()), // reused id - strictly higher gen
@@ -146,7 +151,7 @@ pub fn owner_of(id: ResourceId) -> Option<OwnerId> {
     if !is_delegated(id) {
         return None;
     }
-    BAND.lock().owner_at(slot_of(id))
+    BAND.lock_irq().owner_at(slot_of(id))
 }
 
 /// Release a just-allocated delegated id that could not be handed out (e.g. the caller's
@@ -154,7 +159,7 @@ pub fn owner_of(id: ResourceId) -> Option<OwnerId> {
 /// re-registers at a higher generation.
 pub fn release(id: ResourceId) {
     if is_delegated(id) {
-        BAND.lock().free(slot_of(id));
+        BAND.lock_irq().free(slot_of(id));
     }
 }
 
@@ -167,7 +172,7 @@ pub fn revoke_owned(id: ResourceId, caller: OwnerId) -> bool {
         return false;
     }
     let slot = slot_of(id);
-    let mut band = BAND.lock();
+    let mut band = BAND.lock_irq();
     if !band.is_owner(slot, caller) {
         return false;
     }
@@ -188,7 +193,7 @@ pub fn release_owner(owner: OwnerId) -> u32 {
     let mut freed = 0u32;
     loop {
         let id = {
-            let mut band = BAND.lock();
+            let mut band = BAND.lock_irq();
             band.take_one_owned(owner).map(id_of)
         };
         match id {
