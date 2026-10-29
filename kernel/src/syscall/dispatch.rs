@@ -1663,8 +1663,13 @@ fn do_call(
                 if deadline != 0 {
                     scheduler::set_wake_deadline(my_slot, deadline);
                 }
-                let err = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
-                if err != 0 { break err; }
+                // The wake result is NOT returned, as the comment above has always said and the code did
+                // not do: a replier that queued its reply, woke us with 0 and then died before we ran had
+                // its death overwrite the wake with ReplyDead, and we returned that with the reply sitting
+                // in the mailbox - where, if the replier respawned on the same id, the next Call to it would
+                // have taken that orphan as its answer (backlog/90 D6). call_dequeue reads the truth: the
+                // reply if it is there, ReplyDead only when the target is dead AND nothing is queued.
+                let _ = scheduler::block_and_reschedule(TaskState::BlockedOnRecv);
             }
             Err(e) => break ipc_err_to_i64(e),   // ReplyDead (-12) or EndpointDead (-7)
         }

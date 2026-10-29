@@ -2,7 +2,7 @@
 
 **Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19; under way since 2026-10-26 on `feat/v1-groundwork`, with Kani, Creusot and Verus as layer C's tools, run in CI (Next step).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
 the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
-enforcement-layer defects are listed below; since 2026-10-26 D1, D2, D3, D5, D12, D16, D19, D23, D26, D29, the id and IRQ halves of D15 and the placement half of
+enforcement-layer defects are listed below; since 2026-10-26 D1, D2, D3, D5, D6, D12, D13, D16, D19, D22, D23, D26, D29, the id and IRQ halves of D15 and the placement half of
 D17 are fixed, and E1 to E6 are repaired apart from the parts each row names as open. Of the four executable
 prototypes, C4 is landed (`scripts/syscall_gate_check.py`); the other three are outside the tree. The brief, as recorded on 2026-10-15, follows; only its list of checker
 names was spelled out in full, because `scripts/doc_symbols_check.py` could not resolve the short forms.
@@ -181,7 +181,7 @@ catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere
 | D3 | med | a dead task's wait records (blocked sender on a peer, call-await, deadline, badge) reach the slot's next occupant. **Blocked-sender half FIXED 2026-10-27** with D1 (`forget_blocked_sender`, `t6`); deadline and badge open | `task/scheduler.rs:2576-2640` |
 | D4 | med | CallDeadline's bound does not cover the send leg | `syscall/dispatch.rs:1557-1590` |
 | D5 | med | Call liveness, reply correlation, AcquireSendCap and ResourceInvoke key identity on a bare, LIFO-reused endpoint id (partly KNOWN). **Call half FIXED 2026-10-27:** every message carries its sender's endpoint generation (`sender_gen`, recorded per task at spawn so the send path pays one atomic load), a Call's reply must match id AND generation, and a target whose entry has another generation is a successor, so the caller gets `ReplyDead`; `t3`, `t4a`, `t4b` pass unignored. `AcquireSendCap` and `ResourceInvoke` open | `ipc/routing.rs:581-589`, `dispatch.rs:1312`/`:1350` |
-| D6 | med | a delivered reply loses to ReplyDead | `syscall/dispatch.rs:1638-1639` |
+| D6 | med | a delivered reply loses to ReplyDead. **FIXED 2026-10-29:** `do_call` ignores the wake result and asks `call_dequeue` again, which returns the reply if it is queued and ReplyDead only when the target is dead and nothing is; `t9` in `tests/host-ipc` plays the trace on the real routing code. KVM A/B, five runs a side: no cost above the instrument's floor; a T630 perf card is owed | `syscall/dispatch.rs:1638-1639` |
 | D9 | med | `CORE_PENDING_PML4` is one slot (leaks a root, an L1 slot on arm32); the pending-stack overflow branch frees the stack in use (a proof gap: nine undrained self-kills not shown reachable) | `task/scheduler.rs:852`, `:3107`, `:3156-3160` |
 | D11 | med | `run()` picks with interrupts on, then claims a different life of the slot: a kernel panic from userspace kill and spawn. **Seen in QEMU 2026-10-26** (`backlog/95`, where a guard for it was tried and reverted) | `task/scheduler.rs:1569-1593` |
 | D14 | med | the kill path publishes the death before it releases device state, IRQ routes and the band | `task/scheduler.rs:2560-2903` |

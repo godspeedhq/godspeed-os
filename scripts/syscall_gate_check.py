@@ -156,6 +156,10 @@ ALLOW_ZERO = {
         "terminal died between lookup and enqueue; counted and reported every 100th (CONSOLE_LOST)",
     ("handle_sleep", "let_=scheduler::block_and_reschedule(TaskState::BlockedOnRecv);"):
         "a sleep woken early reports success: see finding F-sleep-early-wake-0",
+    ("do_call", "let_=scheduler::block_and_reschedule(TaskState::BlockedOnRecv);"):
+        "the wake result is not the outcome: the loop asks call_dequeue again, which returns the reply, "
+        "ReplyDead or EndpointDead from the routing state, and a delivered reply must not lose to a death "
+        "that overwrote its wake (backlog/90 D6)",
     ("handle_resource_mint", "let_=delegated::revoke_owned(id,owner);"):
         "cleanup after a failed copy-out; the id was just allocated by this owner",
 }
