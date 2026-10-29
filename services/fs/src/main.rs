@@ -1491,6 +1491,11 @@ fn serve(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreadable: 
     }
     if errored && len != REPLY_SENT_DIRECTLY && p.first().map_or(false, |&op| op_is_read_only(op)) {
         ctx.log("fs: device I/O error while serving - re-mounting and retrying this request once");
+        // The re-mount builds a fresh state with an empty open-file table, so the caps the old one
+        // handed out are revoked first, as at the top of the serve loop (A9-3): otherwise each such
+        // event left up to 64 band slots live, and a holder's next use answered "no such file" for a
+        // file that exists (backlog/90 D26).
+        if let Some(old) = vol.as_mut() { old.revoke_all_open(ctx); }
         match Fs::mount_into(ctx, vol) {
             Ok(()) => {
                 len = 0;
@@ -1740,6 +1745,9 @@ fn serve_once(ctx: &ServiceContext, vol: &mut Option<Fs>, capacity: u64, unreada
             }
             let ll = if p.len() >= 2 { (p[1] as usize).min(LABEL_MAX) } else { 0 };
             let label = if p.len() >= 2 + ll { &p[2..2 + ll] } else { &[][..] };
+            // Formatting replaces the volume, so what the old one handed out goes first (A10-5's
+            // OP_FLASH site, which the revokes at the other three missed; backlog/90 D26).
+            if let Some(old) = vol.as_mut() { old.revoke_all_open(ctx); }
             match Fs::format_into(ctx, capacity, label, vol) {
                 Ok(()) => {
                     // A fresh disk carries the standard tree (`docs/filesystem-layout.md`, L1): the
