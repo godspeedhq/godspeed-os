@@ -194,6 +194,20 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// framebuffer is not a race the service can defend against, so the kernel simply stops.
 static OWNED_BY_KERNEL: AtomicBool = AtomicBool::new(true);
 
+/// Set by `reclaim_for_panic`: nothing will run again, so no writer may wait for `FB`.
+///
+/// `FB` is taken with interrupts masked everywhere (`lock_irq`), so the tick on a core can never find it
+/// held by that same core - which is what the arm32 power-off path did, from the tick, while idle held it
+/// with interrupts on, and the core waited on itself (backlog/90 D13). The panic and power-off paths take
+/// it with `try_lock` instead, and so does every writer after them: a holder another core left halted
+/// mid-draw must not keep the last words off the screen. Serial has them either way (11.4).
+static PANICKING: AtomicBool = AtomicBool::new(false);
+
+/// The floor's lock, for every writer: masked, or - once a panic or power-off has begun - not waited for.
+fn fb() -> Option<crate::smp::spinlock::SpinLockGuard<'static, Boot>> {
+    if PANICKING.load(Ordering::Acquire) { FB.try_lock() } else { Some(FB.lock_irq()) }
+}
+
 /// True once `init` has run AND the kernel still owns the screen. An arch that mirrors serial output to
 /// the display checks this so it can call `put_bytes` unconditionally.
 pub fn ready() -> bool {
@@ -205,7 +219,7 @@ pub fn ready() -> bool {
 pub fn init(p: FbParams) {
     let (rs, gs, bs) = (p.r_shift, p.g_shift, p.b_shift);
 
-    let mut s = FB.lock();
+    let mut s = FB.lock_irq();
     s.phys = p.phys;
     s.pitch = p.pitch;
     s.bpp = p.bpp;
@@ -248,7 +262,7 @@ pub fn grant() -> Option<FbGrant> {
     if !READY.load(Ordering::Acquire) {
         return None;
     }
-    let s = FB.lock();
+    let s = FB.lock_irq();
     Some(FbGrant {
         phys: s.phys,
         len: (s.pitch * s.height) as u64,
@@ -288,7 +302,7 @@ pub fn reclaim_on_death() {
         return;
     }
     OWNED_BY_KERNEL.store(true, Ordering::Release);
-    let mut s = FB.lock();
+    let Some(mut s) = fb() else { return };
     clear(&mut s);
     commit(&mut s);
 }
@@ -304,7 +318,10 @@ pub fn reclaim_for_panic() {
         return;
     }
     OWNED_BY_KERNEL.store(true, Ordering::Release);
-    let mut s = FB.lock();
+    PANICKING.store(true, Ordering::Release);
+    // Held by someone who will not let go (halted mid-draw, or this core's own interrupted writer): the
+    // screen is not cleared, and the reason still goes to serial. Never a wait (D13).
+    let Some(mut s) = FB.try_lock() else { return };
     clear(&mut s);
     commit(&mut s);
 }
@@ -314,7 +331,7 @@ pub fn put_bytes(bytes: &[u8]) {
     if !ready() {
         return;
     }
-    let mut s = FB.lock();
+    let Some(mut s) = fb() else { return };
     for &b in bytes {
         put(&mut s, b);
     }
@@ -326,7 +343,7 @@ pub fn clear_and_home() {
     if !ready() {
         return;
     }
-    let mut s = FB.lock();
+    let Some(mut s) = fb() else { return };
     clear(&mut s);
     commit(&mut s);
 }
