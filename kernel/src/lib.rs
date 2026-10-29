@@ -62,6 +62,9 @@ pub mod arch {
     pub mod imp {
         #[inline(always)] pub fn local_irq_save() -> bool { false }
         #[inline(always)] pub fn local_irq_restore(_was_enabled: bool) {}
+        // The lock wait's clock (`smp::spinlock::Wait`): with no bound the host build keeps the spin count.
+        #[inline(always)] pub fn read_cycle_counter() -> u64 { 0 }
+        #[inline(always)] pub fn liveness_deadline_cycles() -> u64 { 0 }
     }
 }
 

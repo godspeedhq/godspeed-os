@@ -60,8 +60,8 @@ machine on the inference.**
 | `task/scheduler.rs:2679` | `liveness_deadline_cycles()/4` = 75 quanta ~ 0.75 s | another core releasing a task slot - **PROVEN reachable, `backlog/fixed/48`** |
 | `task/scheduler.rs:1616` | 300 quanta ~ 3 s of ticks | another core making any progress |
 | `smp/ipi.rs` (gone) | 500,000,000 **spins** | other cores acknowledging a TLB shootdown - **deleted 2026-10-10**: the shootdown it bounded had no caller, and both went (`backlog/fixed/80` K20) |
-| `smp/spinlock.rs:35` | `LOCK_WATCHDOG_SPINS` **spins** | a lock holder releasing |
-| `memory/allocator.rs:470` | `ALLOC_WATCHDOG_SPINS` **spins** | the frame-allocator lock holder releasing - its own message names "preempted holder" as a cause |
+| `smp/spinlock.rs` | ~~spins~~ **FIXED 2026-10-28**: the watchdog's allowance in counter ticks, and only when the SAME hold lasted it (each lock counts its releases beside its held flag, so a waiter sees contention as the count changing and opens another window, at most 4). Perf under WSL2 + KVM, ten runs before and six after, interleaved: every median inside the before runs' spread; B2 cross-core p50 the one leaning slower (46 of 60 pairings, not significant at 5%) and the instrument's own floor ~10%, so a T630 perf card is owed before the cost is called nil | a lock holder releasing |
+| `memory/allocator.rs` | ~~spins~~ **FIXED 2026-10-28**, the same `smp::spinlock::Wait` | the frame-allocator lock holder releasing - its old message named "preempted holder" as a cause |
 
 Three of the five are bounded by a SPIN COUNT, which is the shape this project has already learned
 is not a bound on anything: a count means a different wall time on every machine, and a spinning core
