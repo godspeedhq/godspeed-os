@@ -2419,7 +2419,7 @@ fn handle_signal_input_ready(cap_slot: u64) -> i64 {
 /// u8, [9..16] pad. Requires INTROSPECT (READ) - discloses a task's authority
 /// (the in-OS form of `osdev caps`, §17; makes authority visible per §26.9).
 ///
-/// Best-effort snapshot (see `scheduler::for_each_cap_of`). Returns -1 on bad args.
+/// Best-effort snapshot (see `scheduler::for_each_cap_of`). Returns -1 on bad args, or when no task is in `slot`.
 fn handle_task_caps(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     const ENTRY: usize = 16;
     const MAX_ENTRIES: usize = 64; // CapTable holds at most 64 slots
@@ -2429,6 +2429,10 @@ fn handle_task_caps(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     {
         return cap_err_to_i64(CapError::CapNotHeld);
     }
+    // No task in that slot is -1 on every port. It used to fall through to a zero-length write, which
+    // arm32's range check accepts and the other three refuse, so the same question answered 0 on the
+    // Pi 2 and -1 elsewhere (backlog/90 D27).
+    if !scheduler::task_valid(slot as usize) { return -1; }
     let cap = (buf_len as usize / ENTRY).min(MAX_ENTRIES);
     if cap == 0 { return 0; }
 
@@ -2446,6 +2450,8 @@ fn handle_task_caps(slot: u64, buf_ptr: u64, buf_len: u64) -> i64 {
     });
 
     let bytes = n * ENTRY;
+    // A live task that holds nothing: nothing to copy, and no zero-length range to ask a port about.
+    if bytes == 0 { return 0; }
     if !validate_user_ptr(buf_ptr, bytes) { return -1; }
     if write_user_bytes(buf_ptr, &tmp[..bytes]) { n as i64 } else { -1 }
 }

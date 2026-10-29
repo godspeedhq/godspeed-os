@@ -1393,6 +1393,11 @@ pub fn for_each_active_cap<F: FnMut(&Capability)>(mut f: F) {
 /// command via `TaskCaps`): a concurrent spawn/kill may be seen inconsistently,
 /// which is acceptable for display. Same posture as `for_each_active_cap` and
 /// `task_stat`. No-op for an empty/invalid slot.
+/// Is there a task in `slot` whose capability table may be read (the `for_each_cap_of` test)?
+pub fn task_valid(slot: usize) -> bool {
+    slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Acquire)
+}
+
 pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
     if slot >= MAX_TASKS { return; }
     if !TASK_VALID[slot].load(Ordering::Acquire) { return; }
