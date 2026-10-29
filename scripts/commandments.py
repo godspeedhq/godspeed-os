@@ -2028,9 +2028,9 @@ CHECKS = [
                         "vector is resolved from its DEVICE CLASS by the arch seam, so the contract's "
                         "number and the grant are different kinds of fact and pretending to reconcile "
                         "them would be the very thing this check exists to catch. Nor does it cover "
-                        "the kernel-only privileges (CONSOLE_PUSH, INTROSPECT, REBOOT, "
-                        "and GPIO) - the U15 doctrine makes the kernel their single "
-                        "source and they have no contract key by design",
+                        "INTROSPECT, REBOOT and GPIO, which have no contract key and ride the "
+                        "supervisor's spawn request (13.6), or console_push, a schema key not "
+                        "reconciled yet (contract_not_reconciled in the baseline)",
          probes=[
              dict(why="a contract claiming authority it is not granted must be caught",
                   pins={"contract_privileges": {"log_write": "SERVICE_CONTROL"}}, expect=True),

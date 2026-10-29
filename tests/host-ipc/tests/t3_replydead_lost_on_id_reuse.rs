@@ -12,7 +12,7 @@ use host_ipc::*;
 use host_ipc::ipc::{routing, message::IpcError, queue::QUEUE_DEPTH};
 
 #[test]
-fn t3_replydead_lost_when_target_id_is_reused_before_caller_registers() {
+fn t3_replydead_reaches_caller_when_target_id_is_reused_before_it_registers() {
     let s = ep(150);   // server S, first incarnation at generation 5
     let rc = ep(151);  // caller C's reply mailbox; C is slot 30
     routing::register(s, 0, g(5));

@@ -981,9 +981,10 @@ pub const AUTHORITIES: &[(u64, &str, &str)] = &[
     (11, "gpio_device", "drive the GPIO pins"),
     (14, "fire_irq", "inject a test interrupt"),
     (15, "image_spawn", "start a program from an image it supplies"),
-    (16, "pci_cfg", "read and write PCI configuration space"),
+    (16, "pci_cfg", "read PCI configuration space"),
     (17, "device_power", "cut and restore the power of the device it was granted"),
     (18, "cpu_clock", "set the Arm clock"),
+    (19, "power_off", "turn the machine off, now or at a deadline"),
 ];
 
 // ---------------------------------------------------------------------------

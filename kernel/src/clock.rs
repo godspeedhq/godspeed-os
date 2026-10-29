@@ -45,36 +45,6 @@ pub fn epoch_secs(packed: u64) -> i64 {
 pub const CLOCK_MIN_PLAUSIBLE: i64 = 1_577_836_800;
 pub const CLOCK_MAX_PLAUSIBLE: i64 = 4_102_444_800;
 
-/// The inverse of `epoch_secs`: Unix epoch seconds -> a `read_datetime`-packed value (same LSB-first
-/// layout: sec[6] min[6] hour[5] day[5] month[4] year[12]). Howard Hinnant's civil_from_days, so it is
-/// leap-year correct and round-trips `epoch_secs` exactly. It served the RTC-less ARM ports' network-set
-/// wall clock, which went with its setter (backlog/fixed/59); nothing in the kernel calls it now, only
-/// the tests below. Pure math, host-testable.
-pub fn packed_from_epoch(epoch: i64) -> u64 {
-    let days = epoch.div_euclid(86_400);
-    let rem = epoch.rem_euclid(86_400);
-    let hour = rem / 3_600;
-    let min = (rem % 3_600) / 60;
-    let sec = rem % 60;
-    // civil_from_days (days since 1970-01-01 -> y/m/d).
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;                                   // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);            // [0, 365]
-    let mp = (5 * doy + 2) / 153;                                  // [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1;                          // [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };                 // [1, 12]
-    let year = y + (m <= 2) as i64;
-    (sec as u64 & 0x3F)
-        | ((min as u64 & 0x3F) << 6)
-        | ((hour as u64 & 0x1F) << 12)
-        | ((d as u64 & 0x1F) << 17)
-        | ((m as u64 & 0x0F) << 22)
-        | ((year as u64 & 0xFFF) << 26)
-}
-
 #[cfg(test)]
 mod tests {
     use super::deglitch_epoch;
@@ -125,6 +95,36 @@ mod epoch_tests {
             | ((d  as u64 & 0x1F) << 17)
             | ((mo as u64 & 0x0F) << 22)
             | ((y  as u64 & 0xFFF) << 26)
+    }
+
+    /// The inverse of `epoch_secs`: Unix epoch seconds -> a `read_datetime`-packed value (same LSB-first
+    /// layout: sec[6] min[6] hour[5] day[5] month[4] year[12]). Howard Hinnant's civil_from_days, so it is
+    /// leap-year correct and round-trips `epoch_secs` exactly. It served the RTC-less ARM ports' network-set
+    /// wall clock, which went with its setter (backlog/fixed/59); it lives here now, as a second closed form
+    /// for the sweeps to check `epoch_secs` against (Audit 26: it had no caller outside these tests).
+    fn packed_from_epoch(epoch: i64) -> u64 {
+        let days = epoch.div_euclid(86_400);
+        let rem = epoch.rem_euclid(86_400);
+        let hour = rem / 3_600;
+        let min = (rem % 3_600) / 60;
+        let sec = rem % 60;
+        // civil_from_days (days since 1970-01-01 -> y/m/d).
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;                                   // [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);            // [0, 365]
+        let mp = (5 * doy + 2) / 153;                                  // [0, 11]
+        let d = doy - (153 * mp + 2) / 5 + 1;                          // [1, 31]
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };                 // [1, 12]
+        let year = y + (m <= 2) as i64;
+        (sec as u64 & 0x3F)
+            | ((min as u64 & 0x3F) << 6)
+            | ((hour as u64 & 0x1F) << 12)
+            | ((d as u64 & 0x1F) << 17)
+            | ((m as u64 & 0x0F) << 22)
+            | ((year as u64 & 0xFFF) << 26)
     }
 
     fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
@@ -185,7 +185,6 @@ mod epoch_tests {
     fn packed_from_epoch_round_trips_epoch_secs_over_the_sweep() {
         // The inverse must round-trip the forward map for every date the wall clock can show. Cover the
         // same multi-century sweep so a leap/century/month bug in civil_from_days cannot hide.
-        use super::packed_from_epoch;
         for y in 1971..=2100i64 {
             for mo in 1..=12i64 {
                 let last = days_in_month(y, mo);
@@ -204,7 +203,6 @@ mod epoch_tests {
     /// before reads back as the same instant, so a round trip cannot see it; the fields can.
     #[test]
     fn packed_from_epoch_gives_the_exact_fields() {
-        use super::packed_from_epoch;
         assert_eq!(packed_from_epoch(0), pack(1970, 1, 1, 0, 0, 0));
         assert_eq!(packed_from_epoch(946_684_800), pack(2000, 1, 1, 0, 0, 0));
         assert_eq!(packed_from_epoch(951_782_400), pack(2000, 2, 29, 0, 0, 0));
@@ -222,7 +220,6 @@ mod epoch_tests {
     /// directions run (0000-01-01 is 62,167,219,200 s before the Unix epoch).
     #[test]
     fn year_zero_takes_the_negative_era_branches() {
-        use super::packed_from_epoch;
         const Y0: i64 = -62_167_219_200;
         assert_eq!(epoch_secs(pack(0, 1, 1, 0, 0, 0)), Y0);
         assert_eq!(packed_from_epoch(Y0), pack(0, 1, 1, 0, 0, 0));

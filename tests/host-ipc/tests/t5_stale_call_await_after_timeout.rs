@@ -17,7 +17,7 @@ fn timed_out(mailbox: host_ipc::ipc::endpoint::EndpointId, slot: usize) {
 }
 
 #[test]
-fn t5a_timed_out_call_stays_registered() {
+fn t5a_timed_out_call_is_withdrawn() {
     let s = ep(180); let rc = ep(181);
     routing::register(s, 0, g(5));
     routing::register(rc, 0, g(6));
@@ -29,7 +29,7 @@ fn t5a_timed_out_call_stays_registered() {
 }
 
 #[test]
-fn t5b_later_death_of_old_target_targets_the_task_with_replydead() {
+fn t5b_later_death_of_old_target_wakes_no_one() {
     let s = ep(182); let rc = ep(183);
     routing::register(s, 0, g(5));
     routing::register(rc, 0, g(6));
@@ -42,7 +42,7 @@ fn t5b_later_death_of_old_target_targets_the_task_with_replydead() {
 }
 
 #[test]
-fn t5c_late_reply_wakes_the_timed_out_caller() {
+fn t5c_late_reply_does_not_wake_the_timed_out_caller() {
     let s = ep(184); let rc = ep(185);
     routing::register(s, 0, g(5));
     routing::register(rc, 0, g(6));

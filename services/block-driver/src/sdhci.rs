@@ -16,7 +16,7 @@
 
 use godspeed as gs;
 use godspeed::driver::Registers;
-use godspeed::{ipc::Message, ServiceContext};
+use godspeed::ServiceContext;
 
 // Register offsets from the EMMC base.
 const BLKSIZECNT: usize = 0x04;
@@ -409,33 +409,29 @@ impl<'a> Sd<'a> {
     }
 }
 
-/// Reply non-blocking, and say so if it could not be delivered. See `Reply::send` in main.rs for why a
-/// blocking reply here is a deadlock and not a style preference (§8.9), and why logging every failure
-/// is bounded by the protocol rather than needing a rate limit.
-fn reply_send(ctx: &ServiceContext, reply: gs::cap::Cap, msg: &Message) {
-    if gs::ipc::try_send_to(ctx, reply, msg).is_err() {
-        ctx.log("block-driver: reply undelivered (caller is gone, or its queue is full) - it will time out and retry");
-    }
-}
-
-/// Decode one block-IPC request and reply. Mirrors the AHCI backend's `serve` (same wire protocol).
-fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: gs::cap::Cap) {
-    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_WRITE_BLOCK, OP_WRITE_ZEROS, STATUS_ERR, STATUS_OK};
-    let err = |ctx: &ServiceContext| { reply_send(ctx, reply, &Message::from_bytes(&[STATUS_ERR])); };
+/// Decode one block-IPC request and reply. Mirrors the AHCI backend's `serve` (same wire protocol): the
+/// first byte is the caller's correlation tag, carried back in `crate::Reply`, and the runs
+/// (`OP_READ_BLOCKS`, `OP_WRITE_BLOCKS`) are served block by block, since this is PIO. Brought up to the
+/// protocol on 2026-10-29 (Audit 26): it predated the tag and the runs, so a board that compiled it in
+/// would have had every reply rejected, and every write run refused, which `fs` does not retry singly.
+fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: crate::Reply) {
+    use super::{OP_CAPACITY, OP_FLUSH, OP_READ_BLOCK, OP_READ_BLOCKS, OP_WRITE_BLOCK, OP_WRITE_BLOCKS,
+                OP_WRITE_ZEROS, READ_RUN_MAX, STATUS_ERR, STATUS_OK, WRITE_RUN_MAX};
+    let err = |ctx: &ServiceContext| { reply.send(ctx, &[STATUS_ERR]); };
     if p.is_empty() { return err(ctx); }
     if p[0] == OP_FLUSH {
         // An SD/EMMC single-block write is already durable when it completes: the card holds DAT0 low
         // while it programs the flash, and this driver waits for that busy period to end before
         // reporting success. There is no separate volatile cache to flush in this access mode, so the
         // guarantee the caller wants is one the write path already provides.
-        reply_send(ctx, reply, &Message::from_bytes(&[STATUS_OK]));
+        reply.send(ctx, &[STATUS_OK]);
         return;
     }
     if p[0] == OP_CAPACITY {
         let mut out = [0u8; 9];
         out[0] = STATUS_OK;
         out[1..9].copy_from_slice(&sd.sectors.to_le_bytes());
-        reply_send(ctx, reply, &Message::from_bytes(&out));
+        reply.send(ctx, &out);
         return;
     }
     if p.len() < 9 { return err(ctx); }
@@ -447,15 +443,38 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: gs::cap::Cap) {
                 let mut out = [0u8; 513];
                 out[0] = STATUS_OK;
                 out[1..].copy_from_slice(&buf);
-                reply_send(ctx, reply, &Message::from_bytes(&out));
+                reply.send(ctx, &out);
             } else { err(ctx); }
+        }
+        OP_READ_BLOCKS => {
+            let count = p.get(9).copied().unwrap_or(0) as usize;
+            if count == 0 || count > READ_RUN_MAX { return err(ctx); }
+            let mut out = [0u8; 1 + READ_RUN_MAX * 512];
+            let mut buf = [0u8; 512];
+            for i in 0..count {
+                if !sd.read_block(lba + i as u64, &mut buf) { return err(ctx); }
+                out[1 + i * 512..1 + (i + 1) * 512].copy_from_slice(&buf);
+            }
+            out[0] = STATUS_OK;
+            reply.send(ctx, &out[..1 + count * 512]);
         }
         OP_WRITE_BLOCK => {
             if p.len() < 521 { return err(ctx); }
             let mut buf = [0u8; 512];
             buf.copy_from_slice(&p[9..521]);
             let status = if sd.write_block(lba, &buf) { STATUS_OK } else { STATUS_ERR };
-            reply_send(ctx, reply, &Message::from_bytes(&[status]));
+            reply.send(ctx, &[status]);
+        }
+        OP_WRITE_BLOCKS => {
+            let count = p.get(9).copied().unwrap_or(0) as usize;
+            if count == 0 || count > WRITE_RUN_MAX || p.len() < 10 + count * 512 { return err(ctx); }
+            let mut buf = [0u8; 512];
+            let mut ok = true;
+            for i in 0..count {
+                buf.copy_from_slice(&p[10 + i * 512..10 + (i + 1) * 512]);
+                if !sd.write_block(lba + i as u64, &buf) { ok = false; break; }
+            }
+            reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
         }
         OP_WRITE_ZEROS => {
             if p.len() < 17 { return err(ctx); }
@@ -465,9 +484,17 @@ fn serve(sd: &Sd, ctx: &ServiceContext, p: &[u8], reply: gs::cap::Cap) {
             for i in 0..count {
                 if !sd.write_block(lba + i, &zero) { ok = false; break; }
             }
-            reply_send(ctx, reply, &Message::from_bytes(&[if ok { STATUS_OK } else { STATUS_ERR }]));
+            reply.send(ctx, &[if ok { STATUS_OK } else { STATUS_ERR }]);
         }
         _ => err(ctx),
+    }
+}
+
+/// The tag a request carries, and the request after it (as `ahci`'s `serve_no_disk` reads it).
+fn split_tag(raw: &[u8]) -> (u8, &[u8]) {
+    match raw.split_first() {
+        Some((t, rest)) => (*t, rest),
+        None => (0, &raw[..0]),
     }
 }
 
@@ -478,18 +505,20 @@ pub fn run(ctx: &ServiceContext, mmio: &Registers) -> ! {
     if !sd.init(ctx) {
         ctx.log("block-driver: no usable SD card - serving errors so fs never hangs");
         loop {
-            let _msg = gs::ipc::recv(ctx);
-            if let Some(reply) = gs::ipc::take_sent_cap(ctx) {
-                reply_send(ctx, reply, &Message::from_bytes(&[super::STATUS_ERR]));
-                gs::cap::remove(ctx, reply);
+            let msg = gs::ipc::recv(ctx);
+            if let Some(cap) = gs::ipc::take_sent_cap(ctx) {
+                let (tag, _) = split_tag(msg.payload_bytes());
+                crate::Reply::plain(cap, tag).send(ctx, &[super::STATUS_ERR]);
+                gs::cap::remove(ctx, cap);
             }
         }
     }
     ctx.log("block-driver: SD (EMMC/PIO) serving block I/O");
     loop {
         let msg = gs::ipc::recv(ctx);
-        let reply = match gs::ipc::take_sent_cap(ctx) { Some(c) => c, None => continue };
-        serve(&sd, ctx, msg.payload_bytes(), reply);
-        gs::cap::remove(ctx, reply);
+        let cap = match gs::ipc::take_sent_cap(ctx) { Some(c) => c, None => continue };
+        let (tag, p) = split_tag(msg.payload_bytes());
+        serve(&sd, ctx, p, crate::Reply::plain(cap, tag));
+        gs::cap::remove(ctx, cap);
     }
 }

@@ -2136,21 +2136,27 @@ changed line in a source file was checked to be comment or docstring text.
 1. FIXED 2026-10-29, in the commit after this audit. `tests/kani` did not compile since `99095070`: `spinlock.rs`'s `Wait::look` calls
    `arch::imp::liveness_deadline_cycles` and `read_cycle_counter`, and the Kani crate's arch seam stubs only the
    interrupt mask. `verify.yml` runs on any change to `spinlock.rs`.
-2. Backlog number 94 is used twice (`backlog/94`, `backlog/fixed/94`), and `backlog_check.py` keys duplicates by
+2. FIXED 2026-10-29, in the second commit after this audit. The open entry is `backlog/95` now, and `backlog_check.py` keys a number across both
+   folders. Backlog number 94 is used twice (`backlog/94`, `backlog/fixed/94`), and `backlog_check.py` keys duplicates by
    folder, so it cannot see it.
-3. `scripts/commandments.py`, IV-contract-authority's `does_not_prove` string: the same U15 claim corrected in the
+3. FIXED 2026-10-29, in the second commit after this audit. `scripts/commandments.py`, IV-contract-authority's `does_not_prove` string: the same U15 claim corrected in the
    baseline's comment above.
-4. `kernel/src/syscall/dispatch.rs`: `NET_FRAME_MAX` is dead code.
-5. `kernel/src/clock.rs`: `packed_from_epoch` has no caller but its tests.
-6. `sdk/rust/src/service_context.rs` `AUTHORITIES`: no row for 19 (`power_off`), so `caps` shows the shell's
+4. FIXED 2026-10-29, in the second commit after this audit. `kernel/src/syscall/dispatch.rs`: `NET_FRAME_MAX` is dead code.
+5. FIXED 2026-10-29, in the second commit after this audit. Moved into the tests it serves. `kernel/src/clock.rs`: `packed_from_epoch` has no caller
+   but its tests.
+6. FIXED 2026-10-29, in the second commit after this audit. Row 19 added, and `ask` reads "shutdown" as it. `sdk/rust/src/service_context.rs` `AUTHORITIES`: no row for 19 (`power_off`), so `caps` shows the shell's
    POWER_OFF as an endpoint; the `pci_cfg` row says read and write of a read-only privilege. Predates the branch.
-7. `tests/host-ipc`: several test names (t3, t4a, t4b, t5a, t5b) name the bug where the test asserts the fix.
-8. `kernel/mutants-survivors.txt` may list survivors this branch's new tests kill (for example `packed_from_epoch`'s
+7. FIXED 2026-10-29, in the second commit after this audit. Renamed for what they assert, t5c with them. `tests/host-ipc`: several test names (t3, t4a, t4b, t5a, t5b) name the bug where the test asserts the fix.
+8. FIXED 2026-10-29, in the second commit after this audit. `packed_from_epoch`'s entry went with the function, and a full run the same day left
+   the other four and no new survivor.
+   `kernel/mutants-survivors.txt` may list survivors this branch's new tests kill (for example `packed_from_epoch`'s
    `|` to `^`); only a mutants run settles it.
-9. `services/block-driver/src/sdhci.rs` has no `OP_READ_BLOCKS` arm. Latent: the backend is not compiled in.
-10. `kernel/src/syscall/CLAUDE.md`'s "the first thing validates the capability, no exceptions" - Yield, Park and Exit
+9. FIXED 2026-10-29, in the second commit after this audit. Both runs and the reply tag, which it also predated; compiled once by hand to check.
+   `services/block-driver/src/sdhci.rs` has no `OP_READ_BLOCKS` arm. Latent: the backend is not compiled in.
+10. FIXED 2026-10-29, in the second commit after this audit. Reworded to name the exceptions and the list that holds them. `kernel/src/syscall/CLAUDE.md`'s "the first thing validates the capability, no exceptions" - Yield, Park and Exit
     take none, by design (14.5). Predates the branch; a wording question for the operator.
-11. Left alone as ratified text: Appendix C.2's note says `InspectKernel` has 25 queries (28 now), and section 5's
+11. FIXED 2026-10-29, in the second commit after this audit. C.2 gains a dated update; "paused" is the word `build.yml`'s own trigger uses, and
+    stays. Left alone as ratified text: Appendix C.2's note says `InspectKernel` has 25 queries (28 now), and section 5's
     "WHERE THESE RUN" calls `build.yml` paused (it is still `workflow_dispatch`-only, and builds green).
 
 **Gates:** every documentation checker green (dash, refs, symbols, index, facts, line refs, commands, comment

@@ -247,6 +247,7 @@ const CAN_WORDS: &[(&str, u64)] = &[
     ("pci", 16),
     ("power", 17),
     ("cpu", 18),
+    ("shutdown", 19),
 ];
 
 /// Read a question about this machine. `known` is the names of its services - the task table's and the
@@ -2430,6 +2431,7 @@ mod tests {
     #[test]
     fn who_can_what_is_and_what_can_are_read() {
         assert_eq!(rk("who can reboot?"), Reading::One(Kind::WhoCan(8), Event::Unnamed));
+        assert_eq!(rk("who can shutdown?"), Reading::One(Kind::WhoCan(19), Event::Unnamed));
         assert_eq!(rk("which services can kill?"), Reading::One(Kind::WhoCan(6), Event::Unnamed));
         assert_eq!(rk("who can juggle?"), Reading::One(Kind::WhoCan(0), Event::Unnamed));
         assert_eq!(rk("what is fs?"), Reading::One(Kind::About(2), Event::Unnamed));

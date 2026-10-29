@@ -2496,10 +2496,6 @@ fn handle_reboot() -> i64 {
 }
 
 
-/// Largest ethernet frame the removed NetFrameTx/NetFrameRx syscalls (42-44) moved; nothing reads it
-/// now that they are gone (backlog/fixed/21).
-const NET_FRAME_MAX: usize = 1600;
-
 // ---------------------------------------------------------------------------
 // DevicePower (54), CpuClock (55), and PciCfgRead (53) - the last is step D2's configuration
 // read, the mechanism a userspace hardware enumerator needs.

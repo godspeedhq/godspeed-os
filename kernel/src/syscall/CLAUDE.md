@@ -17,7 +17,11 @@ If you are adding a syscall:
 1. Assign it a number in `SyscallNumber`.
 2. Add a handler `handle_<name>` in `dispatch.rs`.
 3. The first thing `handle_<name>` does is validate the capability.
-4. There are no exceptions to this rule.
+4. The only exception is a syscall that reaches no authority, because it acts on the caller alone:
+   `Yield`, `Sleep`, `Park` and `Exit` on the caller's own task, `AllocMem` within its own budget, and
+   four that read or shrink its own capability table. Each is listed, with its reason, in
+   `ALLOW_UNGATED` in `scripts/syscall_gate_check.py`, which fails any other arm that has no
+   recognised gate. A new exception is an edit to that list, made in the open (CLAUDE.md 14.5, 21).
 
 **Two validation forms.** Most syscalls take a `cap_slot` argument and validate
 with `CapTable::get(slot, right)`. Syscalls whose arguments fill the ABI registers

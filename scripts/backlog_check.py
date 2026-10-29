@@ -34,8 +34,9 @@ def main():
         print('backlog check: no backlog/ directory')
         return 0
 
-    # The open items, then the fixed ones in `fixed/` (2026-10-13), which keep their old numbers and
-    # so are numbered apart: a number may be used once in each folder.
+    # The open items, then the fixed ones in `fixed/` (2026-10-13), which keep their old numbers. A
+    # number is used ONCE across both folders: keyed per folder, this let an open 94 be filed beside
+    # a fixed 94, and every citation of number 94 then meant whichever the reader guessed (Audit 26).
     entries = sorted(f for f in os.listdir(BACKLOG)
                      if f.endswith('.md') and f != 'README.md')
     fixed_dir = os.path.join(BACKLOG, 'fixed')
@@ -58,14 +59,14 @@ def main():
     # 2. no number used twice
     seen = {}
     for name in entries:
-        folder, _, base = name.rpartition('/')
+        _, _, base = name.rpartition('/')
         num = base.split('-', 1)[0]
         if not num.isdigit():
             failures.append('BAD NAME: backlog/%s does not begin with a number' % name)
             continue
-        key = folder + str(int(num))
+        key = int(num)
         if key in seen:
-            failures.append('DUPLICATE NUMBER %s: %s and %s' % (key, seen[key], name))
+            failures.append('DUPLICATE NUMBER %d: %s and %s' % (key, seen[key], name))
         seen[key] = name
 
     # 3. every entry carries a status line a survey can read

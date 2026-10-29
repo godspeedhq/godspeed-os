@@ -163,11 +163,11 @@ panic line is quoted here as it was read.
 **A fifth time, 2026-10-26, and then tipped on purpose-free changes.** `osdev test shell`, on `feat/v1-groundwork`,
 core 0 running `shell`, 0 timer interrupts and 0 halts, at a supervisor respawn of `chaos kill-storm supervisor`,
 each time 21 checks failing behind it (255 passed), at 1.0002x to 1.0024x the allowance. It came with a scheduler
-guard for `backlog/94` that NEVER ran its slow path, and went with it: wedged in 5 of 7 runs with the guard (as a
+guard for `backlog/95` that NEVER ran its slow path, and went with it: wedged in 5 of 7 runs with the guard (as a
 function called on every switch, and as an inline compare with the function only on a mismatch), 0 of 3 without.
 The guard was reverted. So on this host the respawn sits close enough to the allowance that a few instructions on
 the switch path can decide whether it passes - which makes this entry the gate on judging ANY change to the
-switch path with `osdev test shell` (`backlog/94`).
+switch path with `osdev test shell` (`backlog/95`).
 
 ## Measured, 2026-10-28: the respawn is NOT the 7.8 s with interrupts off
 

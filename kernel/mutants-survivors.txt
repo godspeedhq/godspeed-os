@@ -5,4 +5,3 @@ kernel/src/capability/delegated.rs: replace % with + in Band::claim
 kernel/src/capability/rights.rs: replace << with >>
 kernel/src/capability/table.rs: replace >= with < in CapTable::get
 kernel/src/clock.rs: replace < with <= in deglitch_epoch
-kernel/src/clock.rs: replace | with ^ in packed_from_epoch

@@ -11,7 +11,7 @@ use host_ipc::*;
 use host_ipc::ipc::{routing, message::IpcError};
 
 #[test]
-fn t4a_late_reply_of_dead_incarnation_is_accepted_by_call_to_respawn() {
+fn t4a_late_reply_of_dead_incarnation_is_not_taken_by_call_to_respawn() {
     let s = ep(160); let rc = ep(161); // caller C = slot 40
     routing::register(s, 0, g(5));
     routing::register(rc, 0, g(6));
@@ -32,7 +32,7 @@ fn t4a_late_reply_of_dead_incarnation_is_accepted_by_call_to_respawn() {
 }
 
 #[test]
-fn t4b_request_from_dead_client_is_accepted_as_reply_from_new_owner_of_its_id() {
+fn t4b_request_from_dead_client_is_not_taken_as_reply_from_new_owner_of_its_id() {
     // A service S2 with NO reply mailbox (spawn refuses one past the reserve: routing.rs:286-328,
     // task/mod.rs ~1749-1756) awaits replies on its primary endpoint, which also gets requests.
     let s2 = ep(170);
