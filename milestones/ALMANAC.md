@@ -145,7 +145,7 @@ hypothesis, not a verdict.
 ## ~2026-05-30 - The day the thin client taught me about real concurrency
 
 On the Wyse, bare-metal boot froze shortly after the supervisor came up, and a cross-core
-reply-to-the-BSP path stalled hard under load. The diagnosis (`bugs/1_FINDINGS_AP_TO_BSP_IPI.md`,
+reply-to-the-BSP path stalled hard under load. The diagnosis (`backlog/fixed/96-a-cross-core-reply-to-the-bsp-never-reaches-its-receiver.md`, its appendix,
 2026-05-30): core 0 wedged with interrupts disabled, so a sender blocked on `recv` on the BSP
 was never woken. Development moved to the **HP T630 (AMD GX-420GI, Jaguar/Puma+, 4 cores)**,
 the permanent SMP test machine thereafter.

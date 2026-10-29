@@ -47,8 +47,8 @@ endpoint is intermittently flaky - one failed SETUP must not abandon the device.
 Fixed: five tries, same as the rest, and a line naming the device if all five fail rather than a silent
 `continue`.
 
-**And it is the same FAMILY as `bugs/3`**, which is worth more than the resemblance suggests, because that
-one was root-caused and fixed. `bugs/3_DWC2_SPLIT_XACTERR_LOWSPEED_KBD.md` is a low-speed keyboard behind
+**And it is the same FAMILY as `backlog/fixed/98`**, which is worth more than the resemblance suggests, because that
+one was root-caused and fixed. `backlog/fixed/98-dwc2-split-transactions-fail-for-a-low-speed-keyboard-behind-the-hub.md` is a low-speed keyboard behind
 a hub on the Pi 2, and its finding was that the controller *"cannot sequence a multi-packet transfer over
 a SPLIT... it halts XferCompl after the first low/full-speed packet"*, fixed by sequencing one
 maximum-packet-sized packet per split transaction. The mechanism differs - EHCI's hardware TT is supposed
@@ -122,7 +122,7 @@ configures, because the transfer that failed now gets five attempts instead of o
 descriptor read over the same endpoint already succeeded.
 
 If it still fails, the retry line will say so by name (`config descriptor failed after 5 tries`) and the
-re-scan lines will show three more whole attempts - at which point it IS `bugs/3`'s per-packet
+re-scan lines will show three more whole attempts - at which point it IS `backlog/fixed/98`'s per-packet
 sequencing and this entry should be reopened with that evidence. The two fixes are deliberately
 distinguishable in the log for exactly that reason.
 

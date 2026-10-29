@@ -1768,7 +1768,7 @@ while t < SERIAL_LOCK_SPIN_CAP { ...try acquire...; t += 1; }
 ```
 
 That give-up is deliberate and correct in intent: an unbounded spin here wedged a core with IF=0
-once already (`bugs/1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md`), so the cap must stay. But the
+once already (`backlog/fixed/96-a-cross-core-reply-to-the-bsp-never-reaches-its-receiver.md`), so the cap must stay. But the
 consequence has never been stated: **when the cap is exhausted the kernel silently interleaves two
 messages**, and a UART is slow enough for that to be reachable - a 45-byte line is 45 bounded THRE
 polls with the lock held, which another core under load can outlast.

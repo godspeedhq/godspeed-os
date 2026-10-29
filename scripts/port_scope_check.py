@@ -93,7 +93,7 @@ LINKER_SCRIPT = re.compile(r"^kernel/kernel-[a-z0-9_]+\.ld$")
 # the opposite of the failure this checks for, so none of it is a finding. `SHARED-SURFACE.baseline.txt`
 # is here because it is the ratchet's own file: raising it is governed by `shared_surface_check.py`,
 # which is a stricter gate than this one and already refuses a rise without a reason.
-FREE_PREFIXES = ("docs/", "backlog/", "milestones/", "boot/", "bugs/", "website/")
+FREE_PREFIXES = ("docs/", "backlog/", "milestones/", "boot/", "website/")
 FREE_FILES = ("README.md", "SHARED-SURFACE.baseline.txt", "CLAUDE.md")
 
 # Files the guide marks `-` with a REASON. Repeating the reason at the moment of the violation is the

@@ -54,14 +54,14 @@ def load_haystack():
     parts = []
     for base, _dirs, files in os.walk(ROOT):
         norm = base.replace('\\', '/')
-        # audits/, milestones/ and bugs/ are DATED EVIDENCE, not a statement of what exists
+        # audits/ and milestones/ are DATED EVIDENCE, not a statement of what exists
         # now - and an audit that lists dead names would otherwise make them resolve, which is
         # exactly what happened when Audit 7 was written. Second time this instrument fooled
         # itself by reading its own output; the first was reading the comments under test.
         # `.claude/` holds the parallel workers' git worktrees - other checkouts, whose copies of
         # every name would make a dead one RESOLVE here, which is the failure this file exists to stop.
         if any(s in norm for s in ('/target', '/.git', '/build', '/__pycache__',
-                                   '/audits', '/milestones', '/bugs', '/.claude')):
+                                   '/audits', '/milestones', '/.claude')):
             continue
         for fn in files:
             if not fn.endswith(('.rs', '.md', '.toml', '.py', '.gsh', '.json', '.conf', '.txt')):

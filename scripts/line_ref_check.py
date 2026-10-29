@@ -21,7 +21,7 @@ the cited line satisfies it. Only citations under services/, kernel/, sdk/, osde
 and tests/ ending `.rs` or `.py` are recognised (not `stdlib/`), in `.md`, `.rs` and `.py` files - code
 comments as well as documents. The printed count includes sites a `conform-ok` marker exempted.
 
-WHAT IS EXCLUDED, for a reason rather than convenience. `audits/`, `milestones/` and `bugs/` are
+WHAT IS EXCLUDED, for a reason rather than convenience. `audits/` and `milestones/` are
 append-only DATED evidence: a line number correct on the day an audit ran is a true record of what
 was seen, and rewriting it later would destroy the evidence. They are history, not claims about now.
 """
@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conform_ok               # noqa: E402  - the shared `conform-ok` escape marker
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SKIP_DIRS = ('target', '.git', 'build', 'node_modules', 'book', 'audits', 'milestones', 'bugs', '.claude')  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
+SKIP_DIRS = ('target', '.git', 'build', 'node_modules', 'book', 'audits', 'milestones', '.claude')  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
 # `tests/conformance/` is the UI-fixture corpus and the GENERATED gallery, which quote
 # violations VERBATIM - a rotted citation and a POSIX word used as a command are in there on
 # purpose, because that is what they catalogue. Same genre as the `audits/` exemption above:
@@ -123,14 +123,14 @@ def main():
         print()
         print('A line number rots on the next edit above it. Either re-point it, or cite the')
         print('FUNCTION or the distinctive comment instead - those survive editing and a reader')
-        print('can find them with grep. `audits/`, `milestones/` and `bugs/` are exempt: their')
+        print('can find them with grep. `audits/` and `milestones/` are exempt: their')
         print('numbers are dated evidence of what was seen, not claims about the code now.')
         return 1
     note = ''
     if supp.allowed:
         note = ', %d site(s) exempted by a `conform-ok` marker' % supp.allowed
     print('line refs: %d `path:line` citation(s) still point at what they claim '
-          '(dated evidence in audits/, milestones/, bugs/ exempt%s)' % (checked, note))
+          '(dated evidence in audits/ and milestones/ exempt%s)' % (checked, note))
     return 0
 
 

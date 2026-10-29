@@ -183,7 +183,7 @@ RULES = {
             "it. Audit 7 found 7 of 11 live citations wrong, with four documents citing ONE dead line "
             "because the citation had been copied rather than checked.",
         help="Re-point it, or cite the FUNCTION or the distinctive comment instead - those survive "
-             "editing and a reader can grep for them. `audits/`, `milestones/` and `bugs/` are exempt: "
+             "editing and a reader can grep for them. `audits/` and `milestones/` are exempt: "
              "a line number correct on the day an audit ran is a true record of what was seen."),
 
     "facts_check.py": dict(

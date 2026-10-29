@@ -130,7 +130,7 @@ error[GS0001]: the kernel has six responsibilities, and every module claims one
 
 ## a line citation that rotted
 
-A line number is the fastest-rotting citation in the repository - every edit above it moves it. Audit 7 found 7 of 11 live citations wrong, with FOUR documents citing one dead line because the citation had been copied rather than checked. `audits/`, `milestones/` and `bugs/` are exempt: a line number correct on the day an audit ran is a true record of what was seen. The check is ANCHORED - it looks for a distinctive word from the citing sentence near the cited line - so a citation must carry a real word to be judged. The first draft cited a line past the end of a file in a sentence with nothing to anchor on, and was blessed to "no finding".
+A line number is the fastest-rotting citation in the repository - every edit above it moves it. Audit 7 found 7 of 11 live citations wrong, with FOUR documents citing one dead line because the citation had been copied rather than checked. `audits/` and `milestones/` are exempt: a line number correct on the day an audit ran is a true record of what was seen. The check is ANCHORED - it looks for a distinctive word from the citing sentence near the cited line - so a citation must carry a real word to be judged. The first draft cited a line past the end of a file in a sentence with nothing to anchor on, and was blessed to "no finding".
 
 *Planted in `docs/pipes.md` (`append`), caught by `scripts/line_ref_check.py`.*
 
@@ -143,9 +143,9 @@ error[GS0404]: a `path:line` citation no longer points at what it claims
            it moves it. Audit 7 found 7 of 11 live citations wrong, with four documents
            citing ONE dead line because the citation had been copied rather than checked.
     = help: Re-point it, or cite the FUNCTION or the distinctive comment instead - those
-            survive editing and a reader can grep for them. `audits/`, `milestones/` and
-            `bugs/` are exempt: a line number correct on the day an audit ran is a true
-            record of what was seen.
+            survive editing and a reader can grep for them. `audits/` and `milestones/` are
+            exempt: a line number correct on the day an audit ran is a true record of what
+            was seen.
     = note: `py scripts/conform.py --explain GS0404` for the long form
 
   line_ref_check.py reported:

@@ -624,7 +624,7 @@ pub fn note_user_task(_slot: usize) {}
 pub fn serial_write_byte(b: u8) {
     use core::sync::atomic::Ordering;
     // Bounded best-effort lock acquire: a wedged SERIAL_LOCK must never spin a
-    // core forever with IF=0 (see bugs/1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md).
+    // core forever with IF=0 (see backlog/fixed/96-a-cross-core-reply-to-the-bsp-never-reaches-its-receiver.md).
     let mut got = false;
     let mut t = 0u32;
     while t < SERIAL_LOCK_SPIN_CAP {

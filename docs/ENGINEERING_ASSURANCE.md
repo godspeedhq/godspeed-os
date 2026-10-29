@@ -189,7 +189,7 @@ wrong, insecure or unmaintainable. The same standard applies to every line howev
 architecture, the source, the recorded decisions, the reproducible tests and the observed behaviour.
 
 The project neither hides AI involvement nor makes it its identity. The evidence for how it is used is public: the
-commit history, the design documents, the defect investigations in `bugs/` and `backlog/`, and the corrections
+commit history, the design documents, the defect investigations in `backlog/`, and the corrections
 recorded in amendments and release notes.
 
 ## 5. Independent maintainability
@@ -222,7 +222,7 @@ how the affected code was written. For a significant one:
 7. look for the same defect class on related paths;
 8. record the fix and any uncertainty left.
 
-`bugs/` holds long-form investigations, `backlog/` the open items. A vulnerability is not evidence that every
+`backlog/` holds the open items, and `backlog/fixed/` the closed ones with their investigations. A vulnerability is not evidence that every
 design decision is wrong; passing tests is not evidence that none remain.
 
 ## 7. Claims and evidence

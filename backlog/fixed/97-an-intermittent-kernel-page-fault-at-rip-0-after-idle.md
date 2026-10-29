@@ -1,4 +1,4 @@
-# Bug 2 - Intermittent KERNEL PF (rip=0) on core 0 after a benchmark/test completes
+# 97. Intermittent KERNEL PF (rip=0) on core 0 after a benchmark/test completes
 
 **Date:** 2026-05-31 · **Hardware:** HP T630 (AMD GX-420GI) · **Branch:** `stress/cross-core-t630`
 **Status: RESOLVED 2026-06-01.** Root cause: the `ud2`/#UD syscall path entered on

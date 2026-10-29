@@ -553,7 +553,7 @@ pub fn enumerate_downstream(
     //
     // Pi 2, 2026-09-27: the WiFi dongle on hub port 5 was detected, reset, sized and ADDRESSED - four
     // transfers that all worked - and then one SETUP came back `HCINT=0x00000082 XACTERR` and it was
-    // dropped. `bugs/3` recorded this same dongle enumerating on this same board, and the T630's xhci
+    // dropped. `backlog/fixed/98` recorded this same dongle enumerating on this same board, and the T630's xhci
     // read its descriptors twice the same afternoon, so it is not an unreadable device.
     //
     // The log says what it probably contended with: `dwc2-svc: sector 0 first bytes 47 53 46 53` lands

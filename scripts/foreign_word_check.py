@@ -50,7 +50,7 @@ REFUSAL (typing `ls` to demonstrate the machine rejecting it is worth documentin
 
 A sentence ABOUT the foreign word is fine and must stay fine - "`ls` is now `dir`", "the Unix
 reflex is `ls`", "typing `ls` over serial" - which is why the check looks for the word in COMMAND
-POSITION rather than anywhere. `audits/`, `milestones/` and `bugs/` are exempt: they are dated
+POSITION rather than anywhere. `audits/` and `milestones/` are exempt: they are dated
 records of what was typed on a day, and rewriting them would destroy the evidence.
 """
 import io
@@ -60,7 +60,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHELL = os.path.join(ROOT, "services", "shell", "src", "main.rs")
-SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", "bugs", ".claude")  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
+SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", ".claude")  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
 # `tests/conformance/` is the UI-fixture corpus and the GENERATED gallery, which quote
 # violations VERBATIM - a rotted citation and a POSIX word used as a command are in there on
 # purpose, because that is what they catalogue. Same genre as the `audits/` exemption above:

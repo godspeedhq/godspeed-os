@@ -482,12 +482,12 @@ os/
     0_conventions.md     #   the 14 rules every utility obeys
   website/               # the published book (mdBook); pages `{{#include}}` the
                          #   sources above, so a doc and its page cannot drift
-  backlog/               # open items - recorded rather than closed (§26.7)
+  backlog/               # open items - recorded rather than closed (§26.7); `fixed/` holds the closed ones,
+                         #   the long-form hardware investigations among them (96-98, once `bugs/`)
   boot/                  # per-board boot config (pi2/, pi4/)
   contracts/schema/      # the JSON Schema a service contract is validated against
   examples/              # 15 worked services
   milestones/            # what was achieved and when; ALMANAC.md is the chronicle
-  bugs/                  # long-form investigations of four specific hardware bugs
   editors/               # syntax files for the gsh shell language
 ```
 
@@ -3273,7 +3273,7 @@ column is isolated (uncontended), so they compare fairly only where both were cl
 BP1/BP4/BP8 at ~1.9-2.5×, genuine Jaguar-vs-Goldmont IPC. Where the T630 number is *lower*
 (BP3) the J5005 figure was itself contention-inflated. BP5/BP6 (spawn/restart) are
 memory-bandwidth-bound - the low-power thin client lags most there. The full investigation
-behind BP2 (the COM2 timer-ISR wedge, fixed `a306fd3`) is in `bugs/1_FINDINGS_AP_TO_BSP_IPI.md`.
+behind BP2 (the COM2 timer-ISR wedge, fixed `a306fd3`) is in `backlog/fixed/96-a-cross-core-reply-to-the-bsp-never-reaches-its-receiver.md`, its appendix.
 
 ### 23.4 Out of Scope for v1
 

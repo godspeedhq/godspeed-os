@@ -569,7 +569,7 @@ fn tell_bulk(ctx: &ServiceContext, gone: &mut bool) -> bool {
     false
 }
 
-/// The dongle on the Pi 2's hub, confirmed on hardware twice - `bugs/3` recorded it via this driver and
+/// The dongle on the Pi 2's hub, confirmed on hardware twice - `backlog/fixed/98` recorded it via this driver and
 /// the T630's `xhci` read the same pair on 2026-09-27.
 pub const VID: u16 = 0x0bda;
 pub const PID: u16 = 0x8176;

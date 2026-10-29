@@ -220,7 +220,7 @@ reached core 0's IRR) - it was `control::process_pending` draining COM2 with an
 `0xFF` (Data-Ready permanently set) → the loop never returns → core 0 spins
 interrupts-disabled and can never take the latched `WAKE_RECEIVER` IPI. Fixed by
 bounding the drain to 256 iterations/call (commit `a306fd3` on `main`; full
-investigation in `bugs/1_FINDINGS_AP_TO_BSP_IPI.md`).
+investigation in `backlog/fixed/96-a-cross-core-reply-to-the-bsp-never-reaches-its-receiver.md`, its appendix).
 
 **Full perf-brutal run.** With the fix in place, all ten BP probes completed,
 no panic, no `#PF`, over a sustained ~27k-line run. BP2 was measured for the
@@ -323,7 +323,7 @@ and would catch a future handler that performs a privileged action without valid
 
 The last known kernel bug: an intermittent `rip → kstack` `#PF` under heavy cross-core
 `recv` load on real hardware (root-caused earlier, banked; full history in
-`bugs/2_INTERMITTENT_RIP0_PF_POST_IDLE.md`, Updates 1-9).
+`backlog/fixed/97-an-intermittent-kernel-page-fault-at-rip-0-after-idle.md`, Updates 1-9).
 
 **Root cause.** On the GX-420GI the live syscall path is `ud2`/#UD, which enters on
 `TSS.rsp0 = K0T` - the same top-of-kstack region the timer ISR's context-switch path

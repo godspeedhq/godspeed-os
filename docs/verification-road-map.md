@@ -10,7 +10,7 @@
 > on five machines across four ISAs (CLAUDE.md 23.3, `docs/multi-arch.md`) - but not in the form
 > step 6 below asks for: the bare-metal supervisors gate out the test probes, so the identity suite
 > itself has not run on hardware, and `docs/hardware-findings.md` was never written; the divergences
-> are in `bugs/` and `backlog/` instead. The "deferred pending hardware" markers below are dated
+> are in `backlog/` instead. The "deferred pending hardware" markers below are dated
 > history, left as written.
 
 ---

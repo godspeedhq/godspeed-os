@@ -39,7 +39,7 @@ one is still open.
 | **HP T630** | None | - | - | - |
 
 **The Pi 2's dongle was already identified, by this project, on this hardware.**
-`bugs/3_DWC2_SPLIT_XACTERR_LOWSPEED_KBD.md` records the hub enumeration: port 1 is the `smsc95xx`
+`backlog/fixed/98-dwc2-split-transactions-fail-for-a-low-speed-keyboard-behind-the-hub.md` records the hub enumeration: port 1 is the `smsc95xx`
 ethernet at `0424:ec00`, and **port 5 is a Realtek WiFi dongle at `0bda:8176`**. It enumerated all
 along, as a high-speed device needing no SPLIT transaction. So there is no unknown here and nothing to
 plug in and look up: the chip is an RTL8188CUS (the RTL8192CU family).

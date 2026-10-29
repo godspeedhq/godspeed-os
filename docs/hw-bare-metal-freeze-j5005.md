@@ -12,8 +12,8 @@ The C-state hypothesis below was never confirmed, and it is not what was blockin
 locked by firmware on this part, the OS still cannot raise the C-state limit, and it boots anyway.
 `milestones/ALMANAC.md` records the diagnosis this board's symptoms were traced to instead, and it
 was in our own concurrency - core 0 wedging with interrupts disabled, so a task blocked on `recv` on
-the BSP was never woken (`bugs/1_CROSS_CORE_IPC_REPLY_TO_BSP_STALLS.md`,
-`bugs/1_FINDINGS_AP_TO_BSP_IPI.md`). Nothing in the boot path had to be told about this board; the
+the BSP was never woken (`backlog/fixed/96-a-cross-core-reply-to-the-bsp-never-reaches-its-receiver.md`
+and its appendix). Nothing in the boot path had to be told about this board; the
 rest of this file is the record of the investigation as it stood.
 
 ## Symptom

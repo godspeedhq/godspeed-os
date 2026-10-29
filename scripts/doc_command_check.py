@@ -45,7 +45,7 @@ A prompt has neither problem: no English collision, and nobody writes a proposal
 token that is a PATH, a PLACEHOLDER, a number or a flag is an argument and is skipped - `dir /data`,
 `write <path>`, `events log 5` all pass. A bare `` `events` `` is prose and must keep passing.
 
-`audits/`, `milestones/` and `bugs/` are exempt: dated records of what was typed on a day.
+`audits/` and `milestones/` are exempt: dated records of what was typed on a day.
 
 WHAT IT DOES NOT CHECK: that the COMMAND itself exists (a prompt line is judged only when its first
 word is a key of `SUBCMD_FIRST`, so `gsh> nosuchcmd x` passes - `foreign_word_check.py` covers the
@@ -67,7 +67,7 @@ COMMAND_OK = re.compile(r"<!--\s*doc-command-ok\b")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SHELL = os.path.join(ROOT, "services", "shell", "src", "main.rs")
 OSDEV = os.path.join(ROOT, "osdev", "src", "main.rs")
-SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", "bugs", ".claude")  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
+SKIP_DIRS = ("target", ".git", "build", "node_modules", "book", "audits", "milestones", ".claude")  # .claude/ holds the parallel workers' git worktrees: other checkouts, not this tree
 
 # At a gsh prompt ONLY. A backticked pair was tried and produced a flood of false hits - see the
 # header: `` `a` to scan `b` `` reads as `` `to scan` `` to any regex that ignores backtick parity.

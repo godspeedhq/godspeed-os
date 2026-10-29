@@ -1,4 +1,4 @@
-# DWC2 split-transaction XactErr: low-speed keyboard behind the LAN9514 hub
+# 98. DWC2 split-transaction XactErr: low-speed keyboard behind the LAN9514 hub
 
 **Status: RESOLVED (2026-07-24), QEMU-validated; hardware boot pending (user away).** The XactErr
 was TWO bugs stacked, both in how we drove HCSPLT / the split DATA stage - not microframe

@@ -124,3 +124,20 @@ io_is_busy                         # docs/power.md 15.7 - Linux ondemand tunable
 sampling_down_factor               # docs/power.md 15.7 - Linux ondemand tunable, EXTERNAL; raspi-config sets it 50
 sampling_rate                      # docs/power.md 15.7 - Linux ondemand tunable, EXTERNAL; raspi-config sets it 100000 us
 up_threshold                       # docs/power.md 15.7 - Linux ondemand tunable, EXTERNAL; raspi-config sets it 50
+DBG_PICK6                          # backlog/fixed/96 (was bugs/1), 2026-05 T630 investigation - a DEBUG PROBE removed after the fix; dated evidence of what was instrumented
+DBG_WAKE6                          # backlog/fixed/96 (was bugs/1), 2026-05 T630 investigation - a DEBUG PROBE removed after the fix; dated evidence of what was instrumented
+TICK_ON                            # backlog/fixed/96 (was bugs/1), 2026-05 T630 investigation - a DEBUG PROBE removed after the fix; dated evidence of what was instrumented
+TLB_ACK                            # backlog/fixed/96 (was bugs/1), 2026-05 T630 investigation - a DEBUG PROBE removed after the fix; dated evidence of what was instrumented
+bsp_irr_f0                         # backlog/fixed/96 (was bugs/1), 2026-05 T630 investigation - a DEBUG PROBE removed after the fix; dated evidence of what was instrumented
+ipi_wake_received                  # backlog/fixed/96 (was bugs/1), 2026-05 T630 investigation - a DEBUG PROBE removed after the fix; dated evidence of what was instrumented
+nmi_record                         # backlog/fixed/96 (was bugs/1) - a symbol of the 2026-05 release ELF, quoted with its address; dated evidence
+nmi_stub                           # backlog/fixed/96 (was bugs/1) - a symbol of the 2026-05 release ELF, quoted with its address; dated evidence
+SPLIT_PORT                         # backlog/fixed/98 (was bugs/3) - the in-kernel arch/arm/dwc2.rs, DELETED 2026-08-17 (services/dwc2 replaced it); dated evidence
+hcsplt_for_current                 # backlog/fixed/98 (was bugs/3) - the in-kernel arch/arm/dwc2.rs, DELETED 2026-08-17 (services/dwc2 replaced it); dated evidence
+select_device                      # backlog/fixed/98 (was bugs/3) - the in-kernel arch/arm/dwc2.rs, DELETED 2026-08-17 (services/dwc2 replaced it); dated evidence
+dma_desc                           # backlog/fixed/98 (was bugs/3) - Linux drivers/usb/dwc2, EXTERNAL; the reference the split path was diffed against
+dwc2_dma_desc                      # backlog/fixed/98 (was bugs/3) - Linux drivers/usb/dwc2, EXTERNAL; the reference the split path was diffed against
+dwc2_hc_init                       # backlog/fixed/98 (was bugs/3) - Linux drivers/usb/dwc2, EXTERNAL; the reference the split path was diffed against
+dwc2_hc_init_split                 # backlog/fixed/98 (was bugs/3) - Linux drivers/usb/dwc2, EXTERNAL; the reference the split path was diffed against
+dwc2_hc_init_xfer                  # backlog/fixed/98 (was bugs/3) - Linux drivers/usb/dwc2, EXTERNAL; the reference the split path was diffed against
+dwc2_hc_start_transfer             # backlog/fixed/98 (was bugs/3) - Linux drivers/usb/dwc2, EXTERNAL; the reference the split path was diffed against
