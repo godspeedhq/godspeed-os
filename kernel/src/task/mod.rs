@@ -1801,6 +1801,12 @@ fn spawn_service_with_image(
             caps.insert(d)
                 .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
         }
+        // And the console read, which rides a spawn FLAG rather than a privilege bit
+        // (`SPAWN_FLAG_REQ_CONSOLE`), GRANT-only like the rest: SpawnImage passes it on only to a caller
+        // that holds it, so a spawner hands on what it has and never mints (14.1 step 4, backlog/90 D22).
+        let cr = mint_cap(CONSOLE_READ_RESOURCE, Rights::GRANT);
+        caps.insert(cr)
+            .map_err(|_| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::CapTableFull })?;
     }
 
     if resource_mint {

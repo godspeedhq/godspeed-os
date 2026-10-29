@@ -1053,6 +1053,14 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
             return -1;
         }
     }
+    // The same rule for the console read, which is asked for by a flag: the kernel minted it to the child
+    // for any caller that set the bit (backlog/90 D22).
+    if req.flags & SPAWN_FLAG_REQ_CONSOLE != 0
+        && !scheduler::current_task_holds_resource(crate::capability::CONSOLE_READ_RESOURCE, Rights::GRANT)
+    {
+        crate::kprintln!("task: SpawnImage refused - caller asked to grant 'CONSOLE_READ' which it does not hold itself");
+        return -1;
+    }
 
     let name_len = req.name_len as usize;
     if name_len == 0 || name_len > crate::task::PEER_NAME_BYTES {
