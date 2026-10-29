@@ -1249,8 +1249,11 @@ fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result
         Some(n) if crate::smp::core::is_ready(n) => Ok(n),
         Some(_) => Err(SpawnError::PlacementInvalid),
         None if preferred_core == u32::MAX => {
+            // The k-th READY core, not core k: the ready ids need not be 0..count (D17).
             let count = crate::smp::core::ready_count() as u32;
-            Ok(if count == 0 { 0 } else { RR.fetch_add(1, Ordering::Relaxed) % count })
+            Ok(if count == 0 { 0 } else {
+                crate::smp::core::nth_ready(RR.fetch_add(1, Ordering::Relaxed) % count).unwrap_or(0)
+            })
         }
         None => {
             if crate::smp::core::is_ready(preferred_core) {
@@ -1260,7 +1263,8 @@ fn resolve_spawn_core(core_override: Option<u32>, preferred_core: u32) -> Result
                 // reroute - §11.3 needs a machine with fewer ready cores to come up - but a silent
                 // reroute is the exact failure backlog/01 opened on, and saying so costs nothing.
                 let count = crate::smp::core::ready_count() as u32;
-                let chosen = RR.fetch_add(1, Ordering::Relaxed) % count.max(1);
+                let chosen = crate::smp::core::nth_ready(RR.fetch_add(1, Ordering::Relaxed) % count.max(1))
+                    .unwrap_or(0);
                 crate::kprintln!(
                     "task: preferred core {} is not ready - placing on core {} instead (§9.2 preference)",
                     preferred_core, chosen);

@@ -96,6 +96,23 @@ pub fn ready_count() -> u32 {
     READY_COUNT.load(Ordering::Acquire)
 }
 
+/// The `k`-th ready core's id, counting from 0 in id order; `None` past the last.
+///
+/// **A count is not an id range.** `ready_count()` says how many cores came up, not which: on a machine
+/// whose AP 2 failed and AP 3 started (11.3 says carry on), the ready ids are 0, 1 and 3, and treating
+/// `0..ready_count()` as the ids placed a service on core 2, which runs no scheduler, and never checked
+/// core 3's liveness (backlog/90 D17). Placement and the watchdog ask by id through this and `is_ready`.
+pub fn nth_ready(k: u32) -> Option<u32> {
+    let mut seen = 0u32;
+    for c in 0..num_cores() as u32 {
+        if is_ready(c) {
+            if seen == k { return Some(c); }
+            seen += 1;
+        }
+    }
+    None
+}
+
 pub fn is_ready(core_id: u32) -> bool {
     let c = core_id as usize;
     // A contract may name a core beyond the machine's count; that core is simply not ready.

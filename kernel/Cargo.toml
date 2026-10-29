@@ -88,6 +88,11 @@ fault-dump-wide = []
 # Commandment IX: "If recovery cannot be tested, it does not exist." Off by default; test builds only.
 # See `arch/x86_64/pci.rs::msi_ordering` and `audits/kernel-audit.md` Audit 9.
 mmio-map-fault-test = []
+# x86 only. Leave the AP that would be core 2 un-started while core 3 still starts, so the ready core
+# ids have a GAP (0, 1, 3) - what 11.3 asks the kernel to carry on through when one AP fails. Placement
+# and the liveness watchdog must ask by ready id, not by `0..ready_count()` (backlog/90 D17). Off by
+# default; a QEMU run with `-smp 4` or more shows it.
+ap-gap-test = []
 # Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
 # EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
 # reports banks above 4 GiB that the low-4-GiB identity map does not reach - recording those as usable
@@ -133,7 +138,7 @@ pi4-smp = []
 # same reason, and it is a different thing from the `single-core` flag that was deleted: that one
 # forced a state the same binary could already reach, where two SoCs with different RAM bases cannot
 # share one non-relocatable image. The honest fix that would remove it is a position-independent
-# kernel, which is real work and is recorded in backlog/14 rather than pretended at.
+# kernel, which is real work and is recorded in backlog/fixed/14 rather than pretended at.
 visionfive = []
 # (The GENET feature that stood here was DELETED with the in-kernel driver it selected: the Pi 4's
 # ethernet is the `nic-driver` SERVICE in every build. `arch/aarch64/genet.rs` is now discovery only -

@@ -436,7 +436,7 @@ pub mod wake_trace {
     /// Core 0's tick. Reports every 500 of them, and only after a send since the last report.
     pub fn maybe_report(ticks: u64) {
         if ticks % 500 != 0 { return; }
-        let ncores = (crate::smp::core::ready_count() as usize).min(CORES);
+        let ncores = crate::smp::percpu::num_cores().min(CORES); // ids, not a count of ready cores (D17)
         let total: u32 = (0..ncores).map(|c| SENT[c].load(Ordering::Relaxed)).sum();
         if total == LAST_SENT_TOTAL.swap(total, Ordering::Relaxed) { return; }
         let now = crate::arch::imp::read_cycle_counter();
@@ -1982,7 +1982,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         // undiagnosable. `0` still means "this arch cannot say" and still disables the check - but that
         // is now a deliberate per-arch answer rather than a side effect of an unrelated constant.
         let deadline = crate::arch::imp::liveness_deadline_cycles();
-        let ncores = crate::smp::core::ready_count() as usize;
+        // Every core that IS ready, by id: a count is not an id range, so `0..ready_count()` skipped a
+        // ready core above a gap and looked at a dead one inside it (backlog/90 D17).
+        let ncores = crate::smp::percpu::num_cores();
         // SAY whether the watchdog is on, once, the first time it arms. A safety net that is silently
         // absent is worse than one that is absent loudly: arm32 ran without this check for the whole
         // port and nothing ever said so, which is exactly how a wedge came to be undiagnosable. One line
@@ -1993,7 +1995,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         }
         if deadline > 0 {
             for other in 0..ncores {
-                if other == cid { continue; }
+                if other == cid || !crate::smp::core::is_ready(other as u32) { continue; }
                 let last = CORE_LAST_TICK_TSC.get(other).0.load(Ordering::Relaxed);
                 // saturating_sub: if now < last (small cross-core TSC skew, or it stamped a hair ago)
                 // this reads 0, never a spurious huge delta - so skew cannot false-fire the panic.

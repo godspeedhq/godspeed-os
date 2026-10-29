@@ -87,6 +87,12 @@ pub unsafe fn start_all_aps(_boot_info: &super::BootInfo) -> u32 {
         // Record this AP's LAPIC ID before starting it so `lapic_to_core_id`
         // works as soon as the AP reads its own LAPIC register.
         crate::smp::core::set_core_lapic_id(core_idx, cpu.lapic_id);
+        // `ap-gap-test`: core 2 keeps its id and is never started, so the ready ids are 0, 1, 3.
+        if cfg!(feature = "ap-gap-test") && core_idx == 2 {
+            crate::kprintln!("smp: ap-gap-test - core 2 deliberately NOT started (backlog/90 D17)");
+            core_idx += 1;
+            continue;
+        }
         // Pass the assigned core_id via Limine's extra_argument field.
         // SAFETY: we have exclusive access to the response at this point; APs
         //         are still spinning and have not read extra_argument yet.
@@ -109,6 +115,8 @@ pub unsafe fn start_all_aps(_boot_info: &super::BootInfo) -> u32 {
     // and there is no late-join race. (Spin-count is CPU-speed-dependent; a
     // TSC-based wall-clock bound would be more robust - future work.)
     let expected_ready = ap_count as u32 + 1; // +1 for BSP
+    // `ap-gap-test` started one fewer, and waiting out the full budget for it costs minutes under TCG.
+    let expected_ready = if cfg!(feature = "ap-gap-test") && ap_count >= 3 { expected_ready - 1 } else { expected_ready };
     let mut spins: u64 = 0;
     while crate::smp::core::ready_count() < expected_ready && spins < 2_000_000_000 {
         core::hint::spin_loop();

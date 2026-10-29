@@ -56,6 +56,10 @@ features = [
 # REMOVES concurrency rather than adding a code path, which is also what makes it useful: a bug that
 # survives on one hart is not a race.
     "riscv-single-hart",
+# x86 test build only: core 2 is never started while core 3 is, so the ready ids have a gap and a
+# QEMU run shows placement and the liveness watchdog asking by ready id (backlog/90 D17). It removes
+# one AP's start from a test boot and adds nothing to a shipping one.
+    "ap-gap-test",
     "arm-autochaos",
     "arm-fault-test",
     "arm-sched-demo",
@@ -110,7 +114,7 @@ features = [
 # `shift 0 width 1` on QEMU and `shift 2 width 4` on the JH7110 without being told which it is on.
 # What remains is only the link address, and that one genuinely cannot be discovered at runtime: a
 # non-relocatable kernel must be placed before it can run. The change that retires the pin entirely
-# is a position-independent kernel (backlog/14). QEMU enters the
+# is a position-independent kernel (backlog/fixed/14). QEMU enters the
 # kernel at 0x8020_0000, the JH7110 at 0x4020_0000 - both read off the board's own OpenSBI banner and
 # confirmed by the vendor image's `kernel_addr_r`. Not even the UART differs (0x1000_0000 on both).
 #
@@ -121,7 +125,7 @@ features = [
 # NOT the `single-core` case. That flag forced a state the same binary could already reach, which is
 # why it was deleted once it had found its bug. Two SoCs with different RAM bases cannot share one
 # non-relocatable image, so this is a real difference rather than a forced one. The change that would
-# retire it is a position-independent kernel - real work, recorded in backlog/14 rather than pretended
+# retire it is a position-independent kernel - real work, recorded in backlog/fixed/14 rather than pretended
 # at. If that lands, this pin goes.
     "visionfive",
 # Diagnostic ONLY, registered for the reason `name-trace` is: it gates OUTPUT, never what the kernel
