@@ -890,6 +890,17 @@ fn is_intel_cpu() -> bool {
     r.ebx == 0x756e_6547 && r.edx == 0x4965_6e69 && r.ecx == 0x6c65_746e
 }
 
+/// Returns true when a hypervisor says it is present (CPUID.1:ECX bit 31).
+///
+/// A guest's package C-states belong to the host, and a hypervisor need not emulate the MSRs that
+/// set them: KVM on an Intel host reports `GenuineIntel` and raises #GP(0) on a read of MSR 0xE2,
+/// which panicked this kernel in boot on every Intel KVM guest.
+fn under_hypervisor() -> bool {
+    // SAFETY: __cpuid(1) is universally safe on x86_64.
+    let r = core::arch::x86_64::__cpuid(1);
+    r.ecx & (1 << 31) != 0
+}
+
 /// Limit package C-states to PC1 to prevent APIC power-gate on Goldmont+.
 ///
 /// On Intel Atom / Goldmont+ (Gemini Lake, Wyse 5070 J5005), the firmware
@@ -917,6 +928,13 @@ unsafe fn limit_package_cstates(core_id: u32) -> bool {
     // On AMD processors this MSR does not exist; RDMSR/WRMSR cause #GP(0). AMD has no Goldmont+ APIC
     // power-gate, so halting there is governed by ARAT elsewhere - report "no gate concern".
     if !is_intel_cpu() {
+        return true;
+    }
+    // A guest has no Goldmont+ APIC power gate to defend against - its halts are the host's - and
+    // the MSR may not exist there at all (see `under_hypervisor`). Said once per core, so a reader
+    // of the log knows the limit was skipped rather than applied.
+    if under_hypervisor() {
+        crate::kprintln!("cstate: core {} under a hypervisor - package C-states are the host's, MSR 0xE2 not touched", core_id);
         return true;
     }
 
