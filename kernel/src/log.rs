@@ -119,7 +119,8 @@ const SERIAL_STAGE: usize = 512;
 /// and releasing the lock for each byte, which let console output interleave into the gaps
 /// and garble the boot log.
 struct LogSink<'a> {
-    ring: &'a mut RingBuffer,
+    /// `None` only on a panic that found RING held: the line goes to serial alone (`enter_panic`).
+    ring: Option<&'a mut RingBuffer>,
     stage: [u8; SERIAL_STAGE],
     n: usize,
 }
@@ -136,7 +137,9 @@ impl LogSink<'_> {
 impl fmt::Write for LogSink<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for &b in s.as_bytes() {
-            self.ring.write_byte(b);
+            if let Some(ring) = self.ring.as_deref_mut() {
+                ring.write_byte(b);
+            }
             if self.n == SERIAL_STAGE {
                 self.flush();
             }
@@ -145,6 +148,20 @@ impl fmt::Write for LogSink<'_> {
         }
         Ok(())
     }
+}
+
+/// Set once, first thing on a panic: from then on no log line WAITS for `RING`.
+///
+/// The panic path printed through the ordinary lock, so a panic on a core whose interrupted code held
+/// RING - or one while another core held it and was then halted mid-line - spun forever on a holder
+/// that would never let go, and the machine stopped without saying why (backlog/90 D28). The same
+/// shape `bootcon` fixed for `FB` (D13). With this set a line tries RING once; if it is held, the line
+/// goes to serial without the ring, which is the copy that matters when the machine is about to stop.
+static PANICKING: AtomicBool = AtomicBool::new(false);
+
+/// Called by the panic handler before its first line.
+pub fn enter_panic() {
+    PANICKING.store(true, Ordering::Release);
 }
 
 pub fn write_fmt(args: fmt::Arguments) {
@@ -158,8 +175,17 @@ pub fn write_fmt(args: fmt::Arguments) {
     // under QEMU. The serial flush is bounded (THRE poll drops on timeout, SERIAL_LOCK spin is capped),
     // so the interrupts-off window stays bounded.
     crate::smp::without_interrupts(|| {
-        let mut ring = RING.lock();
-        let mut sink = LogSink { ring: &mut ring, stage: [0u8; SERIAL_STAGE], n: 0 };
+        let mut guard = if PANICKING.load(Ordering::Acquire) { RING.try_lock() } else { Some(RING.lock()) };
+        // `panic-ring-test`: panic while THIS core holds RING, on the 200th line, so the panic path is
+        // shown to report rather than spin on its own lock (backlog/90 D28). Test builds only.
+        #[cfg(feature = "panic-ring-test")]
+        {
+            static LINES: AtomicU32 = AtomicU32::new(0);
+            if guard.is_some() && LINES.fetch_add(1, Ordering::Relaxed) == 200 {
+                panic!("panic-ring-test: a panic while this core holds the log ring");
+            }
+        }
+        let mut sink = LogSink { ring: guard.as_deref_mut(), stage: [0u8; SERIAL_STAGE], n: 0 };
         if SERIAL_LINE_OPEN.load(Ordering::Relaxed) || CONSOLE_WRITES.load(Ordering::Relaxed) > 0 {
             sink.stage[..2].copy_from_slice(b"\r\n");
             sink.n = 2;

@@ -452,6 +452,9 @@ fn panic(info: &PanicInfo) -> ! {
     // and then simply never called here - the guarantee was in the constitution and absent from the
     // code, and the first real panic on hardware showed a black screen and said nothing.
     bootcon::reclaim_for_panic();
+    // And never wait for the log ring: a panic on a core whose interrupted code held it, or with another
+    // core halted holding it, would spin here and say nothing (backlog/90 D28).
+    log::enter_panic();
     // STOP QUEUEING SERIAL OUTPUT. Runtime log lines are handed to a ring and put on the wire by
     // whichever core finds it free - which is what keeps four cores from shredding each other's lines
     // without any of them waiting. A panic halts every core, so a queued line may never be drained by

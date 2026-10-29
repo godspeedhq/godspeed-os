@@ -102,6 +102,9 @@ features = [
 # NOT behind it: they are silent in a healthy run, so they cost nothing to leave in, and they are the
 # half that says something is wrong rather than merely what happened.
     "name-trace",
+# Test builds only: panics while the core holds the log ring, so a QEMU boot shows the panic path
+# reports rather than spinning on its own lock (backlog/90 D28). Nothing in a shipping kernel.
+    "panic-ring-test",
     "pi4",
     "pi4-demo-services",
     "pi4-sched-demo",
