@@ -37,7 +37,7 @@ static IRQ_TABLE: SpinLock<[Option<EndpointId>; MAX_IRQ]> = SpinLock::new([None;
 /// a new holder takes the debt on by holding it. `deliver` masks again on the first interrupt, as it
 /// always has, and a no-op for edge and MSI vectors, where masking never applied.
 pub fn register(irq: u8, endpoint: EndpointId) {
-    {
+    let overwrote = {
         let mut table = IRQ_TABLE.lock_irq();
         // SEC-16: never SILENTLY steal an IRQ line. On a clean driver restart the death path calls
         // `unregister_endpoint` first, so the slot is None here; a Some for a DIFFERENT endpoint
@@ -45,13 +45,14 @@ pub fn register(irq: u8, endpoint: EndpointId) {
         // it loudly (invariant 12) rather than a silent overwrite. The new registration still wins
         // (a respawn's fresh endpoint must take over its line); today it is unreachable (distinct
         // per-device vectors).
-        if let Some(existing) = table[irq as usize] {
-            if existing != endpoint {
-                crate::kprintln!(
-                    "interrupt: IRQ {} already routed - overwriting (second claim or a missed release?)", irq);
-            }
-        }
+        let overwrote = matches!(table[irq as usize], Some(existing) if existing != endpoint);
         table[irq as usize] = Some(endpoint);
+        overwrote
+    };
+    // Said outside the table lock, which the ISR takes (backlog/90 D28).
+    if overwrote {
+        crate::kprintln!(
+            "interrupt: IRQ {} already routed - overwriting (second claim or a missed release?)", irq);
     }
     // Touches the interrupt controller, so OUTSIDE the table lock - as `unregister_endpoint` does.
     crate::arch::imp::ioapic::unmask_vector(irq);

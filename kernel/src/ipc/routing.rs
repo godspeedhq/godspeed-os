@@ -203,6 +203,8 @@ pub fn forget_blocked_sender(slot: usize) {
     if let Some(idx) = find_index(&*table, ep) {
         table[idx].waiting = table[idx].waiting.saturating_sub(1);
     }
+    // Said after the table is released: a serial line is ~9 ms on the ARM ports (backlog/90 D28).
+    drop(table);
     let n = SENDS_ABANDONED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     if n == 1 || n % 64 == 0 {
         crate::kprintln!(
@@ -212,8 +214,9 @@ pub fn forget_blocked_sender(slot: usize) {
 }
 
 /// Clear every record naming `ep` (TABLE held). Used when an id is (re)registered: its earlier life's
-/// waiters were drained by its kill path, so finding one here means a drain was missed - said loudly.
-fn clear_waiters_for(ep: EndpointId) {
+/// waiters were drained by its kill path, so finding one here means a drain was missed - said loudly,
+/// by the caller once it has released the table (`say_stale_waiters`, backlog/90 D28). Returns how many.
+fn clear_waiters_for(ep: EndpointId) -> u32 {
     let mut p = PENDING.lock();
     let mut stale = 0u32;
     for rec in p.by_task.iter_mut() {
@@ -223,6 +226,11 @@ fn clear_waiters_for(ep: EndpointId) {
             stale += 1;
         }
     }
+    stale
+}
+
+/// Say what `clear_waiters_for` found, outside the table lock.
+fn say_stale_waiters(ep: EndpointId, stale: u32) {
     if stale > 0 {
         crate::kprintln!("routing: endpoint {} registered with {} stale blocked sender(s) - dropped", ep.0, stale);
     }
@@ -334,7 +342,9 @@ pub fn register(id: EndpointId, core_id: u32, generation: Generation) {
             entry.queue.reset();
             entry.blocked_receiver = None;
             entry.waiting          = 0;
-            clear_waiters_for(id);
+            let stale = clear_waiters_for(id);
+            drop(table);
+            say_stale_waiters(id, stale);
         }
         // BOOT-TIME CALLERS ONLY. Spawning a task goes through `try_register` and REFUSES the spawn
         // when the table is full, because a chaos kill storm reaching this panic took the whole
@@ -510,7 +520,9 @@ pub fn try_register(id: EndpointId, core_id: u32, generation: Generation) -> boo
             entry.queue.reset();
             entry.blocked_receiver = None;
             entry.waiting          = 0;
-            clear_waiters_for(id);
+            let stale = clear_waiters_for(id);
+            drop(table);
+            say_stale_waiters(id, stale);
             true
         }
         None => false,
@@ -935,6 +947,14 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
     // Bounded and rate-limited: an endpoint dying with a full queue is 16 messages, and a storm kills
     // many endpoints, so say the first and then every 64th.
     let discarded = table[idx].queue.len();
+    table[idx].queue.drain();
+    let rx = table[idx].blocked_receiver.take();
+    // The oldest blocked sender. Any others are drained by the caller with `take_blocked_sender`,
+    // which every kill path runs right after this (there can be many since backlog/90 D1).
+    let tx = take_oldest(&mut table[idx]).map(|(slot, _)| slot);
+    // Said after the table is released: a serial line is ~9 ms on the ARM ports, and every send on
+    // every core waits on this lock (backlog/90 D28).
+    drop(table);
     if discarded > 0 {
         let n = QUEUED_LOST.fetch_add(discarded as u64, core::sync::atomic::Ordering::Relaxed)
             + discarded as u64;
@@ -944,11 +964,6 @@ pub fn kill_endpoint(endpoint: EndpointId) -> (Option<usize>, Option<usize>) {
                 endpoint.0, discarded, n);
         }
     }
-    table[idx].queue.drain();
-    let rx = table[idx].blocked_receiver.take();
-    // The oldest blocked sender. Any others are drained by the caller with `take_blocked_sender`,
-    // which every kill path runs right after this (there can be many since backlog/90 D1).
-    let tx = take_oldest(&mut table[idx]).map(|(slot, _)| slot);
     (rx, tx)
 }
 
