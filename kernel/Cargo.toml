@@ -100,6 +100,10 @@ irq-miss-test = []
 # Panic on the 200th log line, while this core holds the log ring, so the panic path is shown to report
 # rather than spin on its own lock (backlog/90 D28). Off by default; a QEMU boot must print KERNEL PANIC.
 panic-ring-test = []
+# Shrink the delegated band to one slot, so a file-cap run (two caps held at once) exhausts it and
+# the kernel's "delegated band is full" line is shown to fire (backlog/90 D26). Off by default; test
+# builds only.
+band-full-test = []
 # Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
 # EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
 # reports banks above 4 GiB that the low-4-GiB identity map does not reach - recording those as usable

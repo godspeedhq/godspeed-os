@@ -38,7 +38,12 @@ type OwnerId = u64;
 pub const DELEGATED_BASE: u64 = 4096;
 /// Number of simultaneously-live delegated resources (open file caps). Reuse makes the
 /// *total* unbounded; this caps how many can be live at once (loud failure past it, §26.6).
+#[cfg(not(feature = "band-full-test"))]
 pub const DELEGATED_CAP: usize = 2048; // band = [4096, 6144)
+/// `band-full-test`: one slot, so `fcap`, which holds two file caps at once, exhausts the band and
+/// the kernel's refusal line is shown to fire (backlog/90 D26). Test builds only.
+#[cfg(feature = "band-full-test")]
+pub const DELEGATED_CAP: usize = 1;
 
 /// The owner-endpoint table for the band. `owner[i] == None` means slot `i` is free.
 /// Pure state - no global side effects - so it is unit-testable in isolation.

@@ -1731,7 +1731,20 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
     let rights = Rights((rights_bits as u8) & allowed.0);
     let id = match delegated::allocate(owner) {
         Some(i) => i,
-        None    => return -1, // band full (loud, §26.6)
+        None    => {
+            // Band full. The comment here said "loud", and nothing said anything: the caller got the
+            // same -1 as for a cap table that is full or an id it could not be told, so a band leak
+            // (D26's unrevoked remount, say) read as an ordinary refusal. Said here, the first time
+            // and every 64th, naming the owner, since it is the owner's leak or the owner's load.
+            static BAND_FULL: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+            let n = BAND_FULL.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n % 64 == 0 {
+                crate::kprintln!(
+                    "kernel: resource mint REFUSED - the delegated band is full ({} slots), owner endpoint {} ({} refusal(s) so far)",
+                    delegated::DELEGATED_CAP, owner, n);
+            }
+            return -1;
+        }
     };
     let cap = mint_cap(id, rights);
     let slot = match scheduler::current_task_insert_cap(cap) {
