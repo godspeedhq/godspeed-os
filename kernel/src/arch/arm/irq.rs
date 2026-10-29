@@ -277,6 +277,14 @@ pub fn ring_doorbell(core: u32) {
     if core >= 4 {
         return; // four cores on this SoC; a bad index would write into another block's registers
     }
+    // Whatever the woken core is about to read - the task marked Ready, the message queued for it -
+    // must be visible before the doorbell is. A Release store orders what came BEFORE it, not the Device
+    // write after it, so on this weak-ordered core the mailbox could be rung first and the woken core find
+    // the task not Ready yet; only an unrelated barrier elsewhere happened to cover it (backlog/90 D28).
+    // `dmb ishst` is what Linux's driver for this controller issues here (`smp_wmb()` in
+    // `bcm2836_arm_irqchip_ipi_send_mask`).
+    // SAFETY: a store barrier; no memory operand, no register or flag effect.
+    unsafe { core::arch::asm!("dmb ishst", options(nostack, preserves_flags)) };
     // SAFETY: volatile write of one bit to a Device-mapped mailbox WRITE-SET register. Write-set
     // semantics ignore 0s, so this cannot disturb a bit another sender has set.
     local_write(CORE_MBOX_WRITE_SET + 16 * core as usize, MBOX_WAKE_BIT);

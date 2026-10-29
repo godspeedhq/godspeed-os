@@ -2776,7 +2776,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/context.rs | 6 | permitted |
 | arch/arm/context_switch.rs | 13 | permitted |
 | arch/arm/dtb.rs | 6 | permitted |
-| arch/arm/irq.rs | 17 | permitted |
+| arch/arm/irq.rs | 18 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
 | arch/arm/mmu.rs | 8 | permitted |
 | arch/arm/video.rs | 17 | permitted |
@@ -3836,3 +3836,16 @@ nothing. Removed from `hw_random` (leaf 1) and from the three in `cpu_identity` 
 0x80000002-4 and 0). The calls, their order and the extended-leaf guard are unchanged. `_rdrand32_step`
 keeps its block, which it needs. The `__cpuid` calls in `boot.rs` sit inside `unsafe fn` bodies, where the
 compiler does not flag them, and are left as they are.
+
+## `arch/arm/irq.rs` 17 -> 18 (2026-10-29): the doorbell is rung after what it announces
+
+`ring_doorbell` gains one block, `dmb ishst`, before the mailbox WRITE-SET store (backlog/90 D28). A
+cross-core wake marks the task Ready (a Release store) and then rings the target core's mailbox, a Device
+write. Release orders the accesses before the store, not the Device write after it, so on the
+weak-ordered Cortex-A7 the doorbell could reach the other core before the Ready store did, and only an
+unrelated barrier elsewhere covered it. The barrier is the one Linux's driver for this controller issues
+in the same place (`smp_wmb()` in `bcm2836_arm_irqchip_ipi_send_mask`).
+
+| Block | Why it is sound |
+|---|---|
+| `asm!("dmb ishst")` | A store barrier: no memory operand, no register or flag effect, valid in any mode at PL1 |

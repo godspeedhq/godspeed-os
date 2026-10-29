@@ -65,6 +65,7 @@ allow_el0
 any_held
 arm_spawn_events_neutral
 arm_spawn_shell_neutral
+bcm2836_arm_irqchip_ipi_send_mask  # Linux irqchip (drivers/irqchip/irq-bcm2836.c), the driver for the Pi 2's core-local mailboxes, cited by arch/arm/irq.rs for the store barrier before the doorbell (backlog/90 D28) - external, 26.14
 bcm54xx_config_clock_delay
 bcmgenet_dma_regs_v3plus
 bcmgenet_probe
