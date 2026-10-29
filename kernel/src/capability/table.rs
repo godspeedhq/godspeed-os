@@ -81,6 +81,17 @@ impl CapTable {
             });
         }
 
+        // A record that has ended refuses EVERY capability, including one carrying its current
+        // generation. Such a cap can exist: `mint_cap` reads whatever the record holds, so a mint that
+        // races a death (AcquireSendCap after its name lookup, a spawn handing back an endpoint whose
+        // service already died) is issued at the dead generation. It used to validate here, and only the
+        // routing table refused the send (backlog/90 D25).
+        match record.liveness {
+            Liveness::Alive   => {}
+            Liveness::Dead    => return Err(CapError::EndpointDead),
+            Liveness::Revoked => return Err(CapError::CapRevoked),
+        }
+
         if !cap.rights.contains(required_right) {
             return Err(CapError::CapInsufficientRights);
         }
@@ -213,12 +224,12 @@ impl GlobalResourceTable {
         let i = id.0 as usize;
         if i < DIRECT_CAP {
             if self.present[i] {
-                self.records[i].generation = self.records[i].generation.bump();
+                self.records[i].generation = ended_generation(self.records[i].generation);
                 self.records[i].liveness   = liveness;
             }
         } else if let Some((_, r)) = self.overflow[..self.overflow_len]
                 .iter_mut().find(|(rid, _)| *rid == id) {
-            r.generation = r.generation.bump();
+            r.generation = ended_generation(r.generation);
             r.liveness   = liveness;
         }
     }
@@ -240,6 +251,18 @@ impl GlobalResourceTable {
             self.overflow_len += 1;
         }
     }
+}
+
+/// The generation a record takes when it ends: above its own, and a value the global counter will
+/// never issue again. An endpoint id is reused at `next_generation()`, and `bump()` alone gave the
+/// ended record `gen + 1`, which the counter could hand straight back to the id's next life: a cap
+/// minted on the dead record would then have validated against the new service, and no-resurrection
+/// rested on which spawn took the counter's next value (backlog/90 D25). Taking a counter value makes
+/// the dead generation unique. A delegated id is reused at the record's own `bump()`, above it either way.
+fn ended_generation(g: Generation) -> Generation {
+    let bumped = g.bump();
+    let issued = super::generation::next_generation();
+    if issued.0 > bumped.0 { issued } else { bumped }
 }
 
 static GLOBAL_RESOURCES: SpinLock<GlobalResourceTable> =
@@ -469,10 +492,29 @@ mod tests {
             let slot = ct.insert(mint_cap(ResourceId(id), Rights::SEND)).unwrap();
             if id == 5003 { mark_dead_resource(ResourceId(id)) } else { bump_resource_generation(ResourceId(id)) }
             assert_eq!(ct.get(slot, Rights::SEND).unwrap_err(), CapError::EndpointDead);
-            // A cap minted AFTER the death carries the new generation, and is valid again.
-            let fresh = ct.insert(mint_cap(ResourceId(id), Rights::SEND)).unwrap();
-            assert!(ct.get(fresh, Rights::SEND).is_ok());
+            // A cap minted AFTER the death carries the dead record's generation, and is refused too: an
+            // ended record validates nothing (backlog/90 D25). This asserted the opposite until then.
+            let late = ct.insert(mint_cap(ResourceId(id), Rights::SEND)).unwrap();
+            assert_eq!(ct.get(late, Rights::SEND).unwrap_err(), CapError::EndpointDead);
         }
+    }
+
+    /// backlog/90 D25: a cap minted on a dead record does not come back to life when the id is reused.
+    /// An endpoint id is reused at `next_generation()`; the dead record's generation came from the same
+    /// counter, so the next life is strictly above it whichever spawn took the counter's next value.
+    #[test]
+    fn a_cap_minted_on_a_dead_record_stays_dead_when_the_id_is_reused() {
+        let id = ResourceId(3020);
+        register_resource_at_gen(id, crate::capability::generation::next_generation());
+        mark_dead_resource(id);
+        let mut ct = CapTable::empty();
+        let late = ct.insert(mint_cap(id, Rights::SEND)).unwrap();
+        // The very next counter value goes to the id's next life, the case `bump()` alone collided with.
+        register_resource_at_gen(id, crate::capability::generation::next_generation());
+        assert_eq!(ct.get(late, Rights::SEND).unwrap_err(), CapError::EndpointDead,
+            "a cap minted on the dead record validated against the id's next life");
+        let fresh = ct.insert(mint_cap(id, Rights::SEND)).unwrap();
+        assert!(ct.get(fresh, Rights::SEND).is_ok());
     }
 
     /// An id REUSED after its resource ended - registered again, alive, at a higher generation, as a
@@ -539,12 +581,12 @@ mod tests {
         assert!(t.get_record(ResourceId(b)).is_some());
         assert!(t.get_record(ResourceId(a + 1)).is_none());
         t.bump_generation(ResourceId(b), Liveness::Revoked);
-        assert_eq!(t.get_record(ResourceId(b)).unwrap().generation.0, 1);
+        assert!(t.get_record(ResourceId(b)).unwrap().generation.0 >= 1, "an end moves the generation up");
         assert_eq!(t.get_record(ResourceId(b)).unwrap().liveness, Liveness::Revoked);
         assert_eq!(t.get_record(ResourceId(a)).unwrap().generation.0, 0, "a bump touches one record");
         // The FIRST overflow id is in the list, not past the end of the direct array.
         t.bump_generation(ResourceId(a), Liveness::Dead);
-        assert_eq!(t.get_record(ResourceId(a)).unwrap().generation.0, 1);
+        assert!(t.get_record(ResourceId(a)).unwrap().generation.0 >= 1);
         t.bump_generation(ResourceId(DIRECT_CAP as u64 - 1), Liveness::Dead);
         assert!(t.get_record(ResourceId(DIRECT_CAP as u64 - 1)).is_none(), "an unregistered id is not created");
     }

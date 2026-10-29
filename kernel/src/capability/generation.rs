@@ -48,8 +48,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// older caps regardless, subsuming the ABA guard id-reuse needed). It replaces the by-name/by-slot
 /// seeding, whose by-name source the self-heal removed.
 ///
-/// Per-resource `bump()` on death/revoke is unchanged; this only sources the generation a fresh
-/// endpoint STARTS at. Starts at 1 (0 = `INITIAL`, reserved for stable kernel resources). Panics on
+/// It also sources the generation a record takes when it ENDS (`table::ended_generation`), so a dead
+/// endpoint's generation is never handed to the id's next life (backlog/90 D25); the rest of this note
+/// is about the generation a fresh endpoint STARTS at. Starts at 1 (0 = `INITIAL`, reserved for stable kernel resources). Panics on
 /// u32 wrap rather than rolling to 0 (which would alias `INITIAL` and resurrect authority) - ~4.2B
 /// creations per boot, unreachable in practice; loud per H7.
 static NEXT_GENERATION: AtomicU32 = AtomicU32::new(1);
