@@ -286,8 +286,25 @@ pub fn load_from(src: &ImageSource) -> Result<LoadedElf, LoadError> {
 
         // Map full page-aligned VA range covering [p_vaddr .. p_vaddr + p_memsz).
         let va_start = p_vaddr & !(PAGE_SIZE as u64 - 1);
-        let va_end   = (p_vaddr + p_memsz as u64 + PAGE_SIZE as u64 - 1)
+        let va_end   = p_vaddr.checked_add(p_memsz as u64)
+                       .and_then(|e| e.checked_add(PAGE_SIZE as u64 - 1))
+                       .ok_or(LoadError::SegmentOutOfBounds)?
                        & !(PAGE_SIZE as u64 - 1);
+
+        // Every page of the segment must be a USER address, below the arch's user ceiling. Unchecked,
+        // a crafted image could lay a user page over a kernel or MMIO address, and on x86 the kernel half
+        // of every page table is shared by pointer, so the overlay would not stay in this task's address
+        // space (backlog/90 D29, A5-10). The window is one ceiling and the range does not wrap (checked
+        // above), so its first and last pages decide it; `validate_user_ptr` is the range check the
+        // syscall path already trusts, on every arch.
+        if va_end > va_start
+            && !(crate::arch::imp::validate_user_ptr(va_start, PAGE_SIZE)
+                 && crate::arch::imp::validate_user_ptr(va_end - PAGE_SIZE as u64, PAGE_SIZE))
+        {
+            crate::kprintln!(
+                "loader: segment at {:#x}..{:#x} is outside the user address space - refused", va_start, va_end);
+            return Err(LoadError::SegmentOutOfBounds);
+        }
 
         let mut va = va_start;
         while va < va_end {

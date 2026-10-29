@@ -199,7 +199,7 @@ catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere
 | D25 | low | a cap minted on a dead record validates at the capability layer; no-resurrection rests on spawn order | `capability/table.rs:59-70`, `:261-265` |
 | D27 | low | results that do not reflect outcomes (SpawnImage error after success, AllocMem leak KNOWN A10-15, stub successes, arch-divergent codes) | `syscall/dispatch.rs:1144-1179` |
 | D28 | low | serial output under hot locks; panic path not re-entrant; `nomem` interrupt-mask asm | `ipc/routing.rs:776-779` |
-| D29 | low | KNOWN A5-10: the loader never bounds `p_vaddr`; on x86 that reaches the shared kernel half | `loader.rs:262-332` |
+| D29 | low | KNOWN A5-10: the loader never bounds `p_vaddr`; on x86 that reaches the shared kernel half. **FIXED 2026-10-29:** a segment whose first or last page fails the arch's `validate_user_ptr` (the user ceiling the syscall path already uses, on every arch) is refused, and `p_vaddr + p_memsz` is checked for wrap | `loader.rs:262-332` |
 
 ### D1 fixed, 2026-10-27 (with D3's blocked-sender half)
 
