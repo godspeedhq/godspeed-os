@@ -241,7 +241,7 @@ def main():
     print("OK  %s  (%d bytes, flat, load at 0x40200000)" % (out, size))
     print("")
     print("Deploy: copy it to the card's FAT partition (partition 3, the ESP) and add a label to")
-    print("        /extlinux/extlinux.conf pointing at it - see backlog/14 for the exact stanza.")
+    print("        /extlinux/extlinux.conf pointing at it - see backlog/fixed/14 for the exact stanza.")
     print("        Or, faster for first light, load and `booti` it from the U-Boot prompt.")
 
 

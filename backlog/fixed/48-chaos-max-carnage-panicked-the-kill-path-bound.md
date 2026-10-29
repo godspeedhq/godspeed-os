@@ -34,7 +34,7 @@ separate answer - see Provenance below, where it is checked rather than assumed.
 **It is not the guard being wrong to exist.** The message is the guard working exactly as written: a
 core that will not release a slot cannot have its stack and page tables freed underneath it, and
 waiting forever while pretending otherwise is the silent hang this project refuses. Panicking loudly
-is the correct second choice. `backlog/17` records this bound landing as one of the three neutral
+is the correct second choice. `backlog/fixed/17` records this bound landing as one of the three neutral
 kernel changes that closed the riscv64 chaos wedge, hardware-verified on three memory models with
 "zero kill-path panics".
 
@@ -151,7 +151,7 @@ lines: `build.rs` twice (embedded-service list, rebuild trigger), `main.rs` (hel
 
 **None is in the kill path.** `kernel/src/task/scheduler.rs` last changed 2026-09-13, and the three
 commits that shaped this code are 2026-09-10/11 - `f86a5b55`, `25d30ab2` and `54c95c8d`, the riscv64
-chaos-wedge work recorded in `backlog/17`. So the bound is as it was when that work was
+chaos-wedge work recorded in `backlog/fixed/17`. So the bound is as it was when that work was
 hardware-verified across three memory models with "zero kill-path panics"; what is new is a host
 contended enough to stop a vCPU for three quarters of a second, which no hardware run had.
 

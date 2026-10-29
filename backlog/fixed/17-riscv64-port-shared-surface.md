@@ -1,6 +1,8 @@
 # 17. What the riscv64 port changed OUTSIDE riscv64, and what still needs testing elsewhere
 
-**Status: OPEN** - one item (xHCI, below), and it needs hardware. Everything else here is a finding, recorded so nobody has to
+**Status: CLOSED 2026-10-29.** Its one open item, xHCI hot-plug, was verified on the Pi 4, the Wyse, the T630, the Pi 2 and the VisionFive with zero panics (this entry's 2026-09-11 section); only this status line was never updated.
+
+**Status before 2026-10-29: OPEN** - one item (xHCI, below), and it needs hardware. Everything else here is a finding, recorded so nobody has to
 re-derive the blast radius of this branch before touching another board.
 
 Measured at `c05aa845` on `feat/riscv64`, against `main`.

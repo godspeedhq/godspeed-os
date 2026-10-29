@@ -1,6 +1,8 @@
 # 3. Pi 4: the shell faults with a return address of ASCII spaces
 
-**Status: OPEN.** Three sightings, most recent 2026-09-06 @ `f91663e8`. Cause NOT established.
+**Status: CLOSED 2026-10-29.** Not seen since `backlog/fixed/72` (`f587acbe`, 2026-10-04): a missing `isb` after a TTBR0 write left a core using stale translations, which fits a return address of ASCII spaces - the bytes `console` writes when it clears the screen, one frame seen through two address spaces. The Pi 4 cards of 2026-10-19 to 2026-10-26 (`build/card_pi4.log`, `final_pi4.log`, `step5_pi4.log`) show no user fault. Closed as not reproduced; reopen on a sighting.
+
+**Status before 2026-10-29: OPEN.** Three sightings, most recent 2026-09-06 @ `f91663e8`. Cause NOT established.
 The next step is a kernel change and two hardware round-trips - see the end of the file.
 
 **Severity:** correctness. Costs one command, never the machine - the supervisor respawns a fresh

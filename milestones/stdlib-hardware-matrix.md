@@ -69,7 +69,7 @@ now held on RTL8168 over PCIe, smsc95xx over USB, and GENET and dwmac on-SoC.
 - **`backlog/fixed/48` / `backlog/49`** - a userspace-reachable kernel panic, reproduced under load. A
   violation of an absolute bar (CLAUDE.md §22). Not caused or worsened by this branch, whose kernel
   diff is comments only, and already scheduled for after it.
-- **`backlog/52`** - the QEMU shell suite flaking on `sock` and `serve`. Five green boards do not make
+- **`backlog/not_required/52`** - the QEMU shell suite flaking on `sock` and `serve`. Five green boards do not make
   a flaky harness deterministic.
 - **Chaos and power-cut behaviour**, which are their own runs with their own evidence
   (`docs/gsfs-carnage.md`, `milestones/resilience/`).

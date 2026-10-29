@@ -1,6 +1,8 @@
 # 10. IPC cost - the lever is fewer ROUND TRIPS, not a tighter protocol
 
-**Status: OPEN BY DECISION.** Analysed, not built, and nothing is broken today. This file owns
+**Status: CLOSED - NO LONGER REQUIRED, 2026-10-29.** Its item 1, batching the block protocol, was built under `backlog/93` (`OP_WRITE_BLOCKS`, `OP_READ_BLOCKS`, `55ac17ec` and `c723f4b9`, 2026-10-27). The rest - co-location as a rule, a small-message shape - has no failing test or measured cost behind it (26.2). `docs/ipc-efficiency.md` keeps the reasoning.
+
+**Status before 2026-10-29: OPEN BY DECISION.** Analysed, not built, and nothing is broken today. This file owns
 the status; `docs/ipc-efficiency.md` owns the reasoning.
 
 **Severity:** performance. Nothing here is broken; this is about what to do when a hot path needs it.
@@ -53,7 +55,7 @@ reason from.
 **The message is a fixed `[u8; 4096]` struct.** The kernel copies only `payload_len` from userspace,
 so the syscall path is honest - but `Message` itself is ~4,224 bytes, a queue slot is that size
 regardless of payload, and the routing table is therefore **72 KiB per endpoint x 96 endpoints =
-6.8 MiB** of the kernel's 22.5 MiB `.bss` (see backlog/09).
+6.8 MiB** of the kernel's 22.5 MiB `.bss` (see backlog/not_required/09).
 
 A small-message representation - inline for payloads under some threshold, the big buffer only when
 needed - would cut both that memory AND every in-kernel move of a struct that is mostly empty. Most

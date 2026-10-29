@@ -73,7 +73,7 @@ BOARDS = {
         "artifacts": ["build/godspeed-riscv64-visionfive.img"],
         "deploy": [
             "run scripts/deploy_visionfive.ps1 (elevated), or copy the .img to the card's",
-            "ESP and point /extlinux/extlinux.conf at it - backlog/14 has the stanza",
+            "ESP and point /extlinux/extlinux.conf at it - backlog/fixed/14 has the stanza",
         ],
     },
     "x86": {

@@ -842,7 +842,7 @@ Five boards. **A QEMU pass is never recorded as a hardware pass.**
 | Dell Wyse 5070 | x86-64 | 502 / 0 / 0, twice | no EHCI present, so it could not test the handoff below |
 | HP T630 | x86-64 | 502 / 0 / 0, twice | **the EHCI BIOS handoff ran for the first time ever** |
 | Raspberry Pi 2 | armv7 | 493 / 0 / **1**, three times | `chaos kill-storm dwc2` 100 rounds, 100/100 recovered |
-| Raspberry Pi 4 | aarch64 | 502 / 0 / 0, twice | no `backlog/03` fault, no `backlog/22` blanking |
+| Raspberry Pi 4 | aarch64 | 502 / 0 / 0, twice | no `backlog/fixed/03` fault, no `backlog/22` blanking |
 | VisionFive 2 Lite | riscv64 | 502 / 0 / 0, twice | **`reboot` was a spin loop**; fixed and verified |
 
 **The counts are self-consistent, which is worth more than the zeros.** 502 wherever PCI exists and

@@ -2,8 +2,8 @@
 
 **Status: OPEN, 2026-10-16; the programme from here set by the operator 2026-10-19; under way since 2026-10-26 on `feat/v1-groundwork`, with Kani, Creusot and Verus as layer C's tools, run in CI (Next step).** Phases 1 and 2 done against the core kernel at `537e6861`, read-only:
 the evidence is `audits/2026-10-16-kernel-verification.md`. 29 kernel defects (7 high) and 6
-enforcement-layer defects are listed below; since 2026-10-26 D1, D2, D3, D5, D12, D16, D19, D26, D29, the id and IRQ halves of D15 and the CMOS half of
-D23 are fixed, and E1 to E6 are repaired apart from the parts each row names as open. Of the four executable
+enforcement-layer defects are listed below; since 2026-10-26 D1, D2, D3, D5, D12, D16, D19, D23, D26, D29, the id and IRQ halves of D15 and the placement half of
+D17 are fixed, and E1 to E6 are repaired apart from the parts each row names as open. Of the four executable
 prototypes, C4 is landed (`scripts/syscall_gate_check.py`); the other three are outside the tree. The brief, as recorded on 2026-10-15, follows; only its list of checker
 names was spelled out in full, because `scripts/doc_symbols_check.py` could not resolve the short forms.
 

@@ -39,9 +39,12 @@ def main():
     # a fixed 94, and every citation of number 94 then meant whichever the reader guessed (Audit 26).
     entries = sorted(f for f in os.listdir(BACKLOG)
                      if f.endswith('.md') and f != 'README.md')
-    fixed_dir = os.path.join(BACKLOG, 'fixed')
-    if os.path.isdir(fixed_dir):
-        entries += sorted('fixed/' + f for f in os.listdir(fixed_dir) if f.endswith('.md'))
+    # And `not_required/` (2026-10-29): entries no longer needed, kept with their number and why. All three
+    # folders share one number space, so `backlog/NN` names one entry wherever it now lives.
+    for sub in ('fixed', 'not_required'):
+        d = os.path.join(BACKLOG, sub)
+        if os.path.isdir(d):
+            entries += sorted(sub + '/' + f for f in os.listdir(d) if f.endswith('.md'))
     if not entries:
         print('backlog check: no entries')
         return 0

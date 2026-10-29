@@ -1,6 +1,8 @@
 # 14. RISC-V 64 port - what exists, what it runs on, and what is next
 
-**Status: OPEN TAILS ONLY - the port SHIPPED (v0.16.0) and is hardware-verified on the StarFive
+**Status: CLOSED 2026-10-29.** The port shipped (v0.16.0) and is hardware-verified on the VisionFive 2 Lite. Its tails: riscv32 parity closed in `backlog/fixed/60`; the stale peer-cap symptom is the open `backlog/86`'s. Not carried anywhere: `xhci`'s retry and USB-IS-DEGRADED paths have never executed.
+
+**Status before 2026-10-29: OPEN TAILS ONLY - the port SHIPPED (v0.16.0) and is hardware-verified on the StarFive
 VisionFive 2 Lite.** What is left is scaffold parity for `riscv32` and the hardware notes at the
 end; the port itself is not open work.
 

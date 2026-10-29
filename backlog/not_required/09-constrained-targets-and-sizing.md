@@ -1,6 +1,8 @@
 # 9. Constrained targets: what actually blocks a microcontroller, and how the sizing should be tuned
 
-**Status: OPEN BY DECISION (26.2).** Unforced - nobody has the hardware. The measurements are
+**Status: CLOSED - NO LONGER REQUIRED, 2026-10-29.** No constrained board is in hand and no test fails: `MAX_TASKS` (224) and `MAX_ENDPOINTS` (96) are as recorded, and sizing the arenas at boot has nothing pulling it (26.2). Reopen with the hardware.
+
+**Status before 2026-10-29: OPEN BY DECISION (26.2).** Unforced - nobody has the hardware. The measurements are
 here so the answer is not re-derived when someone does.
 
 **Severity:** design question, unforced. Nobody has the hardware; this exists so the answer is not

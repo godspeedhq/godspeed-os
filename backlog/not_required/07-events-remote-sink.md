@@ -1,6 +1,8 @@
 # 7. `events persist start <url>` - ship a capture off-box
 
-**Status: OPEN BY DECISION - a deferral, not debt (26.2).** Nothing is waiting on it and nothing
+**Status: CLOSED - NO LONGER REQUIRED, 2026-10-29.** A deferral by decision (26.2) that nothing has pulled since: no destination exists, no caller asks for one, and no test fails without it. The design below stays readable should something need it.
+
+**Status before 2026-10-29: OPEN BY DECISION - a deferral, not debt (26.2).** Nothing is waiting on it and nothing
 is degraded by its absence. Recorded so the design is not re-derived from scratch.
 
 **Severity:** feature, deliberately deferred.

@@ -1,6 +1,8 @@
 # 44. Commandment VIII is the only one nothing automated watches
 
-**Status: OPEN, noticed 2026-09-23.** Not a defect, an absence - and one with a same-day example, so
+**Status: CLOSED - NO LONGER REQUIRED, 2026-10-29.** An absence, not a defect, and it cannot be lost: `scripts/commandments.py` prints Commandment VIII as having NO CHECK on every report (`UNMECHANISED`). Its one concrete pull, the suites that assert on time under load, is `backlog/43`.
+
+**Status before 2026-10-29: OPEN, noticed 2026-09-23.** Not a defect, an absence - and one with a same-day example, so
 it is written down rather than left as a nice observation.
 
 ## The fact

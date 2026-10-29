@@ -1,6 +1,8 @@
 # 8. D3: the assignment / re-enumeration split, and "cost 2"
 
-**Status: OPEN - a DECISION, not work.** The data gate is met and both walks agree on every
+**Status: CLOSED 2026-10-29.** Both decisions were made and built: `docs/service-ownership.md` Slice 2 (the kernel derives BAR and IRQ from a BDF) and Slice 4 (the assignment / re-enumeration split), with Slice 3 finished by `39746569`. That doc keeps the one caveat: the already-programmed-BAR branch has not run on hardware.
+
+**Status before 2026-10-29: OPEN - a DECISION, not work.** The data gate is met and both walks agree on every
 machine available; what remains is the split below, which nobody has chosen between.
 
 **Severity:** design decision, blocking the D3 gate.

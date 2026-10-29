@@ -63,7 +63,7 @@ was established by observation, not by reading.
 controller by clearing PCI Bus-Master-Enable, and this board's xHCI is a platform device with no BDF,
 so `task_hw_bdf` returns `0xFFFF` and nothing stops it. A respawned driver therefore meets a **running**
 controller. That is why `xhci` must halt the controller before resetting it and allow a realistic
-`HCRST` budget - see `services/xhci` and `backlog/14`.
+`HCRST` budget - see `services/xhci` and `backlog/fixed/14`.
 
 **No generic PCI host bridge.** `ECAM_BASE == 0` means *we found no `pci-host-ecam-generic` node*, NOT
 that the machine has no PCI. The VisionFive has PCIe (U-Boot probes `starfive_pcie pcie@2C000000`);

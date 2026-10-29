@@ -1,7 +1,8 @@
 # IPC efficiency - backlog
 
-**Status:** tracked as [`backlog/10-ipc-efficiency.md`](../backlog/10-ipc-efficiency.md) - the status
-lives there, the reasoning lives here. Nothing here is built. Recorded because the cost it addresses grows with every
+**Status:** tracked as [`backlog/not_required/10-ipc-efficiency.md`](../backlog/not_required/10-ipc-efficiency.md) - the status
+lives there, the reasoning lives here. One idea here is built: batching the block protocol (`OP_WRITE_BLOCKS`,
+`OP_READ_BLOCKS`, under `backlog/93`); the entry is no longer required, and the rest is unbuilt. Recorded because the cost it addresses grows with every
 step of §4.4's kernel-shrinking work, and the decisions are easier to make before a hot path depends
 on them.
 

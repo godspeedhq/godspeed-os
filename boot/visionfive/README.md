@@ -183,7 +183,7 @@ this one is the one the hardware obeys.
 ## History, and what it cost
 
 An earlier card used a different arrangement: a single FAT32 partition whose 16-byte MBR entry was moved
-from slot 1 to slot 3. `backlog/14-riscv64-port.md` records it, and `build/mbr_backup.bin` is the
+from slot 1 to slot 3. `backlog/fixed/14-riscv64-port.md` records it, and `build/mbr_backup.bin` is the
 pre-move backup (slot 1, type 0x0C, startLBA 2048, 15952344 sectors; slots 2, 3, 4 empty). It works, but
 **how the move was performed was never written down**, and it needs raw-sector access from an elevated
 shell. The procedure above needs no sector surgery, so it is the one to use.
@@ -206,7 +206,7 @@ not boot, and the recovery went wrong three more times before it went right:
   one-line copy, never a multi-line paste.
 
 All of it was avoidable. `scripts/riscv_build.py` prints "copy it to the card's FAT partition
-(partition 3, the ESP)" on every single build, `backlog/14` describes the deployment, and a serial
+(partition 3, the ESP)" on every single build, `backlog/fixed/14` describes the deployment, and a serial
 capture of the card booting before anything was touched had been sitting in `build/` the whole time.
 That capture is the whole answer, in six lines:
 

@@ -92,6 +92,8 @@ PATHISH = re.compile(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_./-]+\.(?:rs|md|toml|py|jso
 BACKLOG_REF = re.compile(r"`?backlog/(\d+)`?")
 # ...and a FIXED entry, moved to `backlog/fixed/` with its number kept (2026-10-13).
 FIXED_REF = re.compile(r"`?backlog/fixed/(\d+)`?")
+# ...and one no longer required, moved to `backlog/not_required/` with its number kept (2026-10-29).
+NOTREQ_REF = re.compile(r"`?backlog/not_required/(\d+)`?")
 
 # Source trees whose COMMENTS cite backlog entries. Only the backlog check runs over these: scanning
 # source for `PATHISH` would match path-shaped string literals and produce noise, and a wrong finding
@@ -125,6 +127,7 @@ def check_backlog_refs():
     """Every `backlog/NN` cited anywhere must name an entry that exists. Returns a list of misses."""
     have = backlog_entries()
     have_fixed = backlog_entries("fixed")
+    have_notreq = backlog_entries("not_required")
     misses = []
     files = []
     for pat in PATTERNS + SOURCE_PATTERNS:
@@ -144,6 +147,9 @@ def check_backlog_refs():
         for n in set(FIXED_REF.findall(text)):
             if n not in have_fixed:
                 misses.append((rel, "fixed/" + n))
+        for n in set(NOTREQ_REF.findall(text)):
+            if n not in have_notreq:
+                misses.append((rel, "not_required/" + n))
     return misses
 
 # Paths named by prose that is ABOUT their removal. Listed one by one rather than matched by a

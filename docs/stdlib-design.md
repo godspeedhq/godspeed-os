@@ -1669,7 +1669,7 @@ is untouched by any of this and is a violation of an absolute bar (CLAUDE.md 22:
 never panic on user-controllable input). It is not caused or worsened by this branch, whose kernel
 diff is comments only, and the operator has already scheduled it for after this work.
 
-`backlog/52` - the shell suite flaking on `sock` and `serve` in QEMU - is also untouched. Five boards
+`backlog/not_required/52` - the shell suite flaking on `sock` and `serve` in QEMU - is also untouched. Five boards
 passing does not make a flaky harness deterministic.
 
 ---

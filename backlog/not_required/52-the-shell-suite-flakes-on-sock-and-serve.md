@@ -1,6 +1,8 @@
 # 52 - `osdev test shell` flakes on `sock` and `serve`, and the failure CASCADES into `scrollback`
 
-**Status:** OPEN - measured across five runs on one machine in one session, not root-caused.
+**Status: CLOSED - NO LONGER REQUIRED, 2026-10-29.** A duplicate of `backlog/62`, which tracks the same `sock`-cluster flake in `osdev test shell`. Neither has a recorded `sock` or `serve` failure in the October runs; 62 carries the counted loop that would close it.
+
+**Status before 2026-10-29:** OPEN - measured across five runs on one machine in one session, not root-caused.
 **Found:** 2026-09-25, during Audit 7, by a control experiment that was looking for something else.
 
 ## What was measured
