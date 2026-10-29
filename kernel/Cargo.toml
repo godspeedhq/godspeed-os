@@ -93,6 +93,10 @@ mmio-map-fault-test = []
 # and the liveness watchdog must ask by ready id, not by `0..ready_count()` (backlog/90 D17). Off by
 # default; a QEMU run with `-smp 4` or more shows it.
 ap-gap-test = []
+# Skip the FIRST notification of every interrupt vector, as queue pressure would, so the owed-notification
+# retry on core 0's tick is EXERCISED: without it a level line `deliver` masked would stay masked forever,
+# with nothing said (backlog/90 D18). Off by default; a QEMU boot shows each skipped vector paid a tick later.
+irq-miss-test = []
 # Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
 # EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
 # reports banks above 4 GiB that the low-4-GiB identity map does not reach - recording those as usable

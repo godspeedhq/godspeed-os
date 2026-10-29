@@ -143,56 +143,138 @@ pub unsafe fn deliver(irq: u8) {
 
     let endpoint = IRQ_TABLE.lock_irq()[irq as usize];
     if let Some(ep) = endpoint {
-        // COALESCE interrupt notifications, but only against QUEUE PRESSURE - never against the mere
-        // presence of unrelated work.
-        //
-        // This read `endpoint_queue_depth(ep) == 0`, so ANY queued message suppressed the interrupt.
-        // A driver whose endpoint carries more than interrupts - `xhci` receives block requests from
-        // `block-driver` on the same endpoint - therefore lost IRQ notifications whenever it happened
-        // to have a request pending. The comment claimed "the kernel re-notifies once the queue
-        // drains"; there is NO such path. This is the only enqueue site, and nothing re-triggers it
-        // but the next hardware interrupt.
-        //
-        // It is currently masked by those drivers ALSO polling their event ring every pass, which is
-        // why it has never been seen. It becomes a lost keystroke - or a lost disk completion - the
-        // moment a driver stops polling, which is exactly the direction xhci is moving.
-        //
-        // Half the queue is the reserve. Below it, always notify: a pending block request must never
-        // cost an interrupt. At or above it, skip: that is a genuine storm, the queue is the thing
-        // under pressure, and the driver reads its ring on the next pass regardless. So the
-        // pathology this was written for (notifications piling up until `observe` shows a full queue
-        // after a max-carnage interrupt storm) is still bounded, and the correctness hole is closed.
-        //
-        // (The EOI below still fires unconditionally, on every path.)
-        const IRQ_NOTIFY_RESERVE: u8 = (crate::ipc::queue::QUEUE_DEPTH / 2) as u8;
-        static IRQ_DROP_SAID: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if crate::ipc::routing::endpoint_queue_depth(ep) < IRQ_NOTIFY_RESERVE {
-            let msg = crate::ipc::message::Message::interrupt_event(irq);
-            match crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
-                // wake_by_slot marks the receiver Ready and sends a WAKE_RECEIVER IPI
-                // to its core if it lives on a different core than the one handling
-                // this IRQ (§12.2 cross-core delivery path).
-                crate::ipc::routing::Enqueue::Woke(receiver_slot) => {
-                    crate::task::scheduler::wake_by_slot(receiver_slot, 0);
-                }
-                crate::ipc::routing::Enqueue::Queued
-                | crate::ipc::routing::Enqueue::NoEndpoint => {}
-                // Should be unreachable: the depth guard above reserves half the queue precisely so
-                // this cannot happen. Said ONCE if it ever does, because a silently lost interrupt is
-                // a driver that stops for no visible reason - and an impossible case that turns out to
-                // be possible is worth hearing about the first time, not the hundredth.
-                crate::ipc::routing::Enqueue::QueueFull => {
-                    if !IRQ_DROP_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                        crate::kprintln!(
-                            "kernel: IRQ {} to endpoint {} DROPPED - queue full despite the reserve; the driver missed an interrupt",
-                            irq, ep.0);
-                    }
-                }
+        // `irq-miss-test`: the first notification of each vector is skipped, as queue pressure would
+        // skip it, so the retry below is exercised on every boot of a test build (backlog/90 D18).
+        #[cfg(feature = "irq-miss-test")]
+        {
+            use core::sync::atomic::Ordering;
+            static SKIPPED: [portable_atomic::AtomicU64; 4] =
+                [const { portable_atomic::AtomicU64::new(0) }; 4];
+            let b = 1u64 << (irq & 63);
+            if SKIPPED[(irq >> 6) as usize].fetch_or(b, Ordering::Relaxed) & b == 0 {
+                crate::kprintln!("irq-miss-test: skipping vector {:#x}'s first notification", irq);
+                note_missed(irq);
+                crate::arch::imp::interrupts::send_eoi();
+                return;
             }
+        }
+        if !try_notify(irq, ep) {
+            note_missed(irq);
         }
     }
     // EOI must fire unconditionally - even on discard and even on full queue.
     // If the APIC is not re-armed here, the IRQ line stays masked and the system hangs.
     crate::arch::imp::interrupts::send_eoi();
 }
+
+/// Send `irq`'s notification to `ep`, unless the queue is under pressure. True if it went out (or the
+/// endpoint is gone, which leaves nothing to owe); false if it was skipped or dropped, and is owed.
+fn try_notify(irq: u8, ep: EndpointId) -> bool {
+    // COALESCE interrupt notifications, but only against QUEUE PRESSURE - never against the mere
+    // presence of unrelated work.
+    //
+    // This read `endpoint_queue_depth(ep) == 0`, so ANY queued message suppressed the interrupt.
+    // A driver whose endpoint carries more than interrupts - `xhci` receives block requests from
+    // `block-driver` on the same endpoint - therefore lost IRQ notifications whenever it happened
+    // to have a request pending. The comment claimed "the kernel re-notifies once the queue
+    // drains"; there was NO such path. There is one now: a notification skipped here is OWED, and
+    // `retry_missed` sends it from core 0's tick once the queue has room (backlog/90 D18).
+    //
+    // It is currently masked by those drivers ALSO polling their event ring every pass, which is
+    // why it has never been seen. It becomes a lost keystroke - or a lost disk completion - the
+    // moment a driver stops polling, which is exactly the direction xhci is moving.
+    //
+    // Half the queue is the reserve. Below it, always notify: a pending block request must never
+    // cost an interrupt. At or above it, skip for now: that is a genuine storm and the queue is the
+    // thing under pressure. The skip is recorded and retried on the tick, because a LEVEL line stays
+    // masked until its driver hears of it - "the driver reads its ring on the next pass" was true only
+    // of a driver that polls. So the
+    // pathology this was written for (notifications piling up until `observe` shows a full queue
+    // after a max-carnage interrupt storm) is still bounded, and the correctness hole is closed.
+    //
+    // (The EOI below still fires unconditionally, on every path.)
+    const IRQ_NOTIFY_RESERVE: u8 = (crate::ipc::queue::QUEUE_DEPTH / 2) as u8;
+    static IRQ_DROP_SAID: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if crate::ipc::routing::endpoint_queue_depth(ep) >= IRQ_NOTIFY_RESERVE {
+        return false;
+    }
+    let msg = crate::ipc::message::Message::interrupt_event(irq);
+    match crate::ipc::routing::enqueue_from_interrupt(ep, msg) {
+        // wake_by_slot marks the receiver Ready and sends a WAKE_RECEIVER IPI
+        // to its core if it lives on a different core than the one handling
+        // this IRQ (§12.2 cross-core delivery path).
+        crate::ipc::routing::Enqueue::Woke(receiver_slot) => {
+            crate::task::scheduler::wake_by_slot(receiver_slot, 0);
+            true
+        }
+        crate::ipc::routing::Enqueue::Queued
+        | crate::ipc::routing::Enqueue::NoEndpoint => true,
+        // Should be unreachable: the depth guard above reserves half the queue precisely so
+        // this cannot happen. Said ONCE if it ever does, because a silently lost interrupt is
+        // a driver that stops for no visible reason - and an impossible case that turns out to
+        // be possible is worth hearing about the first time, not the hundredth.
+        crate::ipc::routing::Enqueue::QueueFull => {
+            if !IRQ_DROP_SAID.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                crate::kprintln!(
+                    "kernel: IRQ {} to endpoint {} DROPPED - queue full despite the reserve; owed, and retried on the tick",
+                    irq, ep.0);
+            }
+            false
+        }
+    }
+}
+
+/// One bit per vector: a notification was skipped or dropped and has not been sent since.
+///
+/// A level line is MASKED by `deliver` and opened again only by its driver's `IrqUnmask`, which the
+/// driver calls after it handles the notification. So a notification that is skipped under queue
+/// pressure, or dropped by a full queue, was a line masked FOREVER, with nothing said: the device
+/// keeps it asserted, the controller holds it shut, and no later interrupt comes to try again
+/// (backlog/90 D18). The bit makes the notification owed rather than lost, and `retry_missed` pays it
+/// on core 0's tick once the queue has room. For an edge or MSI vector it is one extra notification at
+/// most, which the driver treats as any other: it reads its ring and finds whatever is there.
+static NOTIFY_MISSED: [portable_atomic::AtomicU64; 4] =
+    [const { portable_atomic::AtomicU64::new(0) }; 4];
+
+fn note_missed(irq: u8) {
+    use core::sync::atomic::Ordering;
+    NOTIFY_MISSED[(irq >> 6) as usize].fetch_or(1u64 << (irq & 63), Ordering::Relaxed);
+}
+
+/// Send every owed notification whose queue now has room. Called on core 0's tick, with interrupts
+/// masked as `deliver` runs. Bounded: four loads when nothing is owed, and at most one notification per
+/// owed vector per tick. A vector whose route has gone is dropped - its owner is dead, and the next
+/// holder's `register` opens the line itself.
+pub fn retry_missed() {
+    use core::sync::atomic::Ordering;
+    for w in 0..NOTIFY_MISSED.len() {
+        // A load first: the common case is nothing owed, and a swap would write the line every tick.
+        if NOTIFY_MISSED[w].load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let mut bits = NOTIFY_MISSED[w].swap(0, Ordering::Relaxed);
+        while bits != 0 {
+            let b = bits.trailing_zeros();
+            bits &= bits - 1;
+            let irq = ((w as u32) << 6 | b) as u8;
+            let endpoint = IRQ_TABLE.lock_irq()[irq as usize];
+            if let Some(ep) = endpoint {
+                if try_notify(irq, ep) {
+                    // Said once a boot: a skip is the reserve doing its job, and this is the line that
+                    // shows the debt being paid rather than a driver going quiet for no visible reason.
+                    static PAID_SAID: core::sync::atomic::AtomicBool =
+                        core::sync::atomic::AtomicBool::new(false);
+                    if !PAID_SAID.swap(true, Ordering::Relaxed) {
+                        crate::kprintln!(
+                            "irq: vector {:#x}'s notification was skipped under queue pressure and sent on the tick (further ones are not logged)",
+                            irq);
+                    }
+                } else {
+                    note_missed(irq);
+                }
+            }
+        }
+    }
+}
+

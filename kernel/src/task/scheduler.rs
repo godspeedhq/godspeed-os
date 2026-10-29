@@ -1951,6 +1951,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             // wake or sub-tick entry is not 10 ms of time (backlog/90 D12).
             if a_tick {
                 scan_timed_wakes();
+                // An interrupt notification skipped or dropped under queue pressure is owed, not lost:
+                // send it now if its queue has room (backlog/90 D18).
+                crate::interrupt::route::retry_missed();
             }
             #[cfg(feature = "wake-trace")]
             wake_trace::maybe_report(monotonic_ticks());
