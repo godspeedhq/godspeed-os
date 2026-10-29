@@ -2133,7 +2133,7 @@ changed line in a source file was checked to be comment or docstring text.
   for an entry still open.
 
 **Code findings, recorded and not fixed (an audit changes no code):**
-1. `tests/kani` does not compile since `99095070`: `spinlock.rs`'s `Wait::look` calls
+1. FIXED 2026-10-29, in the commit after this audit. `tests/kani` did not compile since `99095070`: `spinlock.rs`'s `Wait::look` calls
    `arch::imp::liveness_deadline_cycles` and `read_cycle_counter`, and the Kani crate's arch seam stubs only the
    interrupt mask. `verify.yml` runs on any change to `spinlock.rs`.
 2. Backlog number 94 is used twice (`backlog/94`, `backlog/fixed/94`), and `backlog_check.py` keys duplicates by
