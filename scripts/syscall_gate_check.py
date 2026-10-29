@@ -140,9 +140,6 @@ ALLOW_UNGATED_QUERY = {
                  "200000-read spin (finding F-q19-ungated-device-writes)",
              effects={"device_read", "device_write", "store", "static_write", "asm", "log", "lock"}),
     20: dict(why="EMMC base clock learned at boot", effects=set()),
-    21: dict(why="pops ONE byte off the COM2 operator channel: a CONSUMING read of state the `control` "
-                 "service depends on, by any task, with no capability (finding F-q21-com2-ungated-pop)",
-             effects={"device_read", "store", "asm"}),
     23: dict(why="the board MAC, a hardware identity fact", effects={"device_read", "device_write", "store", "lock", "asm", "log"}),
     28: dict(why="pending power action, ungated by design so a planted deadline cannot be hidden "
                  "(docs/shutdown.md 6)", effects=set()),

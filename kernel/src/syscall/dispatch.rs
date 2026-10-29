@@ -1919,8 +1919,7 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // self-state (0 = own alloc bytes, 13 = do I own the console foreground), the cycle counter (3),
     // and task-neutral board/transport facts that disclose nobody's state: the input-ready flag (10),
     // the RTC and timing reads (11, 12, 16, 17), NIC identity and BAR, driver-presence bits, a hardware random word, the
-    // EMMC base clock, one byte off the COM2 operator channel, the board MAC and which ethernet controller
-    // is on the SoC (14, 15, 18, 19, 20, 21, 23, 29). And one that IS system-wide, deliberately: 28, the
+    // EMMC base clock, the board MAC and which ethernet controller is on the SoC (14, 15, 18, 19, 20, 23, 29). And one that IS system-wide, deliberately: 28, the
     // seconds left on a pending power-off or reboot and which it is,
     // ungated so a pending shutdown can never be hidden (`docs/shutdown.md` 6). Every other query discloses another task's or system-wide state and requires the
     // INTROSPECT capability with READ (docs/introspection-capability.md).
@@ -1929,7 +1928,11 @@ fn handle_inspect_kernel(query_id: u64, arg1: u64, arg2: u64) -> i64 {
     // were listed until 2026-10-10 as dead entries (`backlog/fixed/80` K18), which made an AUTHORITY list
     // name two things that do not exist; an unknown query now falls on the gated side like any other,
     // and answers -1 to a holder.
-    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 23 | 28 | 29)
+    //
+    // 21 is GATED (backlog/90 D23). It POPS a byte off the COM2 operator channel, so ungated it let any
+    // task read and delete the commands meant for `control`, which holds INTROSPECT. A destructive read
+    // of the operator's input is not a fact that "discloses nobody's state".
+    if !matches!(query_id, 0 | 3 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 23 | 28 | 29)
         && !scheduler::current_task_holds_resource(
             crate::capability::INTROSPECT_RESOURCE, Rights::READ)
     {

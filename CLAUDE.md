@@ -3533,7 +3533,7 @@ Constraint: this must not pollute kernel scope. The kernel publishes; the metric
 > the full argument and the three-part test any new mechanism must pass first. Non-normative, as is
 > this appendix.
 >
-> *(Update 2026-10-29: `InspectKernel` answers 28 queries now, not 25, and 17 of them need no
+> *(Update 2026-10-29: `InspectKernel` answers 28 queries now, not 25, and 16 of them need no
 > INTROSPECT. The note is left as written because it is dated; the live count is the pin,
 > `introspect_queries` in `COMMANDMENTS.baseline.toml`, which a hand-written number here cannot be.)*
 

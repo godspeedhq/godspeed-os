@@ -3012,7 +3012,8 @@ impl ServiceContext {
     ///
     /// The kernel owns the UART - hardware, and §11.4 already sanctions it owning a serial console -
     /// and hands bytes out; the `control` service owns what they MEAN. Transport in the kernel,
-    /// interpretation in a service (C1-6).
+    /// interpretation in a service (C1-6). INTROSPECT-gated: the read deletes the byte, so an ungated one
+    /// let any task eat the operator's commands (backlog/90 D23). `None` for a caller without it too.
     pub fn com2_byte(&self) -> Option<u8> {
         // SAFETY: syscall(13) = InspectKernel; query 21 = pop one COM2 byte, -1 when empty.
         let v = unsafe { raw_syscall(13, 21, 0, 0) };

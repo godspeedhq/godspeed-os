@@ -273,9 +273,9 @@ again**, because a developer service with a send cap to `fs` on a real board tou
 It does not limit what every task can already do, and the kernel verification found two things there
 (`audits/2026-10-16-kernel-verification.md`), both open in `backlog/90`:
 
-- **Ungated queries.** Any task may call the ungated `InspectKernel` queries. On x86, query 21 pops a byte
-  of the COM2 operator channel, so a floor service can read and delete the commands meant for `control`
-  (D23); queries 11 and 17 race on the unlocked CMOS index port and can return a date years ahead.
+- **Ungated queries.** Any task may call the ungated `InspectKernel` queries. Two of them did harm until
+  they were fixed (D23): query 21, which pops a byte of the COM2 operator channel, is INTROSPECT-gated since
+  2026-10-29, and queries 11 and 17 take the CMOS lock across the index and data ports.
 - **Kernel defects reachable by any task.** A service that faults exercises the self-kill path, which has
   a double-free window (D8), a page-table-root leak (D9, an L1 arena slot on the Pi 2) and a slot-reuse
   race (D10). The restart loop in 3.4 repeats that path for a service that crashes on start, which is why
