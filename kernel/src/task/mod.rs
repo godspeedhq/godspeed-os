@@ -1408,6 +1408,12 @@ fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<Endp
         let _ = crate::ipc::routing::kill_endpoint(rep);
         crate::capability::table::mark_dead_resource(
             crate::capability::cap::ResourceId::from(rep));
+        // And the ID, as the kill path frees it (`scheduler.rs`, after the same two steps). Killed and
+        // marked dead but never freed, every spawn that failed past this point kept one id for good,
+        // and nothing sweeps a dead entry back to the free list (backlog/90 D15). Its IRQ routes first,
+        // as on the kill path: LIFO reuse would otherwise hand the next endpoint this one's lines.
+        let _ = crate::interrupt::route::unregister_endpoint(rep);
+        crate::ipc::free_endpoint_id(rep);
     }
     if let Some(ep_id) = own_endpoint {
         // Mark the routing entry Dead (recyclable) + drain its queue + bump generation.
@@ -1429,6 +1435,8 @@ fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<Endp
                     name, ep_id, other);
             }
         }
+        // The routes a spawn wired to this endpoint go with it, before the id can be reused (D15).
+        let _ = crate::interrupt::route::unregister_endpoint(ep_id);
         crate::ipc::free_endpoint_id(ep_id);
     }
     scheduler::release_task_slot(task_slot);
@@ -1622,6 +1630,11 @@ fn spawn_service_with_image(
             crate::kprintln!(
                 "task: '{}' spawn REFUSED - IPC routing table full, no mailbox available",
                 name);
+            // The id was allocated and its resource registered above, and nothing else has it yet:
+            // no routing entry, no name, no cap. Give both back, or every refusal - which runs when
+            // the table is under pressure - keeps an id for good (backlog/90 D15).
+            crate::capability::table::mark_dead_resource(resource_id);
+            crate::ipc::free_endpoint_id(ep_id);
             cleanup_partial_spawn(task_slot, name, None);
             return Err(SpawnError::NoMemory);
         }
