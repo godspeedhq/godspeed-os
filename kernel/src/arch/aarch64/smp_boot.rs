@@ -41,7 +41,7 @@ use super::{put_dec, put_str};
 
 /// How many secondaries this board has. The BCM2711 is a fixed quad-core part; there is nothing to
 /// discover and nothing that varies, so this is a constant rather than a probe.
-const SECONDARIES: usize = 3;
+pub const SECONDARIES: usize = 3;
 
 /// Stack for each secondary. Fixed, in `.bss`, sized like the boot stack - a bounded, visible footprint
 /// (§26.6.1) rather than an allocation that has to succeed this early.
@@ -363,6 +363,18 @@ extern "C" fn ap_high_entry() -> ! {
     // Vectors before anything can fault. A secondary without them takes its first exception into
     // whatever VBAR happened to hold, which is not a fault report, it is a silent lockup.
     super::exceptions::init();
+
+    // `late-ap-test`: core 2 checks in two seconds late, after the boot core's one-second wait has given
+    // up on it, while core 3 is on time - so the arenas are shown to cover a core that was released but
+    // late, and the one numbered past it (backlog/90 D17). Test builds only.
+    #[cfg(feature = "late-ap-test")]
+    if core_id == 2 {
+        let hz = super::timer::frequency().max(1);
+        let start = super::read_cycle_counter();
+        while super::read_cycle_counter().wrapping_sub(start) < 2 * hz {
+            core::hint::spin_loop();
+        }
+    }
 
     AP_READY.fetch_add(1, Ordering::AcqRel);
 

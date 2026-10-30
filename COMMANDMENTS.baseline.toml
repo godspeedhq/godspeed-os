@@ -92,6 +92,9 @@ features = [
     # carries on - which is the actual question. It adds no kernel responsibility: no syscall, no
     # subsystem, and no behaviour change on any path that is not already about to abandon.
     "kill-abandon-test",
+# Test builds only (Pi 4): core 2 checks in late, so the per-core arenas are shown to cover a released-
+# but-late core and the one numbered past it (backlog/90 D17).
+    "late-ap-test",
     "memmap-clamp-test",
     "mmio-map-fault-test",
 # The ROUTINE half of the kernel's name-directory trace - every register, every clear. Admitted as a

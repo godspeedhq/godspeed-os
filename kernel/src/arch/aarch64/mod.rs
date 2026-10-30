@@ -859,10 +859,16 @@ extern "C" fn boot_high() -> ! {
         // Release the other cores FIRST: `percpu_init` sizes its per-core arenas from `ap_count()`, so
         // it has to run after they have checked in. They park immediately afterwards and do not enter a
         // scheduler until `release_secondaries` says the arenas exist.
+        //
+        // Sized for EVERY secondary released, not for those that checked in within the second. They were
+        // the same number only when all three were on time: `release_secondaries` lets every parked core
+        // go by hardware id, so a core that checked in late - or one numbered past a late one - ran on
+        // arenas sized without it, indexing past their end (backlog/90 D17). A slot for a core that never
+        // arrives costs a little memory and nothing else, since placement and the watchdog ask by READY id.
         #[cfg(feature = "pi4-smp")]
         {
-            let up = smp_boot::start_secondaries();
-            AP_COUNT.store(up as u32, core::sync::atomic::Ordering::Release);
+            let _up = smp_boot::start_secondaries();
+            AP_COUNT.store(smp_boot::SECONDARIES as u32, core::sync::atomic::Ordering::Release);
         }
 
         crate::smp::percpu_init(&bi);
@@ -1199,9 +1205,9 @@ pub enum MemoryKind {
 }
 
 // ---- Lifecycle ----
-/// How many secondaries came up. Zero without the SMP feature, and zero if none checked in - both of
-/// which leave the machine correctly running single-core rather than indexing arenas for cores that do
-/// not exist.
+/// How many secondaries were RELEASED, which is what the per-core arenas are sized for: zero without
+/// the SMP feature, else every one, whether or not it checked in in time (a late one still runs; D17).
+/// Which of them reached the scheduler is `smp::core::is_ready`, not this.
 #[cfg(feature = "pi4")]
 static AP_COUNT: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "pi4")]
