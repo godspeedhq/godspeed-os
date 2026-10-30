@@ -1198,6 +1198,13 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
                     // life begins at - a reset on the death path would be missed by any death that
                     // does not run it (a kill from another core, a panic-adjacent teardown).
                     TASK_PENDING_RECV_CAP_COUNT[i] = 0;
+                    // And the rest of the previous life's wait state, for the same reason (backlog/90 D3):
+                    // a deadline it armed and never cleared - a kill does not run the wait's tidy-up - would
+                    // wake this task early from a wait it never timed, and a badge from its last receive would
+                    // make this task's first ordinary message read as a file-capability invocation.
+                    TASK_WAKE_DEADLINE[i].store(0, Ordering::Relaxed);
+                    TASK_LAST_BADGE[i].store(0, Ordering::Relaxed);
+                    TASK_WAKE_PENDING[i].store(false, Ordering::Relaxed); // one spurious re-check at most, but not its own
                     TASK_VALID[i].store(true, Ordering::Release);
                     found = Some(i);
                     break;
