@@ -104,9 +104,13 @@ impl<const N: usize, const L: usize> NameTable<N, L> {
         // bytes are initialised and stable. The pointer targets a `static`, so the `'static` borrow
         // outlives every caller. No `&mut` to this slot can exist concurrently (single writer, and
         // it runs with the slot reserved and interrupts off).
+        //
+        // ONE ROW, never the table: `&*self.bytes.get()` borrowed every slot at once while `set` was
+        // writing another, which is aliasing a `&mut` in the language's terms whatever the hardware does
+        // (backlog/90 D24). The pointer is offset to this slot's row and only that row is borrowed.
         let b = unsafe {
-            let rows: &[[u8; L]; N] = &*self.bytes.get();
-            &rows[slot][..len.min(L)]
+            let row: &[u8; L] = &*(self.bytes.get() as *const [u8; L]).add(slot);
+            &row[..len.min(L)]
         };
         core::str::from_utf8(b).unwrap_or("")
     }
@@ -121,12 +125,21 @@ impl<const N: usize, const L: usize> NameTable<N, L> {
         if slot >= N { return; }
         let b = name.as_bytes();
         let n = b.len().min(L);
+        // Withdraw the previous life's name first, so a reader arriving during the rewrite sees "" rather
+        // than the old length over half-written bytes. A reader that loaded the old length before this
+        // can still overlap the write; a name borrowed `'static` from a slot that is later reused is the
+        // limit of this table, recorded in backlog/90 D24.
+        self.lens[slot].store(0, Ordering::Release);
         // SAFETY: the caller guarantees exclusive write access to this slot; no reader can observe
         // the bytes as part of the name until the length store below publishes them.
+        //
+        // ONE ROW, never the table: this was `&mut *self.bytes.get()`, a `&mut` to EVERY slot while other
+        // cores were reading theirs - undefined behaviour however the bytes landed (backlog/90 D24). The
+        // write is through a pointer to this slot's row alone.
         unsafe {
-            let rows: &mut [[u8; L]; N] = &mut *self.bytes.get();
-            rows[slot] = [0u8; L];
-            rows[slot][..n].copy_from_slice(&b[..n]);
+            let row: &mut [u8; L] = &mut *(self.bytes.get() as *mut [u8; L]).add(slot);
+            *row = [0u8; L];
+            row[..n].copy_from_slice(&b[..n]);
         }
         // LENGTH LAST: this is the release that publishes the bytes above.
         self.lens[slot].store(n as u8, Ordering::Release);
