@@ -2741,6 +2741,11 @@ fn drain_pending_kstack(cid: usize) {
     // runs the core has switched to a different CR3, so freeing the old PML4
     // frame no longer risks a concurrent zeroing race (see CORE_PENDING_PML4).
     // AtomicU64 load/store: no unsafe needed here.
+    // `pml4-pending-test`: the drain leaves a pending root alone, so every second self-kill on a core
+    // finds one still there and the kill path's own free of it is exercised (backlog/90 D9). Test only.
+    #[cfg(feature = "pml4-pending-test")]
+    let pml4_phys = 0u64;
+    #[cfg(not(feature = "pml4-pending-test"))]
     let pml4_phys = CORE_PENDING_PML4.get(cid).load(Ordering::Acquire);
     if pml4_phys != 0 {
         CORE_PENDING_PML4.get(cid).store(0, Ordering::Relaxed);
@@ -3364,8 +3369,22 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                     // Defer the PML4 frame: our CR3 still points to it, and freeing it now lets
                     // another core zero it (PageTable::new) while we hold that CR3, causing a
                     // TLB-miss → zeroed PML4 → KERNEL PF (see CORE_PENDING_PML4).
+                    //
+                    // ONE slot per core, so a second self-kill here before the drain OVERWROTE the first
+                    // root, which then was never freed: a frame on x86, one of 32 static L1 slots on arm32,
+                    // lost until reboot (backlog/90 D9). A second self-kill on this core is proof the core
+                    // already switched off the first task - it is running, and dying, on another root - so
+                    // the root the swap hands back is no longer loaded here, and no other core loads a dead
+                    // task's root after the wait above. Free it now.
                     if pml4_phys != 0 {
-                        CORE_PENDING_PML4.get(my_core).store(pml4_phys, Ordering::Release);
+                        let prev = CORE_PENDING_PML4.get(my_core).swap(pml4_phys, Ordering::AcqRel);
+                        if prev != 0 && prev != pml4_phys {
+                            crate::arch::imp::page_tables::free_page_table_root(prev);
+                            static SAID: AtomicBool = AtomicBool::new(false);
+                            if !SAID.swap(true, Ordering::Relaxed) {
+                                crate::kprintln!("kill_task: a second self-kill on core {} before the drain - the first's page-table root freed here, not lost (further ones are not logged)", my_core);
+                            }
+                        }
                     }
                 } else if pml4_phys != 0 {
                     // Not a self-kill: no core is running or leaving this task, so free the page-table
@@ -3415,9 +3434,17 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                         (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[len] = kstack;
                         CORE_PENDING_KSTACK_LEN.get(my_core).store(len + 1, Ordering::Relaxed);
                     } else {
-                        // Queue overflow (>8 sequential self-kills): free immediately.
-                        // Bounded risk - less likely than permanently leaking the stack.
-                        super::free_kstack(kstack);
+                        // Queue full. This freed `kstack` - the stack this core is STANDING ON, since a
+                        // self-kill runs on the dying task's own kernel stack (backlog/90 D9). Every
+                        // queued stack, on the other hand, belongs to an EARLIER self-kill on this core,
+                        // and the core has switched off each of them to reach this one. So those are
+                        // freed, and this one queued in their place.
+                        for i in 0..len {
+                            let old = (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[i];
+                            if old != 0 { super::free_kstack(old); }
+                        }
+                        (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[0] = kstack;
+                        CORE_PENDING_KSTACK_LEN.get(my_core).store(1, Ordering::Relaxed);
                     }
                 }
             }
