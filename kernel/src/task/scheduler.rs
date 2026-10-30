@@ -666,6 +666,42 @@ pub fn task_hw_bdf(slot: usize) -> u32 {
     if slot < MAX_TASKS { TASK_HW_BDF[slot].load(Ordering::Relaxed) } else { 0xFFFF }
 }
 
+/// Another live task, not `excluding`, that was given device `bdf` - the one case being a live handover
+/// (`SPAWN_FLAG_HANDOVER`), whose successor is granted the same device while its predecessor still runs.
+/// Asked before a device is quiesced, so ending one of the two never stops the device under the other.
+pub fn other_live_holder_of_bdf(bdf: u32, excluding: usize) -> Option<usize> {
+    (0..MAX_TASKS).find(|&i| i != excluding
+        && TASK_VALID[i].load(Ordering::Acquire)
+        && TASK_HW_BDF[i].load(Ordering::Relaxed) == bdf
+        && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead)
+}
+
+/// Another live task, not `excluding`, granted device `kind` - as `other_live_holder_of_bdf`, for the
+/// fixed devices a kind names (the display, above all).
+pub fn other_live_holder_of_kind(kind: u32, excluding: usize) -> Option<usize> {
+    (0..MAX_TASKS).find(|&i| i != excluding
+        && TASK_VALID[i].load(Ordering::Acquire)
+        && TASK_HW_KIND[i].load(Ordering::Acquire) == kind
+        && TaskState::from(TASK_STATE[i].load(Ordering::Acquire)) != TaskState::Dead)
+}
+
+/// Quiesce the device a task was given, as its death or its failed spawn gives it up: stop its bus
+/// mastering and release its IOMMU confinement. Not while another live task holds it (a live handover):
+/// that one is driving it now, and clearing its bus master would stop its DMA mid-flight. Said, since
+/// it is the one time a device outlives the task it was given to.
+pub fn quiesce_device_of(slot: usize, bdf: u32) {
+    if bdf == 0xFFFF {
+        return;
+    }
+    if let Some(other) = other_live_holder_of_bdf(bdf, slot) {
+        crate::kprintln!(
+            "kill: device {:#x} left running - slot {} still drives it (a live handover)", bdf, other);
+        return;
+    }
+    crate::arch::imp::pci::clear_bus_master(bdf);
+    let _ = crate::arch::imp::iommu::release_device(bdf);
+}
+
 /// Whether this task's death is reported to the supervisor and counted as a restart - the SPAWNER's
 /// request (`SPAWN_FLAG_WATCHED`), recorded at every spawn. This replaced two lists of service names: the
 /// kernel no longer knows which services matter, only which tasks it was asked to watch.
@@ -3022,7 +3058,11 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // way to say why (invariant 12).
         // The task granted the DISPLAY, not whatever is called `console`: the kernel gave it the framebuffer
         // and takes it back from the same record.
-        if task_hw_kind(slot) == crate::task::kind::FRAMEBUFFER {
+        // Unless another live task holds the display: a live handover's successor took the screen at its
+        // own spawn, and the predecessor ending must not take it back from under it.
+        if task_hw_kind(slot) == crate::task::kind::FRAMEBUFFER
+            && other_live_holder_of_kind(crate::task::kind::FRAMEBUFFER, slot).is_none()
+        {
             crate::bootcon::reclaim_on_death();
         }
         // Reported to the supervisor because the supervisor ASKED, at spawn, to hear of this task's death -
@@ -3104,21 +3144,16 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // ehci, block-driver, nic-driver), so a fifth DMA driver - audio-driver - died with its
         // controller still mastering until somebody remembered to add it. The record is written only by
         // a DMA driver's spawn, so it IS the question, and the kernel learns nothing it did not hold.
-        let bdf = take_task_hw_bdf(slot);
-        if bdf != 0xFFFF {
-            use crate::arch::imp::pci;
-            // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which
-            // service drives which controller. See `TASK_HW_BDF`. TAKEN, not read: see
-            // `take_task_hw_bdf` for what a stale record in a reused slot would otherwise stop.
-            pci::clear_bus_master(bdf);
-            // H1: revert the IOMMU DTE to passthrough + free the I/O page table so a restart re-confines
-            // cleanly. For ANY device, not by name: this was `xhci`/`ehci` only, so a third confined
-            // driver (audio-driver) would have leaked its I/O page table on every restart, the respawn
-            // overwriting the record that pointed at it. `release_device` looks the device up in its
-            // own table of confined devices and does nothing for one that was never confined (AHCI and
-            // nic-driver run in passthrough), so asking for every device is exact, not approximate.
-            let _ = crate::arch::imp::iommu::release_device(bdf);
-        }
+        //
+        // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which service
+        // drives which controller. See `TASK_HW_BDF`. TAKEN, not read: see `take_task_hw_bdf` for what a
+        // stale record in a reused slot would otherwise stop. `quiesce_device_of` clears bus mastering and
+        // then (H1) reverts the IOMMU DTE to passthrough and frees the I/O page table so a restart
+        // re-confines cleanly - for ANY device, not by name (this was `xhci`/`ehci` only, so a third
+        // confined driver leaked its I/O page table on every restart). `release_device` does nothing for a
+        // device that was never confined, so asking for every device is exact. It skips a device another
+        // live task still holds - a live handover's successor - and says so.
+        quiesce_device_of(slot, take_task_hw_bdf(slot));
 
         // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.
         //

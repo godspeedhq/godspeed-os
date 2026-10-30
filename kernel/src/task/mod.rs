@@ -1401,10 +1401,30 @@ const SPAWN_TRACE: bool = false;
 ///
 /// `own_endpoint` is `None` for a service with no recv endpoint (and at the pre-endpoint cap
 /// inserts), in which case only the task slot is released - identical to the prior behaviour.
+/// The slot of a spawn granted the framebuffer that has not yet committed, or `usize::MAX`. One
+/// display, so one word: set at the grant, cleared at commit, and read by `cleanup_partial_spawn` to
+/// give the screen back when a spawn fails between the two (backlog/90 D15).
+static FB_GRANTED_TO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
 fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<EndpointId>) {
-    // The device record too: a spawn can fail after recording it, and the kill path quiesces whatever
-    // device a slot's record names, so a stale one would be inherited by the next task in this slot.
-    let _ = crate::task::scheduler::take_task_hw_bdf(task_slot);
+    // The device too: a spawn can fail after it turned on the device's bus mastering, and this threw the
+    // record away, so the controller was left mastering with no driver and no record of it (backlog/90
+    // D15). It is quiesced as the kill path quiesces it - and not while a live handover's predecessor
+    // still drives it. Taken, so the next task in this slot cannot inherit it.
+    let bdf = crate::task::scheduler::take_task_hw_bdf(task_slot);
+    if bdf != 0xFFFF {
+        crate::kprintln!("spawn[dma]: '{}' failed after its device {:#x} was enabled - quiescing it", name, bdf);
+        crate::task::scheduler::quiesce_device_of(task_slot, bdf);
+    }
+    // And the display: a spawn granted the framebuffer has already stopped the kernel drawing
+    // (`bootcon::release`), so failing after that left the screen with no owner at all. The kind is
+    // recorded only at commit, which a failed spawn never reaches, so the grant is marked on its own.
+    if FB_GRANTED_TO.compare_exchange(task_slot, usize::MAX, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed).is_ok()
+        && scheduler::other_live_holder_of_kind(kind::FRAMEBUFFER, task_slot).is_none()
+    {
+        crate::kprintln!("spawn[fb]: '{}' failed after the framebuffer was granted - the kernel takes the screen back", name);
+        crate::bootcon::reclaim_on_death();
+    }
     // A spawn that fails half-way must give back BOTH endpoints, for the same reason death must:
     // a leaked endpoint is permanent, and enough of them fill the routing table and take the kernel
     // down. Read-and-clear, so a later kill of this slot cannot reclaim the same one twice.
@@ -2169,6 +2189,18 @@ fn spawn_service_with_image(
                     // moments are seconds apart on a quiet boot, and drawing in the gap put the floor's
                     // text on top of the terminal's.
                     crate::bootcon::release();
+                    FB_GRANTED_TO.store(task_slot, core::sync::atomic::Ordering::Release);
+                    // `spawn-unwind-test`: the first spawn granted the display fails here, so the unwind is
+                    // shown to give the screen back (backlog/90 D15). Test builds only.
+                    #[cfg(feature = "spawn-unwind-test")]
+                    {
+                        static FAILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                        if !FAILED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                            crate::kprintln!("spawn-unwind-test: failing '{}' after the framebuffer was granted", name);
+                            cleanup_partial_spawn(task_slot, name, own_endpoint);
+                            return Err(SpawnError::MapFailed);
+                        }
+                    }
                     crate::kprintln!(
                         "spawn[fb]: '{}' {}x{} at phys {:#x} -> VA {:#x} ({} KiB)",
                         name, g.width, g.height, g.phys, FB_VA, g.len / 1024
@@ -2319,6 +2351,17 @@ fn spawn_service_with_image(
                     scheduler::set_task_hw_bdf(task_slot, bdf);
                     pci::set_power_d0(bdf);  // bring the device to D0 first - firmware may park a non-boot NIC in D3
                     pci::set_bus_master(bdf);
+                    // `spawn-unwind-test`: the first spawn given a device fails here, after its bus mastering
+                    // is on, so the unwind is shown to quiesce it (backlog/90 D15). Test builds only.
+                    #[cfg(feature = "spawn-unwind-test")]
+                    {
+                        static FAILED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                        if !FAILED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                            crate::kprintln!("spawn-unwind-test: failing '{}' after its device was enabled", name);
+                            cleanup_partial_spawn(task_slot, name, own_endpoint);
+                            return Err(SpawnError::MapFailed);
+                        }
+                    }
                 }
                 (crate::arch::imp::DRIVER_DMA_VA, phys, len)
             }
@@ -2475,6 +2518,8 @@ fn spawn_service_with_image(
     // They replace two lists of service names and four name checks (`docs/audio.md`).
     scheduler::set_task_watched(task_slot, watched);
     scheduler::set_task_hw_kind(task_slot, hw.kind_code());
+    // The display's grant is the kind's record from here on; the unwind's marker is done with.
+    let _ = FB_GRANTED_TO.compare_exchange(task_slot, usize::MAX, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         scheduler::commit_task(task_slot, name, ctx, true, kstack_top as u64, own_endpoint);
     }

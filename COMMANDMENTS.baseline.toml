@@ -113,6 +113,9 @@ features = [
     "pi4-sched-demo",
     "pi4-smp",
     "pi4-supervisor",
+# Test builds only: fails the first device and the first framebuffer spawn after their grants, so the
+# failed-spawn unwind is shown to quiesce the device and give the screen back (backlog/90 D15).
+    "spawn-unwind-test",
     "test-bad-elf",
     "test-bad-elf-brutal",
     "test-bad-supervisor",
