@@ -3858,3 +3858,21 @@ D24): `TASK_CORE` (written at spawn, read by every core's scheduler) is `AtomicU
 Relaxed, which is the instruction the plain access was; their ordering is still `TASK_VALID`'s and
 `TASK_STATE`'s Release/Acquire. Two blocks existed only to read `TASK_CORE` in `pick_next` and are gone.
 The other blocks that touched them keep their other contents. A fall, so no 18.5 amendment.
+
+## Corrections (2026-10-30, backlog/90 D24): two arguments above were wrong
+
+No count changes. Two entries above argue soundness from an ordering the code does not have, and are
+corrected here rather than rewritten, since this file is the record of what was argued and when.
+
+- **`for_each_cap_of` / `for_each_active_cap`** (the cross-task cap-table read). The argument was that
+  `TASK_VALID` observed true, Acquire, means the table was fully initialised before it. It does not:
+  `TASK_VALID` is set when the slot is RESERVED, before `task_cap_init_empty` zeroes the table and the
+  spawn fills it. What publishes the table is `commit_task`'s Release store of `Ready`. The reader now
+  gates on that (`task_valid`: valid AND not Dead, Acquire), and its SAFETY comment says so. The read
+  stays a best-effort snapshot against the owner's own inserts and removes, which is why the cap
+  assertion over it no longer panics for another task's table.
+- **`NameTable::set`**. Recorded as sound; it made a `&mut` to the whole table while other cores read
+  rows of it. It now writes through a pointer to its own row, and `get` borrows only the row it reads.
+
+Also: `current_task_remove_cap`, `current_task_read_cap_rights` and `current_task_insert_cap` each had
+an `unsafe` block with no SAFETY comment (18.3); each has one now.

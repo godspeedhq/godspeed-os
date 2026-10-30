@@ -1392,6 +1392,9 @@ pub fn current_task_endpoint() -> Option<EndpointId> {
 /// Remove the capability at `slot` from the current task's table (GRANT).
 pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     let cid = current_core_id();
+    // SAFETY: the CURRENT task's own table - it is running, so `commit_task` has written and published
+    // it, and only this core touches it, inside this task's own syscall (IF=0, CORE_CURRENT stable for
+    // this core). The SAFETY text these three accessors lacked (backlog/90 D24).
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
@@ -1407,6 +1410,9 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
 /// Used by `QueryCapRights` (syscall 14) - read-only, no side effects.
 pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
     let cid = current_core_id();
+    // SAFETY: the CURRENT task's own table - it is running, so `commit_task` has written and published
+    // it, and only this core touches it, inside this task's own syscall (IF=0, CORE_CURRENT stable for
+    // this core). The SAFETY text these three accessors lacked (backlog/90 D24).
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
@@ -1438,15 +1444,25 @@ pub fn for_each_active_cap<F: FnMut(&Capability)>(mut f: F) {
 /// which is acceptable for display. Same posture as `for_each_active_cap` and
 /// `task_stat`. No-op for an empty/invalid slot.
 /// Is there a task in `slot` whose capability table may be read (the `for_each_cap_of` test)?
+///
+/// VALID and COMMITTED. `TASK_VALID` is set when a slot is RESERVED, before `task_cap_init_empty` zeroes
+/// the table and the spawn fills it; it publishes the slot's claim, not its contents. What publishes the
+/// table is `commit_task`'s Release store of `Ready`, after every field is written - and until then the
+/// state reads `Dead`, as it does at boot and after a death. So a reader that tested `TASK_VALID` alone
+/// could walk a table being zeroed or filled, or a dead tenant's (backlog/90 D24).
 pub fn task_valid(slot: usize) -> bool {
-    slot < MAX_TASKS && TASK_VALID[slot].load(Ordering::Acquire)
+    slot < MAX_TASKS
+        && TASK_VALID[slot].load(Ordering::Acquire)
+        && TaskState::from(TASK_STATE[slot].load(Ordering::Acquire)) != TaskState::Dead
 }
 
 pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
-    if slot >= MAX_TASKS { return; }
-    if !TASK_VALID[slot].load(Ordering::Acquire) { return; }
-    // SAFETY: TASK_VALID[slot] observed true (Acquire) guarantees the CapTable was
-    // fully initialised before the Release store that set valid=true.
+    if !task_valid(slot) { return; }
+    // SAFETY: `task_valid` observed the slot committed - a non-Dead state, read Acquire, which pairs with
+    // `commit_task`'s Release store of `Ready` made after the table was written. (This said `TASK_VALID`
+    // published the table; it is set at RESERVATION, before the table is zeroed, so it did not - D24.)
+    // The table is a static, so its bytes are always initialised; what this read can still see is the
+    // owner inserting or removing a cap on its own core, which is why it is a best-effort snapshot.
     unsafe { TASK_CAP[slot].assume_init_ref() }.for_each_slot(&mut f);
 }
 
@@ -1673,6 +1689,9 @@ pub fn core_total_ticks(core: usize) -> u64 {
 /// Insert a capability into the current task's table (incoming GRANT).
 pub fn current_task_insert_cap(cap: Capability) -> Result<usize, CapError> {
     let cid = current_core_id();
+    // SAFETY: the CURRENT task's own table - it is running, so `commit_task` has written and published
+    // it, and only this core touches it, inside this task's own syscall (IF=0, CORE_CURRENT stable for
+    // this core). The SAFETY text these three accessors lacked (backlog/90 D24).
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
