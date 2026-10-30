@@ -2817,7 +2817,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/x86_64/rtc.rs | 1 | permitted |
 | arch/x86_64/syscall_entry.rs | 14 | permitted |
 | capability/table.rs | 7 | permitted |
-| memory/allocator.rs | 48 | permitted |
+| memory/allocator.rs | 49 | permitted |
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
@@ -3876,3 +3876,14 @@ corrected here rather than rewritten, since this file is the record of what was 
 
 Also: `current_task_remove_cap`, `current_task_read_cap_rights` and `current_task_insert_cap` each had
 an `unsafe` block with no SAFETY comment (18.3); each has one now.
+
+## `memory/allocator.rs` 48 -> 49 (2026-10-30): a frame that cannot be mapped goes back
+
+`alloc_zeroed_placed` (backlog/90 D27, KNOWN A10-15): allocate a frame, zero it, hand its address to a
+caller's closure - `AllocMem`'s mapping - and, if the closure fails, return the frame with `free_frame`.
+`AllocMem` leaked the frame on a failed mapping; it could not free it itself without an `unsafe` block in
+`syscall/`, whose floor is frozen, so the free lives here, in a permitted layer, behind a safe signature.
+
+| Block | Why it is sound |
+|---|---|
+| `unsafe { free_frame(frame) }` | `frame` came from `alloc_frame` in the same call and the closure that would have mapped it failed, so it was never mapped or shared; freeing it is its only remaining use |

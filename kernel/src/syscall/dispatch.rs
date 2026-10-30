@@ -13,7 +13,7 @@ use crate::capability::cap::CapError;
 use crate::capability::rights::Rights;
 use crate::ipc::endpoint::EndpointId;
 use crate::ipc::message::{IpcError, Message, MAX_MESSAGE_SIZE};
-use crate::memory::allocator::{alloc_frame, zero_frame};
+use crate::memory::allocator::alloc_zeroed_placed;
 use crate::task::scheduler;
 use crate::task::state::TaskState;
 
@@ -1950,19 +1950,20 @@ fn handle_alloc_mem(size: u64) -> i64 {
 
     for i in 0..pages {
         let va = base_va + i * 4096;
-        let frame = match alloc_frame() {
-            Some(f) => f,
-            None    => return -1, // physical memory exhausted; budget already updated
+        // SEC-21: the frame is ZEROED before it becomes user-readable - `alloc_frame` may return one still
+        // holding a dead task's contents, and AllocMem needs no capability. And a frame that cannot be
+        // mapped goes back to the allocator: it was leaked here (backlog/90 D27, A10-15).
+        // `alloc_zeroed_placed` keeps both in the permitted memory/ layer (§18.5); this stays safe.
+        let placed = alloc_zeroed_placed(|phys| {
+            // SAFETY: va is in the task heap range (`TASK_HEAP_VA_START`+); phys is from the
+            // allocator; the task's page table is the active CR3 during this syscall.
+            unsafe { map_in_active_tables(va, phys, flags) }
+        });
+        let mapped = match placed {
+            None => return -1, // physical memory exhausted; budget already updated
+            Some(r) => r,
         };
-        let phys = frame.phys_addr().0;
-        // SEC-21: zero the frame before it becomes user-readable. `alloc_frame` may return a frame
-        // still holding a dead task's contents (the allocator zeroes neither on alloc nor on free),
-        // and AllocMem needs no capability, so an un-zeroed page would leak stale cross-task memory.
-        // `zero_frame` keeps the `unsafe` in the permitted memory/ layer (§18.5); this stays safe.
-        zero_frame(phys);
-        // SAFETY: va is in the task heap range (`TASK_HEAP_VA_START`+); phys is from the
-        // allocator; the task's page table is the active CR3 during this syscall.
-        if let Err(e) = unsafe { map_in_active_tables(va, phys, flags) } {
+        if let Err(e) = mapped {
             // SAID, not just refused: a bare -1 told the caller "no memory" while 8 GiB sat free - the
             // fault was the mapping, and only this line can say which page and why.
             crate::kprintln!("alloc_mem: '{}' page {} of {} at {:#x} could not be mapped ({:?})",

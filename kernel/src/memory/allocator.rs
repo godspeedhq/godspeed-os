@@ -551,6 +551,28 @@ pub fn alloc_dma_arena(n: usize) -> Option<u64> {
     })
 }
 
+/// Allocate a zeroed frame and hand its physical address to `place` - mapping it, in practice. If
+/// `place` fails, the frame goes straight back to the allocator: nothing else has seen it.
+///
+/// `None` when no frame is free. The leak this closes: `AllocMem` took a frame, failed to map it, and
+/// returned -1 with the frame held by nobody (backlog/90 D27, KNOWN A10-15). Safe, unlike `free_frame`,
+/// because the frame never escapes on the failure path - `place` gets an address to map, and a mapping
+/// that failed holds no reference to it.
+pub fn alloc_zeroed_placed<E>(place: impl FnOnce(u64) -> Result<(), E>) -> Option<Result<(), E>> {
+    let frame = alloc_frame()?;
+    let phys = frame.phys_addr().0;
+    zero_frame(phys);
+    match place(phys) {
+        Ok(()) => Some(Ok(())),
+        Err(e) => {
+            // SAFETY: `frame` came from `alloc_frame` just above and `place` failed, so it was never
+            // mapped or shared; returning it is its only remaining use.
+            unsafe { free_frame(frame) };
+            Some(Err(e))
+        }
+    }
+}
+
 /// Return a frame to the allocator.
 ///
 /// # Safety
