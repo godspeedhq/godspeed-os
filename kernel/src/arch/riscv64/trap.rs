@@ -167,7 +167,20 @@ pub const REG_S4: usize = 20;
 /// caught it in one run: `events` faulted at 0x401fde, something else faulted at 0x401c4e, and the
 /// terse line named a USER address, which is what gave it away. The flag means "a report is in
 /// progress", not "a report has happened".
-static REPORTING: AtomicBool = AtomicBool::new(false);
+///
+/// **Per hart, never one flag for the machine** (2026-10-30). Two services faulting at once on two harts
+/// are two reports, not one recursing: a single flag made the second look like a fault inside the first
+/// and halted the whole machine, which any task could cause just by faulting while another did.
+static REPORTING: [AtomicBool; TRAP_HARTS] = [const { AtomicBool::new(false) }; TRAP_HARTS];
+
+/// This hart's `REPORTING` flag, by `tp` (the hart id, a register read that cannot fault). `None` past
+/// `TRAP_HARTS`, where a report runs unguarded.
+fn reporting_flag() -> Option<&'static AtomicBool> {
+    let hart: u64;
+    // SAFETY: reading a general register with no side effects.
+    unsafe { core::arch::asm!("mv {}, tp", out(reg) hart, options(nomem, nostack)) };
+    REPORTING.get(hart as usize)
+}
 
 /// Cause codes worth naming. The rest are printed as numbers, because a wrong name is worse than
 /// an honest integer.
@@ -431,7 +444,8 @@ fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user
     // Least, because everything it might add is a thing that could fault: no task name, no page
     // walk, no formatting. The `sepc` and `scause` of the SECOND fault are what a reader needs, and
     // they are already in hand.
-    if REPORTING.swap(true, Ordering::Acquire) {
+    let guard = reporting_flag();
+    if guard.is_some_and(|g| g.swap(true, Ordering::Acquire)) {
         super::serial_write_bytes_lockfree(
             b"\nriscv64: FAULT WHILE REPORTING A FAULT - halting\n  scause ",
         );
@@ -510,7 +524,9 @@ fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user
     // to catch. Outside the `from_user` arm deliberately: a kernel fault halts anyway, but leaving a
     // path that never releases would be relying on the halt, and a flag whose correctness depends on
     // its caller dying is one refactor away from being wrong.
-    REPORTING.store(false, Ordering::Release);
+    if let Some(g) = guard {
+        g.store(false, Ordering::Release);
+    }
 }
 
 /// Bytes of stack a trap frame occupies. Deliberately larger than the struct so `sp` stays 16-byte

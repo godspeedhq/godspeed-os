@@ -2756,7 +2756,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 16 | permitted |
+| arch/aarch64/exceptions.rs | 17 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 8 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
@@ -2794,7 +2794,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/fdt.rs | 3 | permitted |
 | arch/riscv64/sbi.rs | 12 | permitted |
 | arch/riscv64/sv39.rs | 51 | permitted |
-| arch/riscv64/trap.rs | 10 | permitted |
+| arch/riscv64/trap.rs | 11 | permitted |
 | arch/riscv64/plic.rs | 5 | permitted |
 | arch/riscv64/syscall.rs | 1 | permitted |
 | arch/riscv64/context_switch.rs | 35 | permitted |
@@ -3954,3 +3954,15 @@ The page and block writes themselves are inside `enable`'s existing `unsafe` blo
 
 backlog/90 D21. The kernel-fault end of `aarch64_trap_report` parked only the faulting core in a `wfe` loop,
 one `unsafe` line; it now calls `halt_all_cores`, as a panic does, and the line goes. A fall, recorded.
+
+## `arch/aarch64/exceptions.rs` 16 -> 17, `arch/riscv64/trap.rs` 10 -> 11 (2026-10-30): the fault-report guard is per core
+
+The re-entrancy guard on the trap report was one flag for the whole machine on both ports, so two services
+faulting at once on two cores read as a fault inside a report, and the second halted the machine - which any
+task could cause by faulting while another did. Each port now keeps one flag per core and reads its own by a
+register that cannot fault: `MPIDR_EL1` affinity 0 on aarch64, `tp` on riscv64.
+
+| Block | Why it is sound |
+|---|---|
+| aarch64 `reporting_flag`: `mrs mpidr_el1` (1) | A side-effect-free system-register read at EL1, valid in any context including inside a fault |
+| riscv64 `reporting_flag`: `mv tp` (1) | A general-register read with no side effects; `tp` is the hart id in the kernel, as `get_lapic_id` reads it |

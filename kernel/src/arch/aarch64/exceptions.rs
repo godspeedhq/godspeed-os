@@ -686,7 +686,8 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // SAFETY: `frame` is the trap frame the vector assembly just built on the current stack; it is
     // valid for the life of this call and nothing else aliases it.
     let f = unsafe { &*frame };
-    if REPORTING.swap(true, core::sync::atomic::Ordering::Acquire) {
+    let guard = reporting_flag();
+    if guard.is_some_and(|g| g.swap(true, core::sync::atomic::Ordering::Acquire)) {
         // The least that can be said: no task, no walk, no register dump - each a thing that could
         // fault again. The second fault's syndrome, address and pc are already in hand.
         super::put_str(b"\r\n*** aarch64: FAULT WHILE REPORTING A FAULT - halting every core\r\n    ESR_EL1 = ");
@@ -1256,7 +1257,9 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
         };
         // Released first: the next fault, in another task, is a report of its own and not this one
         // recursing. `kill_current` does not return.
-        REPORTING.store(false, core::sync::atomic::Ordering::Release);
+        if let Some(g) = guard {
+            g.store(false, core::sync::atomic::Ordering::Release);
+        }
         crate::task::kill_current(kind, addr);
         // `kill_current` marks the task Dead and reschedules, so it does not come back. If it ever
         // does, falling through to the halt below is right: resuming a corpse's context is worse
@@ -1271,6 +1274,20 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     super::halt_all_cores();
 }
 
-/// Set while a fault is being reported; see `aarch64_trap_report`. Released by a report that ends in
-/// killing an EL0 task, so only a fault INSIDE a report is treated as recursion.
-static REPORTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Set while a fault is being reported ON THAT CORE; see `aarch64_trap_report`. Released by a report that
+/// ends in killing an EL0 task, so only a fault INSIDE a report is treated as recursion.
+///
+/// **Per core, never one flag for the machine.** Two services faulting at once on two cores are two
+/// reports, not one recursing: a single flag made the second look like a fault inside the first and
+/// halted the whole machine, which any task could cause just by faulting while another did. Only this
+/// core's report can fault into this core's next trap.
+static REPORTING: [core::sync::atomic::AtomicBool; 8] = [const { core::sync::atomic::AtomicBool::new(false) }; 8];
+
+/// This core's `REPORTING` flag, by `MPIDR_EL1` affinity 0 - a register read that cannot fault, valid in
+/// any context. `None` past the table, where a report runs unguarded as it did before.
+fn reporting_flag() -> Option<&'static core::sync::atomic::AtomicBool> {
+    let mpidr: u64;
+    // SAFETY: reading MPIDR_EL1 at EL1 is a side-effect-free system-register read.
+    unsafe { core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack)) };
+    REPORTING.get((mpidr & 0xff) as usize)
+}
