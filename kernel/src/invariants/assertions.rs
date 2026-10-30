@@ -32,16 +32,37 @@ pub fn assert_no_mid_execution_migration(original_core: u32, current_core: u32) 
 ///
 /// Stale caps (generation < current) are expected after endpoint death and are
 /// not flagged here; they fail with `EndpointDead` / `CapRevoked` on next use.
+///
+/// **Only the CALLER's own table can panic.** This walked every task's table and panicked on what it
+/// found, but every other table is read with no lock while its owner inserts and removes caps on its
+/// own core, so a torn read could look like a cap from the future and take the kernel down from a
+/// userspace `kill` - a Rust data race deciding a panic (backlog/90 D24). The caller's table is changed
+/// only by the caller's own syscalls, and the caller is inside this one, so that reading is sound and a
+/// violation there still halts. Everyone else's is a snapshot: a violation is SAID, the first and every
+/// 64th, naming the slot, and the machine stays up. A real violation does not go away when re-read, so
+/// it keeps being said.
 pub fn assert_cap_table_consistent() {
-    crate::task::scheduler::for_each_active_cap(|cap| {
-        if let Some(current_gen) = crate::capability::get_resource_generation(cap.resource_id) {
-            if cap.generation.0 > current_gen.0 {
-                panic!(
-                    "invariant violation: cap for {:?} carries generation {} \
-                     but resource is at generation {} (§7.8)",
-                    cap.resource_id, cap.generation.0, current_gen.0,
-                );
+    use crate::task::scheduler;
+    let me = scheduler::current_task_slot();
+    for slot in 0..scheduler::MAX_TASKS {
+        scheduler::for_each_cap_of(slot, |cap| {
+            if let Some(current_gen) = crate::capability::get_resource_generation(cap.resource_id) {
+                if cap.generation.0 > current_gen.0 {
+                    if slot == me {
+                        panic!(
+                            "invariant violation: cap for {:?} carries generation {} but resource is at generation {} (§7.8)",
+                            cap.resource_id, cap.generation.0, current_gen.0,
+                        );
+                    }
+                    static SEEN: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+                    let n = SEEN.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                    if n == 1 || n % 64 == 0 {
+                        crate::kprintln!(
+                            "invariant: slot {}'s cap for {:?} reads generation {} with the resource at {} (§7.8) - a cap from the future, or a torn read of a table changing on another core; not a halt, since that read is unsynchronised ({} seen)",
+                            slot, cap.resource_id, cap.generation.0, current_gen.0, n);
+                    }
+                }
             }
-        }
-    });
+        });
+    }
 }

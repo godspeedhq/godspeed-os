@@ -31,6 +31,11 @@ Do NOT add assertions that:
 | `assert_no_mid_execution_migration` | §3.11 / §9.1                  |
 | `assert_cap_table_consistent`       | §7.8                          |
 
+`assert_cap_table_consistent` halts only on the CALLER's own table. It reads every other task's table with
+no lock while those tables change on other cores, so a violation found there is reported, not a panic:
+a torn read deciding a halt would let a userspace `kill` take the kernel down (`backlog/90` D24). That is
+the one exception to "panic on violation" above, and it is the reading that is unsound, not the invariant.
+
 `assert_cap_validated` (passed a literal `Ok`, so it could not fire) and `assert_tcb_alive` (over an
 empty TCB set since Phase 6) were deleted 2026-10-10, `backlog/fixed/80` K20: an assertion that cannot fail
 reports a pass while measuring nothing.
