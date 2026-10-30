@@ -58,6 +58,10 @@ pub const DEVICE_BASE: u64 = 0xFC00_0000;
 extern "C" {
     static __el0_start: u8;
     static __el0_end: u8;
+    // Page-aligned section starts, for the high map's W^X (`enable`).
+    static __text_start: u8;
+    static __rodata_start: u8;
+    static __data_start: u8;
 }
 
 /// Bring-up shim: the linker-placed EL0 region, plus the peripheral window, are built EL0-accessible.
@@ -106,6 +110,7 @@ const DESC_BLOCK: u64 = 0b01; // maps a block directly (valid at L1 and L2)
 const DESC_AF: u64 = 1 << 10; // Access Flag - a walk with this clear takes an access fault
 const DESC_SH_INNER: u64 = 0b11 << 8; // inner shareable (Normal memory only; ignored for Device)
 const DESC_AP_RW_EL1: u64 = 0b00 << 6; // EL1 read/write, EL0 no access
+const DESC_AP_RO_EL1: u64 = 0b10 << 6; // EL1 read-only, EL0 no access
 const DESC_PXN: u64 = 1 << 53; // never execute at EL1
 const DESC_UXN: u64 = 1 << 54; // never execute at EL0
 
@@ -309,6 +314,20 @@ pub fn enable() -> u64 {
         // the same walk as the low map because the base was chosen to make the L1 indices line up.
         // No EL0 bit anywhere in here - the whole point of moving the kernel up is that a task's
         // address space (TTBR0) cannot name it at all.
+        //
+        // W^X (backlog/90 D21): the blocks that hold `.text` or `.rodata` are built as 4 KiB pages from
+        // the split arena - text read-only and executable, rodata read-only, the rest of each block
+        // read/write - and every other RAM block is never-executable. Built here, before translation is
+        // on, because changing a live mapping the core is executing from needs break-before-make. If the
+        // arena runs out, a block stays as it was (read/write/execute) and `report_wx` says so.
+        let (text_lo, rodata_lo, data_lo) = (
+            virt_to_phys(core::ptr::addr_of!(__text_start) as u64),
+            virt_to_phys(core::ptr::addr_of!(__rodata_start) as u64),
+            virt_to_phys(core::ptr::addr_of!(__data_start) as u64),
+        );
+        let normal = DESC_AF | DESC_SH_INNER | attr_idx(MAIR_IDX_NORMAL) | DESC_UXN;
+        let mut wx_blocks = 0u32;
+        let mut wx_failed = 0u32;
         let l1h = &raw mut L1_HIGH;
         let l2h = &raw mut L2_HIGH;
         for i in 0..L1_USED {
@@ -316,15 +335,34 @@ pub fn enable() -> u64 {
             (*l1h).0[i] = l2_pa | DESC_TABLE;
             for j in 0..ENTRIES {
                 let pa = (i as u64) * (ENTRIES as u64) * BLOCK_SIZE + (j as u64) * BLOCK_SIZE;
+                let image = pa < data_lo && pa + BLOCK_SIZE > text_lo;
                 (*l2h)[i].0[j] = if pa >= DEVICE_BASE {
                     pa | DESC_BLOCK | DESC_AF | DESC_AP_RW_EL1
                         | attr_idx(MAIR_IDX_DEVICE) | DESC_PXN | DESC_UXN
+                } else if !image {
+                    pa | DESC_BLOCK | DESC_AP_RW_EL1 | normal | DESC_PXN
+                } else if let Some(t) = take_split_table_mmu_off() {
+                    for k in 0..ENTRIES {
+                        let p = pa + (k as u64) * 4096;
+                        let perm = if p >= text_lo && p < rodata_lo {
+                            DESC_AP_RO_EL1
+                        } else if p >= rodata_lo && p < data_lo {
+                            DESC_AP_RO_EL1 | DESC_PXN
+                        } else {
+                            DESC_AP_RW_EL1 | DESC_PXN
+                        };
+                        (*t).0[k] = p | DESC_PAGE_L3 | normal | perm;
+                    }
+                    wx_blocks += 1;
+                    virt_to_phys(t as u64) | DESC_TABLE
                 } else {
-                    pa | DESC_BLOCK | DESC_AF | DESC_SH_INNER | DESC_AP_RW_EL1
-                        | attr_idx(MAIR_IDX_NORMAL) | DESC_UXN
+                    wx_failed += 1;
+                    pa | DESC_BLOCK | DESC_AP_RW_EL1 | normal
                 };
             }
         }
+        WX_REPORT.store(((wx_failed as u64) << 32) | wx_blocks as u64, Ordering::Relaxed);
+        WX_SPAN.store((text_lo << 32 >> 32) | (data_lo << 32), Ordering::Relaxed);
 
         // The PCIe outbound window, in BOTH halves. Low, because the root-complex bring-up runs before
         // the jump; high, because everything after it names devices through the direct map. One L1 slot
@@ -665,6 +703,41 @@ unsafe fn high_l2_entry(va: u64) -> Option<*mut u64> {
     unsafe {
         let l2h = &raw mut L2_HIGH;
         Some(&raw mut (*l2h)[i].0[j])
+    }
+}
+
+/// What `enable` did for W^X: blocks split into pages (low half) and blocks it could not split (high
+/// half), and the physical text start (low) and data start (high). Read by `report_wx`, once printing works.
+static WX_REPORT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+static WX_SPAN: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Say what the high map's W^X came to (backlog/90 D21). Called from the boot once `kprintln` works.
+pub fn report_wx() {
+    let r = WX_REPORT.load(Ordering::Relaxed);
+    let span = WX_SPAN.load(Ordering::Relaxed);
+    let (split, failed) = (r & 0xffff_ffff, r >> 32);
+    let (text_lo, data_lo) = (span & 0xffff_ffff, span >> 32);
+    if failed == 0 && split != 0 {
+        crate::kprintln!("aarch64: kernel W^X - image {:#x}..{:#x} in {} blocks of 4 KiB pages (text read-only+executable, rodata read-only), every other RAM block never-executable",
+            text_lo, data_lo, split);
+    } else {
+        crate::kprintln!("aarch64: kernel W^X INCOMPLETE - {} image block(s) could not be split and stay writable AND executable", failed);
+    }
+}
+
+/// `take_split_table` for `enable`, which runs with translation off: there memory is Device-typed and
+/// an exclusive or atomic read-modify-write is not safe, so the count is a plain load and store. One
+/// core is running and nothing else takes from the arena yet.
+fn take_split_table_mmu_off() -> Option<*mut Table> {
+    let n = SPLIT_USED.load(core::sync::atomic::Ordering::Relaxed);
+    if n >= SPLIT_TABLES {
+        return None;
+    }
+    SPLIT_USED.store(n + 1, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `n` is bounded above; the arena is this module's static and index `n` is handed out once.
+    unsafe {
+        let a = &raw mut L3_SPLIT;
+        Some(&raw mut (*a)[n])
     }
 }
 

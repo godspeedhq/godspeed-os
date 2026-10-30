@@ -80,7 +80,7 @@ features = [
     # QEMU boot shows the owed notification paid on the tick (backlog/90 D18). It adds nothing to a
     # shipping kernel.
     "irq-miss-test",
-# Test builds only (riscv64): a write to the kernel's own text, so its W^X map is shown to refuse one
+# Test builds only (riscv64, Pi 4): a write to the kernel's own text, so its W^X map is shown to refuse one
 # (backlog/90 D21).
     "kernel-wx-test",
     # Fault-injection, and registered here for the same reason `iommu-fault-test` is: it exists to make

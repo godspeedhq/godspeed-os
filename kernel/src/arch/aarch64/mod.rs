@@ -852,6 +852,20 @@ extern "C" fn boot_high() -> ! {
         // turn into a loud one.
         crate::task::install_kstack_guards();
 
+        // What `mmu::enable` made of the kernel's W^X, now that a line can be printed (backlog/90 D21).
+        mmu::report_wx();
+        // `kernel-wx-test`: write one byte of the kernel's own code back to itself, so W^X is shown to
+        // refuse it - a permission fault, reported - where the old map took it in silence (backlog/90 D21).
+        #[cfg(feature = "kernel-wx-test")]
+        {
+            crate::kprintln!("kernel-wx-test: writing to the kernel's own text");
+            let at = mmu::report_wx as *const () as *mut u8;
+            // SAFETY: test builds only. The byte written is the byte read, so the image is unchanged if
+            // the store is allowed; with W^X it faults, which is the point.
+            unsafe { at.write_volatile(at.read_volatile()) };
+            crate::kprintln!("kernel-wx-test: the write to text was ALLOWED");
+        }
+
         // The neutral subsystems, in the order the x86 boot brings them up. Done HERE rather than only
         // in the scheduler demo, because a real syscall reaches `current_task_lookup_cap`, which indexes
         // per-core state - and reaching that before it exists is how the user-copy seam went silent

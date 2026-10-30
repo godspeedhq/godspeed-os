@@ -48,12 +48,15 @@ SECTIONS {
     . = KERNEL_VA + 0x80000;
 
     .text : AT(ADDR(.text) - KERNEL_VA) ALIGN(0x1000) {
+        __text_start = .;
         KEEP(*(.text.boot))     /* _start first - the firmware branches to byte 0 */
         *(.text .text.*)
     }
 
-    .rodata : AT(ADDR(.rodata) - KERNEL_VA) ALIGN(0x1000) { *(.rodata .rodata.*) }
-    .data   : AT(ADDR(.data)   - KERNEL_VA) ALIGN(0x1000) { *(.data .data.*) }
+    /* Page-aligned starts, so the high map can make `.text` read-only+executable and `.rodata`
+       read-only at 4 KiB, and everything after it never-executable (W^X, backlog/90 D21). */
+    .rodata : AT(ADDR(.rodata) - KERNEL_VA) ALIGN(0x1000) { __rodata_start = .; *(.rodata .rodata.*) }
+    .data   : AT(ADDR(.data)   - KERNEL_VA) ALIGN(0x1000) { __data_start = .; *(.data .data.*) }
 
     /* EL0 region, on its own 2 MiB boundary.
      *

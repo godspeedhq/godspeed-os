@@ -2752,7 +2752,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 <!-- unsafe-inventory-start -->
 | File (kernel/src/) | Count | Layer |
 |---|---|---|
-| arch/aarch64/mod.rs | 75 | permitted |
+| arch/aarch64/mod.rs | 76 | permitted |
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |
@@ -2763,7 +2763,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/ctxdemo.rs | 7 | permitted |
 | arch/aarch64/gic.rs | 7 | permitted |
 | arch/aarch64/timer.rs | 5 | permitted |
-| arch/aarch64/mmu.rs | 24 | permitted |
+| arch/aarch64/mmu.rs | 25 | permitted |
 | arch/aarch64/ptables.rs | 28 | permitted |
 | arch/aarch64/usermode.rs | 16 | permitted |
 | arch/aarch64/mailbox.rs | 4 | permitted |
@@ -3935,6 +3935,20 @@ page is cut out, so a failure part-way leaves the old map rather than a kernel t
 | `protect_kernel_page`: the two reads down the walk, the leaf read and the leaf write (4) | The kernel's own tables, just split by `split_kernel_to_4k`, so every level above the page is a pointer; indices from `vpn`; only the R/W/X bits of one kernel leaf change. Boot hart, before `satp` is written |
 | `strip_kernel_exec`: the walk's three slot addresses and two reads, and the closure's read and write (7) | The kernel's own root and the tables it wrote, indices < 512; one bit (`X`) cleared on a leaf that holds none of `.text`. Before `satp` is written, with nothing else running |
 | mod.rs, `kernel-wx-test` only: a byte of `.text` written back to itself (1) | Test builds only; the value written is the value read, so the image is unchanged if the store is allowed, and with W^X the store faults, which is what the feature exists to show |
+
+## `arch/aarch64/mmu.rs` 24 -> 25, `mod.rs` 75 -> 76 (2026-10-30): the kernel's high map is W^X
+
+backlog/90 D21. The high-half map (`TTBR1`) gave every RAM block EL1 execute, so a kernel bug that wrote
+chosen bytes anywhere could then run them. `enable` now builds the blocks holding `.text` and `.rodata` as
+4 KiB pages from the split arena - text read-only and executable, rodata read-only, the rest of each block
+read/write - and every other RAM block never-executable (`PXN`), all before translation is on.
+
+| Block | Why it is sound |
+|---|---|
+| `take_split_table_mmu_off`: the arena slot address (1) | As `take_split_table`: `n` bounded by `SPLIT_TABLES`, each index handed out once; the count is a plain load and store because it runs with translation off, where memory is Device-typed and an atomic read-modify-write is not safe, on the one core running |
+| mod.rs, `kernel-wx-test` only: a byte of the kernel's code written back to itself (1) | Test builds only; the value written is the value read, so the image is unchanged if the store is allowed, and with W^X it faults, which is what the feature exists to show |
+
+The page and block writes themselves are inside `enable`'s existing `unsafe` block and add no line.
 
 ## `arch/aarch64/exceptions.rs` 17 -> 16 (2026-10-30): a kernel fault halts every core
 

@@ -124,7 +124,7 @@ pml4-pending-test = []
 # fault that follows is shown to be reported - an x86 double fault rather than a reset, a riscv64 trap
 # on the emergency stack rather than silence (backlog/90 D20). Off by default; test builds only.
 kstack-overflow-test = []
-# riscv64: write a byte of the kernel's own text back to itself just after paging is on, so the
+# riscv64 and the Pi 4: write a byte of the kernel's own text back to itself once faults report, so the
 # kernel's W^X map is shown to refuse it rather than take it in silence (backlog/90 D21). Off by
 # default; test builds only.
 kernel-wx-test = []
