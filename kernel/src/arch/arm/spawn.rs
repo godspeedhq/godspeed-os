@@ -63,6 +63,10 @@ pub(super) fn neutral_bootstrap(ram_end: u32, reserve_end: u32) {
     crate::smp::percpu_init(&boot_info);
     crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
     crate::capability::init();
+    // 6.4 asks that whether DMA can be confined be SAID at boot. The Pi 2 has no IOMMU, so
+    // `iommu::confine_device` refuses every request; said once, in the shape x86 and riscv64 use, so nobody
+    // reading the log believes `dwc2` is confined (backlog/90 D21, SEC-34).
+    crate::kprintln!("iommu: none on this board - a driver given a DMA arena is not confined, and drivers stay in TCB (CLAUDE.md 6.4)");
     // Mark core 0 ready so `is_ready(0)` is true. Cores 1-3 become ready only when `smp_bringup`
     // releases them and each calls `mark_ready(core)` from `ap_boot_main`.
     crate::smp::core::mark_ready(0);

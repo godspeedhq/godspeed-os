@@ -874,6 +874,11 @@ extern "C" fn boot_high() -> ! {
         crate::smp::percpu_init(&bi);
         crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
         crate::capability::init();
+        // 6.4 asks that whether DMA can be confined be SAID at boot. This board has no IOMMU (no SMMU is
+        // wired up on any Pi), so `iommu::confine_device` refuses every request; said once, in the shape
+        // x86 and riscv64 use, so nobody reading the log believes a DMA driver is confined (backlog/90 D21,
+        // SEC-34).
+        crate::kprintln!("iommu: none on this board (no SMMU) - a driver given a DMA arena is not confined, and drivers stay in TCB (CLAUDE.md 6.4)");
 
         // Tell the neutral SMP layer this core exists. Easy to omit, because almost nothing notices:
         // most placement paths fall back with `.max(1)` and land on core 0 regardless. The one that
