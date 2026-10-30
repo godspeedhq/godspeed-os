@@ -140,9 +140,17 @@ pub fn task_declares_peer(slot: usize, peer: &str) -> bool {
 
 static TASK_VALID: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
 /// Which core each task is pinned to (set at enqueue time; immutable after).
-static mut TASK_CORE:  [u32; MAX_TASKS]        = [0u32; MAX_TASKS];
-/// Wakeup result written by `wake_by_slot`; returned by `block_and_reschedule`.
-static mut TASK_WAKEUP_ERR: [i64; MAX_TASKS]  = [0i64; MAX_TASKS];
+///
+/// Atomic, Relaxed: written by the spawning core and read by every core's scheduler, so as a `static mut`
+/// it was a data race in the language's terms however the hardware behaved (backlog/90 D24). The ORDER is
+/// still `TASK_VALID`'s and `TASK_STATE`'s Release/Acquire; a Relaxed load or store is the same instruction
+/// the plain access was, on every port.
+static TASK_CORE: [core::sync::atomic::AtomicU32; MAX_TASKS] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_TASKS];
+/// Wakeup result written by `wake_by_slot`; returned by `block_and_reschedule`. Written by the WAKING core
+/// and read by the woken task's, so atomic for the same reason (D24); published by the `TASK_STATE`
+/// Release store that follows it and read after the Acquire that sees it.
+static TASK_WAKEUP_ERR: [portable_atomic::AtomicI64; MAX_TASKS] =
+    [const { portable_atomic::AtomicI64::new(0) }; MAX_TASKS];
 /// Last message received by each task (filled by `store_recv_message`).
 static mut TASK_RECV_BUF: [Option<Message>; MAX_TASKS] =
     [const { None }; MAX_TASKS];
@@ -1172,7 +1180,7 @@ pub fn reserve_task_slot(core_id: u32) -> Option<usize> {
                     // ordered core (Cortex-A7) that observes VALID==true also sees the data it guards; on
                     // x86 (TSO) an Acquire load / Release store is identical codegen to Relaxed (a plain
                     // mov), so this is behaviour-neutral there.
-                    TASK_CORE[i]  = core_id;
+                    TASK_CORE[i].store(core_id, Ordering::Relaxed);
                     // SEC-35: a task slot must not inherit the previous occupant's pending caps.
                     //
                     // `TASK_PENDING_RECV_CAP_COUNT` was never reset across task lives, so a respawned
@@ -1295,7 +1303,7 @@ pub fn enqueue(
                 TASK_NAMES.set(i, name);
                 TASK_SPAWN_DT[i].store(crate::arch::imp::rtc::now_epoch_monotonic().max(1).max(0) as u64, Ordering::Relaxed);
                 TASK_VALID[i].store(true, Ordering::Release);
-                TASK_CORE[i]             = core_id;
+                TASK_CORE[i].store(core_id, Ordering::Relaxed);
                 TASK_IS_USER[i]          = is_user;
                 TASK_KERNEL_STACK_TOP[i].store(kernel_stack_top, Ordering::Relaxed);
                 TASK_ENDPOINT[i].store(ep_to_u64(endpoint_id), Ordering::Relaxed);
@@ -1612,7 +1620,7 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
         TaskStatRaw {
             valid:       TASK_VALID[slot].load(Ordering::Acquire),
             state:       TASK_STATE[slot].load(Ordering::Acquire),
-            core:        TASK_CORE[slot],
+            core:        TASK_CORE[slot].load(Ordering::Relaxed),
             mem_used:    TASK_ALLOC_BYTES[slot],
             mem_limit:   TASK_LIMIT_BYTES[slot],
             name:        task_name(slot),
@@ -1696,7 +1704,7 @@ unsafe fn prepare_ring3_switch(core_id: usize, slot: usize) {
     // mismatch here means the scheduler attempted a forbidden mid-execution
     // migration (§3.11), which is a kernel logic bug, not a recoverable state.
     crate::invariants::assertions::assert_no_mid_execution_migration(
-        TASK_CORE[slot], core_id as u32,
+        TASK_CORE[slot].load(Ordering::Relaxed), core_id as u32,
     );
 
     let ksp = TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
@@ -2572,7 +2580,7 @@ pub fn wake_by_slot(slot: usize, result: i64) {
             // Do not revive a task that kill_task_by_slot has already marked Dead.
             let first = TASK_STATE[slot].load(Ordering::Acquire);
             if first == TaskState::Dead as u8 { return; }
-            TASK_WAKEUP_ERR[slot] = result;
+            TASK_WAKEUP_ERR[slot].store(result, Ordering::Relaxed);
             // Record the wake BEFORE the state CAS below, and unconditionally - including when the
             // target is already Ready, which is exactly the case the CAS cannot represent. See
             // `TASK_WAKE_PENDING`.
@@ -2616,7 +2624,7 @@ pub fn wake_by_slot(slot: usize, result: i64) {
                 }
             }
 
-            let task_core = TASK_CORE[slot] as usize;
+            let task_core = TASK_CORE[slot].load(Ordering::Relaxed) as usize;
             let my_core   = current_core_id();
 
             if task_core != my_core {
@@ -3503,7 +3511,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         ).is_err() {
             // CAS failed: wake_by_slot already set state to Ready (lost-wakeup prevention).
             crate::arch::imp::enable_interrupts();
-            return TASK_WAKEUP_ERR[slot];
+            return TASK_WAKEUP_ERR[slot].load(Ordering::Relaxed);
         }
 
         let current_ctx = TASK_CTX[slot].assume_init_mut() as *mut TaskContext;
@@ -3557,7 +3565,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
         }
 
         crate::arch::imp::enable_interrupts();
-        TASK_WAKEUP_ERR[slot]
+        TASK_WAKEUP_ERR[slot].load(Ordering::Relaxed)
     }
 }
 
@@ -3609,12 +3617,10 @@ fn pick_next(core_id: usize) -> Option<usize> {
         // Clear the hint regardless - if the slot turns out not to be
         // schedulable the RR scan below will find something else.
         CORE_WAKE_HINT.get(core_id).store(MAX_TASKS, Ordering::Relaxed);
-        // SAFETY: hint < MAX_TASKS; TASK_VALID/TASK_STATE are AtomicBool/AtomicU8
-        // arrays (no unsafe needed); TASK_CORE is static mut but read-only here
-        // after task spawn (immutable once set - see scheduler.rs §9.1 invariant).
+        // hint < MAX_TASKS; all three are atomic arrays, so no unsafe is needed (TASK_CORE since D24).
         let v = TASK_VALID[hint].load(Ordering::Acquire);
         let s = TASK_STATE[hint].load(Ordering::Acquire);
-        let c = unsafe { TASK_CORE[hint] };
+        let c = TASK_CORE[hint].load(Ordering::Relaxed);
         let ready = v
             && TaskState::from(s) == TaskState::Ready
             && c == core_id as u32;
@@ -3639,12 +3645,12 @@ fn pick_next(core_id: usize) -> Option<usize> {
     for i in 0..MAX_TASKS {
         let idx = (start + i) % MAX_TASKS;
         // Acquire: sees the Ready write from wake_by_slot's Release store.
-        // SAFETY: TASK_STATE and TASK_CORE are static mut arrays; idx < MAX_TASKS.
-        let (v2, s2, c2) = unsafe {(
+        // idx < MAX_TASKS; all three are atomic arrays, so no unsafe is needed (TASK_CORE since D24).
+        let (v2, s2, c2) = (
             TASK_VALID[idx].load(Ordering::Acquire),
             TASK_STATE[idx].load(Ordering::Acquire),
-            TASK_CORE[idx],
-        )};
+            TASK_CORE[idx].load(Ordering::Relaxed),
+        );
         let ready = v2
             && TaskState::from(s2) == TaskState::Ready
             && c2 == core_id as u32;

@@ -36,7 +36,7 @@ through their own boot path (§11.1, 2026-09-12 amendment).
 | `capability/`    | §7          | Yes - global table |
 | `smp/`           | §9, §11     | Yes - APIC MMIO |
 | `ipc/`           | §8          | No  |
-| `task/`          | §9, §14     | grandfathered: `mod.rs` 7 (kstack pool + spawn), `scheduler.rs` 37 - see `audits/unsafe-audit.md` |
+| `task/`          | §9, §14     | grandfathered: `mod.rs` 7 (kstack pool + spawn), `scheduler.rs` 35 - see `audits/unsafe-audit.md` |
 | `syscall/`       | §8.2        | 2 grandfathered lines (syscall entry - see audit) |
 | `interrupt/`     | §12         | 1 grandfathered line (IDT delivery - see audit) |
 | `invariants/`    | §22         | No  |

@@ -2831,7 +2831,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 37 | grandfathered |
+| task/scheduler.rs | 35 | grandfathered |
 <!-- unsafe-inventory-end -->
 
 **Permitted total:** 1133 lines across 72 files  
@@ -3849,3 +3849,12 @@ in the same place (`smp_wmb()` in `bcm2836_arm_irqchip_ipi_send_mask`).
 | Block | Why it is sound |
 |---|---|
 | `asm!("dmb ishst")` | A store barrier: no memory operand, no register or flag effect, valid in any mode at PL1 |
+
+## `task/scheduler.rs` 37 -> 35 (2026-10-30): `TASK_CORE` and `TASK_WAKEUP_ERR` are atomic
+
+Two `static mut` arrays, each written on one core and read on others, became atomic arrays (backlog/90
+D24): `TASK_CORE` (written at spawn, read by every core's scheduler) is `AtomicU32`, and `TASK_WAKEUP_ERR`
+(written by the waking core, read by the woken task's) is `portable_atomic::AtomicI64`. Both are accessed
+Relaxed, which is the instruction the plain access was; their ordering is still `TASK_VALID`'s and
+`TASK_STATE`'s Release/Acquire. Two blocks existed only to read `TASK_CORE` in `pick_next` and are gone.
+The other blocks that touched them keep their other contents. A fall, so no 18.5 amendment.
