@@ -1337,8 +1337,13 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
         return cap_err_to_i64(CapError::CapNotHeld);
     }
 
-    let ep_id = match crate::ipc::names::lookup(name) {
-        Some(id) => id,
+    // Resolved WITH the generation of the life the name points at, read under the directory's lock, and
+    // minted at it below - not at whatever holds the id by then (backlog/90 D5, `names::lookup_then`).
+    let (ep_id, ep_gen) = match crate::ipc::names::lookup_then(name, |ep| {
+        (ep, crate::capability::get_resource_generation(crate::capability::cap::ResourceId::from(ep)))
+    }) {
+        Some((id, Some(g))) => (id, g),
+        Some((_, None)) => return ACQUIRE_NAME_NOT_REGISTERED, // named but not registered: mid-spawn
         None     => {
             // SAID, not swallowed - but ONCE PER NAME, because saying it every time was worse than
             // not saying it.
@@ -1375,7 +1380,7 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
     } else {
         crate::capability::Rights::SEND
     };
-    let cap = crate::capability::mint_cap(resource_id, rights);
+    let cap = crate::capability::mint_cap_at(resource_id, rights, ep_gen);
 
     match scheduler::current_task_insert_cap(cap) {
         Ok(slot) => slot as i64,
@@ -1759,7 +1764,10 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
     // Only file-meaningful rights may ride a delegated cap (READ/WRITE), plus GRANT to transfer.
     let allowed = Rights::READ | Rights::WRITE | Rights::GRANT;
     let rights = Rights((rights_bits as u8) & allowed.0);
-    let id = match delegated::allocate(owner) {
+    // With the owner endpoint's generation - this caller's own, it being alive - so the resource's
+    // invocations reach this life of the owner and no successor on a reused id (backlog/90 D5).
+    let owner_gen = crate::ipc::routing::get_generation(EndpointId(owner)).0;
+    let id = match delegated::allocate_for(owner, owner_gen) {
         Some(i) => i,
         None    => {
             // Band full. The comment here said "loud", and nothing said anything: the caller got the
@@ -1831,8 +1839,8 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     if !delegated::is_delegated(file_cap.resource_id) {
         return cap_err_to_i64(CapError::CapWrongScope); // not a delegated/file cap
     }
-    let owner = match delegated::owner_of(file_cap.resource_id) {
-        Some(o) => EndpointId(o), // u64 → the owner endpoint to route to
+    let (owner, owner_gen_at_mint) = match delegated::owner_route(file_cap.resource_id) {
+        Some((o, g)) => (EndpointId(o), g), // the owner endpoint to route to, and the life that minted it
         None    => return ipc_err_to_i64(IpcError::EndpointDead), // resource freed
     };
 
@@ -1857,10 +1865,11 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     msg.caps[0]   = Some(reply_cap);
     msg.cap_count = 1;
 
-    // 4. Route to the owner endpoint. The file cap's generation was validated against the
-    //    global table above; the routing table tracks the OWNER endpoint's generation, so pass
-    //    that (a live owner matches; a dead owner returns EndpointDead via check_live).
-    let owner_gen = crate::ipc::routing::get_generation(owner);
+    // 4. Route to the owner endpoint, at the generation the OWNER had when it minted this resource. This
+    //    passed the owner's CURRENT generation, which a successor on a reused owner id has too, so the 8.7
+    //    check could never refuse it and a file op reached a service that never minted the file (SEC-40,
+    //    backlog/90 D5). A live owner matches; a dead or reused one gets EndpointDead via check_live.
+    let owner_gen = crate::capability::generation::Generation(owner_gen_at_mint);
     let my_slot   = scheduler::current_task_slot();
     match crate::ipc::routing::enqueue(owner, msg, owner_gen, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {

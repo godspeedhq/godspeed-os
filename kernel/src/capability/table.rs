@@ -306,6 +306,15 @@ pub fn mint_cap(id: ResourceId, rights: Rights) -> Capability {
     Capability { resource_id: id, rights, generation: record.generation }
 }
 
+/// Mint a capability for `id` at a generation the caller READ, not the one the record holds now.
+///
+/// For a mint whose target was resolved earlier (`names::lookup_then`): if the id has since been freed and
+/// reused, this cap carries the old life's generation and fails its check on first use, where `mint_cap`
+/// would have handed out a live cap to whoever holds the id now (backlog/90 D5).
+pub fn mint_cap_at(id: ResourceId, rights: Rights, generation: Generation) -> Capability {
+    Capability { resource_id: id, rights, generation }
+}
+
 /// Bump generation and mark as Dead (endpoint/service terminated → `EndpointDead`).
 pub fn mark_dead_resource(id: ResourceId) {
     GLOBAL_RESOURCES.lock_irq().bump_generation(id, Liveness::Dead);

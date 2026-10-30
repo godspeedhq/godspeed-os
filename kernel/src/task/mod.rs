@@ -1988,14 +1988,17 @@ fn spawn_service_with_image(
         };
         if provided { continue; }
 
-        if let Some(peer_ep_id) = crate::ipc::names::lookup(peer_name) {
+        // With the generation read under the directory's lock, and minted at it (backlog/90 D5).
+        if let Some((peer_ep_id, Some(peer_gen))) = crate::ipc::names::lookup_then(peer_name, |ep| {
+            (ep, crate::capability::get_resource_generation(ResourceId::from(ep)))
+        }) {
             let peer_resource_id = ResourceId::from(peer_ep_id);
             let peer_rights = if send_peers_grant {
                 Rights::SEND | Rights::GRANT
             } else {
                 Rights::SEND
             };
-            let send_cap = mint_cap(peer_resource_id, peer_rights);
+            let send_cap = crate::capability::mint_cap_at(peer_resource_id, peer_rights, peer_gen);
             match caps.insert(send_cap) {
                 Ok(cap_slot) => {
                     let nb  = peer_name.as_bytes();

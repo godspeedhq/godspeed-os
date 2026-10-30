@@ -49,12 +49,16 @@ pub const DELEGATED_CAP: usize = 1;
 /// Pure state - no global side effects - so it is unit-testable in isolation.
 struct Band {
     owner: [Option<OwnerId>; DELEGATED_CAP],
+    /// The owner endpoint's GENERATION when the slot was claimed: an invocation is routed to the owner at
+    /// this generation, so an owner id freed and reused by another service fails the routing check
+    /// rather than delivering a file op to it (backlog/90 D5). 0 where `allocate` was used without one.
+    owner_gen: [u32; DELEGATED_CAP],
     next: usize, // bump cursor; wraps and scans for the next free slot
 }
 
 impl Band {
     const fn new() -> Self {
-        Self { owner: [None; DELEGATED_CAP], next: 0 }
+        Self { owner: [None; DELEGATED_CAP], owner_gen: [0; DELEGATED_CAP], next: 0 }
     }
 
     /// Claim the next free slot for `owner`; returns its index, or `None` if the band is full.
@@ -141,7 +145,18 @@ pub fn narrow_embedded_for_receiver(cap: super::cap::Capability) -> super::cap::
 /// and return its `ResourceId`. `None` if the band is full (loud failure at the caller).
 /// Generation is monotonic across reuse (ABA-safe, see module docs).
 pub fn allocate(owner: OwnerId) -> Option<ResourceId> {
-    let slot = BAND.lock_irq().claim(owner)?;
+    allocate_for(owner, 0)
+}
+
+/// `allocate`, recording the owner endpoint's generation with the claim (one lock), so an invocation
+/// can be routed to THAT life of the owner and no other (`owner_route`, backlog/90 D5).
+pub fn allocate_for(owner: OwnerId, owner_gen: u32) -> Option<ResourceId> {
+    let slot = {
+        let mut band = BAND.lock_irq();
+        let slot = band.claim(owner)?;
+        band.owner_gen[slot] = owner_gen;
+        slot
+    };
     let id = id_of(slot);
     match get_resource_generation(id) {
         Some(g) => register_resource_at_gen(id, g.bump()), // reused id - strictly higher gen
@@ -157,6 +172,17 @@ pub fn owner_of(id: ResourceId) -> Option<OwnerId> {
         return None;
     }
     BAND.lock_irq().owner_at(slot_of(id))
+}
+
+/// The owner of a live delegated resource and the owner endpoint's generation recorded at its mint, read
+/// together - what `ResourceInvoke` routes by.
+pub fn owner_route(id: ResourceId) -> Option<(OwnerId, u32)> {
+    if !is_delegated(id) {
+        return None;
+    }
+    let band = BAND.lock_irq();
+    let slot = slot_of(id);
+    band.owner_at(slot).map(|o| (o, band.owner_gen[slot]))
 }
 
 /// Release a just-allocated delegated id that could not be handed out (e.g. the caller's

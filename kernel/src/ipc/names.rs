@@ -224,6 +224,25 @@ pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) -> UnregisterOut
 }
 
 /// Look up an endpoint ID by service name.
+/// `lookup`, with `f` run on the endpoint WHILE the directory still names it - under this lock.
+///
+/// For a caller that must bind what it does to the life the name points at, not to whatever later holds
+/// the id. A death clears its name before it frees its id, and a spawn registers its resource before its
+/// name, so while this lock is held the id a name maps to belongs to that name's life: a generation read
+/// in `f` is that life's. `AcquireSendCap` and spawn's peer wiring mint at it, so an id freed and reused
+/// between the lookup and the mint yields a cap that fails its generation check instead of a live cap
+/// to a different service (backlog/90 D5).
+pub fn lookup_then<R>(name: &str, f: impl FnOnce(EndpointId) -> R) -> Option<R> {
+    let bytes = name.as_bytes();
+    if bytes.len() > NAME_MAX { return None; }
+    let len = bytes.len() as u8;
+
+    let names = NAMES.lock_irq();
+    names.iter().find(|e| {
+        e.valid && e.name_len == len && &e.name[..len as usize] == bytes
+    }).map(|e| f(e.endpoint_id))
+}
+
 pub fn lookup(name: &str) -> Option<EndpointId> {
     let bytes = name.as_bytes();
     if bytes.len() > NAME_MAX { return None; }
