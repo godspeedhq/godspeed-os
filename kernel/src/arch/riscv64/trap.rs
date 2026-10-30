@@ -35,8 +35,82 @@
 //! needs no scratch register at all. Zeroing it on the way in matters as much as loading it on the
 //! way out: a fault INSIDE the handler must take the kernel path, or it would "swap in" a stack it
 //! is already standing on and overwrite the frame it is building.
+//!
+//! **Amended 2026-10-30 (backlog/90 D20): while the kernel runs, the latch is NEGATIVE, not zero.** It
+//! holds this hart's `TrapArea` with bit 63 set - an address no kernel stack can have, since the kernel
+//! is identity-mapped low - so `bltz` tells a kernel trap from a user one as `bnez` did, and the kernel
+//! trap gets two words to save registers in. It needs them: a kernel stack that overflowed into its
+//! guard page cannot take a frame, and finding that out takes arithmetic. Zero still means "kernel, take
+//! the stack you are on", for the few instructions of entry before the marker is written and on a hart
+//! numbered past `TRAP_HARTS`.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Harts with a `TrapArea`. Hart ids are the firmware's, not the kernel's core numbers - the VisionFive
+/// numbers its four 1 to 4 - so this is a bound on the id. A hart past it keeps the zero latch and its
+/// stack overflows are not caught, which `init` says once.
+const TRAP_HARTS: usize = 8;
+/// Bytes of each hart's emergency stack: enough for `report_fault` and the halt, the one path that runs
+/// on it, as x86's double-fault stack is (`arch/x86_64/boot.rs`, `DF_STACK_BYTES`).
+const EMERGENCY_STACK_BYTES: usize = 16 * 1024;
+
+/// One hart's words for the checked kernel trap path (`trap_entry`, label 4), at fixed offsets the
+/// assembly names: the two registers it borrows, where the kernel stacks are, and where this hart's
+/// emergency stack begins. 64 bytes, so the entry finds hart `n`'s at `TRAP_AREA + n * 64`.
+#[repr(C, align(64))]
+struct TrapArea([AtomicU64; 8]);
+const AREA_SAVE_T0: usize = 0;
+const AREA_SAVE_T1: usize = 8;
+const AREA_POOL_BASE: usize = 16;
+const AREA_POOL_LEN: usize = 24;
+const AREA_EMERGENCY_TOP: usize = 32;
+const AREA_POOL_STRIDE: usize = 40;
+const _: () = assert!(core::mem::size_of::<TrapArea>() == 64);
+
+#[allow(clippy::declare_interior_mutable_const)]
+const AREA_ZERO: TrapArea = TrapArea([const { AtomicU64::new(0) }; 8]);
+static TRAP_AREA: [TrapArea; TRAP_HARTS] = [AREA_ZERO; TRAP_HARTS];
+
+#[repr(C, align(16))]
+struct EmergencyStacks([[u8; EMERGENCY_STACK_BYTES]; TRAP_HARTS]);
+/// Written only through `sp` by a trap that found its own stack in a guard page, and that trap halts the
+/// machine; nothing in Rust reads or writes it.
+static mut EMERGENCY_STACKS: EmergencyStacks = EmergencyStacks([[0; EMERGENCY_STACK_BYTES]; TRAP_HARTS]);
+
+fn emergency_stacks() -> (u64, u64) {
+    // SAFETY: the address of a static, taken without forming a reference to it.
+    let base = unsafe { core::ptr::addr_of!(EMERGENCY_STACKS) } as u64;
+    (base, base + core::mem::size_of::<EmergencyStacks>() as u64)
+}
+
+/// Tell every hart's trap entry where the kernel stacks are: `len` bytes from `base`, one `stride` per
+/// stack, a 4 KiB guard page at the bottom of each (`page_tables::unmap_4k_strided`, which calls this
+/// only once every guard is cut). Until then the pool reads as empty and the check never fires.
+///
+/// The boot hart, before any other starts: `sbi::hart_start` orders these stores before the hart it
+/// starts can read them.
+pub fn set_stack_guards(base: u64, len: u64, stride: u64) {
+    let (ebase, _) = emergency_stacks();
+    for (n, area) in TRAP_AREA.iter().enumerate() {
+        area.0[AREA_POOL_BASE / 8].store(base, Ordering::Relaxed);
+        area.0[AREA_POOL_STRIDE / 8].store(stride, Ordering::Relaxed);
+        area.0[AREA_EMERGENCY_TOP / 8].store(ebase + ((n + 1) * EMERGENCY_STACK_BYTES) as u64, Ordering::Relaxed);
+        // Last: a non-zero length is what arms the check, so the fields it reads are in place first.
+        area.0[AREA_POOL_LEN / 8].store(len, Ordering::Release);
+    }
+}
+
+/// The value `sscratch` holds while the kernel runs on hart `hart`: its `TrapArea` with bit 63 set, or
+/// zero (unchecked) for a hart past `TRAP_HARTS`.
+fn kernel_latch(hart: u64) -> u64 {
+    if hart as usize >= TRAP_HARTS {
+        return 0;
+    }
+    (&TRAP_AREA[hart as usize] as *const TrapArea as u64) | (1u64 << 63)
+}
+
+/// Bytes of a guard page, and the slack above one inside which a trap frame would reach it.
+const GUARD_REACH: u64 = 4096 + FRAME_BYTES as u64;
 
 /// `sstatus.SPP` - the privilege the trap came FROM. 0 is user, 1 is supervisor.
 ///
@@ -190,6 +264,17 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     }
     let interrupt = scause >> 63 != 0;
     let code = scause & 0x7fff_ffff_ffff_ffff;
+
+    // ON THE EMERGENCY STACK: the entry found this kernel trap's own stack in a guard page (label 4).
+    // Said first and through the lock-free writer, because nothing else is known to be safe; then the
+    // ordinary kernel-fault path below reports the fault and halts every hart, with room to run here.
+    let (ebase, eend) = emergency_stacks();
+    let at = frame as *const TrapFrame as u64;
+    if at >= ebase && at < eend {
+        super::serial_write_bytes_lockfree(
+            b"\nKERNEL PANIC: kernel stack overflow into its guard page (backlog/90 D20)\n",
+        );
+    }
 
     // COUNT IT HERE, before any dispatch decides what it was. The liveness watchdog asks "did this
     // core take interrupts at all", and a counter placed inside one handler answers a narrower
@@ -465,10 +550,47 @@ unsafe extern "C" fn trap_entry() -> ! {
         ".p2align 2",
         // Swap in the kernel stack, if this trap came from user mode.
         "csrrw sp, sscratch, sp",
+        // Negative: the kernel was running, and this is its latch (the file comment). Check its stack.
+        "bltz  sp, 4f",
         "bnez  sp, 1f",
         // Zero came back, so the kernel was already running and `sscratch` held nothing. The
         // interrupted `sp` is the one we just parked there; take it back.
         "csrr  sp, sscratch",
+        "j     1f",
+        // THE CHECKED KERNEL PATH (backlog/90 D20). `sp` is this hart's `TrapArea` once bit 63 is
+        // cleared, and the interrupted `sp` is in `sscratch`. If that stack sits in a guard page, or
+        // so close above one that a frame would reach it, the frame below would fault, and so would
+        // the trap that fault raises, each 288 bytes lower, until the writes left the guard and landed
+        // in the stack beneath - a neighbour's, silently. Taken on the emergency stack instead, where
+        // the fault is reported and the machine halted. Two registers are borrowed into the area and
+        // given back before either path goes on, so the frame sees them as they were.
+        "4:",
+        "slli  sp, sp, 1",
+        "srli  sp, sp, 1",
+        "sd    t0, {save_t0}(sp)",
+        "sd    t1, {save_t1}(sp)",
+        "csrr  t0, sscratch",
+        "ld    t1, {pool_base}(sp)",
+        "sub   t0, t0, t1",
+        "ld    t1, {pool_len}(sp)",
+        // Outside the pool (a boot stack, or the check not armed yet: length zero): an ordinary trap.
+        "bgeu  t0, t1, 5f",
+        "ld    t1, {pool_stride}(sp)",
+        "remu  t0, t0, t1",
+        // Offset in its stride slot, minus one: 0 to `reach - 2` is inside the guard or too close above
+        // it. Offset 0 is the top of the slot below, an empty stack and not an overflow, and wraps.
+        "addi  t0, t0, -1",
+        "li    t1, {reach_m1}",
+        "bltu  t0, t1, 6f",
+        "5:",
+        "ld    t1, {save_t1}(sp)",
+        "ld    t0, {save_t0}(sp)",
+        "csrr  sp, sscratch",
+        "j     1f",
+        "6:",
+        "ld    t1, {save_t1}(sp)",
+        "ld    t0, {save_t0}(sp)",
+        "ld    sp, {emergency_top}(sp)",
         "1:",
         "addi sp, sp, -{frame}",
         // t0 first, so it can be the scratch for everything below.
@@ -500,6 +622,18 @@ unsafe extern "C" fn trap_entry() -> ! {
         "ld x4, {hartid}(sp)",
         "3:",
         "sd x6, 48(sp)",
+        // RE-ARM THE KERNEL LATCH, now that `tp` is the kernel's on both paths: this hart's `TrapArea`
+        // with bit 63 set, or zero past `TRAP_HARTS` (the file comment). `x5` and `x6` are saved.
+        "li   x5, {harts}",
+        "bgeu x4, x5, 7f",
+        "slli x5, x4, 6",
+        "lla  x6, {area}",
+        "add  x5, x5, x6",
+        "li   x6, 1",
+        "slli x6, x6, 63",
+        "or   x5, x5, x6",
+        "csrw sscratch, x5",
+        "7:",
         "sd x7, 56(sp)",
         "sd x8, 64(sp)",
         "sd x9, 72(sp)",
@@ -541,7 +675,7 @@ unsafe extern "C" fn trap_entry() -> ! {
         "csrw sepc, x5",
         // Re-arm the latch if and only if we are going back to user mode: `sp + frame` is where the
         // kernel stack stood on entry, which is where the NEXT user trap must land. Returning to
-        // S-mode leaves it zero, per the discipline at the top of this file.
+        // S-mode leaves it the kernel latch written above, per the discipline at the top of this file.
         "ld x5, {sstatus}(sp)",
         "andi x5, x5, {spp}",
         "bnez x5, 2f",
@@ -593,6 +727,15 @@ unsafe extern "C" fn trap_entry() -> ! {
         hartid = const OFF_HARTID,
         spp = const SSTATUS_SPP,
         dispatch = sym trap_dispatch,
+        save_t0 = const AREA_SAVE_T0,
+        save_t1 = const AREA_SAVE_T1,
+        pool_base = const AREA_POOL_BASE,
+        pool_len = const AREA_POOL_LEN,
+        pool_stride = const AREA_POOL_STRIDE,
+        emergency_top = const AREA_EMERGENCY_TOP,
+        reach_m1 = const GUARD_REACH - 1,
+        harts = const TRAP_HARTS,
+        area = sym TRAP_AREA,
     )
 }
 
@@ -614,14 +757,24 @@ pub fn init() -> bool {
     if addr & 0x3 != 0 {
         return false;
     }
+    // The kernel latch for this hart (the file comment): its `TrapArea`, marked, so a kernel trap here
+    // is checked for a stack in a guard page. `tp` is this hart's id from its own entry.
+    let hart: u64;
+    // SAFETY: reading a general register with no side effects.
+    unsafe { core::arch::asm!("mv {}, tp", out(reg) hart, options(nomem, nostack)) };
+    let latch = kernel_latch(hart);
+    if latch == 0 {
+        super::print_str("riscv64: this hart's id is past TRAP_HARTS - a kernel stack overflow on it is not caught\n");
+    }
     // SAFETY: a real code address in the kernel image, proven above to have its low two bits clear,
-    // so MODE is 0 (direct) and the address is not truncated. Zeroing `sscratch` establishes the
-    // invariant the entry stub relies on, and is done before the vector so no trap can observe the
-    // register between the two writes.
+    // so MODE is 0 (direct) and the address is not truncated. Setting `sscratch` to the kernel latch
+    // establishes the invariant the entry stub relies on, and is done before the vector so no trap can
+    // observe the register between the two writes.
     unsafe {
         core::arch::asm!(
-            "csrw sscratch, zero",
+            "csrw sscratch, {}",
             "csrw stvec, {}",
+            in(reg) latch,
             in(reg) addr,
             options(nostack)
         );

@@ -882,6 +882,12 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
     // Per-core scheduler arenas, then this core's identity, then READY - in that order, because
     // `lapic_to_core_id` matches only a core that has been marked ready, and `spawn_supervisor`
     // places its task on core 0 through that mapping.
+    // A guard page below every kernel stack, before the first is handed out and before any other hart
+    // or task root exists - the contract `install_kstack_guards` states. It was never called on this
+    // port, and the arch half was an empty stub, so an overflow ran silently into the next task's stack
+    // (backlog/90 D20). After the selftests, which build and free a root of their own.
+    crate::task::install_kstack_guards();
+
     crate::task::scheduler::init_arenas(crate::smp::percpu::num_cores());
     crate::smp::core::mark_ready(0);
 
@@ -2360,7 +2366,41 @@ pub mod page_tables {
         }
         super::sv39::translate(root, virt)
     }
-    pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {}
+    /// Unmap one 4 KiB page every `stride` bytes from `base`, `count` times, in the KERNEL's map: the
+    /// kernel stacks' guard pages (`task::install_kstack_guards`, backlog/90 D20).
+    ///
+    /// This was an empty stub, so on this port a kernel stack overflow wrote straight into the stack
+    /// below it - the neighbouring task's - and nothing said so. The kernel is mapped with 1 GiB leaves,
+    /// so each guard is first cut out of its gigapage (`sv39::split_kernel_to_4k`); the tables that makes
+    /// are shared into every task by `clone_kernel_map` and never freed by `reclaim_user`. The trap
+    /// entry is told where the guards are (`trap::set_stack_guards`), so a fault on one is taken on an
+    /// emergency stack and reported, rather than re-faulting on the stack that ran out.
+    ///
+    /// Boot hart only, before any other hart starts and before any task root is built - the contract
+    /// `install_kstack_guards` states - so the one fence below is the only invalidation owed.
+    pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
+        let root = super::KERNEL_ROOT.load(core::sync::atomic::Ordering::Relaxed);
+        if root == 0 {
+            super::print_str("riscv64: kstack guards NOT installed - paging is not on\n");
+            return;
+        }
+        let mut done = 0usize;
+        for i in 0..count {
+            let va = base + i as u64 * stride;
+            if super::sv39::split_kernel_to_4k(root, va).is_err()
+                || super::sv39::unmap_page(root, va).is_err()
+            {
+                crate::kprintln!("riscv64: kstack guard {} of {} at {:#x} could NOT be cut - the stacks above it are unguarded", i, count, va);
+                break;
+            }
+            done += 1;
+        }
+        // SAFETY: a full `sfence.vma` on this hart, the only one running, after its own table changed.
+        unsafe { core::arch::asm!("sfence.vma zero, zero", options(nostack)) };
+        if done == count {
+            super::trap::set_stack_guards(base, stride * count as u64, stride);
+        }
+    }
     pub fn harden_hhdm_nx() {}
     /// Give a dead task's pages and page tables back to the allocator, and report how many frames
     /// that was.
@@ -2377,8 +2417,9 @@ pub mod page_tables {
         if cr3 == 0 {
             return 0;
         }
-        // SAFETY: contract delegated to the caller above.
-        unsafe { super::sv39::reclaim_user(cr3) }
+        let kernel_root = super::KERNEL_ROOT.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: contract delegated to the caller above; `kernel_root` is the kernel's own.
+        unsafe { super::sv39::reclaim_user(cr3, kernel_root) }
     }
 }
 

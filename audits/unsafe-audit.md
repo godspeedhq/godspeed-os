@@ -2793,15 +2793,15 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
 | arch/riscv64/sbi.rs | 12 | permitted |
-| arch/riscv64/sv39.rs | 29 | permitted |
-| arch/riscv64/trap.rs | 8 | permitted |
+| arch/riscv64/sv39.rs | 40 | permitted |
+| arch/riscv64/trap.rs | 10 | permitted |
 | arch/riscv64/plic.rs | 5 | permitted |
 | arch/riscv64/syscall.rs | 1 | permitted |
 | arch/riscv64/context_switch.rs | 35 | permitted |
 | arch/riscv64/usermode.rs | 17 | permitted |
 | arch/riscv64/uaccess.rs | 7 | permitted |
 | arch/riscv64/display.rs | 6 | permitted |
-| arch/riscv64/mod.rs | 64 | permitted |
+| arch/riscv64/mod.rs | 65 | permitted |
 | arch/s390x/mod.rs | 19 | permitted |
 | arch/x86_64/ap_boot.rs | 3 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
@@ -3901,3 +3901,24 @@ prints one fixed line before halting every core.
 | `(*tss).ist[0] = top` in `init_gdt` (core 0) | Single writer during the BSP's own init, into the BSP's own TSS, before `ltr` loads it; `top` is 16-aligned |
 | `#[unsafe(naked)] df_stub` | `call df_handler` then `ud2`: nothing is saved because nothing returns; six pushed words plus the call leave the ABI's alignment on a 16-aligned IST top |
 | `serial_puts_nolck` in `df_handler` | The lock-free writer, valid from any context including a fault taken while this core held the serial lock |
+
+## `arch/riscv64/` sv39.rs 29 -> 40, trap.rs 8 -> 10, mod.rs 64 -> 65 (2026-10-30): kernel stacks have guard pages
+
+backlog/90 D20. `unmap_4k_strided` was an empty stub and RISC-V never called `install_kstack_guards`, so the
+224 kernel stacks sat end to end and an overflow wrote into the neighbouring task's stack with nothing said.
+The kernel's gigapage holding the pool is now split and each slot's lowest page unmapped; the split tables
+are shared into every task and never freed by a task's death; and the trap entry takes a kernel trap whose
+stack is in a guard page on an emergency stack, so the fault is reported and every hart halted.
+
+| Block | Why it is sound |
+|---|---|
+| sv39.rs `split_kernel_to_4k`: the slot read and write at each level, the 512 child writes (4) | The kernel's own root and tables, identity-mapped and page-aligned, indices from `vpn` (< 512); the children cover exactly the range of the leaf they replace with its bits, so no mapping moves or changes permission. Boot hart only, before any other hart or task root exists; the caller fences |
+| sv39.rs `clone_kernel_map`, the split-gigabyte arm: the root write and the two reads and one write per 2 MiB slot (4) | Root tables and level-1 tables this kernel wrote, indices < 512; only for a gigabyte `split_kernel_to_4k` recorded, and only into slots the task has not claimed |
+| sv39.rs `reclaim_user`: the kernel root and level-1 reads (2) | Reads of the kernel's own tables, checked with `phys_in_ram`, used only to recognise a shared table and skip it |
+| sv39.rs `map_page`: the kernel-table read beside the walk (1) | A read of the kernel's table at the same place, reached through the split record; it only REFUSES a write into a table every address space shares |
+| trap.rs `emergency_stacks`: the address of `static mut EMERGENCY_STACKS` (1) | `addr_of!`, no reference formed; the stacks are written only through `sp` by a trap that then halts the machine, one per hart |
+| trap.rs `init`: the `tp` read (1) | A register read with no side effects, as `get_lapic_id` does |
+| mod.rs `unmap_4k_strided`: `sfence.vma zero, zero` (1) | A full fence on the boot hart, the only one running, after its own table changed |
+
+The entry's checked path is in the existing `naked_asm!` block and adds no line: it borrows `t0` and `t1`
+into the hart's `TrapArea` and gives both back before either path goes on.

@@ -25,6 +25,19 @@
 
 use crate::memory::allocator::alloc_frame;
 use crate::memory::frame::{Frame, PhysAddr};
+use portable_atomic::{AtomicU64, Ordering};
+
+/// The kernel root `split_kernel_to_4k` split, and which of its gigabytes (bit `n` for root index `n`).
+/// Only THESE are shared into tasks as tables (`clone_kernel_map`), skipped by `reclaim_user`, and
+/// refused to `map_page` on a task's root: any other table under the kernel root - one a boot selftest
+/// left behind - is the kernel's alone, as it always was (backlog/90 D20).
+static SPLIT_ROOT: AtomicU64 = AtomicU64::new(0);
+static SPLIT_GIBS: AtomicU64 = AtomicU64::new(0);
+
+/// Is root index `idx` a gigabyte the kernel split, and so shares its tables for?
+fn split_gib(idx: usize) -> bool {
+    idx < 64 && SPLIT_GIBS.load(Ordering::Relaxed) & (1u64 << idx) != 0
+}
 
 /// PTE bits, from the privileged specification.
 pub const PTE_V: u64 = 1 << 0; // valid
@@ -198,11 +211,24 @@ pub fn map_page(root: u64, va: u64, pa: u64, bits: u64) -> Result<(), MapFail> {
         return Err(MapFail::NotCanonical);
     }
     let mut table = root;
+    // The kernel's table at the same place, while the walk is inside a gigabyte it split and shares
+    // (`split_kernel_to_4k`). A task's walk that reaches one of those must stop: a write there would
+    // land in every address space at once.
+    let split_root = SPLIT_ROOT.load(Ordering::Relaxed);
+    let mut ktable = if split_root != 0 && split_root != root && split_gib(vpn(va, 2)) { split_root } else { 0 };
     for lvl in (1..=2).rev() {
         // SAFETY: `table` is a page-aligned frame this kernel owns, identity-mapped; idx < 512.
         let slot = unsafe { (table as *mut u64).add(vpn(va, lvl)) };
         // SAFETY: as above.
         let pte = unsafe { slot.read_volatile() };
+        let kpte = if ktable != 0 {
+            // SAFETY: a kernel table reached through the split record, page-aligned and its own.
+            unsafe { (ktable as *const u64).add(vpn(va, lvl)).read_volatile() }
+        } else { 0 };
+        ktable = if pte_is_valid(kpte) && !pte_is_leaf(kpte) { pte_phys(kpte) } else { 0 };
+        if pte_is_valid(pte) && !pte_is_leaf(pte) && pte == kpte {
+            return Err(MapFail::AlreadyMapped); // the kernel's shared table: not this task's to change
+        }
         if !pte_is_valid(pte) {
             let next = alloc_table().ok_or(MapFail::NoFrame)?;
             // A POINTER PTE: valid, with R/W/X all clear so the walk descends rather than stopping.
@@ -338,6 +364,55 @@ pub fn identity_map_gigapages(root: u64, end: u64, bits: u64) -> Result<(), MapF
     Ok(())
 }
 
+/// Make `va` reachable at 4 KiB granularity in the KERNEL's table, splitting the large leaves above it.
+///
+/// The kernel is mapped with 1 GiB leaves (`identity_map_gigapages`), and a guard page cannot be cut out
+/// of a leaf. So the gigapage holding `va` becomes a table of 512 2 MiB leaves, and the 2 MiB leaf holding
+/// it a table of 512 4 KiB leaves, each with the bits of the leaf it replaces - nothing that was mapped
+/// moves or changes permission. A level already split is followed, so a run of calls over one region
+/// allocates each table once.
+///
+/// Kernel tables only, and before any other hart runs: the caller fences, and no task root may have been
+/// built yet, since `clone_kernel_map` copies what it finds here at spawn time (backlog/90 D20).
+pub fn split_kernel_to_4k(root: u64, va: u64) -> Result<(), MapFail> {
+    if !va_is_canonical(va) {
+        return Err(MapFail::NotCanonical);
+    }
+    let gib = vpn(va, 2);
+    let split_root = SPLIT_ROOT.load(Ordering::Relaxed);
+    if gib >= 64 || (split_root != 0 && split_root != root) {
+        return Err(MapFail::NotCanonical); // past the record above, or a second root: not supported
+    }
+    SPLIT_ROOT.store(root, Ordering::Relaxed);
+    SPLIT_GIBS.fetch_or(1u64 << gib, Ordering::Relaxed);
+    let mut table = root;
+    for lvl in (1..=2).rev() {
+        // SAFETY: `table` is a page-aligned table this kernel owns, identity-mapped; idx < 512.
+        let slot = unsafe { (table as *mut u64).add(vpn(va, lvl)) };
+        // SAFETY: as above.
+        let pte = unsafe { slot.read_volatile() };
+        if !pte_is_valid(pte) {
+            return Err(MapFail::NotMapped);
+        }
+        if pte_is_leaf(pte) {
+            let next = alloc_table().ok_or(MapFail::NoFrame)?;
+            let child_span = 1u64 << (12 + 9 * (lvl - 1));
+            let base = pte_phys(pte);
+            let bits = pte & 0x3ff;
+            for j in 0..512u64 {
+                // SAFETY: `next` was just allocated to us, a zeroed 4 KiB table; j < 512.
+                unsafe { (next as *mut u64).add(j as usize).write_volatile(pte_make(base + j * child_span, bits)) };
+            }
+            // SAFETY: as above. The children cover exactly what the leaf did, with its bits.
+            unsafe { slot.write_volatile(pte_make(next, PTE_V)) };
+            table = next;
+        } else {
+            table = pte_phys(pte);
+        }
+    }
+    Ok(())
+}
+
 /// Copy the kernel's identity mapping into a new address space, WITHOUT disturbing what the task
 /// already has there.
 ///
@@ -375,11 +450,48 @@ pub fn clone_kernel_map(dst: u64, src: u64) -> usize {
     for idx in 0..512usize {
         // SAFETY: both are page-aligned root tables this kernel owns, identity-mapped; idx < 512.
         let k = unsafe { (src as *const u64).add(idx).read_volatile() };
-        if !pte_is_valid(k) || !pte_is_leaf(k) {
-            continue; // the kernel maps this gigabyte through a table, or not at all
+        if !pte_is_valid(k) {
+            continue; // the kernel does not map this gigabyte
         }
         // SAFETY: as above.
         let d = unsafe { (dst as *const u64).add(idx).read_volatile() };
+
+        if !pte_is_leaf(k) && !split_gib(idx) {
+            continue; // the kernel maps this gigabyte through a table of its own: not lent
+        }
+        if !pte_is_leaf(k) {
+            // The gigabyte the kernel SPLIT, to cut the kernel stacks' guard pages out of it
+            // (`split_kernel_to_4k`, backlog/90 D20). Its tables are SHARED, never copied: a copy would
+            // be a snapshot whose guards are only as good as the day it was taken, and the tables are
+            // the kernel's - `reclaim_user` is told to leave them alone. Where the task has a table of
+            // its own here, each 2 MiB slot it has not claimed gets the kernel's entry for that slot,
+            // leaf or pointer, so the stacks are mapped (with their guards) in every address space.
+            if !pte_is_valid(d) {
+                // SAFETY: as above.
+                unsafe { (dst as *mut u64).add(idx).write_volatile(k) };
+                filled += 1;
+                continue;
+            }
+            if pte_is_leaf(d) {
+                continue; // the task owns this whole gigabyte; it was not ours to give
+            }
+            let ktable = pte_phys(k);
+            let table = pte_phys(d);
+            for j in 0..512usize {
+                // SAFETY: both came from pointer PTEs this kernel wrote, so they are 4 KiB tables it
+                // owns; j < 512.
+                let ke = unsafe { (ktable as *const u64).add(j).read_volatile() };
+                // SAFETY: as above.
+                let e = unsafe { (table as *const u64).add(j).read_volatile() };
+                if !pte_is_valid(ke) || pte_is_valid(e) {
+                    continue; // nothing of the kernel's, or the task's own mapping: leave it
+                }
+                // SAFETY: as above.
+                unsafe { (table as *mut u64).add(j).write_volatile(ke) };
+                filled += 1;
+            }
+            continue;
+        }
 
         if !pte_is_valid(d) {
             // SAFETY: as above. Nothing of the task's lives here, so the gigapage goes in whole.
@@ -435,9 +547,15 @@ pub fn clone_kernel_map(dst: u64, src: u64) -> usize {
 /// itself, so the caller frees it separately once nothing is executing in that space
 /// (`free_page_table_root`).
 ///
+/// **Nor a table the KERNEL owns.** The gigabyte the kernel split for its stack guards
+/// (`split_kernel_to_4k`) is shared into every task, at the root or at 2 MiB, by `clone_kernel_map`; an
+/// entry equal to the kernel's own at the same place is that sharing, and is skipped. Freeing one would
+/// hand the kernel's map of its own stacks to the allocator on the first death (backlog/90 D20).
+///
 /// # Safety
-/// `root` must belong to a task already marked Dead, whose frames no other core can reach.
-pub unsafe fn reclaim_user(root: u64) -> usize {
+/// `root` must belong to a task already marked Dead, whose frames no other core can reach, and
+/// `kernel_root` must be the kernel's own root (zero before paging, when nothing is shared).
+pub unsafe fn reclaim_user(root: u64, kernel_root: u64) -> usize {
     use crate::memory::allocator::{free_frame, phys_in_ram};
     let mut freed = 0usize;
     if !phys_in_ram(root) {
@@ -449,6 +567,15 @@ pub unsafe fn reclaim_user(root: u64) -> usize {
         if !pte_is_valid(l1) || pte_is_leaf(l1) {
             continue; // empty, or a gigapage the kernel lent this task
         }
+        // The kernel's entry for this gigabyte, if it is one it split and shares.
+        let k1 = if split_gib(i2) && phys_in_ram(kernel_root) {
+            // SAFETY: the kernel's root, a page-aligned table it owns; i2 < 512.
+            unsafe { (kernel_root as *const u64).add(i2).read_volatile() }
+        } else { 0 };
+        let k1_table = if pte_is_valid(k1) && !pte_is_leaf(k1) { pte_phys(k1) } else { 0 };
+        if k1_table != 0 && l1 == k1 {
+            continue; // the kernel's own table, shared whole: not this task's to free
+        }
         let t1 = pte_phys(l1);
         if !phys_in_ram(t1) {
             continue; // a stale or corrupt pointer: do not walk into it
@@ -458,6 +585,13 @@ pub unsafe fn reclaim_user(root: u64) -> usize {
             let l0 = unsafe { (t1 as *const u64).add(i1).read_volatile() };
             if !pte_is_valid(l0) || pte_is_leaf(l0) {
                 continue; // a 2 MiB leaf is the kernel's, always - see the note above
+            }
+            if k1_table != 0 && phys_in_ram(k1_table) {
+                // SAFETY: the kernel's level-1 table for this gigabyte; i1 < 512.
+                let k0 = unsafe { (k1_table as *const u64).add(i1).read_volatile() };
+                if l0 == k0 {
+                    continue; // the kernel's own 4 KiB table, lent at 2 MiB: not this task's
+                }
             }
             let t0 = pte_phys(l0);
             if !phys_in_ram(t0) {

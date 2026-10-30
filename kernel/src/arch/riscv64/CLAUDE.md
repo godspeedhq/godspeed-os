@@ -52,8 +52,20 @@ parks the kernel's copy at `OFF_HARTID` inside `FRAME_BYTES` (288), and the prol
 on the user path** - reloading it unconditionally corrupts a kernel-mode `tp`.
 
 **`sscratch` is the kernel-stack latch.** It holds this hart's kernel stack pointer while U-mode runs
-and **zero** while the kernel runs, which is what lets a trap handler find a stack before it has one.
-It is the single register a trap may use before anything is set up; treat it as load-bearing.
+and, while the kernel runs, this hart's `TrapArea` with bit 63 set (zero only for the few instructions
+of entry before it is re-armed, and on a hart numbered past `TRAP_HARTS`). That is what lets a trap
+handler find a stack before it has one, and - since 2026-10-30 - what lets a KERNEL trap check its own:
+the area gives it two registers' room to ask whether the interrupted stack is in a kernel stack's guard
+page, and to take the trap on an emergency stack if it is (`trap.rs`, backlog/90 D20). It is the single
+register a trap may use before anything is set up; treat it as load-bearing.
+
+**The kernel stacks have guard pages, and the tables that hold them are SHARED.** The kernel maps RAM
+with 1 GiB leaves, so the gigabyte holding the stack pool is split (`sv39::split_kernel_to_4k`) and each
+stack's lowest page unmapped. Every task gets those tables by reference (`clone_kernel_map`), never a
+copy; `reclaim_user` skips them and `map_page` refuses to write through them on a task's root. On the
+VisionFive the pool shares its gigabyte with every task's stack and MMIO window, so the 2 MiB merge path
+is the one that runs there; QEMU `virt` puts the kernel a gigabyte above, where the root entry is shared
+whole. So the merge path runs only on the board, and QEMU exercises the other.
 
 **DMA coherence is PER MASTER on the JH7110, and the device tree does not say so.** The display
 controller is not coherent; the USB controller is. Silence in the DT is not a claim either way - this
