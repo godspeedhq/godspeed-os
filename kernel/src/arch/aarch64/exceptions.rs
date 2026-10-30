@@ -668,6 +668,12 @@ extern "C" fn aarch64_sync_lower_dispatch(vector: u64, frame: *mut TrapFrame) {
 /// and re-printing - a machine that looks busy while making no progress, which is worse than one that
 /// stops with a reason. An EL0 fault ends in `task::kill_current`, which reschedules and never comes
 /// back; a fault at EL1 halts.
+///
+/// **A fault taken WHILE reporting one is said in a few words and halts every core** (`REPORTING`,
+/// `arch/CLAUDE.md` rule 1). Without it, the report of a kernel fault taken before the scheduler's
+/// per-core arenas exist faulted on its own task lookup, re-entered, and did so 761 times until an
+/// unrelated spinlock watchdog panicked - a write to the kernel's text under W^X, found by
+/// `kernel-wx-test` (backlog/90 D21).
 #[no_mangle]
 extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     let (esr, far): (u64, u64);
@@ -680,6 +686,18 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     // SAFETY: `frame` is the trap frame the vector assembly just built on the current stack; it is
     // valid for the life of this call and nothing else aliases it.
     let f = unsafe { &*frame };
+    if REPORTING.swap(true, core::sync::atomic::Ordering::Acquire) {
+        // The least that can be said: no task, no walk, no register dump - each a thing that could
+        // fault again. The second fault's syndrome, address and pc are already in hand.
+        super::put_str(b"\r\n*** aarch64: FAULT WHILE REPORTING A FAULT - halting every core\r\n    ESR_EL1 = ");
+        super::put_hex(esr);
+        super::put_str(b"  FAR_EL1 = ");
+        super::put_hex(far);
+        super::put_str(b"  ELR_EL1 = ");
+        super::put_hex(f.elr);
+        super::put_str(b"\r\n");
+        super::halt_all_cores();
+    }
     // Ask this core's own MMU about the faulting address BEFORE anything else runs (`backlog/fixed/72`): every
     // line printed below can evict or refill the TLB, and the question is what the core held at the
     // fault. Same gate as the page walk that prints the answer.
@@ -1236,6 +1254,9 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
             0b100010 | 0b100110 => (F_ALIGNMENT, f.elr),
             _ => (F_OTHER, f.elr),
         };
+        // Released first: the next fault, in another task, is a report of its own and not this one
+        // recursing. `kill_current` does not return.
+        REPORTING.store(false, core::sync::atomic::Ordering::Release);
         crate::task::kill_current(kind, addr);
         // `kill_current` marks the task Dead and reschedules, so it does not come back. If it ever
         // does, falling through to the halt below is right: resuming a corpse's context is worse
@@ -1243,10 +1264,13 @@ extern "C" fn aarch64_trap_report(vector: u64, frame: *const TrapFrame) -> ! {
     }
 
     // A fault at EL1 IS the kernel's, and there is nothing above it to recover into. Halting loudly
-    // is the correct end of that path (§26.7), not a missing feature.
-    super::put_str(b"\r\n    halting.\r\n");
-    loop {
-        // SAFETY: WFE is always valid; park forever.
-        unsafe { core::arch::asm!("wfe") };
-    }
+    // is the correct end of that path (§26.7), not a missing feature - and halting EVERY core, as a
+    // panic does (6.2). This parked only the faulting core, leaving the rest running against whatever
+    // state the fault was about, which x86 and riscv64 stopped doing (`backlog/fixed/80` K6).
+    super::put_str(b"\r\n    the KERNEL faulted - halting every core.\r\n");
+    super::halt_all_cores();
 }
+
+/// Set while a fault is being reported; see `aarch64_trap_report`. Released by a report that ends in
+/// killing an EL0 task, so only a fault INSIDE a report is treated as recursion.
+static REPORTING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

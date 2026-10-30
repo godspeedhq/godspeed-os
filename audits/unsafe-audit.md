@@ -2756,7 +2756,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/aarch64/sched_user.rs | 4 | permitted |
 | arch/aarch64/uart_rx.rs | 3 | permitted |
 | arch/aarch64/sdio.rs | 3 | permitted |
-| arch/aarch64/exceptions.rs | 17 | permitted |
+| arch/aarch64/exceptions.rs | 16 | permitted |
 | arch/aarch64/uaccess.rs | 7 | permitted |
 | arch/aarch64/context.rs | 8 | permitted |
 | arch/aarch64/sched_demo.rs | 5 | permitted |
@@ -3935,3 +3935,8 @@ page is cut out, so a failure part-way leaves the old map rather than a kernel t
 | `protect_kernel_page`: the two reads down the walk, the leaf read and the leaf write (4) | The kernel's own tables, just split by `split_kernel_to_4k`, so every level above the page is a pointer; indices from `vpn`; only the R/W/X bits of one kernel leaf change. Boot hart, before `satp` is written |
 | `strip_kernel_exec`: the walk's three slot addresses and two reads, and the closure's read and write (7) | The kernel's own root and the tables it wrote, indices < 512; one bit (`X`) cleared on a leaf that holds none of `.text`. Before `satp` is written, with nothing else running |
 | mod.rs, `kernel-wx-test` only: a byte of `.text` written back to itself (1) | Test builds only; the value written is the value read, so the image is unchanged if the store is allowed, and with W^X the store faults, which is what the feature exists to show |
+
+## `arch/aarch64/exceptions.rs` 17 -> 16 (2026-10-30): a kernel fault halts every core
+
+backlog/90 D21. The kernel-fault end of `aarch64_trap_report` parked only the faulting core in a `wfe` loop,
+one `unsafe` line; it now calls `halt_all_cores`, as a panic does, and the line goes. A fall, recorded.
