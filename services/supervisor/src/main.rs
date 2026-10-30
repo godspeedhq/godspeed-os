@@ -1121,7 +1121,12 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godsp
     req.probe_mode   = mode;
     req.hw_flags     = probes::hw_class_of(name);
     let mut buf = [0u8; 128];
-    ctx.spawn_image(&mut req, &mut buf, peers).map(|_| ())
+    // Nothing wires to a probe through the supervisor, so the endpoint cap the spawn hands back is let go
+    // at once. `.map(|_| ())` dropped the HANDLE and kept the slot: one leaked cap per probe with an
+    // endpoint, and a full `osdev run` filled the 64-slot table part-way through its probes, after which
+    // every spawn the supervisor made with an endpoint - a restart of `shell` or `fs` included - came back
+    // as a failure, though the kernel had started the child (backlog/90 D27).
+    ctx.spawn_image(&mut req, &mut buf, peers).map(|cap| let_go(ctx, cap))
 }
 
 /// Bare-metal carries no probe image, so there is nothing to start. Loud rather than silent: a probe
