@@ -124,6 +124,10 @@ pml4-pending-test = []
 # fault that follows is shown to be reported - an x86 double fault rather than a reset, a riscv64 trap
 # on the emergency stack rather than silence (backlog/90 D20). Off by default; test builds only.
 kstack-overflow-test = []
+# riscv64: write a byte of the kernel's own text back to itself just after paging is on, so the
+# kernel's W^X map is shown to refuse it rather than take it in silence (backlog/90 D21). Off by
+# default; test builds only.
+kernel-wx-test = []
 # Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
 # EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
 # reports banks above 4 GiB that the low-4-GiB identity map does not reach - recording those as usable

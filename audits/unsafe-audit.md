@@ -2793,7 +2793,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
 | arch/riscv64/sbi.rs | 12 | permitted |
-| arch/riscv64/sv39.rs | 40 | permitted |
+| arch/riscv64/sv39.rs | 51 | permitted |
 | arch/riscv64/trap.rs | 10 | permitted |
 | arch/riscv64/plic.rs | 5 | permitted |
 | arch/riscv64/syscall.rs | 1 | permitted |
@@ -2801,7 +2801,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/usermode.rs | 17 | permitted |
 | arch/riscv64/uaccess.rs | 7 | permitted |
 | arch/riscv64/display.rs | 6 | permitted |
-| arch/riscv64/mod.rs | 65 | permitted |
+| arch/riscv64/mod.rs | 66 | permitted |
 | arch/s390x/mod.rs | 19 | permitted |
 | arch/x86_64/ap_boot.rs | 3 | permitted |
 | arch/x86_64/boot.rs | 107 | permitted |
@@ -3922,3 +3922,16 @@ stack is in a guard page on an emergency stack, so the fault is reported and eve
 
 The entry's checked path is in the existing `naked_asm!` block and adds no line: it borrows `t0` and `t1`
 into the hart's `TrapArea` and gives both back before either path goes on.
+
+## `arch/riscv64/sv39.rs` 40 -> 51, `mod.rs` 65 -> 66 (2026-10-30): the kernel's own memory is W^X
+
+backlog/90 D21. The kernel mapped all of RAM with read, write AND execute 1 GiB leaves, so a bug that wrote
+chosen bytes anywhere could then run them. `enable_paging` now cuts the kernel image out at 4 KiB, makes
+`.text` read+execute and `.rodata` read-only, and clears execute on every other leaf - only once every text
+page is cut out, so a failure part-way leaves the old map rather than a kernel that cannot run itself.
+
+| Block | Why it is sound |
+|---|---|
+| `protect_kernel_page`: the two reads down the walk, the leaf read and the leaf write (4) | The kernel's own tables, just split by `split_kernel_to_4k`, so every level above the page is a pointer; indices from `vpn`; only the R/W/X bits of one kernel leaf change. Boot hart, before `satp` is written |
+| `strip_kernel_exec`: the walk's three slot addresses and two reads, and the closure's read and write (7) | The kernel's own root and the tables it wrote, indices < 512; one bit (`X`) cleared on a leaf that holds none of `.text`. Before `satp` is written, with nothing else running |
+| mod.rs, `kernel-wx-test` only: a byte of `.text` written back to itself (1) | Test builds only; the value written is the value read, so the image is unchanged if the store is allowed, and with W^X the store faults, which is what the feature exists to show |

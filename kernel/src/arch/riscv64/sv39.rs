@@ -413,6 +413,73 @@ pub fn split_kernel_to_4k(root: u64, va: u64) -> Result<(), MapFail> {
     Ok(())
 }
 
+/// Give one 4 KiB page of the KERNEL's map the permissions `rwx` (a subset of `PTE_R | PTE_W | PTE_X`),
+/// splitting the large leaves above it first. Valid, accessed and dirty are kept. For W^X (backlog/90
+/// D21): `.text` read+execute, `.rodata` read-only. Same contract as `split_kernel_to_4k`.
+pub fn protect_kernel_page(root: u64, va: u64, rwx: u64) -> Result<(), MapFail> {
+    split_kernel_to_4k(root, va)?;
+    let mut table = root;
+    for lvl in (1..=2).rev() {
+        // SAFETY: the kernel's own tables, just split, so every level above `va` is a pointer; idx < 512.
+        let pte = unsafe { (table as *const u64).add(vpn(va, lvl)).read_volatile() };
+        table = pte_phys(pte);
+    }
+    // SAFETY: the level-0 table holding `va`, the kernel's own; idx < 512.
+    let slot = unsafe { (table as *mut u64).add(vpn(va, 0)) };
+    // SAFETY: as above.
+    let pte = unsafe { slot.read_volatile() };
+    let rwx = rwx & (PTE_R | PTE_W | PTE_X);
+    // SAFETY: as above. Only the permission bits change, and only in the kernel's own map.
+    unsafe { slot.write_volatile((pte & !(PTE_R | PTE_W | PTE_X)) | rwx) };
+    Ok(())
+}
+
+/// Clear `X` on every leaf of the kernel's map that does not lie inside `[text_lo, text_hi)`, at every
+/// level. Run once, after `protect_kernel_page` has cut `.text` out at 4 KiB, so that a leaf holding any
+/// of `.text` is already a table and never a leaf this pass would strip. RAM, the page tables and every
+/// device window are then data, never code (backlog/90 D21). Returns how many leaves lost `X`.
+pub fn strip_kernel_exec(root: u64, text_lo: u64, text_hi: u64) -> usize {
+    let mut stripped = 0;
+    let mut strip = |slot: *mut u64, va: u64, span: u64| {
+        // SAFETY: a slot of the kernel's own tables, reached from its root by the walk below.
+        let pte = unsafe { slot.read_volatile() };
+        if !pte_is_valid(pte) || !pte_is_leaf(pte) || pte & PTE_X == 0 {
+            return;
+        }
+        if va < text_hi && va + span > text_lo {
+            return; // holds text; protect_kernel_page left the text pages themselves executable
+        }
+        // SAFETY: as above. One bit, in the kernel's own map.
+        unsafe { slot.write_volatile(pte & !PTE_X) };
+        stripped += 1;
+    };
+    for i2 in 0..512u64 {
+        let va2 = i2 << 30;
+        // SAFETY: the kernel's root, a page-aligned table it owns; i2 < 512.
+        let slot2 = unsafe { (root as *mut u64).add(i2 as usize) };
+        // SAFETY: as above.
+        let p2 = unsafe { slot2.read_volatile() };
+        if !pte_is_valid(p2) { continue; }
+        if pte_is_leaf(p2) { strip(slot2, va2, 1 << 30); continue; }
+        let t1 = pte_phys(p2);
+        for i1 in 0..512u64 {
+            let va1 = va2 + (i1 << 21);
+            // SAFETY: a level-1 table this kernel wrote; i1 < 512.
+            let slot1 = unsafe { (t1 as *mut u64).add(i1 as usize) };
+            // SAFETY: as above.
+            let p1 = unsafe { slot1.read_volatile() };
+            if !pte_is_valid(p1) { continue; }
+            if pte_is_leaf(p1) { strip(slot1, va1, 1 << 21); continue; }
+            let t0 = pte_phys(p1);
+            for i0 in 0..512u64 {
+                // SAFETY: a level-0 table this kernel wrote; i0 < 512.
+                strip(unsafe { (t0 as *mut u64).add(i0 as usize) }, va1 + (i0 << 12), 1 << 12);
+            }
+        }
+    }
+    stripped
+}
+
 /// Copy the kernel's identity mapping into a new address space, WITHOUT disturbing what the task
 /// already has there.
 ///

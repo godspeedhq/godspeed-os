@@ -611,6 +611,18 @@ extern "C" fn riscv_boot_main(hartid: usize, fdt: *const u8) -> ! {
         print_str("riscv64: TRAP VECTOR REFUSED - handler address is not 4-byte aligned\n");
     }
 
+    // `kernel-wx-test`: write one byte of `.text` back to itself, so W^X is shown to refuse it - a store
+    // page fault and every hart halted - where the old map took it in silence (backlog/90 D21).
+    #[cfg(feature = "kernel-wx-test")]
+    {
+        print_str("kernel-wx-test: writing to the kernel's own text\n");
+        let at = (&raw const __kernel_start) as *mut u8;
+        // SAFETY: test builds only. The byte written is the byte read, so the image is unchanged if the
+        // store is allowed; with W^X it faults, which is the point.
+        unsafe { at.write_volatile(at.read_volatile()) };
+        print_str("kernel-wx-test: the write to text was ALLOWED\n");
+    }
+
     probe_rdcycle();
     calibrate_cycle_counter();
 
@@ -3862,6 +3874,39 @@ fn enable_paging(bi: &BootInfo) {
         return;
     }
 
+    // W^X FOR THE KERNEL (backlog/90 D21). The leaves above are read, write AND execute, so a kernel bug
+    // that wrote attacker-chosen bytes anywhere in RAM could then run them. `.text` becomes read+execute
+    // and `.rodata` read-only, at 4 KiB, and then every other leaf - RAM, the page tables, the device
+    // windows - loses execute. In that order, and the strip only if every text page was cut out: a
+    // failure part-way leaves the old map, which is weaker but runs, rather than a kernel that cannot
+    // execute its own next instruction once `satp` is written.
+    let text_lo = (&raw const __kernel_start) as u64 & !0xfff;
+    let rodata_lo = (&raw const __rodata_start) as u64;
+    let data_lo = (&raw const __data_start) as u64;
+    let mut wx = true;
+    let mut va = text_lo;
+    while wx && va < data_lo {
+        let rwx = if va < rodata_lo { sv39::PTE_R | sv39::PTE_X } else { sv39::PTE_R };
+        wx = sv39::protect_kernel_page(root, va, rwx).is_ok();
+        va += 4096;
+    }
+    if wx {
+        let n = sv39::strip_kernel_exec(root, text_lo, rodata_lo);
+        print_str("riscv64: kernel W^X - text ");
+        print_hex(text_lo);
+        print_str("..");
+        print_hex(rodata_lo);
+        print_str(" read+execute, rodata to ");
+        print_hex(data_lo);
+        print_str(" read-only, execute cleared on ");
+        print_dec(n as u64);
+        print_str(" other leaves\n");
+    } else {
+        print_str("riscv64: kernel W^X NOT applied - could not map ");
+        print_hex(va);
+        print_str(" at 4 KiB; the kernel's memory stays writable AND executable\n");
+    }
+
     print_str("riscv64: enabling paging, satp root ");
     print_hex(root);
     print_str("\n");
@@ -4164,6 +4209,9 @@ fn start_timer(hz: u32) -> bool {
 unsafe extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
+    // Page-aligned section starts from the linker script, for the kernel's W^X map (`enable_paging`).
+    static __rodata_start: u8;
+    static __data_start: u8;
 }
 
 /// Regions handed to the frame allocator. FIXED, no heap (§26.6.1): a machine that describes more

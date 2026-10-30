@@ -15,8 +15,10 @@ SECTIONS {
         KEEP(*(.text.boot))
         *(.text .text.*)
     }
-    .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) *(.srodata .srodata.*) }
-    .data   : ALIGN(0x1000) { *(.data .data.*) *(.sdata .sdata.*) }
+    /* Page-aligned starts, so the kernel map can make `.text` read+execute and `.rodata` read-only
+       at 4 KiB, and everything from `.data` on read+write without execute (W^X, backlog/90 D21). */
+    .rodata : ALIGN(0x1000) { __rodata_start = .; *(.rodata .rodata.*) *(.srodata .srodata.*) }
+    .data   : ALIGN(0x1000) { __data_start = .; *(.data .data.*) *(.sdata .sdata.*) }
 
     . = ALIGN(16);
     __bss_start = .;
