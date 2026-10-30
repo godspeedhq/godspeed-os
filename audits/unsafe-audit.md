@@ -2778,7 +2778,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/dtb.rs | 6 | permitted |
 | arch/arm/irq.rs | 18 | permitted |
 | arch/arm/meminit.rs | 4 | permitted |
-| arch/arm/mmu.rs | 8 | permitted |
+| arch/arm/mmu.rs | 10 | permitted |
 | arch/arm/video.rs | 17 | permitted |
 | arch/arm/bootcon.rs | 2 | permitted |
 | arch/arm/page_tables.rs | 37 | permitted |
@@ -2788,7 +2788,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 17 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 55 | permitted |
+| arch/arm/mod.rs | 56 | permitted |
 | arch/loongarch64/mod.rs | 24 | permitted |
 | arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
@@ -3966,3 +3966,16 @@ register that cannot fault: `MPIDR_EL1` affinity 0 on aarch64, `tp` on riscv64.
 |---|---|
 | aarch64 `reporting_flag`: `mrs mpidr_el1` (1) | A side-effect-free system-register read at EL1, valid in any context including inside a fault |
 | riscv64 `reporting_flag`: `mv tp` (1) | A general-register read with no side effects; `tp` is the hart id in the kernel, as `get_lapic_id` reads it |
+
+## `arch/arm/mmu.rs` 8 -> 10, `mod.rs` 55 -> 56 (2026-10-30): the kernel's own memory is W^X
+
+backlog/90 D21. The Pi 2 mapped all of RAM with read/write/execute 1 MiB sections. `build_tables` now maps
+RAM never-executable, and the sections holding the image as 4 KiB pages from a small static set (`WX_L2`):
+`.text` read-only and executable, `.rodata` read-only, the rest read/write, all PL1 only. A task's L1 shares
+those tables by pointer, and its reclaim frees only tables it owns.
+
+| Block | Why it is sound |
+|---|---|
+| `build_tables`: `&mut WX_L2` (1) | Single-threaded boot with the MMU off, as the `L1` borrow above it; the static is referenced only here and, through the L1 entries written next, by the table walker |
+| `unsafe extern "C"` for `__text_start`, `__rodata_start`, `__data_start` (1) | Linker symbols; only their addresses are taken, never read through |
+| mod.rs, `kernel-wx-test` only: a byte of the kernel's code written back to itself (1) | Test builds only; the value written is the value read, so the image is unchanged if the store is allowed, and with W^X it faults, which is what the feature exists to show |

@@ -950,6 +950,17 @@ extern "C" fn arm_boot_main() -> ! {
     timer::write_dec_pub(video::emmc_clock_hz());
     pl011_write(b" Hz\r\n");
     mmu::enable();
+    // `kernel-wx-test`: write one byte of the kernel's own code back to itself, so W^X is shown to
+    // refuse it - a permission abort, reported - where the old map took it in silence (backlog/90 D21).
+    #[cfg(feature = "kernel-wx-test")]
+    {
+        pl011_write(b"kernel-wx-test: writing to the kernel's own text\r\n");
+        let at = arm_boot_main as *const () as *mut u8;
+        // SAFETY: test builds only. The byte written is the byte read, so the image is unchanged if the
+        // store is allowed; with W^X it faults, which is the point.
+        unsafe { at.write_volatile(at.read_volatile()) };
+        pl011_write(b"kernel-wx-test: the write to text was ALLOWED\r\n");
+    }
     // Map the framebuffer and bring up the text console over it, so the boot log + shell prompt appear
     // on the TV (mirrored from serial). Everything logged from here on shows on the display.
     if let Some(fb) = fb {

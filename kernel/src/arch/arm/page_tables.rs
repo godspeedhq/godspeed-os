@@ -81,7 +81,7 @@ const L2_TYPE_SMALL: u32 = 0b10; // small page; bit 0 (XN) is ORed in separately
 ///
 /// AP/APX come from `WRITABLE`; XN from `NO_EXEC`. `S` (shareable) matches the section mappings `mmu.rs`
 /// made, so a page and a section covering the same memory agree on shareability.
-fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
+pub(super) fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
     let mut d = (pa & 0xFFFF_F000) | L2_TYPE_SMALL;
     if flags.contains(PageFlags::PCD) && flags.contains(PageFlags::PWT) {
         // Normal non-cacheable: TEX=0b001, C=0, B=0. Uncached but gathering - see the note above.
@@ -119,7 +119,7 @@ fn l2_small_page(pa: u32, flags: PageFlags) -> u32 {
 }
 
 /// Encode an L1 descriptor pointing at an L2 table at `l2_pa` (1 KiB aligned), domain 0.
-fn l1_table_ptr(l2_pa: u32) -> u32 {
+pub(super) fn l1_table_ptr(l2_pa: u32) -> u32 {
     (l2_pa & 0xFFFF_FC00) | L1_TYPE_TABLE
 }
 
@@ -583,11 +583,14 @@ pub unsafe fn fill_kernel_identity(pt_root: u32) {
                 // Kernel section under a service table: fill the L2's holes with kernel pages.
                 let l2 = (d & 0xFFFF_FC00) as *mut u32;
                 let sect_base = s & 0xFFF0_0000;         // the 1 MiB physical base
+                // The section's execute-never, carried to its pages: kernel memory outside `.text` is
+                // never executable (W^X, backlog/90 D21), and a page copied from it must not be either.
+                let xn = if s & (1 << 4) != 0 { PageFlags::NO_EXEC } else { PageFlags::empty() };
                 for j in 0..256 {
                     if l2.add(j).read_volatile() == 0 {
                         let page_pa = sect_base | (j as u32) << 12;
                         // Kernel RW, PL0 none (PRESENT|WRITABLE) - present but privileged.
-                        l2.add(j).write_volatile(l2_small_page(page_pa, PageFlags::PRESENT | PageFlags::WRITABLE));
+                        l2.add(j).write_volatile(l2_small_page(page_pa, PageFlags::PRESENT | PageFlags::WRITABLE | xn));
                     }
                 }
                 clean_dcache(l2 as u32, 1024);

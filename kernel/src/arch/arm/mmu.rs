@@ -139,12 +139,54 @@ fn build_tables() {
     // accessed only here and in `enable()`, both before any other core or task exists.
     let l1 = unsafe { &mut *core::ptr::addr_of_mut!(L1) };
 
-    // RAM: Normal memory, executable (the kernel's own text lives down here).
+    // RAM: Normal memory, NEVER executable - except the kernel's own `.text`, below (W^X, backlog/90
+    // D21). RAM is where a kernel bug that wrote chosen bytes would put them; being unable to run them
+    // is the point.
     let ram_end = RAM_END.load(Ordering::Relaxed);
     let mut pa = 0u32;
     while pa < ram_end {
-        l1.0[(pa / SECTION_SIZE) as usize] = section(pa, false, true);
+        l1.0[(pa / SECTION_SIZE) as usize] = section(pa, false, false);
         pa += SECTION_SIZE;
+    }
+
+    // The sections holding the image, as 4 KiB pages: `.text` read-only and executable, `.rodata`
+    // read-only, the rest read/write - all PL1 only. A task's L1 shares these tables by pointer
+    // (`fill_kernel_identity`), and its reclaim frees no table it does not own.
+    let (text_lo, rodata_lo, data_lo) = (
+        core::ptr::addr_of!(__text_start) as u32,
+        core::ptr::addr_of!(__rodata_start) as u32,
+        core::ptr::addr_of!(__data_start) as u32,
+    );
+    let first = (text_lo / SECTION_SIZE) as usize;
+    let last = ((data_lo - 1) / SECTION_SIZE) as usize;
+    if last - first < WX_L2_TABLES {
+        use super::page_tables::PageFlags;
+        // SAFETY: as above - single-threaded boot with the MMU off; `WX_L2` is referenced only here and,
+        // through the L1 entries written below, by the table walker.
+        let wx = unsafe { &mut *core::ptr::addr_of_mut!(WX_L2) };
+        for (n, i) in (first..=last).enumerate() {
+            let sect = (i as u32) * SECTION_SIZE;
+            for j in 0..256u32 {
+                let p = sect | (j << 12);
+                let flags = if p >= text_lo && p < rodata_lo {
+                    PageFlags::PRESENT
+                } else if p >= rodata_lo && p < data_lo {
+                    PageFlags::PRESENT | PageFlags::NO_EXEC
+                } else {
+                    PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::NO_EXEC
+                };
+                wx.0[n][j as usize] = super::page_tables::l2_small_page(p, flags);
+            }
+            l1.0[i] = super::page_tables::l1_table_ptr(core::ptr::addr_of!(wx.0[n]) as u32);
+        }
+        WX_DONE.store(true, Ordering::Relaxed);
+    } else {
+        // More of the image than the tables cover: leave those sections executable, and say so.
+        let mut i = first;
+        while i <= last {
+            l1.0[i] = section((i as u32) * SECTION_SIZE, false, true);
+            i += 1;
+        }
     }
 
     // Peripherals + core-local: Device, never executable.
@@ -158,6 +200,22 @@ fn build_tables() {
         l1.0[(pa / SECTION_SIZE) as usize] = section(pa, true, false);
         pa += SECTION_SIZE;
     }
+}
+
+/// Page tables for the image's sections, for W^X (`build_tables`). The image ends below the service
+/// context page at 0x3ff000 (`kernel-arm.ld` asserts it), so four 1 MiB sections from 0x8000 cover it.
+const WX_L2_TABLES: usize = 4;
+#[repr(C, align(1024))]
+struct WxL2([[u32; 256]; WX_L2_TABLES]);
+static mut WX_L2: WxL2 = WxL2([[0; 256]; WX_L2_TABLES]);
+/// Whether `build_tables` made the image W^X, for `enable`'s line.
+static WX_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "C" {
+    // Page-aligned section starts from `kernel-arm.ld`, for W^X.
+    static __text_start: u8;
+    static __rodata_start: u8;
+    static __data_start: u8;
 }
 
 /// Ask the hardware to translate a VA, using the ATS1CPR address-translation operation.
@@ -251,6 +309,11 @@ pub fn enable() {
     // and the caches on together, so the selftest below runs cached. It used to be printed after,
     // which read as though the selftest had passed with the caches off (backlog/fixed/80 K25).
     pl011_write(b"arm32: caches ON (I + D + branch prediction)\r\n");
+    pl011_write(if WX_DONE.load(Ordering::Relaxed) {
+        b"arm32: kernel W^X - text read-only+executable, rodata read-only, all other RAM never-executable\r\n"
+    } else {
+        b"arm32: kernel W^X NOT applied - the image spans more sections than WX_L2 holds; it stays writable AND executable\r\n"
+    });
     selftest();
 }
 

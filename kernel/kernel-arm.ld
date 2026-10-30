@@ -16,14 +16,17 @@ SECTIONS {
     . = 0x8000;
 
     .text : ALIGN(0x1000) {
+        __text_start = .;
         KEEP(*(.text.boot))     /* _start first - the firmware branches to byte 0 */
         . = ALIGN(32);          /* VBAR ignores the low 5 bits: the table MUST be 32-byte aligned */
         KEEP(*(.text.vectors))
         *(.text .text.*)
     }
 
-    .rodata : ALIGN(0x1000) { *(.rodata .rodata.*) }
-    .data   : ALIGN(0x1000) { *(.data .data.*) }
+    /* Page-aligned starts, so the kernel map can make `.text` read-only+executable and `.rodata`
+       read-only at 4 KiB, and everything else never-executable (W^X, backlog/90 D21). */
+    .rodata : ALIGN(0x1000) { __rodata_start = .; *(.rodata .rodata.*) }
+    .data   : ALIGN(0x1000) { __data_start = .; *(.data .data.*) }
     __kernel_data_end = .;
 
     /* KERNEL MEMORY MUST NOT SIT WHERE A SERVICE'S PAGES DO. The kernel reaches its own memory at its
