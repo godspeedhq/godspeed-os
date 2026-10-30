@@ -1746,6 +1746,14 @@ fn handle_resource_mint(rights_bits: u64, out_id_ptr: u64, _a2: u64) -> i64 {
             return -1;
         }
     };
+    // A minter killed from another core while it was in this syscall may have had its band already
+    // released (`release_owner`, on the kill path). A slot claimed after that would outlive its owner:
+    // nothing would free it, and the next holder of this endpoint id would receive its invocations
+    // (backlog/90 D14). Asked AFTER the claim, so a kill either released it or sees it here.
+    if scheduler::current_task_is_dead() {
+        delegated::release(id);
+        return -1;
+    }
     let cap = mint_cap(id, rights);
     let slot = match scheduler::current_task_insert_cap(cap) {
         Ok(s)  => s,

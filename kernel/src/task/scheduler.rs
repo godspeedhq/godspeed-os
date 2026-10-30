@@ -2853,10 +2853,52 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // if-owner guard is a cheap no-op for the common case of a non-owner death.
         crate::arch::imp::release_console_foreground_if_owner(slot as u32);
 
+        // DEVICE-KEYED STATE FIRST, before anything announces the death or frees an id (backlog/90 D14).
+        // The death is published below - the name cleared, the supervisor told - and a fast respawn then
+        // installs its OWN confinement and bus mastering. Released after that, as it was, the old
+        // instance's teardown cleared the new one's bus master and reverted its DTE to passthrough: a
+        // driver that logged "confined" and ran unconfined with its DMA stopped. And an IRQ route is keyed
+        // on an endpoint id, so it must go before the id can be handed to someone else.
+        let reply_ep = ep_from_u64(TASK_REPLY_ENDPOINT[slot].load(Ordering::Relaxed));
+        {
+            // DMA quiesce is the cure for the chaos `max-carnage` page-table corruption (the round-4286
+            // KERNEL PF): under kill/respawn churn a driver's DMA frames are freed and REUSED (as a page
+            // table, say), and the controller's still-live engine - EHCI's periodic schedule, an in-flight
+            // AHCI command - scribbles into them. Clearing Bus-Master-Enable before the frame reclaim below
+            // stops new DMA, and in-flight transactions drain during the rest of the kill. KEYED ON THE
+            // DEVICE THIS TASK WAS GIVEN (`TASK_HW_BDF`, TAKEN so a reused slot cannot inherit it), not on
+            // a list of names - a fifth DMA driver died mastering until somebody remembered to add it.
+            // `quiesce_device_of` also (H1) reverts the IOMMU DTE and frees the I/O page table for ANY
+            // confined device, and skips one another live task still holds (a live handover).
+            quiesce_device_of(slot, take_task_hw_bdf(slot));
+
+            // The display likewise. The terminal died, so nothing renders it: hand the screen back to the
+            // kernel's floor until the respawned instance takes it (invariant 12) - the task granted the
+            // DISPLAY, not whatever is called `console`. Here and not after the death is announced: a fast
+            // respawn takes the screen at its own spawn, and a later reclaim took it back from under it.
+            // Not while another live task holds it (a live handover's successor).
+            if task_hw_kind(slot) == crate::task::kind::FRAMEBUFFER
+                && other_live_holder_of_kind(crate::task::kind::FRAMEBUFFER, slot).is_none()
+            {
+                crate::bootcon::reclaim_on_death();
+            }
+
+            // Interrupt routes BY ENDPOINT, not by name: a hardcoded name list missed `dwc2` and every
+            // ARM USB restart left its old claim ("IRQ 41 already routed - overwriting"). The routing
+            // table maps line -> owning endpoint, so ask it; `unregister_endpoint` also MASKS each line, so
+            // a reused id cannot inherit the dead driver's interrupts.
+            let mut released = 0;
+            if let Some(ep) = task_ep { released += crate::interrupt::route::unregister_endpoint(ep); }
+            if let Some(rep) = reply_ep { released += crate::interrupt::route::unregister_endpoint(rep); }
+            if released > 0 {
+                crate::kprintln!(
+                    "kill_task: slot={} '{}' released {} IRQ route(s)", slot, task_name, released);
+            }
+        }
+
         // Kill the task's endpoint if it has one.
         // The reply mailbox dies with its task. Reclaiming only the primary is what filled the
         // routing table and panicked the kernel - see `TASK_REPLY_ENDPOINT`.
-        let reply_ep = ep_from_u64(TASK_REPLY_ENDPOINT[slot].load(Ordering::Relaxed));
         if let Some(rep_id) = reply_ep {
             let (rx, tx) = crate::ipc::routing::kill_endpoint(rep_id);
             if let Some(s) = rx { if s != slot { wake_by_slot(s, -7); } }
@@ -2994,31 +3036,8 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                 }
             }
 
-            // Driver-death IRQ-route teardown (Item 2, driver-death quiesce), BEFORE freeing the id.
-            // A driver that registered a hw_interrupt line left a route in IRQ_TABLE; the id is about to
-            // be freed and REUSED, and IRQ_TABLE keys on a bare endpoint id, so a reused id could inherit
-            // the dead driver's interrupts. Clear the route and mask the line now (while the id is still
-            // ours); the respawned driver re-registers and re-opens its gate.
-            // RELEASE BY ENDPOINT, not by service NAME. This was a hardcoded list - "xhci" =>
-            // 0x28, "ehci" => 0x29, anything else => release nothing - and `dwc2` was not on it, so
-            // the ARM USB driver kept its IRQ route across every restart. The kernel said so every
-            // time ("IRQ 41 already routed - overwriting (second claim or a missed unregister?)"),
-            // and the answer was: a missed unregister, here. Interrupt delivery to that service was
-            // erratic across restarts because of it.
-            //
-            // The routing table already maps line -> owning endpoint, so ask it. A list of names
-            // cannot help but go stale as services are added, renamed, or ported to an arch with a
-            // different vector; this cannot. Masking still happens - `unregister_endpoint` masks
-            // each line it releases, which is what stops a reused endpoint id inheriting the dead
-            // driver's interrupts.
-            let mut released = crate::interrupt::route::unregister_endpoint(ep_id);
-            if let Some(rep) = reply_ep {
-                released += crate::interrupt::route::unregister_endpoint(rep);
-            }
-            if released > 0 {
-                crate::kprintln!(
-                    "kill_task: slot={} '{}' released {} IRQ route(s)", slot, task_name, released);
-            }
+            // (The IRQ routes of both endpoints were released at the top of the kill, before any id
+            // could be freed - backlog/90 D14.)
 
             // Reclaim the endpoint id itself for reuse (§14.2). Its routing entry is Dead and its
             // resource generation is bumped, so handing the id out again is safe: the next endpoint to
@@ -3080,18 +3099,6 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // The rule is now one fact in one place: the supervisor marks what it manages WATCHED, and
         // `V-managed-watched` checks that chain. Two lists describing one fact is the shape that caused
         // this, and it was the third time (ARM_SERVICES vs arm_built was the second).
-        // The terminal died, so nothing is rendering the display any more. Hand the screen back to the
-        // kernel's boot floor until the respawned instance takes it, or the machine goes dark with no
-        // way to say why (invariant 12).
-        // The task granted the DISPLAY, not whatever is called `console`: the kernel gave it the framebuffer
-        // and takes it back from the same record.
-        // Unless another live task holds the display: a live handover's successor took the screen at its
-        // own spawn, and the predecessor ending must not take it back from under it.
-        if task_hw_kind(slot) == crate::task::kind::FRAMEBUFFER
-            && other_live_holder_of_kind(crate::task::kind::FRAMEBUFFER, slot).is_none()
-        {
-            crate::bootcon::reclaim_on_death();
-        }
         // Reported to the supervisor because the supervisor ASKED, at spawn, to hear of this task's death -
         // not because its name is on a list here. See the restart counter above.
         //
@@ -3154,33 +3161,8 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
             crate::task::flag_supervisor_respawn();
         }
 
-        // A dying DMA-capable driver: QUIESCE its DMA, then (H1) reclaim its IOMMU resources.
-        //
-        // DMA quiesce is the cure for the chaos `max-carnage` page-table corruption (the round-4286 KERNEL
-        // PF, then caught + skipped by page_tables::walk's guard): under the kill/respawn churn a driver's
-        // DMA frames get freed and REUSED (e.g. as a page table), and the controller's still-live engine -
-        // EHCI's continuous periodic schedule, or an in-flight AHCI command - scribbles foreign data into
-        // them, landing a non-PTE value in a PTE slot. On the T630 ehci + block-driver are IOMMU-PASSTHROUGH,
-        // so nothing else stops the stray write. We clear PCI Bus-Master-Enable BEFORE the frame reclaim
-        // below (the controller cannot start new DMA; any in-flight transaction drains during the kill's
-        // remaining work + the spin-wait); the respawned driver re-enables bus-mastering during init.
-        // xhci is confined (its stray DMA would fault, not corrupt) but quiescing it too is harmless +
-        // correct on a no-IOMMU machine where it is passthrough as well.
-        //
-        // KEYED ON THE DEVICE THIS TASK WAS GIVEN, not on its name. This was a list of four names (xhci,
-        // ehci, block-driver, nic-driver), so a fifth DMA driver - audio-driver - died with its
-        // controller still mastering until somebody remembered to add it. The record is written only by
-        // a DMA driver's spawn, so it IS the question, and the kernel learns nothing it did not hold.
-        //
-        // THE DEVICE THIS TASK WAS GIVEN, remembered from its own spawn - not a table of which service
-        // drives which controller. See `TASK_HW_BDF`. TAKEN, not read: see `take_task_hw_bdf` for what a
-        // stale record in a reused slot would otherwise stop. `quiesce_device_of` clears bus mastering and
-        // then (H1) reverts the IOMMU DTE to passthrough and frees the I/O page table so a restart
-        // re-confines cleanly - for ANY device, not by name (this was `xhci`/`ehci` only, so a third
-        // confined driver leaked its I/O page table on every restart). `release_device` does nothing for a
-        // device that was never confined, so asking for every device is exact. It skips a device another
-        // live task still holds - a live handover's successor - and says so.
-        quiesce_device_of(slot, take_task_hw_bdf(slot));
+        // (The dying task's device was quiesced at the top of the kill, before its death was published -
+        // backlog/90 D14. The frame reclaim below still runs after it, which is the order max-carnage needs.)
 
         // SMP safety: spin until no other core has CORE_CURRENT[c] == slot.
         //
