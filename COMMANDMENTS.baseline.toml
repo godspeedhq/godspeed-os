@@ -122,6 +122,9 @@ features = [
 # Test builds only: the drain leaves a pending page-table root alone, so the kill path is shown to
 # free a second self-kill's predecessor rather than overwrite it (backlog/90 D9).
     "pml4-pending-test",
+# Test builds only: one SpawnImage finds its caller's capability table full, so the refusal is shown
+# to come before the child starts rather than after (backlog/90 D27).
+    "spawn-full-table-test",
 # Test builds only: fails the first device and the first framebuffer spawn after their grants, so the
 # failed-spawn unwind is shown to quiesce the device and give the screen back (backlog/90 D15).
     "spawn-unwind-test",

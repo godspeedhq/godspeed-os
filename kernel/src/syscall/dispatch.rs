@@ -1152,7 +1152,43 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         }
     }
 
-    match crate::task::spawn_from_image(
+    // Reserve the slot the endpoint cap will go in BEFORE the child exists (backlog/90 D27). Inserting it
+    // only after the spawn meant a caller whose table was full got an error for a child that was already
+    // running: the supervisor recorded a failure, and a service ran that nothing held a name -> cap for.
+    // The placeholder grants nothing - no rights, on resource 0, which is never registered - and it holds
+    // the slot for the length of the spawn. An error from here on means nothing was started.
+    let placeholder = crate::capability::mint_cap_at(
+        crate::capability::cap::ResourceId(0), Rights::empty(),
+        crate::capability::generation::Generation::INITIAL);
+    // `spawn-full-table-test`: the fifth call finds the table full (backlog/90 D27). Test builds only.
+    #[cfg(feature = "spawn-full-table-test")]
+    let mut fillers = ([0usize; 64], 0usize);
+    #[cfg(feature = "spawn-full-table-test")]
+    {
+        static CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) == 4 {
+            crate::kprintln!("spawn-full-table-test: filling the caller's capability table before spawning {}", name);
+            while fillers.1 < fillers.0.len() {
+                match scheduler::current_task_insert_cap(placeholder) {
+                    Ok(slot) => { fillers.0[fillers.1] = slot; fillers.1 += 1; }
+                    Err(_)   => break,
+                }
+            }
+        }
+    }
+    let reservation = scheduler::current_task_insert_cap(placeholder);
+    #[cfg(feature = "spawn-full-table-test")]
+    for &slot in &fillers.0[..fillers.1] { scheduler::current_task_remove_cap(slot); }
+    let reserved = match reservation {
+        Ok(slot) => slot,
+        Err(e)   => {
+            crate::kprintln!("task: SpawnImage of {} refused - {}'s capability table is full, so the new service's endpoint cap would have nowhere to go",
+                name, scheduler::task_name(scheduler::current_task_slot()));
+            return cap_err_to_i64(e);
+        }
+    };
+
+    let spawned = crate::task::spawn_from_image(
         name,
         crate::loader::ImageSource::User { base: req.image_ptr, len: req.image_len as usize },
         core_override,
@@ -1170,7 +1206,10 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
         req.flags & SPAWN_FLAG_PEERS_GRANT != 0,
         req.flags & SPAWN_FLAG_WATCHED     != 0,
         req.flags & SPAWN_FLAG_HANDOVER    != 0,
-    ) {
+    );
+    // The placeholder goes whatever happened; on success the real cap takes the slot it leaves free.
+    scheduler::current_task_remove_cap(reserved);
+    match spawned {
         // Hand back a SEND|GRANT cap to the new endpoint, as `SpawnReturningEndpoint` does: the
         // spawner has to be able to record `name -> cap` for the service it just started, or it
         // cannot wire dependents to it and cannot re-wire them after a restart.
