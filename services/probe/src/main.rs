@@ -277,6 +277,7 @@ const MODE_IRQ_RECV:        u32 = 160; // IR1A: recv interrupt event; log pass
 const MODE_ADV_A11:         u32 = 161; // gated query denied without INTROSPECT cap
 const MODE_ADV_A12:         u32 = 162; // reboot denied without REBOOT cap
 const MODE_ADV_A13:         u32 = 163; // AcquireSendCap denied without ACQUIRE_ANY / declared peer
+const MODE_ADV_A16:         u32 = 216; // CallDeadline bounded on the SEND leg too (a full, undrained target)
 
 // Brutal property test modes - Milestone 16.
 const MODE_PROP_BP1:        u32 = 104; // BP1: cap unforgeability - 100k iterations
@@ -420,6 +421,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_A11         => mode_adv_a11(&ctx),
         MODE_ADV_A12         => mode_adv_a12(&ctx),
         MODE_ADV_A13         => mode_adv_a13(&ctx),
+        MODE_ADV_A16         => mode_adv_a16(&ctx),
         MODE_CHAOS_C2        => mode_chaos_c2(&ctx),
         MODE_CHAOS_C2_MON    => mode_chaos_c2_monitor(&ctx),
         MODE_CHAOS_C3        => mode_chaos_c3(&ctx),
@@ -2222,6 +2224,39 @@ fn mode_adv_a13(ctx: &ServiceContext) -> ! {
         idle(ctx);
     }
     ctx.log("adv: A13 pass - AcquireSendCap denied for a non-holder, non-declared service");
+    idle(ctx)
+}
+
+fn mode_adv_a16(ctx: &ServiceContext) -> ! {
+    // A16 - CallDeadline's bound covers the SEND leg (CLAUDE.md 8.2, backlog/90 D4). The target is this
+    // probe's OWN endpoint, filled to the brim first, so the request can only wait on a queue that will
+    // never drain: the one task that could drain it is the caller. Before the fix the deadline was armed
+    // after the send, so this call blocked as a sender for ever; now it must come back timed out, in
+    // about the second it was given.
+    let (sg, recv) = match (gs::cap::self_grant(ctx), ctx.recv_handle()) {
+        (Ok(s), Some(r)) => (s, r),
+        _ => { ctx.log("adv: A16 FAIL - no endpoint of its own to call"); idle(ctx); }
+    };
+    let fill = Message::from_bytes(b"a16");
+    let mut queued = 0u32;
+    while queued < 64 && gs::ipc::try_send_to(ctx, sg, &fill).is_ok() {
+        queued += 1;
+    }
+    let reply = match gs::cap::duplicate(ctx, sg) {
+        Ok(r) => r,
+        Err(_) => { ctx.log("adv: A16 FAIL - could not derive a reply cap"); idle(ctx); }
+    };
+    let t0 = gs::task::epoch_secs_monotonic(ctx);
+    let mut buf = [0u8; 64];
+    let out = godspeed_sdk::ipc::call_deadline_into(sg.handle(), reply.handle(), recv, b"a16-request", &mut buf, 1);
+    let took = gs::task::epoch_secs_monotonic(ctx).saturating_sub(t0);
+    match out {
+        Ok(None) if took <= 3 => ctx.log_fmt(format_args!(
+            "adv: A16 pass - a 1 s CallDeadline to a full, undrained endpoint ({} queued) timed out in about {} s", queued, took)),
+        Ok(None) => ctx.log_fmt(format_args!("adv: A16 FAIL - timed out, but after {} s for a 1 s bound", took)),
+        Ok(Some(_)) => ctx.log("adv: A16 FAIL - a reply came from an endpoint nobody drains"),
+        Err(e) => ctx.log_fmt(format_args!("adv: A16 FAIL - {:?} instead of a timeout", e)),
+    }
     idle(ctx)
 }
 

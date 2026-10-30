@@ -39,7 +39,7 @@ a `TestSpec` table in `osdev/src/validator.rs`, or a function in `osdev/src/shel
 | Fuzz        | Crash resistance on adversarial/malformed inputs  | Active              |
 | Stress      | No drift, leak, or corruption under sustained load| Active              |
 | Performance | Latency / throughput baselines                    | ✅ 10/10 + 10/10 brutal |
-| Adversarial | Capability isolation under direct attack          | A1-A15 + BA1-BA10 brutal |
+| Adversarial | Capability isolation under direct attack          | A1-A16 + BA1-BA10 brutal |
 | Chaos       | Graceful degradation under partial failures       | C1-C7 + C1B (8 cases) + BC1-BC7 brutal |
 
 ## Philosophy (§22.2)
@@ -59,6 +59,6 @@ osdev test property          # run property tests (P1-P10)
 osdev test fuzz              # run fuzz corpus (F1-F8)
 osdev test stress            # run stress scenarios (S1-S10)
 osdev test perf              # run benchmarks (B1-B10)
-osdev test adv               # run red-team tests (A1-A15)
+osdev test adv               # run red-team tests (A1-A16)
 osdev test chaos             # run chaos scenarios (C1-C7, C1B)
 ```

@@ -2537,6 +2537,7 @@ Adversarial tests verify capability isolation holds under direct attack. The sys
 | A13 | Service invokes `AcquireSendCap` without the capability                             |
 | A14 | Ring-3 CPU exception (null read, non-canonical read, divide-by-zero) kills the task, not the kernel |
 | A15 | A bad user pointer kills the caller, not the kernel                                 |
+| A16 | `CallDeadline` to a full queue nobody drains returns on its deadline, never blocks for ever |
 
 Bar: every attack returns a defined error. Any attack that succeeds is a security hole; any attack that panics the kernel is a kernel bug. Both are mandatory fixes.
 

@@ -1579,6 +1579,19 @@ fn do_call(
 
     let my_slot = scheduler::current_task_slot();
 
+    // The deadline bounds the WHOLE call, so it is fixed before the send. It was computed after the
+    // send, so a request to a live peer whose queue was full and not draining blocked as a sender with
+    // no deadline armed, and a "1 s" CallDeadline returned only when the peer drained or died - the
+    // unbounded wait this syscall exists to replace (8.2, 26.6; backlog/90 D4).
+    //
+    // A tick IS a scheduler quantum and the quantum is 10 ms (§9.1), so a second is 100 of them.
+    const TICKS_PER_SEC: u64 = 100;
+    let deadline = if deadline_secs == 0 {
+        0
+    } else {
+        scheduler::monotonic_ticks().wrapping_add(deadline_secs.saturating_mul(TICKS_PER_SEC))
+    };
+
     // 4. Send the request to the peer, removing the reply cap once it is delivered/enqueued (exactly
     //    as SendWithCap). On a full queue we block as a sender; the peer dying there wakes us with
     //    EndpointDead via the existing kill_endpoint blocked-sender path (§8.6).
@@ -1593,9 +1606,32 @@ fn do_call(
         Err(IpcError::QueueFull) => {
             // The request (with reply cap) is now the routing table's pending-send; remove our copy.
             scheduler::current_task_remove_cap(reply_slot);
-            let err = scheduler::block_and_reschedule(TaskState::BlockedOnSend);
-            if err != 0 { return err; }   // peer died before the request was delivered
-            // else: queue drained, request delivered - fall through to await the reply.
+            if deadline == 0 {
+                let err = scheduler::block_and_reschedule(TaskState::BlockedOnSend);
+                if err != 0 { return err; }   // peer died before the request was delivered
+                // else: queue drained, request delivered - fall through to await the reply.
+            } else {
+                // Bounded: the timed-wake scan wakes a BlockedOnSend task at its deadline. A wake with 0
+                // is either the delivery (`promote_waiter`) or the deadline, so ask which: the request
+                // is either still recorded as waiting or it is not, and one lock decides that against a
+                // racing delivery. On a timeout it is WITHDRAWN - never sent, so the peer never sees a
+                // request whose caller has gone - and its embedded reply cap goes with it, as the SDK
+                // already assumes for a timeout (the cap is the kernel's once the call is made).
+                loop {
+                    if scheduler::monotonic_ticks() >= deadline {
+                        if crate::ipc::routing::withdraw_blocked_send(my_slot) {
+                            scheduler::clear_wake_deadline(my_slot);
+                            return RECV_TIMED_OUT;
+                        }
+                        break; // delivered just in time
+                    }
+                    if !crate::ipc::routing::is_blocked_sending(my_slot) { break; } // delivered
+                    scheduler::set_wake_deadline(my_slot, deadline);
+                    let err = scheduler::block_and_reschedule(TaskState::BlockedOnSend);
+                    scheduler::clear_wake_deadline(my_slot);
+                    if err != 0 { return err; } // peer died before the request was delivered
+                }
+            }
         }
         // Failure before delivery (peer already dead): the reply cap was NOT transferred and stays in
         // the caller's table; the SDK reclaims it.
@@ -1609,13 +1645,7 @@ fn do_call(
     // ticks, checked before each block, armed with `set_wake_deadline` so the timer wakes us, and
     // cleared on every exit. Reusing the proven pattern rather than inventing a second one.
     //
-    // A tick IS a scheduler quantum and the quantum is 10 ms (§9.1), so a second is 100 of them.
-    const TICKS_PER_SEC: u64 = 100;
-    let deadline = if deadline_secs == 0 {
-        0
-    } else {
-        scheduler::monotonic_ticks().wrapping_add(deadline_secs.saturating_mul(TICKS_PER_SEC))
-    };
+    // (The deadline was fixed before the send, above.)
 
     // WHERE A SLOW CALL ACTUALLY SPENDS ITS TIME - blocked, or going round this loop.
     //

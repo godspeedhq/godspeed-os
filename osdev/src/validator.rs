@@ -615,6 +615,15 @@ static ADV_TESTS: &[TestSpec] = &[
             timeout_secs: 30,
         },
     },
+    TestSpec {
+        id: "A16", name: "call_deadline_bounds_the_send_leg",
+        spec_ref: "CLAUDE.md 8.2 (CallDeadline); backlog/90 D4 - syscall/dispatch.rs do_call",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A16 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A16 FAIL"],
+            timeout_secs: 30,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------

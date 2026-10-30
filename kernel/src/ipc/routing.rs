@@ -213,6 +213,35 @@ pub fn forget_blocked_sender(slot: usize) {
     }
 }
 
+/// Withdraw the send `slot` is blocked in, if it is still waiting: its message is dropped and its
+/// endpoint's count of waiters falls. `true` if there was one to withdraw; `false` if it had already been
+/// delivered (`promote_waiter` took it) or the endpoint died. One lock decides it, so a delivery and a
+/// withdrawal racing for the same message cannot both happen. Used by `CallDeadline` when its deadline
+/// passes with the request still unsent (backlog/90 D4) - a withdrawal by a LIVE task, so unlike
+/// `forget_blocked_sender` it is not counted or reported as an abandoned send.
+pub fn withdraw_blocked_send(slot: usize) -> bool {
+    let mut table = TABLE.lock_irq();
+    let mut p = PENDING.lock();
+    if slot >= p.by_task.len() || p.by_task[slot].ep == 0 {
+        return false;
+    }
+    let ep = EndpointId(p.by_task[slot].ep);
+    p.by_task[slot].ep = 0;
+    p.by_task[slot].msg = None;
+    drop(p);
+    if let Some(idx) = find_index(&*table, ep) {
+        table[idx].waiting = table[idx].waiting.saturating_sub(1);
+    }
+    true
+}
+
+/// Whether `slot` is still blocked with an undelivered send (a read; see `withdraw_blocked_send`).
+pub fn is_blocked_sending(slot: usize) -> bool {
+    let _table = TABLE.lock_irq();
+    let p = PENDING.lock();
+    slot < p.by_task.len() && p.by_task[slot].ep != 0
+}
+
 /// Clear every record naming `ep` (TABLE held). Used when an id is (re)registered: its earlier life's
 /// waiters were drained by its kill path, so finding one here means a drain was missed - said loudly,
 /// by the caller once it has released the table (`say_stale_waiters`, backlog/90 D28). Returns how many.

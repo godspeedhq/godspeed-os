@@ -207,7 +207,7 @@ GodspeedOS treats testing as architecture. The suite is layered - each layer mus
 | Fuzz (F1-F8) | Kernel never panics on user-controllable input |
 | Stress (S1-S10) | No drift, leaks, or corruption over time |
 | Performance (B1-B10) | Latency / throughput baselines |
-| Adversarial (A1-A15) | Capability isolation under direct attack |
+| Adversarial (A1-A16) | Capability isolation under direct attack |
 | Chaos (C1-C7) | Graceful degradation under partial failures |
 
 The layers above are categories - each generalises over many inputs. Below them sit **scenario tests**,

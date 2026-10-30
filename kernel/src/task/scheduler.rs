@@ -624,9 +624,13 @@ pub fn scan_timed_wakes() {
     }
     for slot in 0..MAX_TASKS {
         let deadline = TASK_WAKE_DEADLINE[slot].load(Ordering::Relaxed);
+        // BlockedOnSend too: `CallDeadline` arms its deadline before the request is sent, so a call
+        // blocked SENDING to a full queue is woken at its deadline as one blocked awaiting the reply is
+        // (backlog/90 D4). Only a deadline-armed wait sets one, and each clears it on return.
+        let st = TASK_STATE[slot].load(Ordering::Relaxed);
         if deadline != 0
             && now >= deadline
-            && TASK_STATE[slot].load(Ordering::Relaxed) == TaskState::BlockedOnRecv as u8
+            && (st == TaskState::BlockedOnRecv as u8 || st == TaskState::BlockedOnSend as u8)
         {
             TASK_WAKE_DEADLINE[slot].store(0, Ordering::Relaxed);
             wake_by_slot(slot, 0);

@@ -42,6 +42,7 @@ const PROBES: &[(&str, u32, bool, u32, Option<u32>, &[&str])] = &[
     ("adv-a11", 161, false, 0, None, &[]),
     ("adv-a12", 162, false, 0, None, &[]),
     ("adv-a13", 163, false, 0, None, &[]),
+    ("adv-a16", 216, true, 0, None, &[]),
     ("adv-a2", 81, false, 0, None, &[]),
     ("adv-a3", 82, false, 4, None, &[]),
     ("adv-a4", 83, true, 0, None, &[]),

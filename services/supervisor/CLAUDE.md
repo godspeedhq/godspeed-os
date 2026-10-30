@@ -40,7 +40,7 @@ The supervisor has mutually exclusive spawn-set features:
 | `perf-only`        | pong + ping + B1-B10 perf probes        | `osdev test perf`                |
 | `perf-brutal-only` | pong + ping + BP1-BP10 brutal probes    | `osdev test perf-brutal`         |
 | `stress-only`      | pong + ping + S1-S10 stress probes      | `osdev image --mode stress`      |
-| `adv-only`         | pong + ping + A1-A15 adversarial probes | `osdev image --mode adv`         |
+| `adv-only`         | pong + ping + A1-A16 adversarial probes | `osdev image --mode adv`         |
 | `chaos-only`       | pong + ping + C2-C7 chaos probes        | `osdev image --mode chaos`       |
 | `fuzz-only`        | pong + ping + F1/F2/F5/F6/F7/F8 + BF1/BF2/BF5/BF6/BF7/BF8 fuzz probes | `osdev image --mode fuzz` |
 | `bare-metal`       | the full service set, NO probes and NO ping/pong/observe - rests at a quiet `gsh>` | `osdev image` (USB boot) |

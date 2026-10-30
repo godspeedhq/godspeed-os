@@ -2889,6 +2889,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "adv-a11"); // introspection gated - denied without INTROSPECT cap
     let _ = probes::probe(&ctx, "adv-a12"); // reboot gated - denied without REBOOT cap (self-contained)
     let _ = probes::probe(&ctx, "adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY (self-contained)
+    let _ = probes::probe(&ctx, "adv-a16"); // CallDeadline bounded on the send leg (self-contained)
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
     let _ = probes::probe(&ctx, "adv-a1");
@@ -3189,6 +3190,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "adv-a11"); // introspection gated - denied without INTROSPECT cap
     let _ = probes::probe(&ctx, "adv-a12"); // reboot gated - denied without REBOOT cap
     let _ = probes::probe(&ctx, "adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY
+    let _ = probes::probe(&ctx, "adv-a16"); // CallDeadline bounded on the send leg (self-contained)
 
     // --- Brutal performance-benchmark probes - Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.

@@ -51,7 +51,7 @@ Open PuTTY, configure Session logging: **All session output**, append to `build/
 | `4_STRESS.md` | Stress | S1-S10 | 8/10 (S3/S9 Goldmont+ backburner); S6/S8 24h bare-metal soak pending |
 | `5_PERFORMANCE.md` | Performance (regular) | B1-B10 | 9/10 (2026-05-24); B2 Goldmont+ backburner; isolation confirmed not load-dependent |
 | `12_PERFORMANCE_BRUTAL.md` | Performance (brutal) | BP1-BP10 | 9/10 (2026-05-21); BP2 Goldmont+ backburner |
-| `6_ADVERSARIAL.md` | Adversarial | A1-A15 (hardware ran A1-A10) | ✅ 10/10 (2026-05-24) |
+| `6_ADVERSARIAL.md` | Adversarial | A1-A16 (hardware ran A1-A10) | ✅ 10/10 (2026-05-24) |
 | `7_CHAOS.md` | Chaos | C1-C7 | ✅ 5/5 PASS (4-core, 2026-05-24); C1 partial (2-core degraded boot verified); C4 skipped |
 
 ## Key differences from QEMU
