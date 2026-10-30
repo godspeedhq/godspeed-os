@@ -2804,7 +2804,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/riscv64/mod.rs | 64 | permitted |
 | arch/s390x/mod.rs | 19 | permitted |
 | arch/x86_64/ap_boot.rs | 3 | permitted |
-| arch/x86_64/boot.rs | 103 | permitted |
+| arch/x86_64/boot.rs | 107 | permitted |
 | arch/x86_64/context_switch.rs | 11 | permitted |
 | arch/x86_64/fb.rs | 2 | permitted |
 | arch/x86_64/interrupts.rs | 26 | permitted |
@@ -3887,3 +3887,17 @@ caller's closure - `AllocMem`'s mapping - and, if the closure fails, return the 
 | Block | Why it is sound |
 |---|---|
 | `unsafe { free_frame(frame) }` | `frame` came from `alloc_frame` in the same call and the closure that would have mapped it failed, so it was never mapped or shared; freeing it is its only remaining use |
+
+## `arch/x86_64/boot.rs` 103 -> 107 (2026-10-30): a double fault has a stack of its own
+
+backlog/90 D20. A kernel stack overflow into its guard page raised a #PF the CPU could not push, which is
+a #DF, which it could not push either: a triple fault, and the machine reset with nothing said. Vector 8
+now runs on IST1, a 16 KiB stack per core (core 0's static, the APs' four contiguous frames each), and
+prints one fixed line before halting every core.
+
+| Block | Why it is sound |
+|---|---|
+| `static mut BSP_DF_STACK` | Core 0's IST1 stack; referenced only by address, from `init_gdt(0)`, and used only by the CPU as that stack |
+| `(*tss).ist[0] = top` in `init_gdt` (core 0) | Single writer during the BSP's own init, into the BSP's own TSS, before `ltr` loads it; `top` is 16-aligned |
+| `#[unsafe(naked)] df_stub` | `call df_handler` then `ud2`: nothing is saved because nothing returns; six pushed words plus the call leave the ABI's alignment on a 16-aligned IST top |
+| `serial_puts_nolck` in `df_handler` | The lock-free writer, valid from any context including a fault taken while this core held the serial lock |

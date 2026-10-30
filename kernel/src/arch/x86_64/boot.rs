@@ -82,11 +82,34 @@ static mut BSP_TSS: Tss = TSS_INIT;
 /// Per-AP TSS arena, boot-allocated, sized to N (slot 0 unused).
 static TSS_ARENA: PerCoreMut<Tss> = PerCoreMut::new();
 
+/// Bytes of each core's DOUBLE-FAULT stack (IST1). A #DF is taken on it whatever the faulting stack was.
+const DF_STACK_BYTES: usize = 16 * 1024;
+
+/// A stack a double fault can always be delivered on. Without one, an overflow of a kernel stack into
+/// its guard page raised a #PF the CPU could not push (the stack was gone), then a #DF it could not push
+/// either, and the third fault RESET the machine: a silent reboot with nothing on serial (backlog/90 D20).
+#[repr(C, align(16))]
+struct DfStack([u8; DF_STACK_BYTES]);
+/// Core 0's: its TSS is set up before the frame allocator exists. The APs' come from the allocator.
+static mut BSP_DF_STACK: DfStack = DfStack([0; DF_STACK_BYTES]);
+
 /// Allocate the per-AP GDT/TSS arenas for `n` cores. Call ONCE at boot after the frame allocator is up
 /// and before any AP starts (the BSP already runs on `BSP_GDT`/`BSP_TSS`). Slot 0 is unused.
 pub fn init_gdt_arenas(n: usize) {
     GDT_ARENA.init_with(n, |_| GDT_TEMPLATE);
-    TSS_ARENA.init_with(n, |_| TSS_INIT);
+    // Each AP's TSS carries its own double-fault stack in IST1 (D20): four contiguous frames, reached
+    // through the direct map. A core that cannot have one says so and keeps the old behaviour.
+    let hhdm = super::hhdm_offset_from_limine();
+    TSS_ARENA.init_with(n, |c| {
+        let mut t = TSS_INIT;
+        if c != 0 {
+            match crate::memory::allocator::alloc_contiguous(DF_STACK_BYTES / 4096) {
+                Some(phys) => t.ist[0] = hhdm + phys + DF_STACK_BYTES as u64,
+                None => crate::kprintln!("boot: core {} has no double-fault stack - a kernel stack overflow there resets the machine silently", c),
+            }
+        }
+        t
+    });
 }
 
 /// `*mut` to core `cid`'s GDT - the BSP's static bootstrap for core 0, the arena for an AP.
@@ -1249,6 +1272,16 @@ pub(super) unsafe fn init_gdt(core_id: u32) {
     let gdt = gdt_for(cid); // *mut [u64; 8]
     let tss = tss_for(cid); // *mut Tss
 
+    // Core 0's double-fault stack (IST1). The APs' were placed in their TSS by `init_gdt_arenas`.
+    if cid == 0 {
+        // SAFETY: single writer during the BSP's init; `BSP_DF_STACK` is used only as this stack, and its
+        // top is 16-aligned (the struct is).
+        unsafe {
+            let top = core::ptr::addr_of!(BSP_DF_STACK) as u64 + DF_STACK_BYTES as u64;
+            (*tss).ist[0] = top;
+        }
+    }
+
     // Fill the TSS descriptor into slots 6 and 7 of this core's GDT.
     // SAFETY: single writer per core during init; gdt/tss point to this core's own GDT/TSS.
     unsafe {
@@ -1543,6 +1576,12 @@ pub(super) unsafe fn init_idt() {
         // correct - CPU exceptions bypass the DPL check, so ud2 from ring-3
         // always dispatches here; int 6 from ring-3 would #GP (intended).
         idt[6]    = IdtEntry::new(super::syscall_entry::ud2_syscall_entry as *const () as u64);
+        // IDT[8] = #DF, on IST1 - its own stack, so it can be delivered when the faulting one is gone
+        // (backlog/90 D20). Kernel-stack overflow is the case: the #PF on the guard page cannot be pushed,
+        // which IS a double fault, and without IST the #DF could not be pushed either - a triple fault, a
+        // silent reset.
+        idt[8] = IdtEntry::new(df_stub as *const () as u64);
+        idt[8].ist = 1;
         idt[13]   = IdtEntry::new(gpf_stub  as *const () as u64);
         idt[14]   = IdtEntry::new(pf_stub   as *const () as u64);
         idt[32]   = IdtEntry::new(timer);
@@ -1603,6 +1642,26 @@ unsafe extern "C" fn ipi_dispatch(vector: u64) {
 #[unsafe(naked)]
 unsafe extern "C" fn spurious_stub() {
     core::arch::naked_asm!("iretq")
+}
+
+/// #DF entry, on IST1. A double fault is not recoverable, so nothing is saved and nothing returns: the
+/// stack is 16-aligned and the CPU pushed six words, so the `call` leaves the ABI's alignment.
+#[unsafe(naked)]
+unsafe extern "C" fn df_stub() {
+    core::arch::naked_asm!("call {h}", "ud2", h = sym df_handler)
+}
+
+/// Say the one thing a double fault most likely is, and stop every core. Deliberately the least it can
+/// do: a fixed string through the lock-free writer and the halt, since anything more is a chance to fault
+/// a third time (`arch/CLAUDE.md`, "a fault report needs a re-entrancy guard ... say the LEAST").
+extern "C" fn df_handler() -> ! {
+    // SAFETY: the lock-free serial writer, valid from any context; this core is not coming back.
+    unsafe {
+        serial_puts_nolck(b"
+KERNEL PANIC: double fault - most likely a kernel stack overflow into its guard page (backlog/90 D20)
+");
+    }
+    super::halt_all_cores()
 }
 
 /// WAKE_RECEIVER ISR stub (vector 0xF0) - cross-core task wakeup (§9.4).

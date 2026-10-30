@@ -2359,6 +2359,21 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
 /// Advisory yield: mark the current task Ready and reschedule.
 /// Also called from the IPI handler for cross-core WAKE_RECEIVER (§9.4).
 pub fn yield_current() {
+    // `kstack-overflow-test`: the 2000th yield recurses on its task's kernel stack until it runs into the
+    // guard page, so the double fault that follows is shown to be REPORTED rather than to reset the
+    // machine (backlog/90 D20). Test builds only.
+    #[cfg(feature = "kstack-overflow-test")]
+    {
+        static YIELDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if YIELDS.fetch_add(1, Ordering::Relaxed) == 2000 {
+            crate::kprintln!("kstack-overflow-test: recursing on this task's kernel stack until it overflows");
+            fn deeper(n: u64) -> u64 {
+                let pad = core::hint::black_box([n; 64]);
+                if n == 0 { pad[1] } else { deeper(n - 1).wrapping_add(pad[2]) }
+            }
+            let _ = core::hint::black_box(deeper(core::hint::black_box(1_000_000)));
+        }
+    }
     crate::arch::imp::disable_interrupts();
 
     let cid = current_core_id();
