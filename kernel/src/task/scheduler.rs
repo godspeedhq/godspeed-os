@@ -2871,6 +2871,20 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
     // SAFETY: IF=0 or lock-free path; TASK_VALID[slot] and Dead state claimed above.
     unsafe {
 
+        // STOP IT FIRST (backlog/90 D14, the zombie window). A task killed while running on another core
+        // went on running user code and making syscalls, with every capability it held, until the stop
+        // IPI sent after the whole teardown below - or, where none was sent, its core's next tick. Sent
+        // here, straight after the Dead claim, the core leaves it within an IPI's latency, while the
+        // teardown is still starting. The later send stays: the wait for the core to let go re-sends.
+        {
+            let my_core = current_core_id();
+            for cid in 0..num_cores() {
+                if cid != my_core && core_still_using(cid, slot) {
+                    crate::smp::ipi::send_ipi(cid as u32, crate::smp::ipi::vectors::WAKE_RECEIVER);
+                }
+            }
+        }
+
         // Capture identity before any slot state changes.
         // A copy, held for the whole death path: the slot is freed below and may be reused (D24).
         let task_name_copy = crate::task::scheduler::task_name(slot);
