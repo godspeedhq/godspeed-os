@@ -1,9 +1,9 @@
 # 49 - five wedge detectors halt the machine on LATENESS, and cannot tell it from a fault
 
 **Opened:** 2026-09-24
-**Status:** OPEN - one instance PROVEN (`backlog/fixed/48`) and fixed, the TLB-shootdown bound deleted with its
+**Status:** OPEN - one instance PROVEN (`backlog/fixed/48`) and fixed, the QEMU respawn wedge found to be a deadlock on the x86 clock lock and fixed (2026-10-31, below), the TLB-shootdown bound deleted with its
 shootdown, and the spinlock and frame-allocator bounds moved from spins to time (2026-10-28, `99095070`); the two
-scheduler bounds remain, neither reads the stuck core's interrupt count, and a T630 perf card is owed for the lock change.
+scheduler bounds remain, neither reads the stuck core's interrupt count, and the lock change was carded for cost on the T630 on 2026-10-31 (no cost it could pin, row below).
 *(2026-10-09: the PROVEN instance is fixed - `backlog/fixed/48` closed 2026-09-25 by deleting the kill-path
 panic. The other four were not re-checked for this note.)*
 **Raised by:** the operator, ruling on `backlog/fixed/48`: *"Nothing above the kernel should have influence
@@ -62,7 +62,7 @@ machine on the inference.**
 | `task/scheduler.rs:2679` | `liveness_deadline_cycles()/4` = 75 quanta ~ 0.75 s | another core releasing a task slot - **PROVEN reachable, `backlog/fixed/48`** |
 | `task/scheduler.rs:1616` | 300 quanta ~ 3 s of ticks | another core making any progress |
 | `smp/ipi.rs` (gone) | 500,000,000 **spins** | other cores acknowledging a TLB shootdown - **deleted 2026-10-10**: the shootdown it bounded had no caller, and both went (`backlog/fixed/80` K20) |
-| `smp/spinlock.rs` | ~~spins~~ **FIXED 2026-10-28**: the watchdog's allowance in counter ticks, and only when the SAME hold lasted it (each lock counts its releases beside its held flag, so a waiter sees contention as the count changing and opens another window, at most 4). Perf under WSL2 + KVM, ten runs before and six after, interleaved: every median inside the before runs' spread; B2 cross-core p50 the one leaning slower (46 of 60 pairings, not significant at 5%) and the instrument's own floor ~10%, so a T630 perf card is owed before the cost is called nil | a lock holder releasing |
+| `smp/spinlock.rs` | ~~spins~~ **FIXED 2026-10-28**: the watchdog's allowance in counter ticks, and only when the SAME hold lasted it (each lock counts its releases beside its held flag, so a waiter sees contention as the count changing and opens another window, at most 4). Perf under WSL2 + KVM, ten runs before and six after, interleaved: every median inside the before runs' spread; B2 cross-core p50 the one leaning slower (46 of 60 pairings, not significant at 5%) and the instrument's own floor ~10%, so a T630 perf card was owed before the cost is called nil. **Carded 2026-10-31:** the T630, four boots of `osdev image --mode perf` at `ad3252ac`, two with the change reverted and two without, nothing else different. B2 cross-core p50 96,755 and 107,389 reverted, 111,633 and 104,482 with it: one inside the reverted spread, one 4% above it. B1, B3 and B9 identical to 1%; B4 and B7 lean slower (B7 3,129 and 3,168 against 3,195 and 3,498), B8 leans faster. Two boots a side cannot reach significance (the best ordering is 1 in 6), and the code agrees with no cost: an uncontended acquire is the one compare-and-swap it was, and a release adds a plain load and store beside the flag | a lock holder releasing |
 | `memory/allocator.rs` | ~~spins~~ **FIXED 2026-10-28**, the same `smp::spinlock::Wait` | the frame-allocator lock holder releasing - its old message named "preempted holder" as a cause |
 
 Three of the five were bounded by a SPIN COUNT (none is now: the shootdown's went with it, and the spinlock and
@@ -206,6 +206,41 @@ interrupts and 0 halts since its last stamp. On a tree carrying `backlog/90` D28
 more passed 276/0 with no wedge. One in four with the change, none in the three earlier runs that day without it,
 and the earlier sightings predate it - not a difference this many runs can show either way, and recorded here so
 the next count includes it.
+
+## Found, 2026-10-31: the QEMU sightings were a DEADLOCK on the x86 clock lock, not lateness
+
+The measurement above said the wedged core "NEVER came back", with interrupts masked or its timer unarmed. It
+was the first: core 0 spinning with interrupts off on a lock whose holder it had itself preempted.
+
+Caught in `osdev test shell` (run 5 of 6 at `ad3252ac`; 255 passed, 21 failed), with two panics at once:
+
+```text
+SpinLock WEDGE: lock@0xffffffff81b90f58 held by ONE holder for 7778300888 counter ticks (1x the watchdog's
+7772322900) with no release - a deadlock or a dead holder, not contention
+LIVENESS WEDGE: core 0 made NO progress ... running task slot 9 'shell'; ... 0 timer interrupts
+```
+
+The lock is `arch::x86_64::rtc::CMOS`, added 2026-10-18 (`80f2bb49`) so two cores could not interleave the
+0x70/0x71 pair - and 2026-10-18 is this entry's first x86 sighting. Taken with plain `lock()`, on the reasoning
+that no interrupt handler reads the clock. But the supervisor respawn runs on core 0 where the timer can preempt
+it (the round-robin above), and it reads the clock in `commit_task`. Preempted holding `CMOS`, it handed core 0 to
+`shell`, whose clock syscall - interrupts off, as every syscall runs - spun on the lock with no tick left that
+could give the core back. Every sighting's shape follows: core 0 "running `shell`", 0 interrupts, right after
+"takes back a reply mailbox" (the respawn in flight), reported at just over 1x because that is when the watchdog
+first looks.
+
+**Proven both ways with `cmos-hold-test`** (the respawn holds `CMOS` for a twentieth of the allowance, so a tick
+lands inside the hold): with the plain lock, the same two panics on the FIRST respawn, 255/21; with `lock_irq()`,
+276/0, core 0 taking 6 to 12 interrupts through each respawn. **FIXED 2026-10-31:** `CMOS.lock_irq()`. It is the
+log ring's bug again - `log::write_fmt` records the same wedge, found when the respawn was made preemptible, and
+masks for it - on a lock added afterwards. The other plain locks on that path were checked: each is either taken
+under a mask (`PENDING` under `TABLE`, `KSTACK_USED`, `RING`) or only from contexts that run with interrupts off
+(the IOMMU's and PCI configuration's, taken by device spawns and kills; `SEEN` in the syscall path).
+
+**What this does not settle.** The five lateness detectors this entry lists are still detectors of lateness, and
+the two scheduler bounds still do not read the stuck core's interrupt count; this sighting was a true stop, which
+they reported correctly. The T630's 2026-10-25 wedge (core 0, 0 interrupts, right after a respawn, 1.11x) has the
+same shape and may be the same lock; not confirmed.
 
 ## On hardware: the T630, twice in one day, each right after a supervisor respawn (2026-10-25)
 
