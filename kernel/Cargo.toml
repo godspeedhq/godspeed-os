@@ -127,6 +127,10 @@ kstack-overflow-test = []
 # x86: while the supervisor is being respawned, the CMOS clock read holds its lock for a twentieth of the
 # liveness watchdog's allowance, so a tick lands inside the hold (backlog/49). Off by default; test builds only.
 cmos-hold-test = []
+# The first time the scheduler loop drains a pending kernel stack, the drain is held across several ticks
+# and a drain that starts inside another says so, so the drain is shown not to be re-entered by the tick
+# (backlog/90 D8). Off by default; test builds only.
+drain-reentry-test = []
 # The first tick's core check after bring-up asks for a LAPIC id no core has, so the miss is shown to
 # be said rather than silently answered as core 0 (backlog/90 D28). Off by default; test builds only.
 lapic-miss-test = []

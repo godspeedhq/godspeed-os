@@ -71,6 +71,9 @@ features = [
 # Test builds only (x86): the CMOS clock lock held across a tick during a supervisor respawn, so a
 # preemptible holder is shown to deadlock its core and an interrupt-masked one not to (backlog/49).
     "cmos-hold-test",
+# Test builds only: a scheduler-loop drain of a pending kernel stack is held across ticks, so the drain is
+# shown not to be re-entered by the timer on its own core (backlog/90 D8).
+    "drain-reentry-test",
     # Diagnostic ONLY, and deliberately registered here rather than slipped in: it changes what the
     # kernel PRINTS on a fatal EL0 fault, never what it does. It widens the stack window, measures the
     # run of whatever fill byte is at SP (the production scan measures ZEROS, so it reported "0 bytes"

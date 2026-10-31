@@ -2761,10 +2761,19 @@ pub fn find_task_by_name_excluding(name: &str, exclude: usize) -> Option<usize> 
 /// guaranteed by the self-kill invariant: the window from kill_task_by_slot to
 /// yield_current's switch_context runs with IF=0, so the timer cannot fire
 /// during that window; after switch_context RSP is on a different stack.
+///
+/// The whole drain runs with interrupts masked (backlog/90 D8). `run()` calls it with interrupts on, and
+/// the timer calls it too, on the same core: a tick between the load of a count or root and its clear
+/// drained the same entries a second time, so a stack or root freed by the tick - and perhaps handed out
+/// again - was freed once more by `run()`. Masked, the two can never interleave; the mask is a no-op from
+/// the timer, which runs with interrupts off, and the drain is bounded by `PENDING_KSTACK_CAP` and one root.
 fn drain_pending_kstack(cid: usize) {
+    let was_enabled = crate::arch::imp::local_irq_save();
+    #[cfg(feature = "drain-reentry-test")]
+    drain_reentry_probe(cid, was_enabled);
     let n = CORE_PENDING_KSTACK_LEN.get(cid).load(Ordering::Relaxed);
     if n != 0 {
-        // Clear before processing so re-entrant callers see an empty queue.
+        // Clear before processing so a later drain sees an empty queue.
         CORE_PENDING_KSTACK_LEN.get(cid).store(0, Ordering::Relaxed);
         for i in 0..n {
             let kstack = unsafe { (*CORE_PENDING_KSTACK.as_mut_ptr(cid))[i] };
@@ -2792,6 +2801,39 @@ fn drain_pending_kstack(cid: usize) {
         unsafe {
             crate::arch::imp::page_tables::free_page_table_root(pml4_phys);
         }
+    }
+    #[cfg(feature = "drain-reentry-test")]
+    DRAIN_BUSY.fetch_and(!(1u64 << (cid % 64)), Ordering::Relaxed);
+    crate::arch::imp::local_irq_restore(was_enabled);
+}
+
+/// `drain-reentry-test`: cores inside `drain_pending_kstack`, one bit each.
+#[cfg(feature = "drain-reentry-test")]
+static DRAIN_BUSY: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "drain-reentry-test")]
+static DRAIN_PROBED: AtomicBool = AtomicBool::new(false);
+
+/// `drain-reentry-test`: say if this drain began inside another on the same core, and once, the first time
+/// `run()` drains a pending stack, hold the drain for a hundredth of the watchdog's allowance - several
+/// ticks - so a tick that could enter it would (backlog/90 D8). Test builds only.
+#[cfg(feature = "drain-reentry-test")]
+fn drain_reentry_probe(cid: usize, was_enabled: bool) {
+    let bit = 1u64 << (cid % 64);
+    if DRAIN_BUSY.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        crate::kprintln!("drain-reentry-test: the drain was RE-ENTERED on core {} - a stack could be freed twice", cid);
+        return;
+    }
+    if was_enabled
+        && CORE_PENDING_KSTACK_LEN.get(cid).load(Ordering::Relaxed) != 0
+        && !DRAIN_PROBED.swap(true, Ordering::Relaxed)
+    {
+        crate::kprintln!("drain-reentry-test: holding a drain on core {} across several ticks", cid);
+        let t0 = crate::arch::imp::read_cycle_counter();
+        let hold = crate::arch::imp::liveness_deadline_cycles() / 100;
+        while crate::arch::imp::read_cycle_counter().wrapping_sub(t0) < hold {
+            core::hint::spin_loop();
+        }
+        crate::kprintln!("drain-reentry-test: the held drain on core {} finished", cid);
     }
 }
 
