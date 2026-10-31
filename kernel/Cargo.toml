@@ -116,8 +116,8 @@ spawn-full-table-test = []
 # so the per-core arenas are shown to cover a released-but-late core and the one numbered past it
 # (backlog/90 D17). Off by default; test builds only.
 late-ap-test = []
-# The drain leaves a self-killed task's pending page-table root alone, so every second self-kill on a core
-# finds it still pending and the kill path is shown to free it rather than overwrite it (backlog/90 D9).
+# The drain leaves a self-killed task's pending page-table root alone, so every self-kill on a core after the
+# first finds one still pending and the kill path is shown to free it rather than overwrite it (backlog/90 D9).
 # Off by default; test builds only.
 pml4-pending-test = []
 # The 2000th yield recurses on its task's kernel stack until it overflows into the guard page, so the

@@ -813,12 +813,13 @@ pub fn entry_for_va(virt: u64) -> Option<u64> {
 // top of the stack below it, which on this port is where a BLOCKED task's saved user registers sit
 // (`srsdb` onto its SVC stack). Added 2026-10-12 while that was the suspect for `ask` and `recorder` dying
 // in slot 15; it was not the cause - the guard never fired, and the cause was the kernel's BSS lying under
-// the services' own pages (`kernel-arm.ld`). It stays because x86 and the Pi 4 have it (RISC-V 64's `unmap_4k_strided` is still a
-// stub).
+// the services' own pages (`kernel-arm.ld`). It stays because every other complete port has it (RISC-V 64
+// since 2026-10-30, backlog/90 D20).
 //
-// So the sections the pool spans are split into 4 KiB pages here, once, at boot, with exactly the
-// attributes the section had (`l2_small_page` with PRESENT|WRITABLE is the section's own Normal
-// write-back, shareable, PL1-only, executable mapping, as `fill_kernel_identity` already relies on), and
+// So the sections the pool spans are split into 4 KiB pages here, once, at boot, with the section's
+// attributes (`l2_small_page` with PRESENT|WRITABLE is Normal write-back, shareable, PL1-only) - all but
+// one: since the kernel's W^X map (backlog/90 D21) a RAM section is execute-never, and these pages are
+// built without NO_EXEC, so the pool's pages are executable where the section was not. And
 // each guard page is then left unmapped. An overflow now takes a data abort in the kernel, which is
 // reported and halts: loud, where it was silent.
 //

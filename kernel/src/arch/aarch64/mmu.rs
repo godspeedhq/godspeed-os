@@ -303,7 +303,9 @@ pub fn enable() -> u64 {
                         | attr_idx(MAIR_IDX_DEVICE) | DESC_PXN | DESC_UXN
                 } else {
                     // RAM: Normal write-back, inner shareable. Left executable - the kernel image is
-                    // in here. W^X is a later refinement, once there are separate mappings to protect.
+                    // in here, and runs from here until the jump to the high map. W^X is applied to the
+                    // HIGH map below (backlog/90 D21), which is where the kernel runs after that; this
+                    // low identity map stays read/write/execute.
                     pa | DESC_BLOCK | DESC_AF | DESC_SH_INNER | DESC_AP_RW_EL1
                         | attr_idx(MAIR_IDX_NORMAL)
                 };

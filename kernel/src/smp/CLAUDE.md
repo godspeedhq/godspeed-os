@@ -7,10 +7,10 @@ Multi-core coordination (§9, §11). The IPI protocol lives in `ipi.rs`; the int
 | File            | Responsibility |
 |-----------------|---------------|
 | `mod.rs`        | `init(boot_info)`: init per-core state, start APs; `percpu_init(boot_info)`: size the per-core arenas to N |
-| `core.rs`       | `CoreState` per core; `mark_ready(core_id)`, `ready_count()`, `is_ready(core_id)` |
+| `core.rs`       | `CoreState` per core; `mark_ready(core_id)`, `ready_count()`, `is_ready(core_id)`, `nth_ready(k)` (a core id is never `ready_count()`-bounded: placement and the watchdog ask by id, backlog/90 D17), `check_this_core_known()` |
 | `ipi.rs`        | `send_ipi(core_id, vector)`, `ipi_handler(vector)` |
 | `percpu.rs`     | `PerCore<T>` - boot-allocated per-core arenas (§26.6.1), sized to N cores at boot from the frame allocator (not `[_; MAX_CORES]`); all `unsafe` isolated here behind safe `get()` |
-| `names.rs`      | `NameTable` / `AtomicNameSet` - fixed-size task-name and peer-name storage, so `task/` needs no `unsafe` for them |
+| `names.rs`      | `NameTable` / `AtomicNameSet` - fixed-size task-name and peer-name storage, so `task/` needs no `unsafe` for them. Atomic bytes behind a per-slot sequence counter; a name is read as a COPY (`Name`), whole or retried, and the file has no `unsafe` since 2026-10-31 (backlog/90 D24) |
 | `spinlock.rs`   | `SpinLock<T>` / `SpinLockGuard<T>` - RAII spinlock for safe mutable statics throughout the kernel |
 
 ## SpinLock usage

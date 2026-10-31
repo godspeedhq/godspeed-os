@@ -8,7 +8,7 @@
 #![deny(unsafe_code)]
 //! `probe` - single-binary identity test probe service (§22 Group A).
 //!
-//! One binary, 193 rows in `table.rs` with different `probe_mode` values. The spawner's request
+//! One binary, 194 rows in `table.rs` with different `probe_mode` values. The spawner's request
 //! carries the mode, the kernel writes it into ServiceContextData at spawn time, and the SDK
 //! exposes it, read through `gs::program::mode`.
 //!

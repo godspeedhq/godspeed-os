@@ -92,7 +92,7 @@ enum Commands {
         /// perf-brutal - brutal perf probes BP1-BP10
         /// identity    - identity-only probes (WatchSerial tests; WithRestart needs COM2)
         /// stress      - S1-S10 stress probes; self-contained, no harness required
-        /// adv         - A1-A10 adversarial probes; self-contained, no harness required
+        /// adv         - A1-A16 adversarial probes; self-contained, no harness required
         /// chaos       - C2-C7 chaos probes; self-contained, no harness required (C1/C4 use bare-metal + HW reconfiguration)
         #[arg(long, default_value = "bare-metal")]
         mode: String,
@@ -1436,7 +1436,7 @@ pub fn cmd_build_bp2_only() {
 }
 
 /// Like `cmd_build_stress` but uses `--features adv-only` for a self-contained
-/// hardware adversarial run (A1-A10). All adversarial probes are self-contained -
+/// hardware adversarial run (A1-A16). All adversarial probes are self-contained -
 /// no QEMU control port required.
 pub fn cmd_build_adv() {
     clean_supervisor();
@@ -3235,7 +3235,7 @@ fn run_fs_check_test() {
 /// `1 bad` - read-only, no repair), and the clean file must still read back. Proves a routine,
 /// non-destructive integrity sweep that detects bit-rot.
 /// Phase M - the adversarial suite. `fs` takes client-supplied paths, offsets, sizes and names over
-/// IPC and had no red-team coverage, while every other subsystem has some (§22 F1-F8, A1-A15).
+/// IPC and had no red-team coverage, while every other subsystem has some (§22 F1-F8, A1-A16).
 ///
 /// **The bar is not that a hostile request succeeds or fails in some particular way. It is that
 /// `fs` NEVER panics, NEVER hangs, and never serves a wrong answer as a right one** - and that

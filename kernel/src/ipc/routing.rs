@@ -107,8 +107,8 @@ static SENDS_ABANDONED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64:
 ///
 /// The two cannot-happen cases below are RECORDED here and said later by `say_deferred`, on core 0's
 /// tick: this runs under `TABLE` and `PENDING`, on the full-queue path of every send, and a serial line
-/// printed here holds both for as long as the line takes (backlog/90 D28, the rule `TABLE`'s comment
-/// states).
+/// printed here holds both for as long as the line takes (backlog/90 D28; the rule is stated in
+/// `try_register_optional`: never print while holding the routing table).
 fn block_sender(entry: &mut RoutingEntry, slot: usize, msg: Message) {
     let mut p = PENDING.lock();
     if slot >= p.by_task.len() {

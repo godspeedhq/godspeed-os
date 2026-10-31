@@ -281,6 +281,10 @@ What can reset this machine without a line, read from the code and not observed:
 Two changes would make the next one say why, and both are kernel changes for their own branch: an IST stack for
 the double fault (a triple fault becomes a printed panic), and a serial flush in `Reboot`.
 
+*(2026-10-30: the first is done - the double fault runs on IST1, a 16 KiB stack per core, and reports the likely
+stack overflow before halting every core (`backlog/90` D20), so the triple fault above is no longer a silent path.
+`Reboot` (18) still resets without flushing serial.)*
+
 ## Next step
 
 The operator's call on scope. `backlog/fixed/48`'s instance is the one with a measurement behind it and the

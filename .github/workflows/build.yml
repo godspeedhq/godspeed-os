@@ -63,7 +63,7 @@ jobs:
 
       # Clippy in RELEASE, after `osdev build`: the kernel `include_bytes!`-embeds the supervisor, and the
       # supervisor embeds every service, so clippy needs the images that build produced - the release
-      # ones. A debug clippy looks for a debug supervisor nothing built (backlog/fixed/53's third layer).
+      # ones. A debug clippy looks for a debug supervisor nothing built (backlog/53's third layer).
       - name: Clippy services (bare-metal)
         run: |
           cargo clippy --release --target x86_64-unknown-none --workspace \

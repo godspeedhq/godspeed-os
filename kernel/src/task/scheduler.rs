@@ -117,7 +117,7 @@ fn core_finished_leaving(cid: usize) {
 ///
 /// So the kernel records what it was ACTUALLY wired with, which is the honest source anyway - the
 /// wiring, not a declaration it has to look up somewhere. Bounded and flat (26.6): one row per
-/// (task, peer) slot, reusing the audited `NameTable` primitive so this adds no `unsafe`.
+/// (task, peer) slot, in `smp::names::AtomicNameSet`, whose atomic bytes need no `unsafe`.
 static TASK_PEERS: crate::smp::names::AtomicNameSet<
     { MAX_TASKS * crate::task::MAX_SEND_PEERS },
     { crate::task::PEER_NAME_BYTES }> = crate::smp::names::AtomicNameSet::new();
@@ -1437,8 +1437,9 @@ pub fn current_task_read_cap_rights(slot: usize) -> Option<Rights> {
 
 /// Call `f` for every capability held by every currently-valid task.
 ///
-/// Used by `invariants::assertions::assert_cap_table_consistent` (§7.8) to
-/// verify generation consistency across all task cap tables. Must not be called
+/// It has no caller: `invariants::assertions::assert_cap_table_consistent` (§7.8), which it was
+/// written for, now walks the slots itself through `for_each_cap_of`, because it must tell the
+/// caller's own table from everyone else's (backlog/90 D24). Must not be called
 /// from a spawn or kill path while TASK_SLOT_LOCKED is held by this core.
 pub fn for_each_active_cap<F: FnMut(&Capability)>(mut f: F) {
     // Delegates to `for_each_cap_of` (which holds the single SAFETY block) so the
@@ -1450,11 +1451,6 @@ pub fn for_each_active_cap<F: FnMut(&Capability)>(mut f: F) {
     }
 }
 
-/// Iterate the held capabilities of the task in `slot` (any task, not just the
-/// current one). Best-effort read-only snapshot for introspection (the `caps`
-/// command via `TaskCaps`): a concurrent spawn/kill may be seen inconsistently,
-/// which is acceptable for display. Same posture as `for_each_active_cap` and
-/// `task_stat`. No-op for an empty/invalid slot.
 /// Is there a task in `slot` whose capability table may be read (the `for_each_cap_of` test)?
 ///
 /// VALID and COMMITTED. `TASK_VALID` is set when a slot is RESERVED, before `task_cap_init_empty` zeroes
@@ -1468,6 +1464,11 @@ pub fn task_valid(slot: usize) -> bool {
         && TaskState::from(TASK_STATE[slot].load(Ordering::Acquire)) != TaskState::Dead
 }
 
+/// Iterate the held capabilities of the task in `slot` (any task, not just the
+/// current one). Best-effort read-only snapshot for introspection (the `caps`
+/// command via `TaskCaps`): a concurrent spawn/kill may be seen inconsistently,
+/// which is acceptable for display. Same posture as `for_each_active_cap` and
+/// `task_stat`. No-op for a slot `task_valid` refuses (empty, reserved but not yet committed, or Dead).
 pub fn for_each_cap_of<F: FnMut(&Capability)>(slot: usize, mut f: F) {
     if !task_valid(slot) { return; }
     // SAFETY: `task_valid` observed the slot committed - a non-Dead state, read Acquire, which pairs with
@@ -2777,8 +2778,8 @@ fn drain_pending_kstack(cid: usize) {
     // runs the core has switched to a different CR3, so freeing the old PML4
     // frame no longer risks a concurrent zeroing race (see CORE_PENDING_PML4).
     // AtomicU64 load/store: no unsafe needed here.
-    // `pml4-pending-test`: the drain leaves a pending root alone, so every second self-kill on a core
-    // finds one still there and the kill path's own free of it is exercised (backlog/90 D9). Test only.
+    // `pml4-pending-test`: the drain leaves a pending root alone, so every self-kill on a core after
+    // the first finds one still there and the kill path's own free of it is exercised (backlog/90 D9). Test only.
     #[cfg(feature = "pml4-pending-test")]
     let pml4_phys = 0u64;
     #[cfg(not(feature = "pml4-pending-test"))]

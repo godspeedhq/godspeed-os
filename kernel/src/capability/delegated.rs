@@ -166,7 +166,8 @@ pub fn allocate_for(owner: OwnerId, owner_gen: u32) -> Option<ResourceId> {
 }
 
 /// The owning endpoint of a delegated resource, or `None` if `id` is not a live delegated
-/// resource. Used to route a `ResourceInvoke` to the owner.
+/// resource. `ResourceInvoke` routes by `owner_route` instead, which carries the owner's generation
+/// at mint (backlog/90 D5); this is left to the unit tests.
 pub fn owner_of(id: ResourceId) -> Option<OwnerId> {
     if !is_delegated(id) {
         return None;

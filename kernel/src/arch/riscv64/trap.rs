@@ -546,9 +546,11 @@ pub(super) const OFF_HARTID: usize = 34 * 8;
 ///
 /// **The stack comes first, and it comes from `sscratch`.** `csrrw sp, sscratch, sp` swaps the two
 /// in one instruction: `sp` becomes what `sscratch` held (this hart's kernel stack if the trap came
-/// from U-mode, zero if it came from the kernel) and `sscratch` becomes the interrupted `sp`. A
-/// single `bnez` then separates the two cases without a scratch register - which matters, because at
-/// this instant there is no register free to use and no stack to spill one onto.
+/// from U-mode; from the kernel, this hart's `TrapArea` with bit 63 set, or zero on a hart past
+/// `TRAP_HARTS` - the file comment's amendment) and `sscratch` becomes the interrupted `sp`. A `bltz`
+/// and a `bnez` then separate the three cases without a scratch register - which matters, because at
+/// this instant there is no register free to use and no stack to spill one onto. Only the negative
+/// (checked kernel) path borrows two registers, into the `TrapArea` it points at.
 ///
 /// SAVES ALL 31 WRITABLE REGISTERS, not just the caller-saved ones. The interrupted code is not a
 /// caller - it did not agree to any calling convention with this handler and may be at any
@@ -762,10 +764,11 @@ unsafe extern "C" fn trap_entry() -> ! {
 /// would become a different mode with a truncated target - discovered only by a fault, which is the
 /// thing this exists to catch. Checked rather than assumed for that reason.
 ///
-/// **`sscratch` is zeroed here, and that is not tidiness.** Its reset value is not architecturally
-/// specified, and the firmware beneath us runs in M-mode with its own `mscratch`, so nothing has
-/// promised to leave this register alone. If it held anything non-zero the FIRST S-mode trap would
-/// read it as "a user trap, here is your kernel stack" and build a frame at an address nobody chose.
+/// **`sscratch` is set here, to this hart's kernel latch (or zero past `TRAP_HARTS`), and that is not
+/// tidiness.** Its reset value is not architecturally specified, and the firmware beneath us runs in
+/// M-mode with its own `mscratch`, so nothing has promised to leave this register alone. If it held a
+/// positive non-zero value the FIRST S-mode trap would read it as "a user trap, here is your kernel
+/// stack" and build a frame at an address nobody chose.
 /// QEMU hands over a zeroed register and would never show this; the emulator supplying the value you
 /// assumed is how the whole class of bug hides.
 pub fn init() -> bool {

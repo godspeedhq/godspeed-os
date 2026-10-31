@@ -13,7 +13,7 @@ tests/
     post_v1/     # verification-roadmap notes (static analysis, mutation, property; coverage + unsafe audit are empty)
     1_IDENTITY/ ... 14_CHAOS_BRUTAL/   # committed serial logs from past suite runs - SNAPSHOTS, not
                  # tests, and not current: a run writes its logs to build/tests/<same name>/, and the
-                 # committed copies predate later cases (no Test 11/15, no A11-A15, no C1B)
+                 # committed copies predate later cases (no Test 11/15, no A11-A16, no C1B)
   hardware/
     x86_64/      # Real hardware - 4-core x86_64, ~3 GHz, UEFI USB boot, null modem serial
       1_IDENTITY.md

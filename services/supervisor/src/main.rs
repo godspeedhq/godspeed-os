@@ -1090,7 +1090,7 @@ fn in_tree_driver_of(class: u32, nic_on_bus: bool) -> Option<&'static str> {
         .map(|row| row.0)
 }
 
-/// The test-probe image - 193 test modes in one binary (docs/probe-params-design.md).
+/// The test-probe image - 194 test modes in one binary (docs/probe-params-design.md).
 ///
 /// NOT PRESENT IN A BARE-METAL BUILD, and that is the point of it living here rather than in the
 /// kernel. It used to be `include_bytes!` in `kernel/src/task/mod.rs` with no cfg at all, so every
@@ -1144,7 +1144,7 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godsp
 // endpoint cap each spawn hands back. It is what wires dependents: `spawn_wired` installs a peer's
 // cap from here, and a restart refreshes the entry in place. Only what `map_keeps` names is kept -
 // watched services, USB device drivers, and peers some row names - so on-demand programs never fill
-// it. The 193 test probes are test infra (out of scope) and are spawned with their parameters from
+// it. The 194 test probes are test infra (out of scope) and are spawned with their parameters from
 // `probe/src/table.rs` - the table that used to be 193 rows of the kernel service catalogue
 // (docs/probe-params-design.md).
 // ───────────────────────────────────────────────────────────────────────────────
@@ -2883,7 +2883,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "chaos-c7");          // TLB shootdown controller on core 1
 }
 
-// adv-only: spawn only the A1-A15 adversarial probe services (A14/A15 are the adv-fault-* probes).
+// adv-only: spawn only the A1-A16 adversarial probe services (A14/A15 are the adv-fault-* probes).
 // All adversarial probes are self-contained - no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {

@@ -67,6 +67,11 @@ VisionFive the pool shares its gigabyte with every task's stack and MMIO window,
 is the one that runs there; QEMU `virt` puts the kernel a gigabyte above, where the root entry is shared
 whole. So the merge path runs only on the board, and QEMU exercises the other.
 
+**The kernel's own memory is W^X (since 2026-10-30, backlog/90 D21).** The 1 GiB leaves are read, write
+and execute, so `enable_paging` cuts the kernel image out at 4 KiB (`sv39::protect_kernel_page`): `.text`
+read+execute, `.rodata` read-only, and then every other leaf loses execute (`sv39::strip_kernel_exec`). If
+any text page cannot be cut out, the old map is kept and the boot says so (`kernel W^X NOT applied`).
+
 **DMA coherence is PER MASTER on the JH7110, and the device tree does not say so.** The display
 controller is not coherent; the USB controller is. Silence in the DT is not a claim either way - this
 was established by observation, not by reading.

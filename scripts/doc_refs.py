@@ -84,8 +84,8 @@ PATHISH = re.compile(r"`([A-Za-z0-9_./-]+/[A-Za-z0-9_./-]+\.(?:rs|md|toml|py|jso
 # see it - that regex requires one. And it is cited from CODE COMMENTS at least as often as from
 # documents, which nothing scanned at all.
 #
-# Both halves mattered: `services/fs/src/main.rs` cited `backlog/fixed/33` for a filesystem limitation, the
-# file did not exist, and the citation read as though the limitation had been recorded. That is the
+# Both halves mattered: `services/fs/src/main.rs` cited backlog entry 33 for a filesystem limitation, the
+# entry did not exist yet, and the citation read as though the limitation had been recorded. That is the
 # exact failure 26.7 names - a recorded limitation is one the next person can plan around, an
 # unrecorded one is discovered by whoever trusted the document - and it was invisible to every gate
 # this project has.

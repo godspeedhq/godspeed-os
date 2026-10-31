@@ -2835,14 +2835,14 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | task/scheduler.rs | 34 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 1133 lines across 72 files  
-**Grandfathered total:** 50 lines across 6 files  
-**Grand total:** 1183 lines across 78 files
+**Permitted total:** 1203 lines across 75 files  
+**Grandfathered total:** 47 lines across 6 files  
+**Grand total:** 1250 lines across 81 files
 
 > These three lines read 394/22, 53/6 and 447/28 until 2026-09-12 - a tree of 28 files that had not
 > existed for months, and a grand total 2.7x low. They are derived by summing the inventory block
 > immediately above, and `scripts/unsafe_check.py` independently prints the same grand total
-> ("78 audited files, 1208 total unsafe lines"). **The check validates the inventory rows, never this
+> ("81 audited files, 1250 total unsafe lines"). **The check validates the inventory rows, never this
 > prose**, which is how a number inside the file the check guards drifted that far. Re-derive them
 > whenever a row moves.
 

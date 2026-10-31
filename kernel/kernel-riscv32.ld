@@ -1,5 +1,5 @@
 /* RISC-V 32 linker script for QEMU `virt` (S-mode via OpenSBI) - the size study, not a port
- * (backlog/60). OpenSBI's 32-bit firmware jumps to the next stage at 0x8040_0000, where the 64-bit
+ * (backlog/fixed/60). OpenSBI's 32-bit firmware jumps to the next stage at 0x8040_0000, where the 64-bit
  * one uses 0x8020_0000 (kernel-riscv64.ld). NS16550 UART at 0x1000_0000. Otherwise the same layout. */
 
 ENTRY(_start)

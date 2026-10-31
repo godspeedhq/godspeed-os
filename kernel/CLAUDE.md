@@ -85,7 +85,7 @@ note in `task/mod.rs` (above `poll_supervisor_respawn`) says so in as many words
 harness drives (`RESTART`/`KILL`, §17) is `services/control`, a restartable userspace service that
 re-opens the port on respawn. It was moved out in C1-6, and `FIRE_IRQ_RESOURCE` in
 `capability/mod.rs` records the move. The kernel still owns the UART and hands its bytes out
-through `InspectKernel` query 21.
+through `InspectKernel` query 21, INTROSPECT-gated since 2026-10-29 (`backlog/90` D23).
 
 The kernel's only remaining stake in it is the gated `FireIrq` syscall (51), which `control` carries in
 its spawn request rather than receiving by name.

@@ -1892,8 +1892,9 @@ pub mod boot {
     /// x86 tells the HARDWARE where a ring-3 interrupt lands by writing `TSS.rsp0`. The RISC-V
     /// equivalent is `sscratch` - and writing it here would be WRONG.
     ///
-    /// `sscratch` must read zero for as long as kernel code is running (`trap.rs`), because that is
-    /// how the trap entry knows it is already on a kernel stack. The scheduler calls this while the
+    /// `sscratch` must hold the kernel latch - this hart's `TrapArea` with bit 63 set, or zero - for as
+    /// long as kernel code is running (`trap.rs`), because that is how the trap entry knows it is
+    /// already on a kernel stack. The scheduler calls this while the
     /// kernel is running, so writing the task's stack pointer now would mean a trap taken between
     /// here and the return to user mode swaps in a stack it is ALREADY standing on, and builds its
     /// frame over the one it is using.

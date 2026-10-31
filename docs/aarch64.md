@@ -819,8 +819,9 @@ Confirm the physical board first: **Pi 4** = two micro-HDMI, USB-C power, 2xUSB3
   their DMA arenas must live in low memory. Fits the existing "reserved DMA arena per driver" model -
   just constrain where the arena is allocated.
 - **No usable SMMU for these peripherals**, so **H1/§6.4 does not travel**: DMA-capable drivers go back
-  to trusted-on-this-machine (the machine-dependent posture the spec already allows). The plan was to
-  announce that loudly at boot; nothing is printed either way yet on this port (SEC-34, §7 below). The same binary is least-privilege where an IOMMU confines it and trust-critical where none
+  to trusted-on-this-machine (the machine-dependent posture the spec already allows). It is announced
+  at boot: since 2026-10-30 the Pi 4 prints `iommu: none on this board (no SMMU) - a driver given a DMA arena
+  is not confined, and drivers stay in TCB` (SEC-34, `backlog/90` D21, §7 below). The same binary is least-privilege where an IOMMU confines it and trust-critical where none
   does - now literally true across x86-with-IOMMU and this Pi.
 
 ## 5. Boot path decision - settled: bare GPU bootloader + DTB
@@ -868,7 +869,8 @@ AArch64 the analog is ...". All three are now recorded in `CLAUDE.md`:
   every `iommu::` entry point on `arm`, `aarch64` and `riscv64` is a stub and `confine_device` returns
   `false`, so all three non-x86 ports are entirely in the "without an IOMMU" case and their DMA-capable
   drivers are trust-critical on this machine. SEC-33/SEC-34 in the §6.4 amendments carry the Pi 4's
-  specifics, including that nothing is printed either way at boot.
+  specifics, including that nothing was printed either way at boot - true until 2026-10-30, when the Pi 4
+  and the Pi 2 began saying at boot that no DMA driver is confined (`backlog/90` D21).
 - **§4.1 / §9 / §10 arch notes** - CR3->TTBR, IPI-shootdown -> broadcast TLBI, ring 0/3 -> EL0/EL1. The
   2026-09-12 multi-architecture amendment to §4.1 makes the noun plural and states the bounded-port
   rule the checkers enforce.

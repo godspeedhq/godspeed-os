@@ -1387,6 +1387,11 @@ pub fn spawn_from_image(
 /// line are kept (legitimate lifecycle output, one line each).
 const SPAWN_TRACE: bool = false;
 
+/// The slot of a spawn granted the framebuffer that has not yet committed, or `usize::MAX`. One
+/// display, so one word: set at the grant, cleared at commit, and read by `cleanup_partial_spawn` to
+/// give the screen back when a spawn fails between the two (backlog/90 D15).
+static FB_GRANTED_TO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
 /// Undo a partially-built spawn on any error path (V2, kernel-audit-2).
 ///
 /// A spawn that fails AFTER the recv-endpoint block (a later driver MMIO/DMA map, or the
@@ -1397,15 +1402,13 @@ const SPAWN_TRACE: bool = false;
 /// Under a `chaos max-carnage` + `mem-pressure` storm those failures accumulate into a kernel
 /// panic. This unwinds the endpoint registrations (mirroring the endpoint-teardown half of
 /// `kill_task_by_slot` for a task that never ran - so no blocked waiters / delegated resources
-/// to handle) and releases the reserved task slot.
+/// to handle), quiesces a device the spawn enabled, gives back a display it was granted, and
+/// releases the reserved task slot. The address space is not this function's: the spawn's
+/// `UnstartedSpace` gives it back when the error return drops it (backlog/90 D15).
 ///
 /// `own_endpoint` is `None` for a service with no recv endpoint (and at the pre-endpoint cap
-/// inserts), in which case only the task slot is released - identical to the prior behaviour.
-/// The slot of a spawn granted the framebuffer that has not yet committed, or `usize::MAX`. One
-/// display, so one word: set at the grant, cleared at commit, and read by `cleanup_partial_spawn` to
-/// give the screen back when a spawn fails between the two (backlog/90 D15).
-static FB_GRANTED_TO: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
-
+/// inserts), in which case no recv endpoint is unwound; the device, the display, the reply
+/// endpoint and the task slot are still given back.
 fn cleanup_partial_spawn(task_slot: usize, name: &str, own_endpoint: Option<EndpointId>) {
     // The device too: a spawn can fail after it turned on the device's bus mastering, and this threw the
     // record away, so the controller was left mastering with no driver and no record of it (backlog/90
@@ -1810,13 +1813,10 @@ fn spawn_service_with_image(
     // The resource-mint authority (§7.10, P2 file-as-capability): held only by services that
     // issue delegated resources whose meaning they define. `fs` mints a file cap per open file.
     // Least-privilege (§3.1) - no other service can create delegated resources.
-    // `resource-server` (examples/) is also granted it BY NAME (the same e1000-BAR-style by-name
-    // kernel grant, never a contract field): this turns the example from a compile-only template
-    // into the real, QEMU-proven `osdev test resource-server`. It only takes effect in the
-    // resource-test build, the only build that spawns `resource-server` - in every other build it
-    // is never spawned, so the grant never fires.
-    // `net-stack` mints SOCKET capabilities (a socket is a delegated resource cap, §7.10, the same
-    // mechanism `fs` uses for files) - so it needs the same minting authority.
+    // Granted from the spawn request's privilege word (`privbits::RESOURCE_MINT`, `resource_mint`
+    // above), never by name: `service_hw` answers none for every name now. `net-stack` (whose SOCKET
+    // capabilities are delegated resource caps, §7.10, the same mechanism `fs` uses for files) and
+    // the `resource-server` example ask for it the same way.
     // The supervisor gets a GRANT-ONLY cap for every delegatable privilege, so it can pass authority
     // to a service it spawns without being able to exercise any of it (see SUPERVISOR_DELEGATABLE).
     if name == "supervisor" {

@@ -2161,3 +2161,63 @@ changed line in a source file was checked to be comment or docstring text.
 
 **Gates:** every documentation checker green (dash, refs, symbols, index, facts, line refs, commands, comment
 symbols, foreign words, site, backlog, line endings, unsafe), `commandments.py` 22/22.
+
+## Audit 27 - documents and code comments, `feat/v1-groundwork` since Audit 26 (2026-10-31)
+
+Scope: everything `feat/v1-groundwork` changed since `b34899c2` (56 commits, 129 files: the backlog/90 kernel fixes
+D3, D4, D5, D9, D14-D18, D20, D21, D24-D28 and their cards on all five boards; kernel W^X on arm, aarch64 and riscv64;
+riscv64's kstack guards; the x86 double-fault stack; the x86 clock lock masked (backlog/49); the backlog reorganised,
+`bugs/` into `backlog/fixed/96-98` and `not_required/`), then every document and comment elsewhere those changes made
+false. Read in three parts - comments in `kernel/`, `sdk/` and `tests/`; comments everywhere else; documents - by three
+independent readers, each finding checked against the code. Comments and documents only: every changed line in a
+source file was checked to be comment text (one `static` in `task/mod.rs` is unchanged; its doc block moved off it).
+
+**Result.** 32 files corrected, and 6 code findings recorded, not fixed. The constitution needed no change.
+
+**In documents:**
+- `audits/unsafe-audit.md`: the totals block (1183 lines in 78 files) had not been re-summed since before Audit 26; the
+  inventory sums to 1250 in 81, which is what `unsafe_check.py` prints.
+- `backlog/README.md`: row 90's fixed list stopped at D1, D2, D3, D5, D12, D19; row 49 lacked the clock-lock deadlock;
+  item 8 is `fixed/08` and its decision was made; the numbering rule counted two folders of three.
+- `backlog/49`: the T630 section asked for an IST stack for the double fault, which it has had since 2026-10-30 (D20);
+  the `Reboot` serial flush it also asks for is still missing.
+- `docs/aarch64.md`: twice, nothing printed about DMA confinement on the Pi 4 (SEC-34) - it is, since `b2831417`.
+- `docs/developer-services-design.md`: D9 and D23 "open"; the CMOS race "a lock would fix" (fixed by `80f2bb49`);
+  D22's CONSOLE_READ half is closed in `dispatch.rs`.
+- `docs/CLAUDE.md`: `ipc-efficiency.md` "open by decision" - closed as not required, one idea built.
+- `kernel/CLAUDE.md`: query 21 is INTROSPECT-gated (D23).
+- `kernel/src/arch/riscv64/CLAUDE.md`: no word of the kernel's W^X; `kernel/src/smp/CLAUDE.md`: `nth_ready`,
+  `check_this_core_known`, and `names.rs`'s atomic, `unsafe`-free name rows.
+- `tests/CLAUDE.md`, `tests/qemu/CLAUDE.md`: A11-A15 where A16 exists.
+
+**In code comments:**
+- `kernel/src/task/scheduler.rs`, `ipc/names.rs`, `task/mod.rs`: three doc comments stranded on a new neighbour
+  (`task_valid`, `lookup_then`, `FB_GRANTED_TO`) put back; `cleanup_partial_spawn` says what it gives back since D15;
+  `for_each_active_cap` has no caller; `TASK_PEERS` is an `AtomicNameSet`; RESOURCE_MINT comes from the spawn request,
+  not by name; `pml4-pending-test` fires on every self-kill after the first (also in `kernel/Cargo.toml`).
+- `kernel/src/arch/riscv64/trap.rs`, `mod.rs`: `sscratch` holds the kernel latch, not zero, and the entry tests it with
+  `bltz` and `bnez`.
+- `kernel/src/arch/aarch64/mmu.rs`: "W^X is a later refinement"; `arm/page_tables.rs`: riscv64's guard is not a stub,
+  and a RAM section is never-executable now; `x86_64/boot.rs`: IST1 is used; `capability/delegated.rs`: `owner_of`
+  routes nothing since D5; `routing.rs`: the rule cited from `TABLE` is written at `try_register_optional`.
+- `services/probe`, `services/supervisor`, `osdev/src/main.rs`: 193 probes and A1-A15 (or A1-A10) where there are 194
+  and A16.
+- `scripts/backlog_check.py`, `doc_refs.py`, `COMMENT-SYMBOLS.baseline.txt`, `.github/workflows/build.yml`: three
+  folders, not two; a history line rewritten by the 2026-10-13 move; `backlog/59` and `fixed/53` cited from the wrong
+  folder; `kernel/kernel-riscv32.ld`: `backlog/fixed/60`.
+
+**Code findings, recorded and not fixed (an audit changes no code):**
+1. `kernel/src/arch/arm/page_tables.rs`, `unmap_4k_strided`: the guard split re-maps the kstack pool as executable
+   pages, undoing D21 for about 15 MiB of kernel stacks on the Pi 2. Folded into `backlog/90` D21 with the fix.
+2. `kernel/src/syscall/dispatch.rs`, `handle_reboot`: no serial flush before `hardware_reset`, unlike `reboot_now`;
+   already in `backlog/49`.
+3. `kernel/src/task/scheduler.rs`, `for_each_active_cap`, and `capability/delegated.rs`, `owner_of`: no production
+   caller left (the second is used by unit tests).
+4. Test builds only: `panic-ring-test` (`log.rs`, `== 200`) and `kstack-overflow-test` (`scheduler.rs`, `== 2000`) fire
+   on the 201st and 2001st, where their comments say the 200th and 2000th.
+5. `services/fs/src/main.rs`: a log string carries a run of 18 spaces from a string continuation, so serial prints it.
+6. Not settled: `tests/host-ipc` t0-t5 cite line numbers as of `537e6861`, which `line_ref_check.py` cannot see; and
+   `services/supervisor/src/main.rs`'s "(183 probes)" against the CLAUDE.md files' 182 for the full build, which needs
+   the spawn list counted.
+
+**Gates:** `build_gates.py` 33/33, with every documentation checker green.

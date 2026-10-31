@@ -127,6 +127,10 @@ So for those two flags, and for the send peers themselves, **the generator's cei
 a generator that set them wrongly would grant, and the kernel would not stop it. That is why 3.3 refuses
 both flags by name, and why the generator's refusals are an authority boundary, not a convenience.
 
+*(2026-10-29: the CONSOLE_READ half is closed - `SpawnImage` refuses `SPAWN_FLAG_REQ_CONSOLE` from a caller
+that does not hold CONSOLE_READ itself, which the supervisor now does, GRANT-only (`backlog/90` D22).
+`SPAWN_FLAG_PEERS_GRANT` and the send peers are still checked by the generator alone.)*
+
 ---
 
 ## 3. Change 1: developer services in a build
@@ -271,14 +275,14 @@ again**, because a developer service with a send cap to `fs` on a real board tou
 
 **What the floor does not bound (added 2026-10-16).** The floor limits a developer service's AUTHORITY.
 It does not limit what every task can already do, and the kernel verification found two things there
-(`audits/2026-10-16-kernel-verification.md`), both open in `backlog/90`:
+(`audits/2026-10-16-kernel-verification.md`), both recorded in `backlog/90`:
 
 - **Ungated queries.** Any task may call the ungated `InspectKernel` queries. Two of them did harm until
   they were fixed (D23): query 21, which pops a byte of the COM2 operator channel, is INTROSPECT-gated since
   2026-10-29, and queries 11 and 17 take the CMOS lock across the index and data ports.
 - **Kernel defects reachable by any task.** A service that faults exercises the self-kill path, which has
-  a double-free window (D8), a page-table-root leak (D9, an L1 arena slot on the Pi 2) and a slot-reuse
-  race (D10). The restart loop in 3.4 repeats that path for a service that crashes on start, which is why
+  a double-free window (D8), a page-table-root leak (D9, an L1 arena slot on the Pi 2; fixed 2026-10-30) and a
+  slot-reuse race (D10). The restart loop in 3.4 repeats that path for a service that crashes on start, which is why
   its backoff and "given up" state matter: they bound how often a broken developer service drives it.
 
 Neither changes the answer above: an in-tree service has the same exposure, and none of it reaches a
@@ -800,8 +804,9 @@ wall clock to be right. Three facts from this tree bear on that:
   `OP_FLOOR_SET` is retired, the floor is set by `time` alone from its own file and its own readings, and
   `date sync` has `time` re-read that file when it never loaded. Merged since (`OP_FLOOR_SET` now
   answers `[0]`, `services/time/src/main.rs`);
-- on x86 the RTC read behind `time` races across cores and can return a date years ahead
-  (`audits/2026-10-16-kernel-verification.md`, D23), which a lock around the CMOS pair would fix.
+- on x86 the RTC read behind `time` raced across cores and could return a date years ahead
+  (`audits/2026-10-16-kernel-verification.md`, D23), fixed since 2026-10-18 by a lock around the CMOS pair
+  (`80f2bb49`).
 
 A clock that is wrong in the other direction cannot replay an old index, because versions only increase.
 

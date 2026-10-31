@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-//! The test-probe parameter table - 193 probes, ONE program.
+//! The test-probe parameter table - 194 probes, ONE program.
 //!
 //! This table used to live in `kernel/src/task/mod.rs`, as 193 `service_config` rows: the same
 //! `probe` ELF, differing by a test-mode number. A parameter is policy, and policy belongs to a
@@ -19,7 +19,7 @@
 //! word). The kernel no longer infers authority from a name.
 //!
 //! Bounded and flat (§26.6): a `const` slice in rodata, no heap, no lookup structure. A linear scan
-//! of 193 rows happens once per spawn, which is already the most expensive thing in the system.
+//! of 194 rows happens once per spawn, which is already the most expensive thing in the system.
 //!
 //! ## Why it lives here, and is shared by source
 //!

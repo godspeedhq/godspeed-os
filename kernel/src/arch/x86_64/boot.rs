@@ -61,7 +61,7 @@ struct Tss {
     rsp1:        u64,        // offset  12  (unused)
     rsp2:        u64,        // offset  20  (unused)
     _res1:       u64,        // offset  28
-    ist:         [u64; 7],   // offset  36..92  (IST stacks, unused in v1)
+    ist:         [u64; 7],   // offset  36..92  (IST stacks: IST1 is the double-fault stack, the rest unused)
     _res2:       u64,        // offset  92
     _res3:       u16,        // offset 100
     io_map_base: u16,        // offset 102  (104 = past limit → no IOPB → ring-3 I/O faults)

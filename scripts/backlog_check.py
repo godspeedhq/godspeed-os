@@ -35,7 +35,7 @@ def main():
         return 0
 
     # The open items, then the fixed ones in `fixed/` (2026-10-13), which keep their old numbers. A
-    # number is used ONCE across both folders: keyed per folder, this let an open 94 be filed beside
+    # number is used ONCE across every folder: keyed per folder, this let an open 94 be filed beside
     # a fixed 94, and every citation of number 94 then meant whichever the reader guessed (Audit 26).
     entries = sorted(f for f in os.listdir(BACKLOG)
                      if f.endswith('.md') and f != 'README.md')

@@ -223,7 +223,6 @@ pub fn unregister_endpoint(name: &str, endpoint_id: EndpointId) -> UnregisterOut
     UnregisterOutcome::NotFound
 }
 
-/// Look up an endpoint ID by service name.
 /// `lookup`, with `f` run on the endpoint WHILE the directory still names it - under this lock.
 ///
 /// For a caller that must bind what it does to the life the name points at, not to whatever later holds
@@ -243,6 +242,7 @@ pub fn lookup_then<R>(name: &str, f: impl FnOnce(EndpointId) -> R) -> Option<R> 
     }).map(|e| f(e.endpoint_id))
 }
 
+/// Look up an endpoint ID by service name.
 pub fn lookup(name: &str) -> Option<EndpointId> {
     let bytes = name.as_bytes();
     if bytes.len() > NAME_MAX { return None; }
