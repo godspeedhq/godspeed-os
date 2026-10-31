@@ -42,6 +42,18 @@ FAILS. They may decrease freely.
 
 ---
 
+## 2026-10-31 - the Pi 2's kernel stacks stay never-executable (backlog/90 D21)
+
+The guard split (`page_tables::unmap_4k_strided`) re-mapped the kstack pool's sections as 4 KiB pages
+without the section's execute-never, so W^X stopped at the kernel stacks. The split now carries XN into
+each page, inside its existing block. One test-only block shows it.
+
+| File | Lines | Why |
+|------|-------|-----|
+| `arch/arm/mod.rs` | 56 -> 57 (+1) | `kstack-exec-test` only: `bx lr` written to the first usable page of stack slot 0, cleaned, the I-cache invalidated, and called. Test builds only, one core, before any task exists, so the stack is unused; with W^X the fetch takes a prefetch abort, which is what the feature exists to show, and without it the instruction returns. |
+
+---
+
 ## 2026-10-28 - the Pi 2's RNG starts at boot (backlog/76, feat/v1-groundwork)
 
 `hw_random` enabled the BCM2835 RNG on its first call and then waited two million register reads for a
@@ -2788,7 +2800,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | arch/arm/syscall.rs | 5 | permitted |
 | arch/arm/usermode.rs | 17 | permitted |
 | arch/arm/timer.rs | 7 | permitted |
-| arch/arm/mod.rs | 56 | permitted |
+| arch/arm/mod.rs | 57 | permitted |
 | arch/loongarch64/mod.rs | 24 | permitted |
 | arch/riscv32/mod.rs | 24 | permitted |
 | arch/riscv64/fdt.rs | 3 | permitted |
@@ -2835,14 +2847,14 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | task/scheduler.rs | 34 | grandfathered |
 <!-- unsafe-inventory-end -->
 
-**Permitted total:** 1203 lines across 75 files  
+**Permitted total:** 1204 lines across 75 files  
 **Grandfathered total:** 47 lines across 6 files  
-**Grand total:** 1250 lines across 81 files
+**Grand total:** 1251 lines across 81 files
 
 > These three lines read 394/22, 53/6 and 447/28 until 2026-09-12 - a tree of 28 files that had not
 > existed for months, and a grand total 2.7x low. They are derived by summing the inventory block
 > immediately above, and `scripts/unsafe_check.py` independently prints the same grand total
-> ("81 audited files, 1250 total unsafe lines"). **The check validates the inventory rows, never this
+> ("81 audited files, 1251 total unsafe lines"). **The check validates the inventory rows, never this
 > prose**, which is how a number inside the file the check guards drifted that far. Re-derive them
 > whenever a row moves.
 

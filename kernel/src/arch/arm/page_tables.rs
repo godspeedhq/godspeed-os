@@ -817,10 +817,10 @@ pub fn entry_for_va(virt: u64) -> Option<u64> {
 // since 2026-10-30, backlog/90 D20).
 //
 // So the sections the pool spans are split into 4 KiB pages here, once, at boot, with the section's
-// attributes (`l2_small_page` with PRESENT|WRITABLE is Normal write-back, shareable, PL1-only) - all but
-// one: since the kernel's W^X map (backlog/90 D21) a RAM section is execute-never, and these pages are
-// built without NO_EXEC, so the pool's pages are executable where the section was not. And
-// each guard page is then left unmapped. An overflow now takes a data abort in the kernel, which is
+// attributes (`l2_small_page` with PRESENT|WRITABLE is Normal write-back, shareable, PL1-only), and with
+// the section's execute-never carried to every page: since the kernel's W^X map (backlog/90 D21) a RAM
+// section is XN, and a page split from it must be too, or the split makes the kernel stacks executable.
+// Each guard page is then left unmapped. An overflow now takes a data abort in the kernel, which is
 // reported and halts: loud, where it was silent.
 //
 // The tables are a static of their own, not the L2 arena: they belong to the kernel and live forever, and
@@ -871,8 +871,10 @@ pub fn unmap_4k_strided(base: u64, stride: u64, count: usize) {
             }
             let t = core::ptr::addr_of_mut!(GUARD_L2.0[n]) as *mut u32;
             let sect = e & 0xFFF0_0000;
+            // The section's XN (bit 4), carried to its pages, as `fill_kernel_identity` does (D21).
+            let xn = if e & (1 << 4) != 0 { PageFlags::NO_EXEC } else { PageFlags::empty() };
             for j in 0..256u32 {
-                t.add(j as usize).write_volatile(l2_small_page(sect | (j << 12), PageFlags::PRESENT | PageFlags::WRITABLE));
+                t.add(j as usize).write_volatile(l2_small_page(sect | (j << 12), PageFlags::PRESENT | PageFlags::WRITABLE | xn));
             }
         }
         for k in 0..count {

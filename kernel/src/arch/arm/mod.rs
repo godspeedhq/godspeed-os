@@ -994,6 +994,25 @@ extern "C" fn arm_boot_main() -> ! {
     // this one never did, so on the Pi 2 a kernel stack that overflowed would have written silently into
     // the saved registers of the task below it (`page_tables::unmap_4k_strided`).
     crate::task::install_kstack_guards();
+    // `kstack-exec-test`: write `bx lr` to the first usable page of stack slot 0 and call it, so the split
+    // the guards made is shown to keep the stacks never-executable - a prefetch abort, reported - where it
+    // once made them executable and the call came back (backlog/90 D21).
+    #[cfg(feature = "kstack-exec-test")]
+    {
+        pl011_write(b"kstack-exec-test: calling an instruction on a kernel stack\r\n");
+        let at = (crate::task::kstack_pool_base() + 4096) as u32;
+        // SAFETY: test builds only, on the one core, before any task exists, so slot 0's stack is unused;
+        // the word is cleaned to the point of coherency and the I-cache invalidated before the call, and
+        // `bx lr` returns to the caller in ARM state if the page is executable.
+        unsafe {
+            (at as *mut u32).write_volatile(0xE12F_FF1E);
+            page_tables::clean_dcache(at, 4);
+            core::arch::asm!("mcr p15, 0, {z}, c7, c5, 0", "dsb", "isb", z = in(reg) 0u32, options(nostack));
+            let f: extern "C" fn() = core::mem::transmute(at as usize);
+            f();
+        }
+        pl011_write(b"kstack-exec-test: the call on a kernel stack RETURNED - the stack is executable\r\n");
+    }
     syscall::selftest();
     usermode::selftest();
     loadtest::selftest();

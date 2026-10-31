@@ -137,6 +137,9 @@ routing-anomaly-test = []
 # kernel's W^X map is shown to refuse it rather than take it in silence (backlog/90 D21). Off by
 # default; test builds only.
 kernel-wx-test = []
+# The Pi 2: call an instruction written to a kernel stack once the guards are in, so the guard split is
+# shown to keep the stacks never-executable (backlog/90 D21). Off by default; test builds only.
+kstack-exec-test = []
 # Inject synthetic memory banks that extend past the identity-map limit, so `memmap`'s clamp is
 # EXERCISED rather than merely reasoned about. The clamp matters on an 8 GiB Pi 4, whose firmware
 # reports banks above 4 GiB that the low-4-GiB identity map does not reach - recording those as usable
