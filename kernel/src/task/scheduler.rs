@@ -2598,6 +2598,11 @@ fn leaving_idle_restore_quantum(prev: usize) {
 }
 
 pub fn current_task_slot() -> usize {
+    // Before the per-core arenas exist no task has run: `IDLE`, so an early kernel fault's report names
+    // no task rather than faulting on the unallocated arena.
+    if !CORE_CURRENT.initialised() {
+        return IDLE;
+    }
     let cid = current_core_id();
     CORE_CURRENT.get(cid).load(Ordering::Relaxed)
 }

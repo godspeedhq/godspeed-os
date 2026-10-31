@@ -61,6 +61,12 @@ pub fn core_lapic_id(core_id: u32) -> u32 {
 /// state. That is said by `check_this_core_known`, on the tick, rather than here: this is the lookup
 /// every syscall makes, and it stays a pure read (backlog/90 D28).
 pub fn lapic_to_core_id(lapic_id: u32) -> u32 {
+    // Before `init_arenas` only the boot core runs, and it is core 0. A kernel fault taken that early
+    // asks this from its report, and reading the unallocated arena faulted the report itself (the Pi 4's
+    // `kernel-wx-test`: FAR 0x4, `ready`'s offset from a null base).
+    if !CORES.initialised() || !CORE_LAPIC_ID.initialised() {
+        return 0;
+    }
     for i in 0..num_cores() {
         if CORES.get(i).ready.load(Ordering::Acquire)
             && CORE_LAPIC_ID.get(i).load(Ordering::Relaxed) == lapic_id
