@@ -70,6 +70,9 @@ features = [
     "band-full-test",
 # Test builds only (x86): the CMOS clock lock held across a tick during a supervisor respawn, so a
 # preemptible holder is shown to deadlock its core and an interrupt-masked one not to (backlog/49).
+# Test builds only: each switch-in site that can abort a claim from a task aborts once, so the core is
+# shown still to claim the task it is on (backlog/90 D7).
+    "claim-abort-test",
     "cmos-hold-test",
 # Test builds only: a scheduler-loop drain of a pending kernel stack is held across ticks, so the drain is
 # shown not to be re-entered by the timer on its own core (backlog/90 D8).

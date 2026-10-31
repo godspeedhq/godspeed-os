@@ -131,6 +131,10 @@ cmos-hold-test = []
 # and a drain that starts inside another says so, so the drain is shown not to be re-entered by the tick
 # (backlog/90 D8). Off by default; test builds only.
 drain-reentry-test = []
+# Each of the three switch-in sites that can abort a claim while on a task (the tick, yield, block) aborts
+# once after boot, as a kill that won the race would, and says whether the core still claims the task it
+# is on (backlog/90 D7). Off by default; test builds only.
+claim-abort-test = []
 # The first tick's core check after bring-up asks for a LAPIC id no core has, so the miss is shown to
 # be said rather than silently answered as core 0 (backlog/90 D28). Off by default; test builds only.
 lapic-miss-test = []

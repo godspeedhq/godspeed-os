@@ -95,6 +95,46 @@ fn core_release_current(cid: usize, to: usize) {
     CORE_CURRENT.get(cid).store(to, Ordering::SeqCst);
 }
 
+/// Give up a claim on `next` while still standing on `prev`: the abort of the switch-in handshake.
+///
+/// Claim leaving `prev`, then release `CORE_CURRENT` to `IDLE`. A second `core_release_current` here read
+/// `next` - published a moment earlier - as the task being left, so it claimed leaving `next` and dropped
+/// `prev`, while the core was still on `prev`'s stack and translating through its root: a concurrent kill
+/// of `prev` then found no core using it and freed both (backlog/90 D7). Correct whether or not `next` was
+/// published, since `prev` is the task this core is on either way.
+#[inline]
+fn core_abort_claim(cid: usize, prev: usize) {
+    #[cfg(feature = "wake-trace")]
+    wake_trace::note_run(IDLE);
+    CORE_LEAVING.get(cid).0.store(prev as u64, Ordering::SeqCst);
+    CORE_CURRENT.get(cid).store(IDLE, Ordering::SeqCst);
+}
+
+/// `claim-abort-test`: abort site `site`'s claim of `next` once, as a kill that won the race would, and
+/// put `next` back to Ready so it still runs (backlog/90 D7). Test builds only.
+#[cfg(feature = "claim-abort-test")]
+fn claim_abort_force(site: u8, next: usize) -> bool {
+    static FORCED: AtomicU8 = AtomicU8::new(0);
+    let bit = 1u8 << site;
+    if FORCED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        let _ = TASK_STATE[next].compare_exchange(
+            TaskState::Running as u8, TaskState::Ready as u8, Ordering::SeqCst, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
+/// `claim-abort-test`: after a forced abort, say whether this core still claims the task it is on.
+#[cfg(feature = "claim-abort-test")]
+fn claim_abort_report(site: &str, cid: usize, prev: usize) {
+    let leaving = CORE_LEAVING.get(cid).0.load(Ordering::SeqCst);
+    if leaving == prev as u64 {
+        crate::kprintln!("claim-abort-test: {} abort on core {} still claims leaving slot {}", site, cid, prev);
+    } else {
+        crate::kprintln!("claim-abort-test: {} abort on core {} claims leaving {} - slot {} it is ON is UNCLAIMED", site, cid, leaving, prev);
+    }
+}
+
 /// This core has re-entered the scheduler, so whatever it was leaving, it has left.
 ///
 /// The first provable moment: re-entry means the previous `switch_context` completed, so the core is
@@ -2310,10 +2350,14 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
                 TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+            #[cfg(feature = "claim-abort-test")]
+            if prev < MAX_TASKS && claim_abort_force(0, next) { abort_to_sched = true; }
         }
         if abort_to_sched {
-            // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
-            core_release_current(cid, IDLE);
+            // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds, still claiming `prev`.
+            core_abort_claim(cid, prev);
+            #[cfg(feature = "claim-abort-test")]
+            if prev < MAX_TASKS { claim_abort_report("timer", cid, prev); }
             if prev >= MAX_TASKS {
                 // Core was idle (in run()'s loop) - nothing to switch out; return to it.
                 return;
@@ -2512,10 +2556,14 @@ pub fn yield_current() {
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
                 TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+            #[cfg(feature = "claim-abort-test")]
+            if prev < MAX_TASKS && claim_abort_force(1, next) { abort_to_sched = true; }
         }
         if abort_to_sched {
-            // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds.
-            core_release_current(cid, IDLE);
+            // Leave CORE_CURRENT off `next` so the racing kill's spin-wait proceeds, still claiming `prev`.
+            core_abort_claim(cid, prev);
+            #[cfg(feature = "claim-abort-test")]
+            if prev < MAX_TASKS { claim_abort_report("yield", cid, prev); }
             if prev >= MAX_TASKS {
                 // Core was idle - nothing to switch out; return to it.
                 crate::arch::imp::enable_interrupts();
@@ -3665,12 +3713,16 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                     core::sync::atomic::fence(Ordering::SeqCst);
                     abort_to_sched =
                         TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+                    #[cfg(feature = "claim-abort-test")]
+                    if claim_abort_force(2, next) { abort_to_sched = true; }
                 }
                 if abort_to_sched {
-                    // Kill won the race: release its spin-wait (CORE_CURRENT off `next`)
-                    // and switch the now-Blocked `slot` to the scheduler context, exactly
-                    // as the None branch does - `slot` resumes here when later woken.
-                    core_release_current(cid, IDLE);
+                    // Kill won the race: release its spin-wait (CORE_CURRENT off `next`), still
+                    // claiming `slot`, and switch the now-Blocked `slot` to the scheduler context,
+                    // exactly as the None branch does - `slot` resumes here when later woken.
+                    core_abort_claim(cid, slot);
+                    #[cfg(feature = "claim-abort-test")]
+                    claim_abort_report("block", cid, slot);
                     let sched = CORE_SCHED_CTX.as_mut_ptr(cid);
                     switch_context(current_ctx, sched);
                 } else {
