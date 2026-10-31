@@ -104,23 +104,61 @@ static PENDING: SpinLock<PendingSends> = SpinLock::ZEROED;
 static SENDS_ABANDONED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 
 /// Record `slot` as blocked sending `msg` to `table[idx]` (TABLE held).
+///
+/// The two cannot-happen cases below are RECORDED here and said later by `say_deferred`, on core 0's
+/// tick: this runs under `TABLE` and `PENDING`, on the full-queue path of every send, and a serial line
+/// printed here holds both for as long as the line takes (backlog/90 D28, the rule `TABLE`'s comment
+/// states).
 fn block_sender(entry: &mut RoutingEntry, slot: usize, msg: Message) {
     let mut p = PENDING.lock();
     if slot >= p.by_task.len() {
-        crate::kprintln!("routing: task slot {} is past MAX_TASKS - its send cannot be held", slot);
+        DEFERRED_PAST_MAX.store(slot as u64 + 1, Ordering::Relaxed);
+        DEFERRED_COUNT.fetch_add(1, Ordering::Relaxed);
         return;
     }
     if p.by_task[slot].ep != 0 {
         // A task waits in one send at a time, and its death clears its record (`forget_blocked_sender`),
-        // so this means a record outlived its task. Say so; the stale record is replaced, and the
+        // so this means a record outlived its task. Said (later); the stale record is replaced, and the
         // endpoint it named copes with a count that finds no record (`take_oldest`).
-        crate::kprintln!("routing: task slot {} still recorded as sending to endpoint {} - replaced",
-            slot, p.by_task[slot].ep);
+        DEFERRED_REPLACED.store(((slot as u64) << 32) | p.by_task[slot].ep as u64, Ordering::Relaxed);
+        DEFERRED_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    // `routing-anomaly-test`: the first blocked send records a replaced record that did not happen, so
+    // the tick is shown to say it - outside the locks this runs under (backlog/90 D28).
+    #[cfg(feature = "routing-anomaly-test")]
+    {
+        static ONCE: portable_atomic::AtomicBool = portable_atomic::AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            DEFERRED_REPLACED.store(((slot as u64) << 32) | entry.id.0 as u64, Ordering::Relaxed);
+            DEFERRED_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let seq = p.next_seq;
     p.next_seq += 1;
     p.by_task[slot] = PendingSend { ep: entry.id.0, seq, msg: Some(msg) };
     entry.waiting = entry.waiting.saturating_add(1);
+}
+
+/// `block_sender`'s cannot-happen cases, recorded under its locks and said by `say_deferred`: the last
+/// slot past `MAX_TASKS` (plus one; 0 = none), the last replaced record (`slot << 32 | endpoint`; 0 =
+/// none), and how many of either have happened since boot.
+static DEFERRED_PAST_MAX: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+static DEFERRED_REPLACED: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+static DEFERRED_COUNT: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Say what `block_sender` recorded, holding no lock. Called from core 0's tick, so a case is said
+/// within one tick of happening; two between ticks are said as the last of them and the running count.
+pub fn say_deferred() {
+    let past = DEFERRED_PAST_MAX.swap(0, Ordering::Relaxed);
+    if past != 0 {
+        crate::kprintln!("routing: task slot {} is past MAX_TASKS - its send could not be held ({} such case(s) since boot)",
+            past - 1, DEFERRED_COUNT.load(Ordering::Relaxed));
+    }
+    let rep = DEFERRED_REPLACED.swap(0, Ordering::Relaxed);
+    if rep != 0 {
+        crate::kprintln!("routing: task slot {} was still recorded as sending to endpoint {} - replaced ({} such case(s) since boot)",
+            rep >> 32, rep & 0xffff_ffff, DEFERRED_COUNT.load(Ordering::Relaxed));
+    }
 }
 
 /// Take the OLDEST blocked sender on `entry`, clearing its record: `(slot, its message)`. TABLE held.

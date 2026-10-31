@@ -2028,6 +2028,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 // An interrupt notification skipped or dropped under queue pressure is owed, not lost:
                 // send it now if its queue has room (backlog/90 D18).
                 crate::interrupt::route::retry_missed();
+                // What the send path recorded rather than printed under its locks (backlog/90 D28).
+                crate::ipc::routing::say_deferred();
             }
             #[cfg(feature = "wake-trace")]
             wake_trace::maybe_report(monotonic_ticks());

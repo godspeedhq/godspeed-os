@@ -127,6 +127,9 @@ kstack-overflow-test = []
 # The first tick's core check after bring-up asks for a LAPIC id no core has, so the miss is shown to
 # be said rather than silently answered as core 0 (backlog/90 D28). Off by default; test builds only.
 lapic-miss-test = []
+# The first blocked send records a routing anomaly that did not happen, so core 0's tick is shown to say
+# what `block_sender` recorded under its locks (backlog/90 D28). Off by default; test builds only.
+routing-anomaly-test = []
 # riscv64 and the Pis: write a byte of the kernel's own text back to itself once faults report, so the
 # kernel's W^X map is shown to refuse it rather than take it in silence (backlog/90 D21). Off by
 # default; test builds only.

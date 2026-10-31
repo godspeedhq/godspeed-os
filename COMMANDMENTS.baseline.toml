@@ -128,6 +128,9 @@ features = [
 # Test builds only: the drain leaves a pending page-table root alone, so the kill path is shown to
 # free a second self-kill's predecessor rather than overwrite it (backlog/90 D9).
     "pml4-pending-test",
+# Test builds only: one routing anomaly recorded on purpose, so the tick is shown to say what the send
+# path recorded rather than printed under its locks (backlog/90 D28).
+    "routing-anomaly-test",
 # Test builds only: one SpawnImage finds its caller's capability table full, so the refusal is shown
 # to come before the child starts rather than after (backlog/90 D27).
     "spawn-full-table-test",
