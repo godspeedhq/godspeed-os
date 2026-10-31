@@ -2821,6 +2821,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | memory/frame.rs | 1 | permitted |
 | memory/mod.rs | 1 | permitted |
 | memory/page.rs | 1 | permitted |
+| smp/core.rs | 1 | permitted |
 | smp/ipi.rs | 4 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 6 | permitted |
@@ -2831,7 +2832,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | main.rs | 2 | grandfathered |
 | syscall/dispatch.rs | 2 | grandfathered |
 | task/mod.rs | 7 | grandfathered |
-| task/scheduler.rs | 35 | grandfathered |
+| task/scheduler.rs | 34 | grandfathered |
 <!-- unsafe-inventory-end -->
 
 **Permitted total:** 1133 lines across 72 files  
@@ -3979,3 +3980,14 @@ those tables by pointer, and its reclaim frees only tables it owns.
 | `build_tables`: `&mut WX_L2` (1) | Single-threaded boot with the MMU off, as the `L1` borrow above it; the static is referenced only here and, through the L1 entries written next, by the table walker |
 | `unsafe extern "C"` for `__text_start`, `__rodata_start`, `__data_start` (1) | Linker symbols; only their addresses are taken, never read through |
 | mod.rs, `kernel-wx-test` only: a byte of the kernel's code written back to itself (1) | Test builds only; the value written is the value read, so the image is unchanged if the store is allowed, and with W^X it faults, which is what the feature exists to show |
+
+## `task/scheduler.rs` 35 -> 34, `smp/core.rs` 0 -> 1 (2026-10-30): the core-id read moves to a permitted layer
+
+backlog/90 D28. The tick now checks, once bring-up has reported its cores, that this core's id matches a
+ready core (`smp::core::check_this_core_known`), and needs the id read to do it. That read was
+`current_core_id`'s own `unsafe` line in a grandfathered file; it is now `smp::core::current_lapic_id`, a
+safe fn in a permitted layer (18.5), and `current_core_id` calls it. A fall in the frozen file, recorded.
+
+| Block | Why it is sound |
+|---|---|
+| smp/core.rs `current_lapic_id`: `boot::get_lapic_id()` (1) | The arch's own read of this core's id register, the same call `current_core_id` made; valid before the scheduler or the tick first runs on any core |

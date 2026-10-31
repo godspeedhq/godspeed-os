@@ -98,6 +98,9 @@ features = [
 # Test builds only: a kernel stack is overflowed on purpose, so the fault is shown to be reported
 # rather than to reset the machine (x86) or pass in silence (riscv64) (backlog/90 D20).
     "kstack-overflow-test",
+# Test builds only: a LAPIC-id lookup that matches no core, so the miss is shown to be said (backlog/90
+# D28).
+    "lapic-miss-test",
 # Test builds only (Pi 4): core 2 checks in late, so the per-core arenas are shown to cover a released-
 # but-late core and the one numbered past it (backlog/90 D17).
     "late-ap-test",

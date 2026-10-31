@@ -1107,9 +1107,7 @@ pub fn init_arenas(n: usize) {
 ///
 /// Must only be called after `init_local_apic` on this core.
 pub fn current_core_id() -> usize {
-    // SAFETY: APIC is mapped before the scheduler ever runs on any core.
-    let lapic_id = unsafe { crate::arch::imp::boot::get_lapic_id() };
-    crate::smp::core::lapic_to_core_id(lapic_id) as usize
+    crate::smp::core::lapic_to_core_id(crate::smp::core::current_lapic_id()) as usize
 }
 
 // ---------------------------------------------------------------------------
@@ -1990,6 +1988,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
     //
     // Cheap: one relaxed load per core per tick, on a path that already runs.
     crate::arch::imp::panic_halt_check();
+    // A core whose id matches no ready core is running as core 0; say so, once (backlog/90 D28).
+    crate::smp::core::check_this_core_known();
     // Free any deferred kstack from a prior self-kill on this core.
     // RSP is now on the current task's kstack, not the dead task's, so
     // freeing the pending kstack is safe.  IF=0 (interrupt gate).

@@ -54,6 +54,12 @@ pub fn core_lapic_id(core_id: u32) -> u32 {
 
 /// Translate a local APIC ID to its assigned core ID.
 /// Returns 0 (BSP) if no match is found.
+///
+/// **Zero is right during bring-up and wrong after it.** A core asks before it is marked ready - the boot
+/// core before `init`, an AP before `mark_ready` - and every caller of that window expects core 0. Once
+/// the arch has reported its cores, a miss means a core is running as core 0, on core 0's per-core
+/// state. That is said by `check_this_core_known`, on the tick, rather than here: this is the lookup
+/// every syscall makes, and it stays a pure read (backlog/90 D28).
 pub fn lapic_to_core_id(lapic_id: u32) -> u32 {
     for i in 0..num_cores() {
         if CORES.get(i).ready.load(Ordering::Acquire)
@@ -64,6 +70,55 @@ pub fn lapic_to_core_id(lapic_id: u32) -> u32 {
     }
     0
 }
+
+/// This core's hardware id - the LAPIC id on x86, the hart or MPIDR affinity elsewhere - as the arch
+/// reads it. The one `unsafe` read `task::scheduler::current_core_id` used to make itself, here in a
+/// permitted layer (18.5).
+pub fn current_lapic_id() -> u32 {
+    // SAFETY: the arch's own read of this core's id register; mapped and valid before the scheduler or
+    // the tick first runs on any core, which is when this is first called.
+    unsafe { crate::arch::imp::boot::get_lapic_id() }
+}
+
+/// Say, once, that this core's id matches no ready core, once the arch has reported its cores. Called
+/// from every core's tick (`timer_tick_from_irq`), so a core running as core 0 by mistake is named at
+/// its first tick after bring-up (backlog/90 D28). Through the lock-free writer, not `kprintln`, which
+/// would ask `lapic_to_core_id` which core it is on. Not a panic: a core that checks in late (backlog/90
+/// D17) runs before it is ready, and that is the case worth seeing.
+pub fn check_this_core_known() {
+    if !CORES_REPORTED.load(Ordering::Relaxed) || MISS_SAID.load(Ordering::Relaxed) {
+        return;
+    }
+    #[allow(unused_mut)] // written only by `lapic-miss-test`
+    let mut id = current_lapic_id();
+    // `lapic-miss-test`: the first check after bring-up asks for an id no core has.
+    #[cfg(feature = "lapic-miss-test")]
+    {
+        static ASKED: AtomicBool = AtomicBool::new(false);
+        if !ASKED.swap(true, Ordering::Relaxed) {
+            id = 0xDEAD;
+        }
+    }
+    for i in 0..num_cores() {
+        if CORES.get(i).ready.load(Ordering::Acquire) && CORE_LAPIC_ID.get(i).load(Ordering::Relaxed) == id {
+            return;
+        }
+    }
+    if MISS_SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mut line = *b"smp: LAPIC id 0x00000000 matches no ready core - it runs as core 0, on core 0's per-core state (backlog/90 D28; said once)\n";
+    let digits = b"0123456789abcdef";
+    for k in 0..8 {
+        line[16 + k] = digits[((id >> (28 - 4 * k)) & 0xf) as usize];
+    }
+    crate::arch::imp::serial_write_bytes_lockfree(&line);
+}
+
+/// Set once the arch has reported its cores; after it, a miss is not bring-up (`check_this_core_known`).
+static CORES_REPORTED: AtomicBool = AtomicBool::new(false);
+/// Whether a miss after bring-up has been said; said once.
+static MISS_SAID: AtomicBool = AtomicBool::new(false);
 
 /// Called by each AP from `ap_main` once its local APIC is initialised.
 pub fn mark_ready(core_id: u32) {
@@ -90,6 +145,7 @@ pub fn report_cores_ready() {
     // count its own subject invites the reader to wonder what else it is approximating.
     let n = ready_count();
     crate::kprintln!("smp: {} core{} ready", n, if n == 1 { "" } else { "s" });
+    CORES_REPORTED.store(true, Ordering::Relaxed);
 }
 
 pub fn ready_count() -> u32 {
