@@ -1104,6 +1104,18 @@ static CORE_PENDING_KSTACK_LEN: PerCore<AtomicUsize> = PerCore::new();
 /// Relaxed/Release/Acquire ordering is sufficient.
 static CORE_PENDING_PML4: PerCore<AtomicU64> = PerCore::new();
 
+/// Per-core task slot a self-kill left RESERVED, released by `drain_pending_kstack` once the core is off it
+/// (backlog/90 D10). `IDLE` = none.
+///
+/// A self-kill used to release its slot (`TASK_VALID = false`) at once, while the core was still running
+/// in that slot - `CORE_CURRENT` still named it, and the switch away had not happened. A spawn on another
+/// core could take the slot in that window and fill it, and the dying core's switch-out then read the slot
+/// as a live task: it saved the dead task's registers into the new task's `TASK_CTX`, so the new task's
+/// first run was the dead one resumed, holding the new task's capabilities. Held here, the slot stays Dead
+/// and valid until the core has left it - `wake_by_slot` will not revive a Dead slot and a second kill
+/// bails on one - and only then can a spawn take it.
+static CORE_PENDING_SLOT: PerCore<AtomicUsize> = PerCore::new();
+
 /// Per-core save area for dead task context during self-kill.
 ///
 /// When a task kills itself and immediately releases TASK_VALID=false, a
@@ -1139,6 +1151,7 @@ pub fn init_arenas(n: usize) {
     CORE_WAKE_HINT.init_with(n, |_| AtomicUsize::new(MAX_TASKS));
     CORE_PENDING_KSTACK_LEN.init_with(n, |_| AtomicUsize::new(0));
     CORE_PENDING_PML4.init_with(n, |_| AtomicU64::new(0));
+    CORE_PENDING_SLOT.init_with(n, |_| AtomicUsize::new(IDLE));
 }
 
 
@@ -2252,9 +2265,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                 // kill_task_by_slot's spin-wait on CORE_CURRENT sees us leave.
                 // Without this, the ISR returns to the dead task, CORE_CURRENT
                 // never changes, and the spin-wait deadlocks.
-                // Check STATE alone (not TASK_VALID): with the deferred-kstack
-                // approach TASK_VALID is false immediately after self-kill, but
-                // STATE=Dead is still the signal we need.
+                // Check STATE alone (not TASK_VALID): STATE=Dead is the signal, whether
+                // or not the slot has been released yet.
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
@@ -2850,9 +2862,36 @@ fn drain_pending_kstack(cid: usize) {
             crate::arch::imp::page_tables::free_page_table_root(pml4_phys);
         }
     }
+    // The slot last, once its stack and root are back: from here a spawn may take it (D10).
+    let pending_slot = CORE_PENDING_SLOT.get(cid).swap(IDLE, Ordering::AcqRel);
+    if pending_slot < MAX_TASKS {
+        release_dead_slot(pending_slot);
+    }
     #[cfg(feature = "drain-reentry-test")]
     DRAIN_BUSY.fetch_and(!(1u64 << (cid % 64)), Ordering::Relaxed);
     crate::arch::imp::local_irq_restore(was_enabled);
+}
+
+/// Release a dead task's slot to `reserve_task_slot`. Interrupts masked (both callers), so the slot lock
+/// cannot be re-entered by the tick.
+fn release_dead_slot(slot: usize) {
+    task_slot_lock();
+    TASK_VALID[slot].store(false, Ordering::Release);
+    task_slot_unlock();
+}
+
+/// `selfkill-release-test`: say, once, whether a self-killed slot is free for a spawn while this core is
+/// still on it (backlog/90 D10). Test builds only.
+#[cfg(feature = "selfkill-release-test")]
+fn selfkill_release_report(cid: usize, slot: usize) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if CORE_CURRENT.get(cid).load(Ordering::SeqCst) == slot && !SAID.swap(true, Ordering::Relaxed) {
+        if TASK_VALID[slot].load(Ordering::Acquire) {
+            crate::kprintln!("selfkill-release-test: slot {} stays reserved while core {} is still on it", slot, cid);
+        } else {
+            crate::kprintln!("selfkill-release-test: slot {} is FREE for a spawn while core {} is still on it", slot, cid);
+        }
+    }
 }
 
 /// `drain-reentry-test`: cores inside `drain_pending_kstack`, one bit each.
@@ -3555,21 +3594,19 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // that crashes, pushing its ISR frame to K_a while this core is still
         // executing there - corrupting both stacks (KERNEL PF).
         //
-        // Fix - deferred kstack only: release the slot immediately (TASK_VALID=false)
-        // so reserve_task_slot can reuse it without the zombie 10ms starvation
-        // window, but enqueue the kstack pointer for free at the next timer tick
-        // or scheduler idle loop, where RSP is on a different stack.
+        // Fix: enqueue the kstack pointer, and the slot itself (`CORE_PENDING_SLOT`,
+        // backlog/90 D10), for release at the next timer tick or scheduler idle loop,
+        // where RSP is on a different stack. The slot was released here until
+        // 2026-10-31, and a spawn that took it before this core switched away had
+        // the dead task's registers saved over its own context.
         //
-        // Context save safety: yield_current (called immediately after this return)
-        // detects TASK_VALID=false and saves the dead task's registers into
-        // CORE_DEAD_CTX[cid] rather than TASK_CTX[slot], preventing a
-        // write-after-claim race if a concurrent spawn has already reserved
-        // TASK_CTX[slot] via reserve_task_slot.
+        // Context save: the slot stays valid until then, so yield_current saves the
+        // dead task's registers into TASK_CTX[slot], which no one else can hold yet.
         //
         // Cross-kill: this core's RSP is on the supervisor's kstack, not K_a.
         // Free immediately and release the slot now.
         if is_self_kill {
-            // Self-kill: defer only the kstack free; release slot immediately.
+            // Self-kill: defer the kstack free and the slot's release.
             if TASK_IS_USER[slot] {
                 let kstack = TASK_KERNEL_STACK_TOP[slot].load(Ordering::Relaxed);
                 if kstack != 0 {
@@ -3592,10 +3629,15 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                     }
                 }
             }
-            // Release slot now - no zombie period, no starvation.
-            task_slot_lock();
-            TASK_VALID[slot].store(false, Ordering::Release);
-            task_slot_unlock();
+            // Keep the slot until this core is off it (D10): `drain_pending_kstack` releases it, at the next
+            // scheduler entry or tick on this core. A slot an EARLIER self-kill here left is released now -
+            // the core switched off it to reach this one, as with the stacks above.
+            let earlier = CORE_PENDING_SLOT.get(my_core).swap(slot, Ordering::AcqRel);
+            if earlier < MAX_TASKS {
+                release_dead_slot(earlier);
+            }
+            #[cfg(feature = "selfkill-release-test")]
+            selfkill_release_report(my_core, slot);
             return;
         }
 

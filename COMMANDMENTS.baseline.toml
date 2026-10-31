@@ -110,6 +110,9 @@ features = [
 # Test builds only (the Pi 2): an instruction on a kernel stack is called, so the guard split is shown
 # to leave the stacks never-executable (backlog/90 D21).
     "kstack-exec-test",
+# Test builds only: the first self-kill says whether its slot is free while its core is still on it
+# (backlog/90 D10).
+    "selfkill-release-test",
 # Test builds only: a LAPIC-id lookup that matches no core, so the miss is shown to be said (backlog/90
 # D28).
     "lapic-miss-test",

@@ -135,6 +135,9 @@ drain-reentry-test = []
 # once after boot, as a kill that won the race would, and says whether the core still claims the task it
 # is on (backlog/90 D7). Off by default; test builds only.
 claim-abort-test = []
+# The first self-kill says whether its slot is free for a spawn while its core is still on it, so the
+# slot is shown to stay reserved until the core has left (backlog/90 D10). Off by default; test builds only.
+selfkill-release-test = []
 # The first tick's core check after bring-up asks for a LAPIC id no core has, so the miss is shown to
 # be said rather than silently answered as core 0 (backlog/90 D28). Off by default; test builds only.
 lapic-miss-test = []
