@@ -473,13 +473,13 @@ fn report_fault(frame: &TrapFrame, scause: u64, code: u64, stval: u64, from_user
         // routing table for a queue depth, recomputes a restart count and reads the monotonic clock,
         // and this path wanted exactly one string out of it. Doing that much work on possibly-corrupt
         // state, from a fault handler, is asking to fault again - and the guard above exists because
-        // it did. `task_name` is a single bounds-checked read from a static table.
+        // it did. `task_name` is a bounds-checked copy out of a static table of atomic bytes.
         //
         // The same call is in `arch/arm/exceptions.rs` and `arch/aarch64/exceptions.rs`; they are a
         // latent instance of this and are left alone here rather than changed untested on hardware
         // this session cannot reach (26.7).
         let name = crate::task::scheduler::task_name(slot);
-        super::print_str(name);
+        super::print_str(&name);
         super::print_str("' (slot ");
         super::print_dec(slot as u64);
         super::print_str(")");

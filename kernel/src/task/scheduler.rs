@@ -53,13 +53,16 @@ const TASK_NAME_MAX: usize = crate::task::PEER_NAME_BYTES;
 /// service (it now holds one, `supervisor`): a caller-supplied name had nowhere to live. Owning the bytes is what lets a SPAWNER name
 /// the task it is spawning (`docs/probe-params-design.md`).
 ///
-/// The interior mutability that needs lives in `smp::names::NameTable`, a permitted layer (18.1),
-/// so this file grows no `unsafe` (18.5). 32 bytes is what `TaskStatRaw` already exposes to
-/// userspace, so the two representations agree instead of one being converted into the other.
+/// The table is `smp::names::NameTable`: atomic bytes, read by COPY. A slot is reused, so a name
+/// borrowed out of it could change in the hand of the code printing it (backlog/90 D24); `task_name`
+/// returns a `TaskName` instead, which reads as a `&str` and cannot.
 static TASK_NAMES: NameTable<MAX_TASKS, TASK_NAME_MAX> = NameTable::new();
 
+/// A task's name, copied out of its slot (`smp::names::Name`).
+pub type TaskName = crate::smp::names::Name<TASK_NAME_MAX>;
+
 /// This slot's name, or `""` for a slot that has none.
-pub fn task_name(slot: usize) -> &'static str { TASK_NAMES.get(slot) }
+pub fn task_name(slot: usize) -> TaskName { TASK_NAMES.get(slot) }
 
 /// Is core `cid` still using `slot` - either running it, or not yet finished leaving it?
 ///
@@ -1612,7 +1615,7 @@ pub struct TaskStatRaw {
     pub core:        u32,
     pub mem_used:    u64,
     pub mem_limit:   u64,
-    pub name:        &'static str,
+    pub name:        TaskName,
     pub restart_count: u64,
     pub queue_depth: u8,
     pub run_ticks:   u64,
@@ -1630,7 +1633,7 @@ pub struct TaskStatRaw {
 pub fn task_stat(slot: usize) -> TaskStatRaw {
     if slot >= MAX_TASKS {
         return TaskStatRaw { valid: false, state: 0, core: 0, mem_used: 0, mem_limit: 0,
-                             name: "", restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
+                             name: TaskName::empty(), restart_count: 0, queue_depth: 0, run_ticks: 0, uptime_secs: 0,
                              endpoint: 0 };
     }
     // SAFETY: read-only snapshot of static arrays; all reads are individually
@@ -1652,7 +1655,7 @@ pub fn task_stat(slot: usize) -> TaskStatRaw {
             // DERIVED, not stored (Commandment III): the restart lineage's one truth is NAME_RESTART
             // (the per-name counter). A live instance's count IS its name's count - so we recompute it
             // here rather than cache a per-slot copy that could drift from the source.
-            restart_count: next_restart_count(task_name(slot)),
+            restart_count: next_restart_count(&task_name(slot)),
             queue_depth,
             run_ticks:   TASK_RUN_TICKS[slot].load(Ordering::Relaxed),
             uptime_secs: {
@@ -2112,7 +2115,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     let slot_num = if stuck_task == IDLE { 0 } else { stuck_task };
                     // NAME THE TASK. "task slot 2" sends a reader to cross-reference a number
                     // against a boot log they may not still have; the name is the fact they need.
-                    let stuck_name = if stuck_task == IDLE { "" } else { task_name(stuck_task) };
+                    let stuck_name = if stuck_task == IDLE { TaskName::empty() } else { task_name(stuck_task) };
                     // ONE REPORTER. A dark core is visible to EVERY neighbour at once and each
                     // independently decides to announce it, so the last two captures printed the
                     // panic twice and the second began mid-line of the first:
@@ -2803,7 +2806,8 @@ fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_
         crate::task::Cause::Killed { by } => {
             note[n] = crate::task::death::KILLED;
             n += 1;
-            let kb = task_name(by).as_bytes();
+            let killer = task_name(by);
+            let kb = killer.as_bytes();
             let k = kb.len().min(TASK_NAME_MAX);
             note[n..n + k].copy_from_slice(&kb[..k]);
             n + k
@@ -2868,7 +2872,9 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
     unsafe {
 
         // Capture identity before any slot state changes.
-        let task_name = crate::task::scheduler::task_name(slot);
+        // A copy, held for the whole death path: the slot is freed below and may be reused (D24).
+        let task_name_copy = crate::task::scheduler::task_name(slot);
+        let task_name: &str = &task_name_copy;
         let task_ep   = ep_from_u64(TASK_ENDPOINT[slot].load(Ordering::Relaxed));
 
         // If this task was itself blocked in a synchronous CALL, drop its outstanding-call record so

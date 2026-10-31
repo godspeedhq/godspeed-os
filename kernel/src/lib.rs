@@ -73,6 +73,8 @@ pub mod arch {
 pub mod smp {
     pub mod spinlock;
     pub use spinlock::SpinLock;
+    // The task-name table, for its copy-not-borrow and torn-read tests (backlog/90 D24).
+    pub mod names;
 }
 
 // Bitmap allocator model - compiled only in test mode.

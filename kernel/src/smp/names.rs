@@ -8,34 +8,30 @@
 //! `service_config` row per service: a caller-supplied name had nowhere to live. Owning the bytes is
 //! what lets a SPAWNER name what it spawns (`docs/probe-params-design.md`).
 //!
-//! Owning them needs interior mutability behind a shared `static`, which is `unsafe`. Section 18.5
-//! says new `unsafe` must first try to live in a permitted layer rather than grow a grandfathered
-//! file - and this is, precisely, a concurrency primitive: a shared array with one writer per slot
-//! and readers on every core. It belongs beside `SpinLock`, audited once, rather than as raw-pointer
-//! code open-coded in `task/`.
+//! It is a concurrency primitive - a shared array with one writer per slot and readers on every core
+//! - so it belongs beside `SpinLock`, not open-coded in `task/`.
 //!
 //! ## The discipline that makes it sound
 //!
-//! - **One writer per slot.** `set` is called from the spawn path with the slot reserved and
-//!   interrupts off, before the task is enqueued and therefore before any other core can see it.
-//! - **Length last, and length first.** The writer publishes the bytes, then the length with
-//!   `Release`; a reader loads the length with `Acquire` and only then the bytes below it. A reader
-//!   that races a write sees the old length over new bytes, or the new length over new bytes - never
-//!   a length that outruns what has been written.
-//! - **Bounded and flat (26.6):** a fixed `N * L` byte array in `.bss`. No heap, no interner, no
-//!   lifetimes to reason about.
+//! - **Atomic bytes, so nothing here is `unsafe`.** A read racing a write is a wrong answer, never
+//!   undefined behaviour.
+//! - **A read is a COPY, never a borrow** (backlog/90 D24). `get` used to hand out `&'static str`
+//!   into a slot's bytes, and a slot is REUSED: the next task to take it rewrote those bytes under
+//!   whoever still held the borrow - a name that changed in the hand of the code printing it. Now
+//!   `get` returns a `Name`, the bytes copied out.
+//! - **A copy is whole or retried.** Each slot has a sequence counter, odd while `set` is writing.
+//!   A reader copies between two reads of it and keeps the copy only if both match and are even, so it
+//!   never mixes two lives' bytes. One writer per slot (the spawn path, slot reserved, interrupts off)
+//!   keeps a rewrite brief; a reader that keeps losing gives up and answers `""` rather than spin.
+//! - **Bounded and flat (26.6):** fixed `N * L` atomic bytes in `.bss`. No heap, no interner.
 
-use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{fence, AtomicU32, AtomicU8, Ordering};
 
 /// `N` slots of at most `L` bytes each, stored ATOMICALLY - so every operation is safe.
 ///
-/// The sibling of `NameTable`, for the case that does not need to BORROW a name: comparison only.
-/// `NameTable` has to hand back a `&'static str`, which forces a raw read out of an `UnsafeCell`;
-/// where a caller only asks "is this slot this name?", atomic bytes answer it with no `unsafe` at
-/// all. That matters beyond tidiness: the caller here is `task/scheduler.rs`, one of 18.5's
-/// GRANDFATHERED floors, which may not grow its unsafe count without a CLAUDE.md amendment. Choosing
-/// the representation that needs none is cheaper than the amendment, and better.
+/// The sibling of `NameTable`, for the case that only ever COMPARES a name. Both are atomic now;
+/// this one has no sequence counter because a comparison racing a rewrite answers wrongly once, and
+/// its one caller (`AcquireSendCap`) can afford that where a printed or reported name could not.
 ///
 /// Per-byte atomics are a real cost, paid once per spawn on a table read only by `AcquireSendCap`.
 pub struct AtomicNameSet<const N: usize, const L: usize> {
@@ -74,74 +70,184 @@ impl<const N: usize, const L: usize> AtomicNameSet<N, L> {
     }
 }
 
-/// `N` slots of at most `L` bytes each.
-pub struct NameTable<const N: usize, const L: usize> {
-    bytes: UnsafeCell<[[u8; L]; N]>,
-    lens:  [AtomicU8; N],
+/// A name copied out of a `NameTable` slot: at most `L` bytes, owned, so it cannot change under its
+/// holder when the slot is reused (backlog/90 D24). Reads as a `&str` (`Deref`, `Display`, `==`).
+#[derive(Clone, Copy)]
+pub struct Name<const L: usize> {
+    buf: [u8; L],
+    len: usize,
 }
 
-// SAFETY: every write goes through `set`, which the caller guarantees is the only writer for that
-// slot (see the module discipline above); readers only ever read bytes below an `Acquire`-loaded
-// length that a `Release` store published after those bytes were written.
-unsafe impl<const N: usize, const L: usize> Sync for NameTable<N, L> {}
+impl<const L: usize> Name<L> {
+    /// The empty name, as a slot never set reads.
+    pub const fn empty() -> Self {
+        Self { buf: [0u8; L], len: 0 }
+    }
+
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+    }
+}
+
+impl<const L: usize> core::ops::Deref for Name<L> {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<const L: usize> core::fmt::Display for Name<L> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<const L: usize> core::fmt::Debug for Name<L> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl<const L: usize> PartialEq<str> for Name<L> {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl<const L: usize> PartialEq<&str> for Name<L> {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/// `N` slots of at most `L` bytes each, one writer per slot, read by copy (`Name`).
+pub struct NameTable<const N: usize, const L: usize> {
+    bytes: [[AtomicU8; L]; N],
+    lens:  [AtomicU8; N],
+    /// Odd while `set` is writing the slot; a copy is kept only if it reads the same even value on
+    /// both sides of the copy.
+    seq:   [AtomicU32; N],
+}
+
+/// How many times `get` tries for a whole copy before answering `""`. A rewrite is a few hundred
+/// stores with interrupts off, so a reader that loses this many times in a row is not going to win.
+const GET_TRIES: usize = 8;
 
 impl<const N: usize, const L: usize> NameTable<N, L> {
     pub const fn new() -> Self {
         Self {
-            bytes: UnsafeCell::new([[0u8; L]; N]),
+            bytes: [const { [const { AtomicU8::new(0) }; L] }; N],
             lens:  [const { AtomicU8::new(0) }; N],
+            seq:   [const { AtomicU32::new(0) }; N],
         }
     }
 
-    /// This slot's name, or `""` for an out-of-range slot or one never set.
-    ///
-    /// The borrow is genuinely `'static`: the table is a kernel-lifetime `static`, and the bytes of
-    /// a slot are only ever rewritten by the single writer that owns it.
-    pub fn get(&'static self, slot: usize) -> &'static str {
-        if slot >= N { return ""; }
-        let len = self.lens[slot].load(Ordering::Acquire) as usize;
-        // SAFETY: `len` was published with `Release` AFTER the bytes below it were written, so those
-        // bytes are initialised and stable. The pointer targets a `static`, so the `'static` borrow
-        // outlives every caller. No `&mut` to this slot can exist concurrently (single writer, and
-        // it runs with the slot reserved and interrupts off).
-        //
-        // ONE ROW, never the table: `&*self.bytes.get()` borrowed every slot at once while `set` was
-        // writing another, which is aliasing a `&mut` in the language's terms whatever the hardware does
-        // (backlog/90 D24). The pointer is offset to this slot's row and only that row is borrowed.
-        let b = unsafe {
-            let row: &[u8; L] = &*(self.bytes.get() as *const [u8; L]).add(slot);
-            &row[..len.min(L)]
-        };
-        core::str::from_utf8(b).unwrap_or("")
+    /// A copy of this slot's name, or the empty name for an out-of-range slot, one never set, or one
+    /// being rewritten for longer than `GET_TRIES` reads.
+    pub fn get(&self, slot: usize) -> Name<L> {
+        if slot >= N {
+            return Name::empty();
+        }
+        for _ in 0..GET_TRIES {
+            let before = self.seq[slot].load(Ordering::Acquire);
+            if before & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let mut name = Name::empty();
+            name.len = (self.lens[slot].load(Ordering::Relaxed) as usize).min(L);
+            for i in 0..name.len {
+                name.buf[i] = self.bytes[slot][i].load(Ordering::Relaxed);
+            }
+            // The copy's loads may not be reordered after the second read of the counter.
+            fence(Ordering::Acquire);
+            if self.seq[slot].load(Ordering::Relaxed) == before {
+                return name;
+            }
+        }
+        Name::empty()
     }
 
     /// Record this slot's name, truncating at `L` bytes rather than refusing - a name is an identity,
     /// and a spawn should not fail because someone chose a long one.
     ///
-    /// # Safety
-    /// The caller must be the only writer for `slot` for the duration of this call. In the kernel
-    /// that is the spawn path, which holds the slot reserved with interrupts off.
-    pub unsafe fn set(&self, slot: usize, name: &str) {
-        if slot >= N { return; }
+    /// The caller must be the only writer for `slot` for the duration of this call - the spawn path,
+    /// which holds the slot reserved with interrupts off. A second writer would give a wrong name, not
+    /// undefined behaviour: every store is atomic.
+    pub fn set(&self, slot: usize, name: &str) {
+        if slot >= N {
+            return;
+        }
         let b = name.as_bytes();
         let n = b.len().min(L);
-        // Withdraw the previous life's name first, so a reader arriving during the rewrite sees "" rather
-        // than the old length over half-written bytes. A reader that loaded the old length before this
-        // can still overlap the write; a name borrowed `'static` from a slot that is later reused is the
-        // limit of this table, recorded in backlog/90 D24.
-        self.lens[slot].store(0, Ordering::Release);
-        // SAFETY: the caller guarantees exclusive write access to this slot; no reader can observe
-        // the bytes as part of the name until the length store below publishes them.
-        //
-        // ONE ROW, never the table: this was `&mut *self.bytes.get()`, a `&mut` to EVERY slot while other
-        // cores were reading theirs - undefined behaviour however the bytes landed (backlog/90 D24). The
-        // write is through a pointer to this slot's row alone.
-        unsafe {
-            let row: &mut [u8; L] = &mut *(self.bytes.get() as *mut [u8; L]).add(slot);
-            *row = [0u8; L];
-            row[..n].copy_from_slice(&b[..n]);
+        // Odd: a write is in progress, so a reader's copy across it is thrown away.
+        self.seq[slot].fetch_add(1, Ordering::Relaxed);
+        // The stores below may not be reordered before the counter went odd.
+        fence(Ordering::Release);
+        for i in 0..L {
+            self.bytes[slot][i].store(if i < n { b[i] } else { 0 }, Ordering::Relaxed);
         }
-        // LENGTH LAST: this is the release that publishes the bytes above.
-        self.lens[slot].store(n as u8, Ordering::Release);
+        self.lens[slot].store(n as u8, Ordering::Relaxed);
+        // Even again: everything above is published by this release.
+        self.seq[slot].fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_copy_survives_the_slot_being_reused() {
+        // backlog/90 D24: a name borrowed out of a slot changed when the slot was reused.
+        let t: NameTable<4, 16> = NameTable::new();
+        t.set(1, "fs");
+        let held = t.get(1);
+        t.set(1, "shell");
+        assert_eq!(held, "fs");
+        assert_eq!(t.get(1), "shell");
+    }
+
+    #[test]
+    fn truncates_at_the_bound_and_answers_empty_out_of_range() {
+        let t: NameTable<2, 4> = NameTable::new();
+        t.set(0, "supervisor");
+        assert_eq!(t.get(0), "supe");
+        assert_eq!(t.get(1), "");
+        assert_eq!(t.get(9), "");
+        t.set(9, "ignored");
+        assert_eq!(t.get(9), "");
+    }
+
+    #[test]
+    fn a_read_racing_a_rewrite_never_mixes_two_names() {
+        // One writer alternating two names of the same length, readers on other threads: every copy
+        // must be one name whole, or empty (a reader that kept losing). Never half of each.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        const L: usize = 64;
+        let a = "a".repeat(L);
+        let b = "b".repeat(L);
+        let t: Arc<NameTable<1, L>> = Arc::new(NameTable::new());
+        t.set(0, &a);
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..3).map(|_| {
+            let (t, stop, a, b) = (t.clone(), stop.clone(), a.clone(), b.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let n = t.get(0);
+                    assert!(n == a.as_str() || n == b.as_str() || n == "", "torn read: {:?}", n);
+                    reads += 1;
+                }
+                reads
+            })
+        }).collect();
+        for i in 0..200_000 {
+            t.set(0, if i % 2 == 0 { &b } else { &a });
+        }
+        stop.store(true, Ordering::Relaxed);
+        let total: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(total > 0);
     }
 }

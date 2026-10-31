@@ -2825,7 +2825,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | smp/ipi.rs | 4 | permitted |
 | smp/mod.rs | 1 | permitted |
 | smp/percpu.rs | 6 | permitted |
-| smp/names.rs | 4 | permitted |
+| smp/names.rs | 0 | permitted |
 | smp/spinlock.rs | 5 | permitted |
 | interrupt/route.rs | 1 | grandfathered |
 | loader.rs | 1 | grandfathered |
@@ -3991,3 +3991,11 @@ safe fn in a permitted layer (18.5), and `current_core_id` calls it. A fall in t
 | Block | Why it is sound |
 |---|---|
 | smp/core.rs `current_lapic_id`: `boot::get_lapic_id()` (1) | The arch's own read of this core's id register, the same call `current_core_id` made; valid before the scheduler or the tick first runs on any core |
+
+## `smp/names.rs` 4 -> 0 (2026-10-31): task names are read by copy, and the table has no `unsafe`
+
+backlog/90 D24. `NameTable::get` handed out `&'static str` into a slot's bytes, and slots are reused: the
+next task to take one rewrote those bytes under whoever still held the borrow. The table's bytes are now
+atomics with a per-slot sequence counter, `get` returns a copied `Name` that is whole or retried, and `set`
+is a safe fn. The `UnsafeCell`, its `unsafe impl Sync`, the raw row borrow in `get` and the write in `set`
+(and `set`'s `unsafe fn`) all go. A fall, recorded.
