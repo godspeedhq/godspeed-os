@@ -2599,7 +2599,9 @@ static SUPERVISOR_RESPAWN_COUNT: portable_atomic::AtomicU64 =
 /// the normal switch PREEMPTS it and runs a ready task. So the spawn is preemptible (lock-holders run
 /// and release) and resumable (it gets quanta) - replacing the old IF=1 pin, which suppressed the
 /// switch to keep the spawn running but STARVED any Core-0 lock-holder and deadlocked under load
-/// (§22 Test 15). The spawn's locks are IRQ-safe, so it is only ever preempted between holds.
+/// (§22 Test 15). The spawn's locks are IRQ-safe, so it is only ever preempted between holds - which
+/// stopped being true when the x86 clock read took a plain lock, and wedged core 0 at about one respawn in
+/// six until it masked interrupts too (backlog/49, `rtc::read_datetime_raw`).
 static SUPERVISOR_RESPAWN_IN_PROGRESS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 

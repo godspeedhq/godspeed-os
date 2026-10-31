@@ -178,9 +178,27 @@ fn read_datetime_raw() -> u64 {
     // that is wrong by seconds, hours or years. Measured in QEMU on 2026-10-18 as reads 55 s and 14 s
     // BEHIND, and eleven years ahead, every few seconds; and a read a little AHEAD that the high-water mark
     // accepted stands `now_epoch_monotonic` still until real time catches it, which stretches every deadline
-    // in the system that long. Read under this lock, the pair is one reader's. The callers are syscalls,
-    // the spawn path and boot - no interrupt handler reads the clock - so the lock cannot be re-entered.
-    let _cmos = CMOS.lock();
+    // in the system that long. Read under this lock, the pair is one reader's.
+    //
+    // WITH INTERRUPTS MASKED for the hold (backlog/49). No interrupt handler reads the clock, but that was
+    // not enough: the supervisor's respawn runs on core 0 where the timer can preempt it, and it reads the
+    // clock in `commit_task`. Preempted while holding this lock, it handed core 0 to a task whose syscall
+    // read the clock too - a syscall runs with interrupts off, so it spun here with no tick that could give
+    // the core back to the holder. Core 0 was dead: `SpinLock WEDGE` on this lock and `LIVENESS WEDGE` with
+    // 0 interrupts, at about one supervisor respawn in six in `osdev test shell` since this lock went in
+    // (2026-10-18), and on every one with `cmos-hold-test`. A holder that cannot be preempted always
+    // finishes, and the hold is a few register reads (the RTC's update window at worst, under 2 ms).
+    let _cmos = CMOS.lock_irq();
+    // `cmos-hold-test`: while the supervisor is being respawned, keep the lock for a twentieth of the
+    // liveness watchdog's allowance, so a tick is sure to land inside the hold (backlog/49). Test builds only.
+    #[cfg(feature = "cmos-hold-test")]
+    if crate::task::supervisor_respawn_in_progress() {
+        let t0 = crate::arch::imp::read_cycle_counter();
+        let hold = crate::arch::imp::liveness_deadline_cycles() / 20;
+        while crate::arch::imp::read_cycle_counter().wrapping_sub(t0) < hold {
+            core::hint::spin_loop();
+        }
+    }
     wait_update_clear();
     let (mut sec, mut min, mut hour) = (cmos_read(0), cmos_read(2), cmos_read(4));
     let (mut day, mut month, mut year, mut century) =

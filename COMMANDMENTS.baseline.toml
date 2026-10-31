@@ -68,6 +68,9 @@ features = [
 # Test builds only: shrinks the delegated band to one slot so the kernel's band-full line is shown
 # to fire (backlog/90 D26). Nothing in a shipping kernel.
     "band-full-test",
+# Test builds only (x86): the CMOS clock lock held across a tick during a supervisor respawn, so a
+# preemptible holder is shown to deadlock its core and an interrupt-masked one not to (backlog/49).
+    "cmos-hold-test",
     # Diagnostic ONLY, and deliberately registered here rather than slipped in: it changes what the
     # kernel PRINTS on a fatal EL0 fault, never what it does. It widens the stack window, measures the
     # run of whatever fill byte is at SP (the production scan measures ZEROS, so it reported "0 bytes"
