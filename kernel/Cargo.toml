@@ -138,6 +138,9 @@ claim-abort-test = []
 # The first self-kill says whether its slot is free for a spawn while its core is still on it, so the
 # slot is shown to stay reserved until the core has left (backlog/90 D10). Off by default; test builds only.
 selfkill-release-test = []
+# The first claim after boot reads as pinned to another core, so the scheduler's give-back is shown to
+# leave the task runnable (backlog/90 D11). Off by default; test builds only.
+stale-claim-test = []
 # The first tick's core check after bring-up asks for a LAPIC id no core has, so the miss is shown to
 # be said rather than silently answered as core 0 (backlog/90 D28). Off by default; test builds only.
 lapic-miss-test = []

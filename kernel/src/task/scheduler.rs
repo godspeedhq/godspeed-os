@@ -1906,7 +1906,8 @@ pub fn run(core_id: u32) -> ! {
                         core_release_current(cid, next);
                         core::sync::atomic::fence(Ordering::SeqCst);
                         abort = TASK_STATE[next].load(Ordering::SeqCst)
-                            != TaskState::Running as u8;
+                            != TaskState::Running as u8
+                            || !claimed_is_ours(next, cid);
                     }
                     if !abort {
                         if TASK_IS_USER[next] {
@@ -2361,7 +2362,8 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
             core_release_current(cid, next);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
-                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8
+                || !claimed_is_ours(next, cid);
             #[cfg(feature = "claim-abort-test")]
             if prev < MAX_TASKS && claim_abort_force(0, next) { abort_to_sched = true; }
         }
@@ -2567,7 +2569,8 @@ pub fn yield_current() {
             core_release_current(cid, next);
             core::sync::atomic::fence(Ordering::SeqCst);
             abort_to_sched =
-                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+                TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8
+                || !claimed_is_ours(next, cid);
             #[cfg(feature = "claim-abort-test")]
             if prev < MAX_TASKS && claim_abort_force(1, next) { abort_to_sched = true; }
         }
@@ -3754,7 +3757,8 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                     core_release_current(cid, next);
                     core::sync::atomic::fence(Ordering::SeqCst);
                     abort_to_sched =
-                        TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8;
+                        TASK_STATE[next].load(Ordering::SeqCst) != TaskState::Running as u8
+                        || !claimed_is_ours(next, cid);
                     #[cfg(feature = "claim-abort-test")]
                     if claim_abort_force(2, next) { abort_to_sched = true; }
                 }
@@ -3828,6 +3832,45 @@ pub fn take_recv_message() -> Option<Message> {
 /// Before the RR scan, checks `CORE_WAKE_HINT`: if a task was just woken by
 /// `wake_by_slot` it is returned immediately without scanning, so a recently
 /// woken task cannot be starved by the current RR position.
+/// Is the task this core has just claimed pinned to THIS core? `false` - and the claim given back - when it is
+/// not, which is always a bug: a task runs only on the core it was spawned on (9.1), and switching into one
+/// pinned elsewhere would run it on two cores at once (backlog/90 D11, `backlog/95`).
+///
+/// A slot can be killed, freed and reused between `pick_next` and the claim: the pick is three separate loads,
+/// the claim is a CAS on the state alone, and a kill does not wait for a core until that core publishes the
+/// slot. Checked AFTER the claim is published and fenced, because only from then on must a kill wait for this
+/// core, so the task read here is the task claimed. A claim of a reused slot pinned to this core is a claim of
+/// a Ready task this core may run, and passes. A mismatch gives the claim back through `wake_by_slot` (Ready
+/// again, or Dead if killed meanwhile, and its own core woken) and the caller aborts the switch as when a kill
+/// wins. Said on the first occurrence and every power of two after.
+///
+/// This guard was in the tree on 2026-10-26 and reverted, because `osdev test shell` then wedged at supervisor
+/// respawns 5 times in 7; those wedges were `backlog/49`'s clock-lock deadlock, fixed 2026-10-31.
+fn claimed_is_ours(next: usize, cid: usize) -> bool {
+    let pinned = TASK_CORE[next].load(Ordering::SeqCst);
+    // `stale-claim-test`: the first claim after boot reads as pinned to another core, so the give-back is
+    // shown to leave the task runnable (backlog/90 D11). Test builds only.
+    #[cfg(feature = "stale-claim-test")]
+    let pinned = {
+        static FAKED: AtomicBool = AtomicBool::new(false);
+        if crate::smp::percpu::num_cores() > 1 && !FAKED.swap(true, Ordering::Relaxed) {
+            ((cid + 1) % crate::smp::percpu::num_cores()) as u32
+        } else { pinned }
+    };
+    if pinned == cid as u32 {
+        return true;
+    }
+    wake_by_slot(next, 0);
+    static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::kprintln!(
+            "sched: core {} claimed slot {}, which is pinned to core {} - claim given back, switch skipped ({} so far)",
+            cid, next, pinned, n);
+    }
+    false
+}
+
 fn pick_next(core_id: usize) -> Option<usize> {
     // Fast path: schedule the just-woken task immediately.
     let hint = CORE_WAKE_HINT.get(core_id).load(Ordering::Acquire);

@@ -113,6 +113,9 @@ features = [
 # Test builds only: the first self-kill says whether its slot is free while its core is still on it
 # (backlog/90 D10).
     "selfkill-release-test",
+# Test builds only: the first claim after boot reads as pinned to another core, so the give-back is
+# shown to leave the task runnable (backlog/90 D11).
+    "stale-claim-test",
 # Test builds only: a LAPIC-id lookup that matches no core, so the miss is shown to be said (backlog/90
 # D28).
     "lapic-miss-test",
