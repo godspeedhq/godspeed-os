@@ -1525,6 +1525,10 @@ fn spawn_service_with_image(
     // 1. Parse ELF.
     let crate::loader::LoadedElf { mut page_table, entry_va, mapped_bytes: elf_mapped_bytes } =
         crate::loader::load_from(&image)?;
+    // From here every early return gives the address space back (backlog/90 D15): the guard owns it
+    // until the task is committed, and an error drops it. A failed spawn used to keep every frame it had
+    // mapped, and the supervisor's retry leaked another set each time.
+    let mut unstarted = crate::memory::UnstartedSpace::new(page_table.cr3_value(), name);
 
     if SPAWN_TRACE { crate::kprintln!("spawn[stack]: '{}'", name); }
 
@@ -2488,7 +2492,8 @@ fn spawn_service_with_image(
         .ok_or_else(|| { cleanup_partial_spawn(task_slot, name, own_endpoint); SpawnError::NoMemory })?;
     if SPAWN_TRACE { crate::kprintln!("spawn[commit]: '{}' kstack ok", name); }
 
-    // 8. Initial ring-3 context.
+    // 8. Initial ring-3 context. Nothing below fails, so the address space is the task's from here.
+    unstarted.disarm();
     let cr3 = page_table.into_cr3();
     // SAFETY: `finalize_service_address_space` - arch hook: on ARM it clones the kernel identity into
     // the service page table and cleans the D-cache for the non-cacheable walker (the kernel is not

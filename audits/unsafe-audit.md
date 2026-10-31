@@ -2819,7 +2819,7 @@ CI script: `scripts/unsafe_check.py` - parses the table between the markers.
 | capability/table.rs | 7 | permitted |
 | memory/allocator.rs | 49 | permitted |
 | memory/frame.rs | 1 | permitted |
-| memory/mod.rs | 1 | permitted |
+| memory/mod.rs | 2 | permitted |
 | memory/page.rs | 1 | permitted |
 | smp/core.rs | 1 | permitted |
 | smp/ipi.rs | 4 | permitted |
@@ -3999,3 +3999,15 @@ next task to take one rewrote those bytes under whoever still held the borrow. T
 atomics with a per-slot sequence counter, `get` returns a copied `Name` that is whole or retried, and `set`
 is a safe fn. The `UnsafeCell`, its `unsafe impl Sync`, the raw row borrow in `get` and the write in `set`
 (and `set`'s `unsafe fn`) all go. A fall, recorded.
+
+## `memory/mod.rs` 1 -> 2 (2026-10-31): a failed spawn gives its address space back
+
+backlog/90 D15, kernel-audit T1 and A5-11. A spawn that failed after building its page table leaked every
+frame it had mapped. `memory::UnstartedSpace` owns the root from the loader's `PageTable::new` until the
+task is committed and, dropped while armed, gives it back through `reclaim_unstarted_address_space`: the
+same two arch calls the kill path makes for a dead task. The `unsafe` is here, in a permitted layer, so
+`loader.rs` and `task/mod.rs` stay at their grandfathered floors (18.5).
+
+| Block | Why it is sound |
+|---|---|
+| `reclaim_unstarted_address_space`: `reclaim_user_frames` + `free_page_table_root` (1) | By the fn's contract the root belongs to a task that never ran: no core has it installed and nothing else points into it, which is what both calls require of a dead task's root. Its one caller is `UnstartedSpace`, the only owner of the root until the task is committed |

@@ -234,6 +234,8 @@ pub fn load_from(src: &ImageSource) -> Result<LoadedElf, LoadError> {
     }
 
     let mut pt = PageTable::new()?;
+    // Every return below this line but the last gives the table back (backlog/90 D15).
+    let mut unstarted = crate::memory::UnstartedSpace::new(pt.cr3_value(), "the loader");
     let mut mapped_bytes = 0u64;
 
     let ph_base  = ehdr.e_phoff as usize;
@@ -356,6 +358,7 @@ pub fn load_from(src: &ImageSource) -> Result<LoadedElf, LoadError> {
         mapped_bytes += va_end - va_start;
     }
 
+    unstarted.disarm();
     Ok(LoadedElf { page_table: pt, entry_va: ehdr.e_entry, mapped_bytes })
 }
 
