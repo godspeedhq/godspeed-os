@@ -146,6 +146,38 @@ static SERIAL_LOCK: AtomicBool = AtomicBool::new(false);
 /// where the alternative is no line at all. Same trade x86 makes, for the same reason.
 const SERIAL_LOCK_SPIN_CAP: u32 = 2_000_000;
 
+/// Who holds `SERIAL_LOCK`, for the halt dump: the hart plus one, or 0 when nobody does.
+///
+/// **A lock that is never released costs every later writer the whole bound, and until this nothing
+/// could say who took it.** A VisionFive run went from clean lines to one write every 120 ms, short or
+/// long, for fifteen seconds until the panic. So the holder records itself and what it was printing.
+static SERIAL_HOLDER: AtomicU32 = AtomicU32::new(0);
+/// The first bytes of the text being printed under the lock, and how far through it the holder got.
+const SERIAL_HELD_BYTES: usize = 48;
+static SERIAL_HELD_TEXT: [core::sync::atomic::AtomicU8; SERIAL_HELD_BYTES] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; SERIAL_HELD_BYTES];
+static SERIAL_HELD_LEN: AtomicUsize = AtomicUsize::new(0);
+static SERIAL_HELD_POS: AtomicUsize = AtomicUsize::new(0);
+/// Writers that gave up on the lock, and when the first of them did.
+static SERIAL_CAPPED: AtomicU32 = AtomicU32::new(0);
+static SERIAL_FIRST_CAP: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+
+/// Record this hart as the holder of what it just took.
+fn serial_note_hold(s: &[u8]) {
+    SERIAL_HOLDER.store(hart_id() as u32 + 1, Ordering::Relaxed);
+    SERIAL_HELD_LEN.store(s.len(), Ordering::Relaxed);
+    SERIAL_HELD_POS.store(0, Ordering::Relaxed);
+    for (i, slot) in SERIAL_HELD_TEXT.iter().enumerate() {
+        slot.store(s.get(i).copied().unwrap_or(0), Ordering::Relaxed);
+    }
+}
+
+/// Give the lock back. Only a writer that took it may call this.
+fn serial_lock_release() {
+    SERIAL_HOLDER.store(0, Ordering::Relaxed);
+    SERIAL_LOCK.store(false, Ordering::Release);
+}
+
 /// Take the lock if it can be had within the bound. Returns whether it was.
 fn serial_lock_acquire() -> bool {
     let mut t = 0u32;
@@ -158,6 +190,9 @@ fn serial_lock_acquire() -> bool {
         }
         core::hint::spin_loop();
         t += 1;
+    }
+    if SERIAL_CAPPED.fetch_add(1, Ordering::Relaxed) == 0 {
+        SERIAL_FIRST_CAP.store(sbi::time(), Ordering::Relaxed);
     }
     false
 }
@@ -1434,6 +1469,14 @@ pub fn halt_all_cores() -> ! {
             core::hint::spin_loop();
         }
     }
+    // Read before the first line below, which takes the lock itself if it is free.
+    let holder = SERIAL_HOLDER.load(Ordering::Relaxed);
+    let (held_len, held_pos) = (SERIAL_HELD_LEN.load(Ordering::Relaxed), SERIAL_HELD_POS.load(Ordering::Relaxed));
+    let mut held = [0u8; SERIAL_HELD_BYTES];
+    for (out, slot) in held.iter_mut().zip(SERIAL_HELD_TEXT.iter()) {
+        let b = slot.load(Ordering::Relaxed);
+        *out = if (0x20..0x7f).contains(&b) { b } else { b'.' };
+    }
     serial_write_bytes_lockfree(b"kernel: hart stages at halt (stage/irqs) -");
     for hart in 0..MAX_HART_ID {
         let st = CORE_STAGE[hart].load(Ordering::Relaxed);
@@ -1464,10 +1507,52 @@ pub fn halt_all_cores() -> ! {
         }
     }
     serial_write_bytes_lockfree(b"\n  stages: 1 trap-entry 2 timer-rearmed 3 usermode-hook 4 fb-publish 5 neutral-sched 6 tick-done 7 trap-exit 8 syscall 9 ipi-drain 10 idle-wfi 11 timer-enter(pre-SBI) 12 fault-report 13 kill 14 in-drain 15 past-drain(pick_next) 16 halted-by-another-hart 17 pre-switch 18 switch-enter 19 switch-armed 20 HALTED-AFTER-KERNEL-FAULT(read the TRAP line above, not this) (syscall NR shown as sN)\n");
+    let now = sbi::time();
+    // WHO HELD THE SERIAL LOCK, and what each hart last trapped on. A stage says which phase a hart
+    // reached; these say what it was printing and which instruction it stopped at.
+    serial_write_bytes_lockfree(b"  serial lock: ");
+    if holder == 0 {
+        serial_write_bytes_lockfree(b"free");
+    } else {
+        serial_write_bytes_lockfree(b"held by h");
+        emit_dec_lockfree(holder as u64 - 1);
+        serial_write_bytes_lockfree(b" at byte ");
+        emit_dec_lockfree(held_pos as u64);
+        serial_write_bytes_lockfree(b" of ");
+        emit_dec_lockfree(held_len as u64);
+        serial_write_bytes_lockfree(b": ");
+        serial_write_bytes_lockfree(&held[..held_len.min(SERIAL_HELD_BYTES)]);
+    }
+    serial_write_bytes_lockfree(b"; writers gave up ");
+    emit_dec_lockfree(SERIAL_CAPPED.load(Ordering::Relaxed) as u64);
+    serial_write_bytes_lockfree(b" times, first ");
+    emit_dec_lockfree(now.saturating_sub(SERIAL_FIRST_CAP.load(Ordering::Relaxed)));
+    serial_write_bytes_lockfree(b" ago\n  last trap (traps/sepc/scause):");
+    for hart in 0..MAX_HART_ID {
+        let traps = CORE_TRAP_COUNT[hart].load(Ordering::Relaxed);
+        if traps == 0 {
+            continue;
+        }
+        serial_write_bytes_lockfree(b" h");
+        emit_dec_lockfree(hart as u64);
+        serial_write_bytes_lockfree(b"=");
+        emit_dec_lockfree(traps);
+        serial_write_bytes_lockfree(b"/");
+        serial_write_hex_lockfree(CORE_TRAP_SEPC[hart].load(Ordering::Relaxed));
+        serial_write_bytes_lockfree(b"/");
+        serial_write_hex_lockfree(CORE_TRAP_CAUSE[hart].load(Ordering::Relaxed));
+    }
+    // Whether the screen was still being published: the display reads memory, not this cache.
+    serial_write_bytes_lockfree(b"\n  cache flush: busy=");
+    emit_dec_lockfree(CCACHE_BUSY.load(Ordering::Relaxed) as u64);
+    serial_write_bytes_lockfree(b" skipped=");
+    emit_dec_lockfree(CCACHE_SKIPPED.load(Ordering::Relaxed) as u64);
+    serial_write_bytes_lockfree(b" last publish ");
+    emit_dec_lockfree(now.saturating_sub(FB_LAST_PUBLISH.load(Ordering::Relaxed)));
+    serial_write_bytes_lockfree(b" ago\n");
     // The idle sample, for any hart that ever halted. `now` is the wall clock as that hart last saw
     // it, so comparing it against `deadline` says whether the wake it was waiting for was already
     // due - and STIE (bit 5 of sie) says whether it could have been delivered at all.
-    let now = sbi::time();
     serial_write_bytes_lockfree(b"  idle sample (hart: armed-in/last-seen-ago/stie/stip) now=");
     emit_dec_lockfree(now);
     for hart in 0..MAX_HART_ID {
@@ -1610,9 +1695,12 @@ pub fn power_off() -> &'static str {
 /// below so it cannot be split.
 pub fn serial_write_byte(b: u8) {
     let got = serial_lock_acquire();
+    if got {
+        serial_note_hold(&[b]);
+    }
     putc(b);
     if got {
-        SERIAL_LOCK.store(false, Ordering::Release);
+        serial_lock_release();
     }
 }
 
@@ -1624,11 +1712,17 @@ pub fn serial_write_byte(b: u8) {
 /// and doing it per byte would leave exactly the gaps two harts interleave through.
 pub fn serial_write_bytes_lockfree(s: &[u8]) {
     let got = serial_lock_acquire();
-    for &b in s {
+    if got {
+        serial_note_hold(s);
+    }
+    for (i, &b) in s.iter().enumerate() {
+        if got {
+            SERIAL_HELD_POS.store(i, Ordering::Relaxed);
+        }
         putc(b);
     }
     if got {
-        SERIAL_LOCK.store(false, Ordering::Release);
+        serial_lock_release();
     }
     mirror_to_screen(s);
 }
@@ -2758,6 +2852,11 @@ static CORE_IRQ_LAST: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; M
 /// and an instrument heavy enough to change the timing of the thing it is watching is how a
 /// heisenbug gets manufactured.
 static CORE_STAGE: [AtomicU32; MAX_HART_ID] = [const { AtomicU32::new(0) }; MAX_HART_ID];
+/// Each hart's trap count, and the `sepc` and `scause` of its last trap. An exception loop shows as a
+/// trap count far past the interrupt count, which `note_irq` cannot show.
+static CORE_TRAP_COUNT: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
+static CORE_TRAP_SEPC: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
+static CORE_TRAP_CAUSE: [AtomicU64; MAX_HART_ID] = [const { AtomicU64::new(0) }; MAX_HART_ID];
 /// WHERE the last stage stamp was made from - the caller's return address.
 ///
 /// **Because a stage names a FUNCTION, and a function has callers.** Three times in this wedge hunt a
@@ -2995,11 +3094,26 @@ pub(super) fn note_syscall(nr: u32) {
 /// id needs a table lookup, and this runs on every interrupt on every hart. The translation happens
 /// in `core_irq_debug`, which runs once, inside a panic.
 pub fn note_irq(vector: u32) {
-    // SAFETY: reads `tp`, which each hart sets to its own id at entry. No side effects.
-    let hart = unsafe { boot::get_lapic_id() } as usize;
+    let hart = hart_id();
     if hart < MAX_HART_ID {
         CORE_IRQ_COUNT[hart].fetch_add(1, Ordering::Relaxed);
         CORE_IRQ_LAST[hart].store(vector, Ordering::Relaxed);
+    }
+}
+
+/// This hart's id, which `tp` carries in the kernel.
+fn hart_id() -> usize {
+    // SAFETY: reads `tp`, which each hart sets to its own id at entry. No side effects.
+    (unsafe { boot::get_lapic_id() }) as usize
+}
+
+/// Record a trap, every kind of it, for the halt dump.
+pub(super) fn note_trap(sepc: u64, scause: u64) {
+    let hart = hart_id();
+    if hart < MAX_HART_ID {
+        CORE_TRAP_COUNT[hart].fetch_add(1, Ordering::Relaxed);
+        CORE_TRAP_SEPC[hart].store(sepc, Ordering::Relaxed);
+        CORE_TRAP_CAUSE[hart].store(scause, Ordering::Relaxed);
     }
 }
 

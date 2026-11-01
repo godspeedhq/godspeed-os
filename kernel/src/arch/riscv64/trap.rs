@@ -294,6 +294,7 @@ extern "C" fn trap_dispatch(frame: &mut TrapFrame) {
     // question than the one being asked - it would read zero for a core that is taking timer
     // interrupts and losing them on the way to the scheduler, which is one of the two cases the
     // watchdog exists to tell apart.
+    super::note_trap(frame.sepc, scause);
     if interrupt {
         super::note_irq(code as u32);
     }
