@@ -236,6 +236,9 @@ log ring's bug again - `log::write_fmt` records the same wedge, found when the r
 masks for it - on a lock added afterwards. The other plain locks on that path were checked: each is either taken
 under a mask (`PENDING` under `TABLE`, `KSTACK_USED`, `RING`) or only from contexts that run with interrupts off
 (the IOMMU's and PCI configuration's, taken by device spawns and kills; `SEEN` in the syscall path).
+Carded on the T630 and the Wyse on 2026-11-01 at `71c183ab`: 128 and 116 supervisor respawns across two
+selfchecks (673/0 each), `chaos kill-storm supervisor 10` and `chaos max-carnage 100`, with no wedge and no panic.
+The T630's 2026-10-25 wedge came right after a respawn, so this is consistent with it being the same lock, not proof.
 
 **What this does not settle.** The five lateness detectors this entry lists are still detectors of lateness, and
 the two scheduler bounds still do not read the stuck core's interrupt count; this sighting was a true stop, which
