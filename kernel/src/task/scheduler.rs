@@ -3834,7 +3834,7 @@ pub fn take_recv_message() -> Option<Message> {
 /// woken task cannot be starved by the current RR position.
 /// Is the task this core has just claimed pinned to THIS core? `false` - and the claim given back - when it is
 /// not, which is always a bug: a task runs only on the core it was spawned on (9.1), and switching into one
-/// pinned elsewhere would run it on two cores at once (backlog/90 D11, `backlog/95`).
+/// pinned elsewhere would run it on two cores at once (backlog/90 D11, `backlog/fixed/95`).
 ///
 /// A slot can be killed, freed and reused between `pick_next` and the claim: the pick is three separate loads,
 /// the claim is a CAS on the state alone, and a kill does not wait for a core until that core publishes the
