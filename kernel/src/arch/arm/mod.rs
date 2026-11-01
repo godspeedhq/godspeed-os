@@ -1208,6 +1208,9 @@ pub fn panic_halt_check() {
 }
 
 pub fn halt_all_cores() -> ! {
+    // No tick will run after this, so anything still queued would never reach the wire. Bounded on a
+    // wedged UART, so a halt cannot hang here.
+    tx_ring_flush_blocking();
     PANIC_HALT.store(true, core::sync::atomic::Ordering::Release);
     park_core_forever()
 }

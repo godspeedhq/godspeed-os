@@ -79,6 +79,11 @@ fn fault_cause(status: u32) -> &'static [u8] {
 /// `extern "C"` and `-> !` because the stubs `b` here rather than `bl` - there is no return.
 #[no_mangle]
 extern "C" fn arm_exception_report(kind: u32, pc: u32, status: u32, addr: u32) -> ! {
+    // Stop queueing first, as a panic does: every core is about to halt, so a line handed to the serial
+    // ring may never be drained. `halt_all_cores` empties the byte ring these writes still use before the
+    // SMP writers exist. Without both, a kernel fault on real hardware printed nothing at all, and QEMU,
+    // whose UART never backs up, showed the report anyway.
+    super::serial_enter_panic_mode();
     pl011_write(b"\r\n\r\n=== GodspeedOS arm32 EXCEPTION: ");
     pl011_write(kind_name(kind));
     pl011_write(b" ===\r\n");
@@ -102,7 +107,7 @@ extern "C" fn arm_exception_report(kind: u32, pc: u32, status: u32, addr: u32) -
     // not yet kill a task, which stopped being true and sent a reader after the wrong problem.
     pl011_write(b"  a fault in the kernel itself - halting every core.\r\n\r\n");
     // Every core, not just this one (CLAUDE.md 6.2, 19): the others would otherwise go on running
-    // against whatever state this fault was about. `halt_all_cores` is a flag store and a park, so it
+    // against whatever state this fault was about. `halt_all_cores` is a flush of queued output, a flag store and a park, so it
     // is safe to call from a fault path that can assume nothing (backlog/fixed/80 K25; the riscv64 port's
     // same fix is K6).
     super::halt_all_cores()
