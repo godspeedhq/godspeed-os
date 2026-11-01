@@ -1,6 +1,6 @@
 # 95. A core switched into a task pinned to another core, once, and how is not established
 
-**Status: FIXED in QEMU, 2026-10-31; carded on the T630, the Wyse and the Pi 4 2026-11-01 (the guard never fired, through 128, 116 and 120 supervisor respawns), the Pi 2 and the VisionFive pending; see "2026-10-31" below.** Was: **OPEN, 2026-10-26.** Seen once in QEMU, not reproduced, cause not established. This is `backlog/90`'s **D11**, which the 2026-10-16 audit found by reading; this entry is the first time it was seen run. A guard was written,
+**Status: FIXED in QEMU, 2026-10-31; carded on the T630, the Wyse, the Pi 4 and the Pi 2 2026-11-01 (the guard never fired, through 128, 116, 120 and 132 supervisor respawns), the VisionFive pending; see "2026-10-31" below.** Was: **OPEN, 2026-10-26.** Seen once in QEMU, not reproduced, cause not established. This is `backlog/90`'s **D11**, which the 2026-10-16 audit found by reading; this entry is the first time it was seen run. A guard was written,
 committed and then REVERTED the same day (operator's choice), because with it in the tree `osdev test shell`
 wedged at a supervisor respawn 5 times in 7 runs against 0 in 3 without it (below). The race is still in the
 kernel.
