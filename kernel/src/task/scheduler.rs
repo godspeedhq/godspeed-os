@@ -1456,6 +1456,16 @@ pub fn current_task_endpoint() -> Option<EndpointId> {
 
 /// Remove the capability at `slot` from the current task's table (GRANT).
 pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
+    with_current_table(|t| t.remove(slot)).flatten()
+}
+
+/// Use up the current task's one-shot cap in `slot`, if that is what it is (`CapTable::spend_once`).
+pub fn current_task_spend_once(slot: usize) {
+    with_current_table(|t| t.spend_once(slot));
+}
+
+/// The current task's own capability table, or `None` if no task is current.
+fn with_current_table<R>(f: impl FnOnce(&mut CapTable) -> R) -> Option<R> {
     let cid = current_core_id();
     // SAFETY: the CURRENT task's own table - it is running, so `commit_task` has written and published
     // it, and only this core touches it, inside this task's own syscall (IF=0, CORE_CURRENT stable for
@@ -1463,7 +1473,7 @@ pub fn current_task_remove_cap(slot: usize) -> Option<Capability> {
     unsafe {
         let cur = CORE_CURRENT.get(cid).load(Ordering::Relaxed);
         if cur < MAX_TASKS && TASK_VALID[cur].load(Ordering::Acquire) {
-            TASK_CAP[cur].assume_init_mut().remove(slot)
+            Some(f(TASK_CAP[cur].assume_init_mut()))
         } else {
             None
         }

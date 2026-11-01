@@ -1177,12 +1177,12 @@ fn handle_reboot() -> i64 {
          edits=[("""fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(e) => return cap_err_to_i64(send_refusal(cap_slot as usize, e)),
     };
     let endpoint_id = EndpointId(cap.resource_id.0);""", """fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(e) => return cap_err_to_i64(send_refusal(cap_slot as usize, e)),
     };
     let endpoint_id = EndpointId(msg_len >> 32);""")]),
     dict(id="M11", what="Reboot's (correct) gate moved into a macro_rules! macro", expect="fp",

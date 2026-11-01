@@ -1361,9 +1361,20 @@ impl ServiceContext {
     /// keeping the original. Returns `None` if the cap lacks GRANT, is stale, or the
     /// cap table is full.
     pub fn derive_cap(&self, held: CapHandle) -> Option<CapHandle> {
+        self.derive(held, 0)
+    }
+
+    /// [`Self::derive_cap`] for a reply cap: the copy carries ONE message and cannot be copied, so the
+    /// one-shot the protocol promises (CLAUDE.md 8.2) is the kernel's to keep. After that message it is
+    /// spent but still occupies its slot, so the holder removes it exactly as it always has.
+    pub fn derive_reply_cap(&self, held: CapHandle) -> Option<CapHandle> {
+        self.derive(held, 1)
+    }
+
+    fn derive(&self, held: CapHandle, flags: u64) -> Option<CapHandle> {
         // SAFETY: syscall(29) = DeriveCap; `held.0` is a slot index into this task's
         // own cap table. The kernel validates GRANT + generation before duplicating.
-        let ret = unsafe { raw_syscall(29, held.0 as u64, 0, 0) };
+        let ret = unsafe { raw_syscall(29, held.0 as u64, flags, 0) };
         if ret < 0 { None } else { Some(CapHandle(ret as u32)) }
     }
 
@@ -1981,7 +1992,7 @@ impl ServiceContext {
         let op = self.trace_in(peer, msg);
         let target = CapHandle(self.find_send_slot(peer)?);
         let self_grant = self.self_grant_handle()?;
-        let reply_cap = self.derive_cap(self_grant)?;
+        let reply_cap = self.derive_reply_cap(self_grant)?;
         if self.offer_request(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);
             self.trace_out(peer, op, crate::trace::KIND_PEER_LOST);
@@ -2130,7 +2141,7 @@ impl ServiceContext {
     ) -> Option<crate::ipc::Message> {
         let target = CapHandle(self.find_send_slot(peer)?);
         let self_grant = self.self_grant_handle()?;
-        let reply_cap = self.derive_cap(self_grant)?;
+        let reply_cap = self.derive_reply_cap(self_grant)?;
         let recv = self.recv_handle()?;
         match crate::ipc::call(target, reply_cap, recv, msg) {
             Ok(reply) => Some(reply),
@@ -2228,7 +2239,7 @@ impl ServiceContext {
                 _ => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
             },
         };
-        let reply_cap = match self.derive_cap(grant) {
+        let reply_cap = match self.derive_reply_cap(grant) {
             Some(c) => c,
             None    => return Err(crate::ipc::IpcError::CapError(crate::capability::CapError::CapNotHeld)),
         };
@@ -2287,7 +2298,7 @@ impl ServiceContext {
                 _ => return DeadlineOutcomeInto::SendFailed,
             },
         };
-        let reply_cap = match self.derive_cap(grant) {
+        let reply_cap = match self.derive_reply_cap(grant) {
             Some(c) => c,
             None => return DeadlineOutcomeInto::SendFailed,
         };
@@ -2358,7 +2369,7 @@ impl ServiceContext {
             Some((r, g)) => (r, g),
             None => (self.recv_handle()?, self.self_grant_handle()?),
         };
-        let reply_cap = self.derive_cap(grant)?;
+        let reply_cap = self.derive_reply_cap(grant)?;
         let secs = deadline_secs(max_secs);
         let out = crate::ipc::call_deadline_into(target, reply_cap, recv, req, buf, secs);
         // The kernel consumes the reply cap on a delivered call - and `Ok(None)` is a delivered call
@@ -2492,7 +2503,7 @@ impl ServiceContext {
     ) -> Option<crate::ipc::Message> {
         let target = CapHandle(self.find_send_slot(peer)?);
         let self_grant = self.self_grant_handle()?;
-        let reply_cap = self.derive_cap(self_grant)?;
+        let reply_cap = self.derive_reply_cap(self_grant)?;
         let recv = self.recv_handle()?;
         if self.offer_request(target, reply_cap, msg).is_err() {
             // The send never left, so the embedded cap was not transferred - reclaim it or a storm of
@@ -2549,7 +2560,7 @@ impl ServiceContext {
     ) -> Option<crate::ipc::Message> {
         let target = CapHandle(self.find_send_slot(peer)?);
         let self_grant = self.self_grant_handle()?;
-        let reply_cap = self.derive_cap(self_grant)?;
+        let reply_cap = self.derive_reply_cap(self_grant)?;
         let recv = self.recv_handle()?;
         if self.offer_request(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);
@@ -2587,7 +2598,7 @@ impl ServiceContext {
     ) -> DeadlineOutcome {
         let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return DeadlineOutcome::SendFailed };
         let self_grant = match self.self_grant_handle() { Some(g) => g, None => return DeadlineOutcome::SendFailed };
-        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
+        let reply_cap = match self.derive_reply_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
         if let Err(e) = self.send_with_cap_by_handle(target, reply_cap, msg) {
             self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
             return match e {
@@ -2642,7 +2653,7 @@ impl ServiceContext {
     ) -> DeadlineOutcome {
         let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return DeadlineOutcome::SendFailed };
         let self_grant = match self.self_grant_handle() { Some(g) => g, None => return DeadlineOutcome::SendFailed };
-        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
+        let reply_cap = match self.derive_reply_cap(self_grant) { Some(c) => c, None => return DeadlineOutcome::SendFailed };
         if let Err(e) = self.send_with_cap_by_handle(target, reply_cap, msg) {
             self.remove_cap(reply_cap);   // send failed: reclaim the untransferred reply cap (no leak)
             return match e {
@@ -2694,7 +2705,7 @@ impl ServiceContext {
         while self.try_recv().is_some() {}
         let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
         let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
-        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
+        let reply_cap = match self.derive_reply_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
         if self.offer_request(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);
             return ReqOutcome::Timeout;
@@ -2764,7 +2775,7 @@ impl ServiceContext {
         while self.try_recv().is_some() {}
         let target = match self.find_send_slot(peer) { Some(s) => CapHandle(s), None => return ReqOutcome::Timeout };
         let self_grant = match self.self_grant_handle() { Some(g) => g, None => return ReqOutcome::Timeout };
-        let reply_cap = match self.derive_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
+        let reply_cap = match self.derive_reply_cap(self_grant) { Some(c) => c, None => return ReqOutcome::Timeout };
         if self.offer_request(target, reply_cap, msg).is_err() {
             self.remove_cap(reply_cap);
             return ReqOutcome::Timeout;

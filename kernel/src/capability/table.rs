@@ -35,6 +35,18 @@ impl CapTable {
         Self { slots: [None; MAX_CAPS_PER_TASK] }
     }
 
+    /// Use up a one-shot cap: every right goes and `ONCE` stays, so the next use is refused. The slot stays
+    /// occupied until its holder removes it, exactly as for a reply cap that was answered and still held:
+    /// emptying it here would let the next received cap land there, and the holder's own removal would
+    /// then destroy that one (`backlog/fixed/67`). Does nothing to any other cap.
+    pub fn spend_once(&mut self, slot: usize) {
+        if let Some(Some(cap)) = self.slots.get_mut(slot) {
+            if cap.rights.contains(Rights::ONCE) {
+                cap.rights = Rights::ONCE;
+            }
+        }
+    }
+
     /// Look up and validate a capability by slot index.
     ///
     /// Returns `Err(CapNotHeld)` if the slot is empty, `Err(EndpointDead)` or
@@ -337,6 +349,30 @@ mod tests {
     use crate::capability::generation::Generation;
     use crate::capability::rights::Rights;
     use proptest::prelude::*;
+
+    #[test]
+    fn a_spent_cap_is_refused_and_keeps_its_slot() {
+        let once = Rights::SEND | Rights::GRANT | Rights::ONCE;
+        let mut ct = CapTable::empty();
+        let id = ResourceId(5100);
+        register_resource(id);
+        let slot = ct.insert(mint_cap(id, once)).unwrap();
+        assert!(ct.get(slot, Rights::SEND).is_ok());
+        ct.spend_once(slot);
+        assert_eq!(ct.get(slot, Rights::SEND).unwrap_err(), CapError::CapInsufficientRights);
+        assert_eq!(ct.get(slot, Rights::GRANT).unwrap_err(), CapError::CapInsufficientRights);
+        assert!(ct.get(slot, Rights::ONCE).is_ok(), "a spent cap can still be told from an ordinary one");
+        assert_ne!(ct.insert(mint_cap(id, Rights::SEND)).unwrap(), slot, "the slot stays occupied");
+    }
+
+    #[test]
+    fn spending_leaves_an_ordinary_cap_alone() {
+        let mut ct = CapTable::empty();
+        register_resource(ResourceId(5101));
+        let slot = ct.insert(mint_cap(ResourceId(5101), Rights::SEND)).unwrap();
+        ct.spend_once(slot);
+        assert!(ct.get(slot, Rights::SEND).is_ok());
+    }
 
     fn make_cap(id: u64, rights_bits: u8, gen: u32) -> Capability {
         Capability {

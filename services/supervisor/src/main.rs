@@ -2883,7 +2883,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "chaos-c7");          // TLB shootdown controller on core 1
 }
 
-// adv-only: spawn only the A1-A16 adversarial probe services (A14/A15 are the adv-fault-* probes).
+// adv-only: spawn only the A1-A17 adversarial probe services (A14/A15 are the adv-fault-* probes).
 // All adversarial probes are self-contained - no QEMU control port required.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), not(feature = "perf-only"), not(feature = "perf-brutal-only"), not(feature = "stress-only"), feature = "adv-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
@@ -2895,6 +2895,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "adv-a12"); // reboot gated - denied without REBOOT cap (self-contained)
     let _ = probes::probe(&ctx, "adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY (self-contained)
     let _ = probes::probe(&ctx, "adv-a16"); // CallDeadline bounded on the send leg (self-contained)
+    let _ = probes::probe(&ctx, "adv-a17"); // a reply cap carries one message
     // Passive/victim services before their attackers so endpoints exist when
     // attacker SEND caps are wired at spawn time.
     let _ = probes::probe(&ctx, "adv-a1");
@@ -3196,6 +3197,7 @@ fn spawn_extended_probes(ctx: &ServiceContext) {
     let _ = probes::probe(&ctx, "adv-a12"); // reboot gated - denied without REBOOT cap
     let _ = probes::probe(&ctx, "adv-a13"); // AcquireSendCap gated - denied without ACQUIRE_ANY
     let _ = probes::probe(&ctx, "adv-a16"); // CallDeadline bounded on the send leg (self-contained)
+    let _ = probes::probe(&ctx, "adv-a17"); // a reply cap carries one message
 
     // --- Brutal performance-benchmark probes - Milestone 19 ---
     // Sender/controller BEFORE echo/recv so endpoints register first.

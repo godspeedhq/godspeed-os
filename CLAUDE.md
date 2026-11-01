@@ -977,6 +977,7 @@ Capability = ResourceId + Rights + Generation
 | `RECV`     | Receive messages from an IPC endpoint                |
 | `GRANT`    | Transfer this capability via IPC                     |
 | `REVOKE`   | Revoke this capability (held by supervisor only)     |
+| `ONCE`     | Not a right but a limit on the others: this cap carries one message, then is spent (8.2) |
 
 ### 7.5 Generations
 
@@ -1153,6 +1154,29 @@ death semantics, never "request/reply" or "RPC". It is the primitive behind the 
 > A new syscall is a new kernel responsibility and the surface is pinned (Commandment I), so this is
 > recorded here rather than merely added: it is `call` with a bound, not a new capability, and the
 > enforcement layer refused the change until this amendment existed.
+
+> **Amendment 2026-11-01 (backlog/90 D5): "one-shot" is the kernel's to keep now, not a convention.** This
+> document has called a reply cap one-shot since `Call` existed, and it was an ordinary SEND|GRANT cap: a
+> replier could keep it, copy it, hand it on and send on it for ever. The harm is bounded - a later message
+> from the same replier could satisfy the caller's next `Call` to it, and any holder could fill the caller's
+> queue - but the law and the code disagreed, and section 1 says which of those is wrong.
+>
+> **What the kernel enforces.** `DeriveCap` takes a flag that sets `ONCE` on the copy, and the SDK makes every
+> reply cap that way. A cap with `ONCE` cannot be copied, and `narrow` keeps the bit. It may still be MOVED, so
+> a server can hand a request to a worker. The first send the kernel accepts spends it: a send that fails, a
+> full queue under `TrySend` among them, leaves it usable, so a retry works. A later send is refused with
+> `CapRevoked`, and the kernel logs the task that tried, because nothing correct does it.
+>
+> **Spent is not removed.** The cap keeps its slot until its holder removes it, as every holder already does
+> after answering. Emptying the slot would let the next received cap land there, and the holder's removal
+> would destroy that one, which is `backlog/fixed/67` in the other direction. So no service changes.
+>
+> **What it adds and what it does not.** No syscall, no responsibility: one flag on `DeriveCap`, one bit in
+> the rights byte, and a check that adds nothing to a send on an ordinary cap beyond reading its rights. A
+> setting of the bit can only take authority away, so it is the one bit a derive may add, and non-escalation
+> (7.3) holds. A cap a service passes on deliberately, without `ONCE`, stays an ordinary cap: only the SDK's
+> reply paths mark theirs, so the promise covers reply caps made through it. Pinned by A17, and the suites
+> logged no service sending twice.
 
 ### 8.3 Routing
 
@@ -2538,6 +2562,7 @@ Adversarial tests verify capability isolation holds under direct attack. The sys
 | A14 | Ring-3 CPU exception (null read, non-canonical read, divide-by-zero) kills the task, not the kernel |
 | A15 | A bad user pointer kills the caller, not the kernel                                 |
 | A16 | `CallDeadline` to a full queue nobody drains returns on its deadline, never blocks for ever |
+| A17 | A reply cap carries one message: a second send and a copy are both refused |
 
 Bar: every attack returns a defined error. Any attack that succeeds is a security hole; any attack that panics the kernel is a kernel bug. Both are mandatory fixes.
 

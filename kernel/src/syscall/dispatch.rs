@@ -343,10 +343,29 @@ fn deliver_to_console_service(bytes: &[u8]) -> i64 {
 // Syscall: Send / Recv / TrySend (1, 2, 3) - Milestone 5/6.
 // ---------------------------------------------------------------------------
 
+/// `DeriveCap`'s flag: the copy carries one message (`Rights::ONCE`). A reply cap is made this way.
+const DERIVE_ONCE: u64 = 1;
+
+/// Why a SEND lookup failed, as the caller is told. A cap of one use that has been used is refused as
+/// revoked, and said out loud: nothing correct sends twice on a reply cap, so the task that did has a bug
+/// or is trying it on (8.2). Logged on powers of two, because a task can repeat it as fast as it likes.
+fn send_refusal(slot: usize, e: CapError) -> CapError {
+    static SPENT_SENDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if e != CapError::CapInsufficientRights || scheduler::current_task_lookup_cap(slot, Rights::ONCE).is_err() {
+        return e;
+    }
+    let n = SPENT_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        crate::kprintln!("cap: {} sent on a reply cap it had already used ({} so far)",
+            scheduler::task_name(scheduler::current_task_slot()), n);
+    }
+    CapError::CapRevoked
+}
+
 fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(e) => return cap_err_to_i64(send_refusal(cap_slot as usize, e)),
     };
     let endpoint_id = EndpointId(cap.resource_id.0);
 
@@ -364,11 +383,17 @@ fn handle_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // no separate record_blocked_sender call needed.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {
+            scheduler::current_task_spend_once(cap_slot as usize);
             scheduler::wake_by_slot(receiver_slot, 0);
             0
         }
-        Ok(None) => 0,
+        Ok(None) => {
+            scheduler::current_task_spend_once(cap_slot as usize);
+            0
+        }
         Err(IpcError::QueueFull) => {
+            // The message is the routing table's now, so a one-shot cap has carried it.
+            scheduler::current_task_spend_once(cap_slot as usize);
             // We are now recorded in the routing table as a blocked sender.
             // block_and_reschedule checks for "already woken" and returns
             // TASK_WAKEUP_ERR[slot] (0 on success, negative on EndpointDead).
@@ -664,7 +689,7 @@ fn handle_sleep(cycles: u64) -> i64 {
 fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let cap = match scheduler::current_task_lookup_cap(cap_slot as usize, Rights::SEND) {
         Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(e) => return cap_err_to_i64(send_refusal(cap_slot as usize, e)),
     };
     let endpoint_id = EndpointId(cap.resource_id.0);
 
@@ -679,10 +704,12 @@ fn handle_try_send(cap_slot: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // Pass None for blocked_sender_slot - QueueFull is returned directly.
     match crate::ipc::routing::enqueue(endpoint_id, msg, cap.generation, None) {
         Ok(Some(receiver_slot)) => {
+            scheduler::current_task_spend_once(cap_slot as usize);
             scheduler::wake_by_slot(receiver_slot, 0);
             0
         }
         Ok(None) => {
+            scheduler::current_task_spend_once(cap_slot as usize);
             0
         }
         Err(e)   => ipc_err_to_i64(e),
@@ -1447,11 +1474,18 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 /// the whole cap wholesale, so duplicating it grants no authority it lacked. Endpoint
 /// caps already permit many concurrent senders, so duplication matches the IPC model.
 /// The generation check inside `current_task_lookup_cap` also forbids deriving from a stale cap.
-fn handle_derive_cap(held_slot: u64, _a1: u64, _a2: u64) -> i64 {
-    let held = match scheduler::current_task_lookup_cap(held_slot as usize, Rights::GRANT) {
+fn handle_derive_cap(held_slot: u64, flags: u64, _a2: u64) -> i64 {
+    let mut held = match scheduler::current_task_lookup_cap(held_slot as usize, Rights::GRANT) {
         Ok(c)  => c,
         Err(e) => return cap_err_to_i64(e),
     };
+    // A copy of a one-shot cap would be a second shot.
+    if held.rights.contains(Rights::ONCE) {
+        return cap_err_to_i64(CapError::CapInsufficientRights);
+    }
+    if flags & DERIVE_ONCE != 0 {
+        held.rights = held.rights | Rights::ONCE;
+    }
     match scheduler::current_task_insert_cap(held) {
         Ok(slot) => slot as i64,
         Err(_)   => -1, // cap table full
@@ -1479,7 +1513,7 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     // 1. Validate endpoint cap (SEND right required).
     let endpoint_cap = match scheduler::current_task_lookup_cap(endpoint_slot, Rights::SEND) {
         Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(e) => return cap_err_to_i64(send_refusal(endpoint_slot, e)),
     };
     let endpoint_id = EndpointId(endpoint_cap.resource_id.0);
 
@@ -1510,16 +1544,19 @@ fn handle_send_with_cap(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     match crate::ipc::routing::enqueue(endpoint_id, msg, endpoint_cap.generation, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {
             scheduler::current_task_remove_cap(grant_slot);
+            scheduler::current_task_spend_once(endpoint_slot);
             scheduler::wake_by_slot(receiver_slot, 0);
             0
         }
         Ok(None) => {
             scheduler::current_task_remove_cap(grant_slot);
+            scheduler::current_task_spend_once(endpoint_slot);
             0
         }
         Err(IpcError::QueueFull) => {
             // Cap is now embedded in the message held by the routing table.
             scheduler::current_task_remove_cap(grant_slot);
+            scheduler::current_task_spend_once(endpoint_slot);
             scheduler::block_and_reschedule(TaskState::BlockedOnSend)
         }
         Err(e) => ipc_err_to_i64(e), // failure before delivery - cap stays
@@ -1586,7 +1623,7 @@ fn do_call(
     // 1. Validate the three caps: SEND to the peer, GRANT on the reply cap, RECV on our own endpoint.
     let target_cap = match scheduler::current_task_lookup_cap(target_slot, Rights::SEND) {
         Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(e) => return cap_err_to_i64(send_refusal(target_slot, e)),
     };
     let target_ep = EndpointId(target_cap.resource_id.0);
 
@@ -1642,14 +1679,17 @@ fn do_call(
     match crate::ipc::routing::enqueue(target_ep, msg, target_cap.generation, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {
             scheduler::current_task_remove_cap(reply_slot);
+            scheduler::current_task_spend_once(target_slot);
             scheduler::wake_by_slot(receiver_slot, 0);
         }
         Ok(None) => {
             scheduler::current_task_remove_cap(reply_slot);
+            scheduler::current_task_spend_once(target_slot);
         }
         Err(IpcError::QueueFull) => {
             // The request (with reply cap) is now the routing table's pending-send; remove our copy.
             scheduler::current_task_remove_cap(reply_slot);
+            scheduler::current_task_spend_once(target_slot);
             if deadline == 0 {
                 let err = scheduler::block_and_reschedule(TaskState::BlockedOnSend);
                 if err != 0 { return err; }   // peer died before the request was delivered

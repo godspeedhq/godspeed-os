@@ -624,6 +624,15 @@ static ADV_TESTS: &[TestSpec] = &[
             timeout_secs: 30,
         },
     },
+    TestSpec {
+        id: "A17", name: "a_reply_cap_carries_one_message",
+        spec_ref: "CLAUDE.md 8.2 (reply cap); backlog/90 D5 - syscall/dispatch.rs send_refusal",
+        kind: TestKind::WatchSerial {
+            expect:       &["adv: A17 pass"],
+            fail_on:      &["KERNEL PANIC", "adv: A17 FAIL"],
+            timeout_secs: 30,
+        },
+    },
 ];
 
 // ---------------------------------------------------------------------------

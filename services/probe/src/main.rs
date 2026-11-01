@@ -278,6 +278,7 @@ const MODE_ADV_A11:         u32 = 161; // gated query denied without INTROSPECT 
 const MODE_ADV_A12:         u32 = 162; // reboot denied without REBOOT cap
 const MODE_ADV_A13:         u32 = 163; // AcquireSendCap denied without ACQUIRE_ANY / declared peer
 const MODE_ADV_A16:         u32 = 216; // CallDeadline bounded on the SEND leg too (a full, undrained target)
+const MODE_ADV_A17:         u32 = 217; // a reply cap carries one message and cannot be copied
 
 // Brutal property test modes - Milestone 16.
 const MODE_PROP_BP1:        u32 = 104; // BP1: cap unforgeability - 100k iterations
@@ -422,6 +423,7 @@ pub extern "C" fn service_main(ctx: ServiceContext) -> ! {
         MODE_ADV_A12         => mode_adv_a12(&ctx),
         MODE_ADV_A13         => mode_adv_a13(&ctx),
         MODE_ADV_A16         => mode_adv_a16(&ctx),
+        MODE_ADV_A17         => mode_adv_a17(&ctx),
         MODE_CHAOS_C2        => mode_chaos_c2(&ctx),
         MODE_CHAOS_C2_MON    => mode_chaos_c2_monitor(&ctx),
         MODE_CHAOS_C3        => mode_chaos_c3(&ctx),
@@ -2257,6 +2259,39 @@ fn mode_adv_a16(ctx: &ServiceContext) -> ! {
         Ok(Some(_)) => ctx.log("adv: A16 FAIL - a reply came from an endpoint nobody drains"),
         Err(e) => ctx.log_fmt(format_args!("adv: A16 FAIL - {:?} instead of a timeout", e)),
     }
+    idle(ctx)
+}
+
+fn mode_adv_a17(ctx: &ServiceContext) -> ! {
+    // A17 - a reply cap is one-shot, and the kernel is what makes it so (CLAUDE.md 8.2, backlog/90 D5). The
+    // cap names this probe's own endpoint, so nothing else is involved: it must take one message, refuse a
+    // copy and refuse a second message, while an ordinary cap to the same endpoint goes on working.
+    let sg = match gs::cap::self_grant(ctx) {
+        Ok(s) => s,
+        Err(_) => { ctx.log("adv: A17 FAIL - no endpoint of its own"); idle(ctx); }
+    };
+    let once = match ctx.derive_reply_cap(sg.handle()) {
+        Some(c) => gs::cap::Cap::from(c),
+        None => { ctx.log("adv: A17 FAIL - could not derive a reply cap"); idle(ctx); }
+    };
+    let msg = Message::from_bytes(b"a17");
+    if gs::cap::duplicate(ctx, once).is_ok() {
+        ctx.log("adv: A17 FAIL - a reply cap was copied");
+        idle(ctx);
+    }
+    if gs::ipc::try_send_to(ctx, once, &msg).is_err() {
+        ctx.log("adv: A17 FAIL - a reply cap refused its one message");
+        idle(ctx);
+    }
+    if gs::ipc::try_send_to(ctx, once, &msg).is_ok() {
+        ctx.log("adv: A17 FAIL - a reply cap carried a second message");
+        idle(ctx);
+    }
+    if gs::ipc::try_send_to(ctx, sg, &msg).is_err() || gs::ipc::try_send_to(ctx, sg, &msg).is_err() {
+        ctx.log("adv: A17 FAIL - an ordinary cap to the same endpoint stopped working");
+        idle(ctx);
+    }
+    ctx.log("adv: A17 pass - a reply cap took one message, refused a second, and could not be copied");
     idle(ctx)
 }
 

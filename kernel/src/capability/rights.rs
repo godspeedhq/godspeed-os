@@ -17,6 +17,10 @@ impl Rights {
     pub const RECV:   Rights = Rights(1 << 3);
     pub const GRANT:  Rights = Rights(1 << 4);
     pub const REVOKE: Rights = Rights(1 << 5);
+    /// Not a right but a limit on the others: this cap carries ONE message (7.4). It is what makes a
+    /// reply cap one-shot. Adding it only ever takes authority away, so it is the one bit a derive may
+    /// set (`DeriveCap`), `narrow` keeps it, and `all` leaves it out.
+    pub const ONCE:   Rights = Rights(1 << 6);
 
     pub const fn empty() -> Self { Rights(0) }
     pub const fn all()   -> Self { Rights(0b0011_1111) }
@@ -25,9 +29,10 @@ impl Rights {
         (self.0 & other.0) == other.0
     }
 
-    /// Narrow `self` to the intersection with `mask`. Never widens.
+    /// Narrow `self` to the intersection with `mask`. Never widens, and never drops `ONCE`, which a
+    /// mask that did not name it would otherwise turn back into a cap of many uses.
     pub fn narrow(self, mask: Rights) -> Rights {
-        Rights(self.0 & mask.0)
+        Rights(self.0 & (mask.0 | Self::ONCE.0))
     }
 
     /// Remove `mask`'s bits from `self` - only ever clears bits, never widens (SEC-7).
@@ -117,6 +122,15 @@ mod tests {
         let b = Rights::GRANT | Rights::SEND;
         assert_eq!((a | b).0, (Rights::READ | Rights::GRANT | Rights::SEND).0);
         assert_eq!((a | a).0, a.0);
+    }
+
+    /// A cap of one use stays one through any narrowing.
+    #[test]
+    fn narrow_never_drops_once() {
+        let r = Rights::SEND | Rights::GRANT | Rights::ONCE;
+        assert!(r.narrow(Rights::SEND).contains(Rights::ONCE));
+        assert!(!r.narrow(Rights::READ).contains(Rights::SEND));
+        assert!(!(Rights::SEND).narrow(Rights::SEND).contains(Rights::ONCE), "narrow adds nothing");
     }
 
     /// `without` clears exactly the mask and keeps everything else (SEC-7 strips GRANT this way).

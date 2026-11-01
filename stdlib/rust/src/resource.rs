@@ -100,7 +100,7 @@ pub(crate) fn invoke(
     req[hdr..body_end].copy_from_slice(body);
 
     let self_grant = ctx.self_grant_handle().ok_or(Error::Unreachable)?;
-    let reply_cap = ctx.derive_cap(self_grant).ok_or(Error::Busy)?;
+    let reply_cap = ctx.derive_reply_cap(self_grant).ok_or(Error::Busy)?;
 
     if let Err(e) = ctx.resource_invoke(cap, right, reply_cap, &Message::from_bytes(&req[..body_end])) {
         // Refused before routing, so the reply cap was NOT consumed: reclaim the slot (8.5).
