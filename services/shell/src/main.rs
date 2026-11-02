@@ -14766,9 +14766,10 @@ fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
 /// Write the spelled-out rights (space-separated, no trailing space) into `buf` (§7.4).
 fn cap_rights_str(r: u8, buf: &mut [u8]) -> usize {
     let mut p = 0usize;
-    let words: [(u8, &[u8]); 6] = [
+    let words: [(u8, &[u8]); 7] = [
         (0x01, b"read"), (0x02, b"write"), (0x04, b"send"),
         (0x08, b"recv"), (0x10, b"grant"), (0x20, b"revoke"),
+        (0x40, b"once"),
     ];
     for (bit, word) in words {
         if r & bit != 0 {
