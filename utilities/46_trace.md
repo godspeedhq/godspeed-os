@@ -462,6 +462,9 @@ Four bugs surfaced only because the tree draws structure a table hides, and each
    indistinguishable from userspace, so they are included and the ambiguity is REPORTED (26.7):
    dropping them hides real dependencies, including them silently shows return addresses as
    dependencies, and an honest ambiguity beats a confident wrong answer in either direction.
+   *(Note 2026-11-02: since `backlog/90` D5 a reply cap from the SDK's request paths carries `ONCE`, so it
+   can be told from a peer, and a spent one has no SEND and is not counted. `events deps` does not use that
+   yet, and a reply cap made with `gs::cap::duplicate` still looks like a peer.)*
 
 **What it deliberately does NOT show: DECLARED dependencies.** A service's send peers live in the
 supervisor's spawn table, the row it sends the kernel in each spawn request (CLAUDE.md 13.6; the

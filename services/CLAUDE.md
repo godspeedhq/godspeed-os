@@ -83,7 +83,7 @@ The supervisor spawns services in this order, observed on hardware (Pi 4, and th
 0. **events**, then **console** - console before anything that produces console output, so the
    display changes hands once, early, rather than mid-boot
 1. In non-bare-metal builds only: **pong** (core 1) before **ping** (core 0), so ping's SEND cap is
-   wired at ping's spawn time; then the probe services (182 in the full build, 16 in `identity-only`)
+   wired at ping's spawn time; then the probe services (184 in the full build, 16 in `identity-only`)
    and **observe**. **These come SECOND, not last.** Spawning the pair early gets cross-core IPC
    running within ~10 s of boot, and the probe loop alone takes 18-120 s on Windows TCG
    (`supervisor/CLAUDE.md`). A `bare-metal` build skips all of them

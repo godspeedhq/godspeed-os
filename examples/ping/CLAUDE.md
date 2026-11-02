@@ -11,7 +11,7 @@ Demonstration service - sends messages to `pong`, one per scheduling tick (§23.
 
 ## Spawn order
 
-Ping is spawned by the supervisor (in every build except `bare-metal` and the isolation builds) **before** any probe services - second only to pong (pong must precede ping because ping's SEND cap to pong is wired at spawn time). This means ping starts sending within seconds of boot, well before the 193 probe services compete for scheduler quanta on Core 0.
+Ping is spawned by the supervisor (in every build except `bare-metal` and the isolation builds) **before** any probe services - second only to pong (pong must precede ping because ping's SEND cap to pong is wired at spawn time). This means ping starts sending within seconds of boot, well before the 184 probe services compete for scheduler quanta on Core 0.
 
 ## Cap-rebinding pattern
 

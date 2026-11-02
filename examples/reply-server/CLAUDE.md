@@ -60,7 +60,7 @@ let reply = gs::ipc::recv(&ctx);
 let _ = reply.payload_bytes();   // "echo me"
 ```
 
-(The standard library packages this exact dance as
+(The standard library packages this dance, with a reply cap the kernel lets carry only one message, as
 `gs::call::request_within(&ctx, "reply-server", &request, secs)` - read it in `stdlib/rust/src/call.rs`.
 It does the same three steps as one bounded kernel `Call` - deriving the reply cap from the client's
 reply mailbox, a second endpoint the kernel gives a receiving task for replies, where it has one - which also leaves any other message on the

@@ -143,7 +143,7 @@ battle-hardening categories use a letter prefix plus a number:
   baseline.
 - **BP** - the **Brutal Perf** variant of the benchmarks (BP1-BP10): the same metrics run
   in a contended "perf-brutal" build, the form quoted in the hardware results table.
-- **A** - **Adversarial / red-team** tests (A1-A10): capability isolation under direct attack.
+- **A** - **Adversarial / red-team** tests (A1-A17): capability isolation under direct attack.
 - **C** - **Chaos** tests (C1-C7): graceful degradation under partial failures.
 - **"brutal"** - in general, the harsher contended variant of a suite (e.g. perf-brutal).
 

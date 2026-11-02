@@ -280,9 +280,9 @@ It does not limit what every task can already do, and the kernel verification fo
 - **Ungated queries.** Any task may call the ungated `InspectKernel` queries. Two of them did harm until
   they were fixed (D23): query 21, which pops a byte of the COM2 operator channel, is INTROSPECT-gated since
   2026-10-29, and queries 11 and 17 take the CMOS lock across the index and data ports.
-- **Kernel defects reachable by any task.** A service that faults exercises the self-kill path, which has
-  a double-free window (D8), a page-table-root leak (D9, an L1 arena slot on the Pi 2; fixed 2026-10-30) and a
-  slot-reuse race (D10). The restart loop in 3.4 repeats that path for a service that crashes on start, which is why
+- **Kernel defects reachable by any task.** A service that faults exercises the self-kill path, which had
+  a double-free window (D8), a page-table-root leak (D9, an L1 arena slot on the Pi 2) and a
+  slot-reuse race (D10), all fixed by 2026-10-31. The restart loop in 3.4 repeats that path for a service that crashes on start, which is why
   its backoff and "given up" state matter: they bound how often a broken developer service drives it.
 
 Neither changes the answer above: an in-tree service has the same exposure, and none of it reaches a

@@ -13,7 +13,7 @@ Demonstration service - receives messages from `ping` (§23.1).
 ## Spawn order
 
 Pong is spawned early (in every build except `bare-metal` and the isolation builds, where you spawn it
-from the shell) - after `events` and `console`, before ping, and before all 193 probe services. (This said "the **first** service spawned" and "178 probe services": `events` and `console` come first, and the probe table says 193.) This ensures pong's endpoint is registered and ready before ping starts sending, and before probe services compete for scheduler quanta. Cross-core IPC between ping and pong is established within ~10 s of boot.
+from the shell) - after `events` and `console`, before ping, and before the 184 probe services of a full build. (This said "the **first** service spawned" and "178 probe services": `events` and `console` come first, `services/probe/src/table.rs` has 195 rows, and a build spawns those it names.) This ensures pong's endpoint is registered and ready before ping starts sending, and before probe services compete for scheduler quanta. Cross-core IPC between ping and pong is established within ~10 s of boot.
 
 ## Why pong has no placement
 

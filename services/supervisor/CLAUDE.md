@@ -35,7 +35,7 @@ The supervisor has mutually exclusive spawn-set features:
 
 | Feature            | Spawns                                  | Used by                          |
 |--------------------|-----------------------------------------|----------------------------------|
-| *(none)*           | pong + ping + all 182 probe services    | `osdev run` (full QEMU build)    |
+| *(none)*           | pong + ping + all 184 probe services    | `osdev run` (full QEMU build)    |
 | `identity-only`    | pong + ping + 16 identity probe services | `osdev test identity`            |
 | `perf-only`        | pong + ping + B1-B10 perf probes        | `osdev test perf`                |
 | `perf-brutal-only` | pong + ping + BP1-BP10 brutal probes    | `osdev test perf-brutal`         |

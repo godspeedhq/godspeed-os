@@ -2221,3 +2221,70 @@ source file was checked to be comment text (one `static` in `task/mod.rs` is unc
    the spawn list counted.
 
 **Gates:** `build_gates.py` 33/33, with every documentation checker green.
+
+## Audit 28 - documents and code comments, `feat/v1-groundwork` since Audit 27 (2026-11-02)
+
+Scope: everything changed since `455a04a9`, up to `f4dde791` (16 commits, 32 files: backlog/90 D5's one-message reply
+cap, D7, D8, D10, D11, the arm kstack guards' W^X and fault-report flush, the riscv64 halt dump, and the five-board
+cards), then every document and comment elsewhere those changes made false. Read in two parts, comments and documents,
+by two independent readers, each finding checked against the code before it was changed. Comments and documents only:
+the code in all 18 source files was compared line for line with `f4dde791`, comments removed, and is unchanged.
+
+**Result.** 35 files corrected, and 9 code findings recorded, not fixed. Two proposed corrections were rejected on
+checking: `h3=1/17418/s35` does not mean core 2 stopped inside syscall 35, since that field is left over across a switch
+to idle; and `milestones/README.md`'s "A1-A10" names what its linked page covers.
+
+**In the constitution (dated notes; the ratified text stands):**
+- `CLAUDE.md` 8.2, the 2026-11-01 amendment: "every reply cap", "cannot be copied" and "logs the task that tried" each
+  claim more than the code does. The first two are the code falling short (findings 1 and 2); the third is the text being
+  loose, since the log is rate-limited on purpose.
+- `CLAUDE.md` 7.7: a spent `ONCE` cap answers `CapRevoked` with no generation change.
+
+**In documents:**
+- `backlog/README.md` row 90 and `backlog/90`: D7, D8, D10 and D11 still waiting on `backlog/49`; the status line called
+  D5 fixed without its open cards; the D5 row said both "pending" and "1 of 2" for the VisionFive, and cited a log from
+  before the dump it was cited for; Next step named finished fixes; "A/B-tested" where each was shown by its own feature.
+- `docs/developer-services-design.md`: D8 and D10 as present defects.
+- `kernel/src/capability/CLAUDE.md`, `sdk/rust/CLAUDE.md`, `examples/asker/CLAUDE.md`, `examples/reply-server/CLAUDE.md`,
+  `utilities/46_trace.md`: no word of `ONCE` or `derive_reply_cap`.
+- Counts and ranges: the full build spawns 184 probes, against 182 in `services/CLAUDE.md` and
+  `services/supervisor/CLAUDE.md` and 193 in `examples/ping` and `examples/pong`, which settles Audit 27 finding 6 for the
+  number; A11-A16, A1-A15 and A1-A10 in `tests/CLAUDE.md`, `tests/qemu/CLAUDE.md`, `docs/gsfs-next.md` and `GLOSSARY.md`.
+
+**In code comments:**
+- `kernel/src/task/scheduler.rs`: a run of comments still said a self-kill releases its slot at once, which D10 ended, and
+  `core_release_current` claimed every release after D7 added a second; five doc comments stranded on a neighbour put back
+  (`pick_next`, `CORE_PENDING_KSTACK`, `WAKE_RESEND_SPINS`, `current_task_slot`, `block_and_reschedule`), only the comment
+  moved; `drain_pending_pml4`, which does not exist; `TASK_KSTACK_MAX` as a size; `init` as a live service; three "kill won
+  the race" that D11's given-back claim widened; two line numbers.
+- `kernel/src/arch/arm/exceptions.rs`: `user_fault_kill`'s doc was stranded and described the old save; `arch/arm/mod.rs`:
+  the blocking flush is not panic-only, and the fault report no longer uses the ring.
+- `kernel/src/arch/riscv64/mod.rs`: the halt dump's path is bounded, not free of the lock, which the new holder line shows.
+- `kernel/src/syscall/dispatch.rs`, `capability/rights.rs`, `capability/table.rs`, `task/mod.rs`,
+  `sdk/rust/src/service_context.rs`, `stdlib/rust/src/cap.rs`, `examples/asker`, `examples/counter`,
+  `services/shell/src/main.rs`: `DeriveCap`'s flag and refusal, `ONCE` in the rights lists, `spend_once`, and the shell's
+  "indistinguishable", which an SDK reply cap no longer is.
+- `services/probe`, `services/supervisor/src/main.rs`: 195 rows, 184 spawned. `COMMANDMENTS.baseline.toml`: the CMOS
+  comment had been left above `claim-abort-test`. `osdev/src/main.rs`: the `drives scrub` doc back on its function.
+
+**Code findings, recorded and not fixed (an audit changes no code). 1 to 6 are folded into `backlog/90` D5:**
+1. Reply caps made with `gs::cap::duplicate` are ordinary caps: `services/time/src/main.rs` (twice), `services/shell/src/main.rs`
+   (`fc_invoke`), `examples/holder`, probe A16. `gs` has no one-shot form, so the fix grows the covered surface.
+2. `handle_spawn_image` (`dispatch.rs`) copies a `ONCE` cap into a child through `installs`. Only the supervisor reaches it.
+3. `handle_resource_invoke` neither spends nor refuses a `ONCE` target cap, and `Rights(right_bits)` accepts bit 0x40, so a
+   spent cap passes its lookup. No caller marks a file cap; low.
+4. `send_refusal` reports any `ONCE` cap lacking SEND as already used, including one that never had SEND. Low.
+5. `narrow_for_grant`'s debug assert fires on a `ONCE` cap, since `narrow` keeps the bit. Unit tests are its only callers.
+6. `cap_rights_str` (`services/shell/src/main.rs`) has no word for `ONCE`: `caps` shows a live reply cap as `send grant` and
+   a spent one as empty. `utilities/6_caps.md` matches the code as it stands.
+7. The riscv64 halt dump, with no capped writer, prints `first <time since boot> ago`; `last publish` has the same zero
+   case; and the "ago" figures carry no unit. Worth fixing before the dump is relied on, as a separate change.
+8. Not settled: the `!TASK_VALID[prev]` branches in `task/scheduler.rs` look unreachable since D10. Nothing was found that
+   reaches them, and nothing proves it. Harmless if so.
+9. Not settled: `SECURITY.md` still names SEC-36 as open, and `backlog/fixed/67` may have closed it. Not re-verified at every
+   site, so left as it is.
+
+**Audit 27's findings:** 1 is fixed (`9ee9e9a6`). 2, 3 and 4 are open. 5 is open and larger: a second string, in the
+`protocol desync` line, has the same run of spaces. 6's probe count is settled; its `tests/host-ipc` line citations were not
+rechecked, as no file there changed.
+

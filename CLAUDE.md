@@ -1050,7 +1050,7 @@ Both error codes are kept; they share a mechanism but communicate different inte
 | `EndpointDead`           | Endpoint/service lifecycle terminated                |
 | `ReplyDead`              | Replier died while the caller was blocked awaiting its reply (the reply-side twin of `EndpointDead`; §8.6) |
 
-Same generation-mismatch mechanism underlies `CapRevoked` and `EndpointDead`; the kernel returns the more specific code based on whether the resource was destroyed (endpoint dead) or had its cap explicitly revoked. `ReplyDead` shares that mechanism on the *reply* side: a caller blocked in a synchronous `Call` (§8.2) wakes with `ReplyDead` the instant its replier's endpoint dies (§8.6).
+Same generation-mismatch mechanism underlies `CapRevoked` and `EndpointDead`; the kernel returns the more specific code based on whether the resource was destroyed (endpoint dead) or had its cap explicitly revoked. `ReplyDead` shares that mechanism on the *reply* side: a caller blocked in a synchronous `Call` (§8.2) wakes with `ReplyDead` the instant its replier's endpoint dies (§8.6). A spent `ONCE` cap (8.2) also answers `CapRevoked`, with no generation change: its rights are gone and the send path says so.
 
 ### 7.8 Capability Table Concurrency
 
@@ -1177,6 +1177,15 @@ death semantics, never "request/reply" or "RPC". It is the primitive behind the 
 > (7.3) holds. A cap a service passes on deliberately, without `ONCE`, stays an ordinary cap: only the SDK's
 > reply paths mark theirs, so the promise covers reply caps made through it. Pinned by A17, and the suites
 > logged no service sending twice.
+>
+> *(Note 2026-11-02, Audit 28: three things above claim more than the code does. "Every reply cap" holds for
+> the SDK's request paths and `gs::resource`; a reply cap made by hand with `gs::cap::duplicate` is still an
+> ordinary cap - `time`'s requests, the shell's `fc_invoke`, `examples/holder` - because `gs` has no one-shot
+> form yet. "Cannot be copied" holds for `DeriveCap`; `SpawnImage`'s `installs` does not yet refuse a `ONCE`
+> cap, which only the supervisor can reach. Those two are the code falling short of this text, recorded in
+> `backlog/90` D5. "Logs the task that tried" is rate-limited on one count across all tasks, at each power of
+> two, so the first refusal is always named and a later one, by another task, may not be: there the code is
+> deliberate and this text is what was loose.)*
 
 ### 8.3 Routing
 

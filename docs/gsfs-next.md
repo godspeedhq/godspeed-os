@@ -18,7 +18,7 @@ Eleven QEMU suites cover them. Snapshots, copy-on-write and mirroring stay defer
 So the gaps are not "more storage features". They are:
 
 1. **`fs` parses untrusted input and has no adversarial suite.** Every other subsystem has one
-   (§22 F1-F8, A1-A15). `fs` takes client-supplied paths, offsets, sizes and names over IPC, and
+   (§22 F1-F8, A1-A17). `fs` takes client-supplied paths, offsets, sizes and names over IPC, and
    `NAME_MAX` alone is validated in four separate places - the shape that drifts.
 2. **A file capability carries READ/WRITE and nothing else.** There is no way to hand out a right to
    APPEND without also handing out the right to rewrite history.

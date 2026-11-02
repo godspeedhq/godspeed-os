@@ -40,8 +40,8 @@ a server that stays alive and silent is bounded by the deadline instead of waite
 ## Why it is built this way (the Commandments)
 
 - **Commandment VII (no ambient authority).** asker grants reply-server the authority to call it back by
-  embedding a reply cap - a SEND|GRANT copy of its reply mailbox's grant cap (the SDK's `derive_cap`, the call
-  `gs::cap::duplicate` wraps, packaged inside `gs::call::request_within`). The server gets exactly that cap and nothing else; there is no
+  embedding a reply cap - a one-message SEND|GRANT copy of its reply mailbox's grant cap (the SDK's
+  `derive_reply_cap`, packaged inside `gs::call::request_within`; CLAUDE.md 8.2). The server gets exactly that cap and nothing else; there is no
   "reply to the sender" channel in the kernel. *(COMMANDMENTS.md VII; CLAUDE.md §7, §8.5, §8.9.)*
 - **Commandment VIII (wait on truth, not time - and the truth must include failure).** asker blocks for
   the *reply* - the truth that the work is done - never for a fixed sleep. And it never assumes a send
