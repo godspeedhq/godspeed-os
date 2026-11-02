@@ -1186,6 +1186,12 @@ death semantics, never "request/reply" or "RPC". It is the primitive behind the 
 > `backlog/90` D5. "Logs the task that tried" is rate-limited on one count across all tasks, at each power of
 > two, so the first refusal is always named and a later one, by another task, may not be: there the code is
 > deliberate and this text is what was loose.)*
+>
+> *(Note 2026-11-02, later: the first two are closed, so the amendment now holds as written. `gs::cap::duplicate_once`
+> is the one-shot form, and every reply cap in the tree uses it or the SDK's request paths; a package that hands
+> out a plain `duplicate` still makes an ordinary cap, as the amendment says of any cap passed on without `ONCE`.
+> `SpawnImage` refuses to install a `ONCE` cap. And `ResourceInvoke` was a send path this amendment missed: an invocation now
+> spends a `ONCE` cap and a spent one is refused, and it refuses a right byte that names `ONCE` or nothing.)*
 
 ### 8.3 Routing
 

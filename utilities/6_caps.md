@@ -27,7 +27,7 @@ any other (authority is explicit, not hidden).
 ```
 gsh> caps
 caps for shell:
-  RESOURCE (target)  RIGHTS (read/write/send/recv/grant/revoke)
+  RESOURCE (target)  RIGHTS (read/write/send/recv/grant/revoke/once)
   spawn             write
   introspect        read
   service_control   write
@@ -35,7 +35,8 @@ caps for shell:
 ```
 
 Each row is one held cap: the resource it targets and its rights spelled out (read,
-write, send, recv, grant, revoke). The kernel's fixed resources, ids 1-18, are named
+write, send, recv, grant, revoke, and `once` on a cap that carries one message; a spent one reads `once` alone).
+The kernel's fixed resources, ids 1-18, are named
 (1=log_write, 2=spawn, 3=console_read, 4=console_push, 5=introspect,
 6=service_control, 7=resource_mint, 8=reboot, 9=acquire_any, 11=gpio_device,
 14=fire_irq, 15=image_spawn, 16=pci_cfg, 17=device_power, 18=cpu_clock, from

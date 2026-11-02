@@ -23,7 +23,7 @@ The capability system (§7). Unsafe boundary: the global resource table uses a r
 
 ## Rights non-escalation (§7.3)
 
-`narrow_for_grant` asserts in debug builds that it does not widen rights. If you are calling `narrow_for_grant` and the assert fires, the caller is violating the cap model. Note that nothing outside the unit tests calls it today: the live paths keep non-escalation by never constructing wider rights - a transfer copies the held cap whole, and `DeriveCap` does too (GRANT-gated), adding only `ONCE` if asked and refusing a source that has it, `SpawnImage` installs copy a cap the caller holds with GRANT, and an embedded delegated cap is narrowed with `without_grant` (SEC-7).
+`narrow_for_grant` asserts in debug builds that it does not widen rights. If you are calling `narrow_for_grant` and the assert fires, the caller is violating the cap model. Note that nothing outside the unit tests calls it today: the live paths keep non-escalation by never constructing wider rights - a transfer copies the held cap whole, and `DeriveCap` does too (GRANT-gated), adding only `ONCE` if asked and refusing a source that has it, `SpawnImage` installs copy a cap the caller holds with GRANT and refuse a `ONCE` one, and an embedded delegated cap is narrowed with `without_grant` (SEC-7).
 
 ## Concurrency (§7.8)
 

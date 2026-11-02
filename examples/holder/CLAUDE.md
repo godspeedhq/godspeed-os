@@ -34,7 +34,7 @@ The client side, using only real `ServiceContext` methods:
 | Trigger revoke | `ctx.resource_invoke(cap, gs::cap::READ, reply, &[OP_CLOSE])` | the owner alone revokes what it owns (a generation bump, §7.5) |
 | Use after revoke | `ctx.resource_invoke(cap, gs::cap::READ, …)` | the cap is now stale -> `CapRevoked` |
 
-The reply cap holder embeds per invoke is a SEND copy of its OWN endpoint (`gs::cap::duplicate` of
+The reply cap holder embeds per invoke is a one-message copy of its OWN endpoint (`gs::cap::duplicate_once` of
 `gs::cap::self_grant`) - the only channel the owner has to answer it. This is the same dance the shell's
 `fcap` command uses against `fs` (`services/shell`, `fc_invoke`); holder is the example-sized version.
 

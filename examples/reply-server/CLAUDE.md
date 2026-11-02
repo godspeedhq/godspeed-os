@@ -45,9 +45,9 @@ use godspeed::{self as gs, ipc::Message};
 
 let request = Message::from_bytes(b"echo me");
 
-// 1. A reply cap = a SEND|GRANT copy of our OWN endpoint cap. The server replies here.
+// 1. A reply cap = a one-message copy of our OWN endpoint cap. The server replies here.
 let self_cap  = gs::cap::self_grant(&ctx).expect("client owns an endpoint");
-let reply_cap = gs::cap::duplicate(&ctx, self_cap).expect("a copy to give away");
+let reply_cap = gs::cap::duplicate_once(&ctx, self_cap).expect("a copy to give away");
 
 // 2. Find the server and send the request WITH the reply cap embedded. The kernel
 //    moves reply_cap into the server's table (it carried GRANT) - that is the server's
