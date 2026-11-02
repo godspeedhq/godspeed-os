@@ -12450,7 +12450,8 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
            "and nic-driver stays stopped while the package holds its device");
     let out = run!(b"godspeed uninstall godspeed/kind-nic yes\r", 120);
     check!(out.contains("uninstalled"), "kind-nic uninstalls");
-    let _ = collect_until(&buf, &mut cursor, b"nic-driver started again", Duration::from_secs(30));
+    // To the END of the line the check below reads: a wait for its start can return with the rest still arriving.
+    let _ = collect_until(&buf, &mut cursor, b"gave its device back", Duration::from_secs(30));
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     check!(log.contains("godspeed/kind-nic's device (class 020000) goes back to nic-driver")
                && log.contains("supervisor: nic-driver started again - an installed package gave its device back"),
@@ -12526,8 +12527,9 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
     monitor_cmd("device_add usb-serial,bus=xhci.0,chardev=fser,id=fser_dev\n");
     let _ = collect_until(&buf, &mut cursor, b"USB device connected (xhci)", Duration::from_secs(30));
     // The prompt drawn again under the notice, with the line - read past here, so the wait for the prompt below
-    // is the one after the command, not this one.
-    let _ = collect_until(&buf, &mut cursor, b"gsh> echo half", Duration::from_secs(10));
+    // is the one after the command, not this one. The line alone: a host's log line can land between the prompt
+    // and it, and a wait for the two together then times out with the run one prompt behind.
+    let _ = collect_until(&buf, &mut cursor, b"echo half", Duration::from_secs(10));
     let finished = run!(b" done\r", 60);
     let around = String::from_utf8_lossy(&buf.lock().unwrap()[typed_at..]).to_string();
     check!(finished.contains("half done") && !around.contains("\nhalf\r") && !around.contains("\nhalf\n"),
@@ -12556,9 +12558,9 @@ pub fn run_driver_packages(image_path: &Path, persist_path: &str, smp: u32) {
            "and reported it as host ehci, beside xhci's report of its own device");
     let stick_out = run!(b"godspeed install /kind-stick-0.1.0.gsp yes\r", 240);
     check!(stick_out.contains("asks for: device"), "a driver of the stick installs");
-    // As for `kind-usb` above: the line may already be in what the install said.
-    if !stick_out.contains("kind-stick: drove") {
-        let _ = collect_until(&buf, &mut cursor, b"kind-stick: drove", Duration::from_secs(60));
+    // As for `kind-usb` above: the line may already be in what the install said. To its end, which the check reads.
+    if !stick_out.contains("QEMU HARDDISK\"; status 0") {
+        let _ = collect_until(&buf, &mut cursor, b"QEMU HARDDISK\"; status 0", Duration::from_secs(60));
     }
     let log = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
     // `ehci` reported the stick at boot, so the package starts at install, with `ehci` - the host that has it - as its
