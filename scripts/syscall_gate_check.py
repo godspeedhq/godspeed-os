@@ -105,8 +105,8 @@ ALLOW_UNGATED = {
 # Arms whose gate right is computed from an argument rather than a `Rights::X` constant.
 ALLOW_RUNTIME_RIGHT = {
     "ResourceInvoke": "the right is the caller's claim, validated against the cap and carried to the "
-                      "owner as badge_right; Rights(0) passes vacuously, so the OWNER must refuse a "
-                      "badge right of 0 (finding F-invoke-empty-right)",
+                      "owner as badge_right; the handler refuses a right of 0 and one naming ONCE before "
+                      "the lookup (backlog/90 D5), because Rights(0) would pass any cap vacuously",
 }
 
 # Ungated InspectKernel queries. `effects` is the set of marker classes the query's callees may show
