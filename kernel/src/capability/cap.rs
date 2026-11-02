@@ -43,7 +43,7 @@ impl Capability {
     pub fn narrow_for_grant(&self, mask: Rights) -> Self {
         // Every bit in mask must already be in self.rights - no widening.
         debug_assert!(
-            self.rights.narrow(mask) == mask,
+            self.rights.contains(mask),
             "narrow_for_grant must not widen rights"
         );
         Capability {
@@ -114,6 +114,15 @@ mod tests {
         let narrowed = cap.narrow_for_grant(Rights::READ);
         assert!(narrowed.rights.contains(Rights::READ));
         assert!(!narrowed.rights.contains(Rights::WRITE));
+        assert!(!narrowed.rights.contains(Rights::GRANT));
+    }
+
+    #[test]
+    fn narrow_for_grant_keeps_once() {
+        let cap = make_cap(Rights::SEND | Rights::GRANT | Rights::ONCE, 0);
+        let narrowed = cap.narrow_for_grant(Rights::SEND);
+        assert!(narrowed.rights.contains(Rights::SEND));
+        assert!(narrowed.rights.contains(Rights::ONCE));
         assert!(!narrowed.rights.contains(Rights::GRANT));
     }
 
