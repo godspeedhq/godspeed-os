@@ -2288,3 +2288,4 @@ to idle; and `milestones/README.md`'s "A1-A10" names what its linked page covers
 `protocol desync` line, has the same run of spaces. 6's probe count is settled; its `tests/host-ipc` line citations were not
 rechecked, as no file there changed.
 
+**Gates:** `build_gates.py` 33/33, with every documentation checker green.
