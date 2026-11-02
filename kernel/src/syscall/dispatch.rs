@@ -351,12 +351,18 @@ const DERIVE_ONCE: u64 = 1;
 /// or is trying it on (8.2). Logged on powers of two, because a task can repeat it as fast as it likes.
 fn send_refusal(slot: usize, e: CapError) -> CapError {
     static SPENT_SENDS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if e != CapError::CapInsufficientRights || scheduler::current_task_lookup_cap(slot, Rights::ONCE).is_err() {
+    if e != CapError::CapInsufficientRights {
         return e;
+    }
+    // Spent is `ONCE` and nothing else (`spend_once`). A one-shot cap that still holds rights was refused
+    // for lacking this one, and it says so as any cap does.
+    match scheduler::current_task_lookup_cap(slot, Rights::ONCE) {
+        Ok(c) if c.rights == Rights::ONCE => {}
+        _ => return e,
     }
     let n = SPENT_SENDS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     if n.is_power_of_two() {
-        crate::kprintln!("cap: {} sent on a reply cap it had already used ({} so far)",
+        crate::kprintln!("cap: {} used a one-shot cap it had already spent ({} so far)",
             scheduler::task_name(scheduler::current_task_slot()), n);
     }
     CapError::CapRevoked
