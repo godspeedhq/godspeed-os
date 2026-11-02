@@ -171,8 +171,8 @@ pub fn tx_ring_drain() {
     }
 }
 
-/// Drain everything, BLOCKING. For the panic path only: a panic message must reach the wire even
-/// though no tick will ever run again.
+/// Drain everything, BLOCKING. For a machine that is stopping: its last output must reach the wire
+/// even though no tick will ever run again.
 pub fn tx_ring_flush_blocking() {
     // SAFETY: as above, plus the bounded TXFF poll `pl011_write_byte` already uses.
     unsafe {
@@ -866,8 +866,8 @@ pub(super) fn pl011_write_raw(s: &[u8], fb: bool) {
 ///
 /// WHAT THIS STILL DOES NOT FIX, said plainly rather than discovered later: a message ASSEMBLED from
 /// several calls is several ring entries, and another core's line can land between them.
-/// `exceptions.rs` builds its fault report from about ten `pl011_write` fragments, so that report can
-/// still interleave. Those sites want to become one `kprintln!` each; this change is what makes that
+/// `exceptions.rs` builds its fault report from about ten `pl011_write` fragments, written straight to
+/// the wire now (`serial_enter_panic_mode`), so that report can still interleave. Those sites want to become one `kprintln!` each; this change is what makes that
 /// worth doing, because until now a single write was not atomic either.
 pub(super) fn pl011_write(s: &[u8]) {
     if !SERIAL_SMP.load(Ordering::Relaxed) { pl011_write_raw(s, true); return; }

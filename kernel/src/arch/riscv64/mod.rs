@@ -1448,10 +1448,11 @@ pub fn panic_halt_check() {
 /// hart's last stage and interrupt count are exactly the two facts that turn "core 0 wedged" into a
 /// phase of the trap handler.
 ///
-/// Written through the LOCK-FREE serial path on purpose. A wedged hart may be holding the console
-/// lock - that is one of the shapes being hunted - and a diagnostic that waits for a lock held by
-/// the thing it is diagnosing prints nothing at all, which is how the machine came to go silent in
-/// the first place.
+/// Written through the bounded serial path on purpose. A wedged hart may be holding the console
+/// lock - that is one of the shapes being hunted - so each write waits at most
+/// `SERIAL_LOCK_SPIN_CAP` and then writes regardless: the dump is slow under a stuck lock, and a
+/// diagnostic that waited for good would print nothing at all, which is how the machine came to go
+/// silent in the first place.
 pub fn halt_all_cores() -> ! {
     // ONE WRITER. Every hart that panics arrives here, and the liveness watchdog panics on EVERY
     // core that notices a dark one - so the last wedge printed this dump three times, concurrently,

@@ -811,7 +811,7 @@ struct ServiceContextData {
     /// did. `docs/net-tags-design.md` rejected a second endpoint for lacking a `CreateEndpoint`
     /// syscall - true, and not needed: the first endpoint is minted at spawn and so is this one.
     reply_recv_slot:    u32,
-    /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
+    /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, the source a reply cap is derived from. `u32::MAX` = none.
     reply_grant_slot:   u32,
     /// The interrupt VECTOR(s) this service was granted, so a driver can learn which one it got.
     ///
@@ -957,7 +957,7 @@ pub struct CapInfo {
     /// 8=reboot, 15=image_spawn); larger ids are IPC endpoints, and [4096, 6144)
     /// is the delegated-resource band (§7.10).
     pub resource_id: u64,
-    /// Rights bitfield: READ=1, WRITE=2, SEND=4, RECV=8, GRANT=16, REVOKE=32.
+    /// Rights bitfield: READ=1, WRITE=2, SEND=4, RECV=8, GRANT=16, REVOKE=32, ONCE=64 (a limit, not a right).
     pub rights: u8,
 }
 
@@ -1358,8 +1358,8 @@ impl ServiceContext {
     ///
     /// Used to hand out many copies of a held endpoint cap: derive a copy per
     /// recipient and grant that copy away (via `send_with_cap_by_handle`) while
-    /// keeping the original. Returns `None` if the cap lacks GRANT, is stale, or the
-    /// cap table is full.
+    /// keeping the original. Returns `None` if the cap lacks GRANT, is stale, carries
+    /// `ONCE` (a reply cap, which cannot be copied), or the cap table is full.
     pub fn derive_cap(&self, held: CapHandle) -> Option<CapHandle> {
         self.derive(held, 0)
     }
@@ -1517,8 +1517,8 @@ impl ServiceContext {
     // (A stray doc block for `request_with_reply` sat here, attached by rustdoc to `trace_as` below. It
     // is a plain comment now; the function's own doc is at `request_with_reply`.)
     //
-    // `request_with_reply` embeds a per-request reply cap - a `SEND|GRANT` copy of this service's own
-    // endpoint cap - so the server can reply via `take_pending_cap()` + `send_by_handle()` (§8). Its
+    // `request_with_reply` embeds a per-request reply cap - a one-message copy (`SEND|GRANT|ONCE`,
+    // `derive_reply_cap`) of this service's own endpoint cap - so the server can reply via `take_pending_cap()` + `send_by_handle()` (§8). Its
     // wait is a synchronous kernel CALL (syscall 41): if `peer` dies after receiving the request but
     // before replying, the kernel wakes the caller with `ReplyDead` (§8.6) instead of hanging it. It
     // returns `None` for that and for a failed send alike, which is exactly the distinction a caller

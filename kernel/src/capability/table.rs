@@ -5,8 +5,8 @@
 //!
 //! 1. `CapTable` - one per task; maps a slot index to a `Capability`.
 //!    Populated at spawn time from the spawn request (§13.6 - the kernel cannot
-//!    read a contract); modified by cap transfer, `DeriveCap`, `RemoveCap`, the
-//!    caps a syscall mints into the caller (`AcquireSendCap`, `ResourceMint`, the
+//!    read a contract); modified by cap transfer, `DeriveCap`, `RemoveCap`, a send
+//!    on a one-shot cap (`spend_once`), the caps a syscall mints into the caller (`AcquireSendCap`, `ResourceMint`, the
 //!    spawn syscalls' returned endpoint cap), and task death.
 //!
 //! 2. `GlobalResourceTable` - one per kernel; maps `ResourceId` to its

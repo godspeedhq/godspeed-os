@@ -1090,7 +1090,7 @@ fn in_tree_driver_of(class: u32, nic_on_bus: bool) -> Option<&'static str> {
         .map(|row| row.0)
 }
 
-/// The test-probe image - 194 test modes in one binary (docs/probe-params-design.md).
+/// The test-probe image - 195 test modes in one binary (docs/probe-params-design.md).
 ///
 /// NOT PRESENT IN A BARE-METAL BUILD, and that is the point of it living here rather than in the
 /// kernel. It used to be `include_bytes!` in `kernel/src/task/mod.rs` with no cfg at all, so every
@@ -1144,7 +1144,7 @@ pub fn spawn_probe_row(ctx: &ServiceContext, r: probes::Row) -> Result<(), godsp
 // endpoint cap each spawn hands back. It is what wires dependents: `spawn_wired` installs a peer's
 // cap from here, and a restart refreshes the entry in place. Only what `map_keeps` names is kept -
 // watched services, USB device drivers, and peers some row names - so on-demand programs never fill
-// it. The 194 test probes are test infra (out of scope) and are spawned with their parameters from
+// it. The 195 test probes are test infra (out of scope) and are spawned with their parameters from
 // `probe/src/table.rs` - the table that used to be 193 rows of the kernel service catalogue
 // (docs/probe-params-design.md).
 // ───────────────────────────────────────────────────────────────────────────────
@@ -2800,7 +2800,7 @@ fn spawn_extended_probes(_ctx: &ServiceContext) {}
 fn spawn_extended_probes(_ctx: &ServiceContext) {}
 
 // perf-only: spawn only the regular performance benchmark probe services.
-// Cuts spawn wait from ~18-120 s (183 probes) to ~2-5 s (~30 services) on TCG.
+// Cuts spawn wait from ~18-120 s (184 probes) to ~2-5 s (~30 services) on TCG.
 #[cfg(all(not(feature = "bare-metal"), not(feature = "identity-only"), feature = "perf-only"))]
 fn spawn_extended_probes(ctx: &ServiceContext) {
     // Sender/controller before echo/recv so the sender's endpoint is registered

@@ -343,7 +343,7 @@ fn deliver_to_console_service(bytes: &[u8]) -> i64 {
 // Syscall: Send / Recv / TrySend (1, 2, 3) - Milestone 5/6.
 // ---------------------------------------------------------------------------
 
-/// `DeriveCap`'s flag: the copy carries one message (`Rights::ONCE`). A reply cap is made this way.
+/// `DeriveCap`'s flag: the copy carries one message (`Rights::ONCE`). The SDK's reply caps are made this way.
 const DERIVE_ONCE: u64 = 1;
 
 /// Why a SEND lookup failed, as the caller is told. A cap of one use that has been used is refused as
@@ -1463,14 +1463,16 @@ fn handle_acquire_send_cap(name_ptr: u64, name_len: u64, include_grant: u64) -> 
 }
 
 /// Syscall: DeriveCap (29) - duplicate a capability the caller holds **with GRANT**
-/// into a fresh slot. arg0 = held cap slot. Returns the new slot, or a negative
-/// cap-error code.
+/// into a fresh slot. arg0 = held cap slot, arg1 = flags (`DERIVE_ONCE`). Returns the
+/// new slot, or a negative cap-error code; a cap with `ONCE` cannot be copied and is
+/// refused with `CapInsufficientRights`.
 ///
 /// This is the primitive that lets a service hand out many copies of one held endpoint
 /// cap: it derives a copy per recipient and grants that copy away (via `SendWithCap`)
 /// while retaining the original. Sound and
 /// non-escalating (§7.3): the copy carries the *same* resource, generation, and
-/// rights - never wider - and the GRANT gate means the caller could already transfer
+/// rights - never wider; `DERIVE_ONCE` adds only `ONCE`, which takes authority away -
+/// and the GRANT gate means the caller could already transfer
 /// the whole cap wholesale, so duplicating it grants no authority it lacked. Endpoint
 /// caps already permit many concurrent senders, so duplication matches the IPC model.
 /// The generation check inside `current_task_lookup_cap` also forbids deriving from a stale cap.

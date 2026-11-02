@@ -163,7 +163,8 @@ mod tests {
     // Only the lower 6 bits are used; generate values in that range.
 
     proptest! {
-        /// narrow(a, b) == a & b: never sets bits absent from either operand (§7.3 non-escalating).
+        /// Over the six rights, narrow(a, b) == a & b: never sets a bit absent from either operand
+        /// (§7.3 non-escalating). `ONCE`, which narrow keeps, is `narrow_never_drops_once`.
         #[test]
         fn narrow_result_equals_bitwise_and(
             a in 0u8..=0b0011_1111u8,

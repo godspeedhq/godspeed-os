@@ -340,14 +340,6 @@ unsafe extern "C" fn stub_dabt() -> ! {
     )
 }
 
-/// A USER-mode task took a data or prefetch abort: it touched memory it does not own. Kill just that
-/// task; the kernel and every other task keep running (§10.4 "a protection violation is unrecoverable -
-/// the service is terminated", and the C2/A14/A15 fault-kills-task-not-kernel property, now on ARM).
-///
-/// Reached from `stub_dabt`/`stub_pabt` already in SVC mode, on the faulting task's own kernel stack,
-/// with IRQs masked (abort entry). Never returns: `kill_current` sets the task Dead and switches to the
-/// next runnable task - `yield_current`'s Dead path saves the abandoned handler context to
-/// `CORE_DEAD_CTX` (not the task slot, so no use-after-free) and never resumes it.
 /// Data-abort entry (`stub_dabt`): the status came from DFSR, the address from DFAR.
 extern "C" fn arm_user_fault_kill(pc: u32, addr: u32, fsr: u32, sp_usr: u32) -> ! {
     user_fault_kill(pc, addr, fsr, sp_usr, "data")
@@ -367,6 +359,15 @@ extern "C" fn arm_user_fault_kill_undef(pc: u32, _addr: u32, _fsr: u32, sp_usr: 
     user_fault_kill(pc, 0, 0, sp_usr, "undefined-instruction")
 }
 
+/// A USER-mode task took a data or prefetch abort: it touched memory it does not own. Kill just that
+/// task; the kernel and every other task keep running (§10.4 "a protection violation is unrecoverable -
+/// the service is terminated", and the C2/A14/A15 fault-kills-task-not-kernel property, now on ARM).
+///
+/// Reached from `stub_dabt`/`stub_pabt` already in SVC mode, on the faulting task's own kernel stack,
+/// with IRQs masked (abort entry). Never returns: `kill_current` sets the task Dead and switches to the
+/// next runnable task - `yield_current` saves the abandoned handler context to the task's own slot, which
+/// stays reserved until this core has left it (backlog/90 D10), or to `CORE_DEAD_CTX` when nothing else is
+/// runnable, and never resumes it.
 fn user_fault_kill(pc: u32, addr: u32, dfsr: u32, sp_usr: u32, kind: &str) -> ! {
     let slot = crate::task::scheduler::current_task_slot();
     // NAME the task, do not just number it. Slots are RECYCLED: during a chaos run a service is killed

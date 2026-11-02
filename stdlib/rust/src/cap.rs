@@ -149,8 +149,9 @@ pub fn reacquire(ctx: &ServiceContext, name: &str) -> bool {
 /// 7.3) and happens where a capability is minted or granted, not here.
 ///
 /// Requires the source to hold [`GRANT`]: a capability you may not pass on is also one you may not
-/// copy for passing on. Fails if it lacks GRANT, has gone stale, or the table is full - and those
-/// three are not distinguished, which is a limitation of the syscall rather than of this wrapper.
+/// copy for passing on. Fails if it lacks GRANT, has gone stale, is a reply capability (one message,
+/// never copied), or the table is full - and those four are not distinguished, because the SDK's
+/// `derive_cap` answers `None` for all of them.
 pub fn duplicate(ctx: &ServiceContext, cap: Cap) -> Result<Cap, Error> {
     match ctx.derive_cap(cap.0) {
         Some(h) => Ok(Cap(h)),

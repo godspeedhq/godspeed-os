@@ -16,7 +16,7 @@
 //!   gs::call::request_within(&ctx, "reply-server", &req, ASK_SECS)
 //!
 //! Under the hood (`stdlib/rust/src/call.rs`, over the kernel's `CallDeadline`) that
-//! call derives a per-request reply cap - a SEND|GRANT copy of asker's REPLY MAILBOX,
+//! call derives a per-request reply cap - a one-message SEND|GRANT copy of asker's REPLY MAILBOX,
 //! the second endpoint the kernel gives a receiving task for replies alone (its own
 //! served endpoint only if it got no mailbox) - embeds it in the request, sends it to
 //! reply-server, and blocks for the reply until it arrives, the server dies, or

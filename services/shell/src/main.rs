@@ -17189,7 +17189,7 @@ fn build_deps_table(ctx: &ShellCtx, name: &str) -> Option<Table> {
     let mut grantable = [false; 16];
     let mut np     = 0usize;
     for cap in caps.iter().take(n) {
-        // Rights bitfield (sdk CapInfo): READ=1 WRITE=2 SEND=4 RECV=8 GRANT=16 REVOKE=32.
+        // Rights bitfield (sdk CapInfo): READ=1 WRITE=2 SEND=4 RECV=8 GRANT=16 REVOKE=32 ONCE=64.
         //
         // EVERY send capability, and the GRANT bit REPORTED rather than used as a filter.
         //
@@ -17199,8 +17199,9 @@ fn build_deps_table(ctx: &ShellCtx, name: &str) -> Option<Table> {
         // re-delegate it - so the filter also deleted real wiring: `net-stack` showed no `nic-driver`
         // dependency at all, right after a ping that demonstrably used it.
         //
-        // The two are indistinguishable from here: same right, same shape, and the kernel does not
-        // record which is which. Dropping them hides real dependencies; including them silently shows
+        // The two are not reliably told apart here: a reply cap the SDK made carries `ONCE` (64), but one
+        // made by `gs::cap::duplicate` has the same right and shape as a peer, and this code does not look
+        // at `ONCE`. Dropping them hides real dependencies; including them silently shows
         // return addresses as dependencies. So they are included and MARKED, and the legend says a
         // grantable edge may be either. An honest ambiguity beats a confident wrong answer in either
         // direction (26.7).

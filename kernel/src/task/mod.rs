@@ -295,7 +295,7 @@ struct ServiceContextData {
     /// did. `docs/net-tags-design.md` rejected a second endpoint for lacking a `CreateEndpoint`
     /// syscall - true, and not needed: the first endpoint is minted at spawn and so is this one.
     reply_recv_slot:    u32,
-    /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, for handing out as a reply cap. `u32::MAX` = none.
+    /// SEND|GRANT cap to `reply_recv_slot`'s endpoint, the source a reply cap is derived from. `u32::MAX` = none.
     reply_grant_slot:   u32,
     /// The interrupt VECTOR(s) this service was granted, so a driver can learn which one it got.
     ///

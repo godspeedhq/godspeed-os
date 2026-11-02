@@ -3229,11 +3229,6 @@ fn run_fs_check_test() {
     crate::shell_test::run_fs_check(&image_path, persist, correct_free, 4);
 }
 
-/// Phase K: `drives scrub` (read-only integrity sweep). Bake a clean file and a file with a
-/// CORRUPTED data block (a flipped payload byte), boot, and `drives scrub`: it must report the
-/// bad block (`1 bad`) without panicking, leave the disk UNCHANGED (a second scrub still reports
-/// `1 bad` - read-only, no repair), and the clean file must still read back. Proves a routine,
-/// non-destructive integrity sweep that detects bit-rot.
 /// Phase M - the adversarial suite. `fs` takes client-supplied paths, offsets, sizes and names over
 /// IPC and had no red-team coverage, while every other subsystem has some (§22 F1-F8, A1-A17).
 ///
@@ -3819,6 +3814,11 @@ fn run_fs_fuzz_test() {
     crate::shell_test::run_fs_fuzz(&image_path, persist, 4);
 }
 
+/// Phase K: `drives scrub` (read-only integrity sweep). Bake a clean file and a file with a
+/// CORRUPTED data block (a flipped payload byte), boot, and `drives scrub`: it must report the
+/// bad block (`1 bad`) without panicking, leave the disk UNCHANGED (a second scrub still reports
+/// `1 bad` - read-only, no repair), and the clean file must still read back. Proves a routine,
+/// non-destructive integrity sweep that detects bit-rot.
 fn run_fs_scrub_test() {
     println!("\n=== fs: drives scrub (read-only integrity sweep) - detect bit-rot, change nothing (Phase K) ===");
     cmd_build_bare_metal();

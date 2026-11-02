@@ -76,13 +76,15 @@ fn core_still_using(cid: usize, slot: usize) -> bool {
 
 /// Stop claiming the task this core is running, and start claiming that it is still LEAVING it.
 ///
-/// **Every release goes through here so that no site can forget the second half.** The first attempt
+/// **Every release but one goes through here so that no site can forget the second half; the abort of a
+/// claim is `core_abort_claim`.** The first attempt
 /// at this fix hand-placed the claim at the two `CORE_CURRENT = next` sites I had found by reading -
 /// and there are FOUR, plus a dozen more that release to `IDLE`, several of them `Relaxed` against a
 /// killer that reads `SeqCst`. Finding call sites by eye is exactly the method that produced the bug.
 ///
 /// So this reads what it is about to release rather than being told, which makes it correct at a site
-/// nobody remembered to think about. `IDLE` released as `IDLE` is harmless: it matches no slot, so the
+/// nobody remembered to think about, so long as `CORE_CURRENT` names the task being left. After an aborted
+/// claim it names `next`, which is why those sites use `core_abort_claim` (backlog/90 D7). `IDLE` released as `IDLE` is harmless: it matches no slot, so the
 /// killer's wait ignores it.
 #[inline]
 fn core_release_current(cid: usize, to: usize) {
@@ -1036,28 +1038,6 @@ static CORE_RR_SLOT: PerCore<AtomicUsize> = PerCore::new();
 /// `pick_next`'s subsequent Acquire load of TASK_STATE.
 static CORE_WAKE_HINT: PerCore<AtomicUsize> = PerCore::new();
 
-/// Per-core queue of kernel stack tops awaiting deferred free after a self-kill.
-///
-/// When a task kills itself (CORE_CURRENT[core] == slot), RSP is still on that
-/// task's kernel stack K_a.  Freeing K_a immediately risks a concurrent alloc +
-/// crash on K_a while this core is still executing - KERNEL PF from stack
-/// corruption.  Instead, only the kstack free is deferred; the slot itself is
-/// released immediately (TASK_VALID=false) so reserve_task_slot can reuse it
-/// without the up-to-10ms slot-starvation window the zombie approach caused.
-///
-/// The queue is drained by `drain_pending_kstack`, called from:
-/// - `timer_tick_from_irq` (every ~10 ms, RSP is on the CURRENT live task's kstack)
-/// - the scheduler `run()` loop (RSP is on the per-core BSS scheduler stack)
-///
-/// Safety: draining only happens when RSP is NOT on any pending kstack.
-/// The self-kill path runs with IF=0 (interrupt gate / syscall context) from
-/// kill_task_by_slot through yield_current's switch_context.  After switch_context
-/// RSP is on a different stack; IF=1 is restored in the incoming task.  The timer
-/// ISR can only fire after that point, by which time RSP is not on K_a.
-/// How often, in spin iterations, the kill-path wait re-sends its WAKE_RECEIVER IPI.
-///
-/// It used to be sent once before the loop and never again, so a core that missed it was never
-/// poked a second time (`backlog/fixed/48`). Re-poking a core that is merely slow costs one IPI.
 /// Test-only: fire the kill-path ABANDON exactly once, so that path is observed rather than assumed.
 ///
 /// The abandon path replaced a `panic!` (`backlog/fixed/48`). The race that reaches it needs a core wedged
@@ -1071,6 +1051,10 @@ static CORE_WAKE_HINT: PerCore<AtomicUsize> = PerCore::new();
 static ABANDON_PROBE_FIRED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// How often, in spin iterations, the kill-path wait re-sends its WAKE_RECEIVER IPI.
+///
+/// It used to be sent once before the loop and never again, so a core that missed it was never
+/// poked a second time (`backlog/fixed/48`). Re-poking a core that is merely slow costs one IPI.
 const WAKE_RESEND_SPINS: u32 = 4096;
 
 /// How many extra budget windows the kill-path wait will grant a core that is PROVING PROGRESS.
@@ -1082,6 +1066,23 @@ const WAKE_RESEND_SPINS: u32 = 4096;
 const MAX_WAIT_EXTENSIONS: u32 = 4;
 
 const PENDING_KSTACK_CAP: usize = 8;
+/// Per-core queue of kernel stack tops awaiting deferred free after a self-kill.
+///
+/// When a task kills itself (CORE_CURRENT[core] == slot), RSP is still on that
+/// task's kernel stack K_a.  Freeing K_a immediately risks a concurrent alloc +
+/// crash on K_a while this core is still executing - KERNEL PF from stack
+/// corruption.  Instead, the kstack free is deferred, and so is the slot's release
+/// (`CORE_PENDING_SLOT`): the slot stays Dead and valid until this core has left it.
+///
+/// The queue is drained by `drain_pending_kstack`, called from:
+/// - `timer_tick_from_irq` (every ~10 ms, RSP is on the CURRENT live task's kstack)
+/// - the scheduler `run()` loop (RSP is on the per-core BSS scheduler stack)
+///
+/// Safety: draining only happens when RSP is NOT on any pending kstack.
+/// The self-kill path runs with IF=0 (interrupt gate / syscall context) from
+/// kill_task_by_slot through yield_current's switch_context.  After switch_context
+/// RSP is on a different stack; IF=1 is restored in the incoming task.  The timer
+/// ISR can only fire after that point, by which time RSP is not on K_a.
 static CORE_PENDING_KSTACK: PerCoreMut<[u64; PENDING_KSTACK_CAP]> = PerCoreMut::new();
 static CORE_PENDING_KSTACK_LEN: PerCore<AtomicUsize> = PerCore::new();
 
@@ -1096,7 +1097,7 @@ static CORE_PENDING_KSTACK_LEN: PerCore<AtomicUsize> = PerCore::new();
 /// the now-zeroed PML4 → PML4[511] = 0 → "not present" → KERNEL PF.
 ///
 /// Fix: skip freeing the PML4 frame during the reclaim loop for self-kills;
-/// store it here and release it in drain_pending_pml4, which is called from
+/// store it here and release it in drain_pending_kstack, which is called from
 /// the scheduler loop and timer tick - both run with a different CR3.
 ///
 /// AtomicU64 (not static mut) so reads and writes at call sites are safe.
@@ -1116,13 +1117,13 @@ static CORE_PENDING_PML4: PerCore<AtomicU64> = PerCore::new();
 /// bails on one - and only then can a spawn take it.
 static CORE_PENDING_SLOT: PerCore<AtomicUsize> = PerCore::new();
 
-/// Per-core save area for dead task context during self-kill.
+/// Per-core place to discard a context that will never be resumed.
 ///
-/// When a task kills itself and immediately releases TASK_VALID=false, a
-/// concurrent spawn on another core can claim TASK_CTX[slot] before
-/// yield_current's switch_context runs.  Saving the dead task's registers into
-/// CORE_DEAD_CTX instead avoids the write-after-claim race.  CORE_DEAD_CTX is
-/// never used as a load source; dead tasks are never resumed.
+/// A Dead task with nothing else runnable is switched away from into this rather than
+/// `TASK_CTX[slot]`, because its registers will never be read. Also the target of the
+/// `!TASK_VALID[prev]` branches, which a self-kill no longer reaches: its slot stays
+/// valid until the core has left it (`CORE_PENDING_SLOT`, backlog/90 D10). Never used
+/// as a load source.
 static CORE_DEAD_CTX: PerCoreMut<TaskContext> = PerCoreMut::new();
 
 /// Saved context for each core's idle scheduler loop.
@@ -2256,7 +2257,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Acquire) {
-                // prev self-killed - discard into CORE_DEAD_CTX (never resumed).
+                // prev's slot was released - discard into CORE_DEAD_CTX (never resumed).
                 CORE_DEAD_CTX.as_mut_ptr(cid)
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
@@ -2282,10 +2283,9 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
                     core_release_current(cid, IDLE);
-                    // Save into CORE_DEAD_CTX - not TASK_CTX[prev] - to avoid a
-                    // write-after-claim race if a concurrent spawn has already
-                    // reserved TASK_CTX[prev] (possible now that TASK_VALID=false
-                    // immediately).  CORE_DEAD_CTX is never used as a load source.
+                    // Save into CORE_DEAD_CTX: a Dead task is never resumed, so its
+                    // registers need not be kept. CORE_DEAD_CTX is never used as a
+                    // load source.
                     let dead_ctx = CORE_DEAD_CTX.as_mut_ptr(cid);
                     let sched_ctx = CORE_SCHED_CTX.as_ptr(cid);
                     switch_context(dead_ctx, sched_ctx);
@@ -2327,7 +2327,7 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
                     (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Acquire) {
-                // prev self-killed (e.g. the supervisor itself) - discard into CORE_DEAD_CTX.
+                // prev's slot was released - discard into CORE_DEAD_CTX (never resumed).
                 CORE_DEAD_CTX.as_mut_ptr(cid)
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
@@ -2406,15 +2406,16 @@ pub extern "C" fn timer_tick_from_irq(_interrupted_rip: u64, _interrupted_cs: u6
         let current_ctx: *mut TaskContext = if prev >= MAX_TASKS {
             CORE_SCHED_CTX.as_mut_ptr(cid)
         } else if !TASK_VALID[prev].load(Ordering::Acquire) {
-            // Slot was immediately released by a self-kill (deferred-kstack
-            // approach).  Save into CORE_DEAD_CTX to avoid a write-after-claim
-            // race with a concurrent spawn.  CORE_DEAD_CTX is never resumed.
+            // The slot is no longer valid, which a self-kill no longer causes: it
+            // keeps the slot until this core has left it (D10). Saved into
+            // CORE_DEAD_CTX so TASK_CTX[prev] is not written. CORE_DEAD_CTX is
+            // never resumed.
             CORE_DEAD_CTX.as_mut_ptr(cid)
         } else {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         };
 
-        // Normal path: switch into `next`. Abort path (kill won the race): switch
+        // Normal path: switch into `next`. Abort path (a kill won the race, or the claim was given back): switch
         // `prev` to the scheduler context instead, where it is rescheduled - never
         // loading `next`'s possibly-freed page table. (prev >= MAX_TASKS already
         // returned above, so current_ctx here is a real task ctx, distinct from the
@@ -2489,16 +2490,14 @@ pub fn yield_current() {
                 // Same Dead-detection as timer_tick_from_irq: if the current task
                 // was killed with no other runnable task, switch to the scheduler
                 // so kill_task_by_slot's spin-wait can exit.
-                // Check STATE alone (not TASK_VALID): TASK_VALID is immediately
-                // false after a self-kill (deferred-kstack approach), but
-                // STATE=Dead is still the signal we need.
+                // Check STATE alone (not TASK_VALID): STATE=Dead is the signal, whether
+                // or not the slot has been released yet.
                 let is_dead = prev < MAX_TASKS
                     && TASK_STATE[prev].load(Ordering::Relaxed) == TaskState::Dead as u8;
                 if is_dead {
                     core_release_current(cid, IDLE);
-                    // Save into CORE_DEAD_CTX, not TASK_CTX[prev], to avoid a
-                    // write-after-claim race with a concurrent spawn that may
-                    // have already reserved the now-available slot.
+                    // Save into CORE_DEAD_CTX: a Dead task is never resumed, so its
+                    // registers need not be kept.
                     let dead_ctx = CORE_DEAD_CTX.as_mut_ptr(cid);
                     let sched_ctx = CORE_SCHED_CTX.as_ptr(cid);
                     switch_context(dead_ctx, sched_ctx);
@@ -2538,7 +2537,7 @@ pub fn yield_current() {
                     (*crate::arch::imp::syscall_entry::syscall_slot(cid)).user_rsp;
             }
             let current_ctx: *mut TaskContext = if !TASK_VALID[prev].load(Ordering::Acquire) {
-                CORE_DEAD_CTX.as_mut_ptr(cid)   // prev self-killed - discard (never resumed)
+                CORE_DEAD_CTX.as_mut_ptr(cid)   // prev's slot was released - discard (never resumed)
             } else {
                 TASK_CTX[prev].assume_init_mut() as *mut TaskContext
             };
@@ -2614,10 +2613,11 @@ pub fn yield_current() {
         // Save the current execution state.
         // Three cases:
         //   prev >= MAX_TASKS  → scheduler idle context (save to CORE_SCHED_CTX)
-        //   TASK_VALID=false   → self-killed task (save to CORE_DEAD_CTX; slot
-        //                        already reclaimed, TASK_CTX[prev] may be reused
-        //                        by a concurrent spawn - must not write there)
-        //   live task          → normal case (save to TASK_CTX[prev])
+        //   TASK_VALID=false   → a released slot (save to CORE_DEAD_CTX, must not
+        //                        write TASK_CTX[prev]); a self-kill does not land
+        //                        here, since its slot stays valid until this core
+        //                        has left it (D10)
+        //   live or self-killed task → save to TASK_CTX[prev]
         // Saving a kstack RSP into CORE_SCHED_CTX would corrupt the scheduler's
         // BSP stack pointer, causing a KERNEL PF on the next scheduler resume.
         // CORE_DEAD_CTX is never used as a load source (dead tasks not resumed).
@@ -2628,7 +2628,7 @@ pub fn yield_current() {
         } else {
             TASK_CTX[prev].assume_init_mut() as *mut TaskContext
         };
-        // Normal: switch into `next`. Abort (kill won the race): switch `prev` to the
+        // Normal: switch into `next`. Abort (a kill won the race, or the claim was given back): switch `prev` to the
         // scheduler context instead, never loading `next`'s possibly-freed page table.
         let next_ctx: *const TaskContext = if abort_to_sched {
             CORE_SCHED_CTX.as_ptr(cid)
@@ -2642,9 +2642,6 @@ pub fn yield_current() {
     }
 }
 
-/// Return the slot index of the currently-running task on this core.
-///
-/// Returns `IDLE` (== MAX_TASKS) if the scheduler loop is active.
 /// Restore this core's preemption timer when it stops being idle.
 ///
 /// THE IDLE TIMER LEAKED, and it made the whole machine run at 1 Hz. An idle core slows its tick to
@@ -2671,6 +2668,9 @@ fn leaving_idle_restore_quantum(prev: usize) {
     }
 }
 
+/// Return the slot index of the currently-running task on this core.
+///
+/// Returns `IDLE` (== MAX_TASKS) if the scheduler loop is active.
 pub fn current_task_slot() -> usize {
     // Before the per-core arenas exist no task has run: `IDLE`, so an early kernel fault's report names
     // no task rather than faulting on the unallocated arena.
@@ -2823,7 +2823,8 @@ pub fn find_task_by_name_excluding(name: &str, exclude: usize) -> Option<usize> 
     None
 }
 
-/// Free all deferred kernel stacks from a prior self-kill on this core.
+/// Finish every self-kill this core has left: free its deferred kernel stacks and page-table root, then
+/// release its slot.
 ///
 /// Safe to call from timer_tick_from_irq (IF=0, RSP on the current live task's
 /// kstack or TSS.rsp0 of the incoming timer frame - either way, NOT on any
@@ -2839,7 +2840,7 @@ pub fn find_task_by_name_excluding(name: &str, exclude: usize) -> Option<usize> 
 /// the timer calls it too, on the same core: a tick between the load of a count or root and its clear
 /// drained the same entries a second time, so a stack or root freed by the tick - and perhaps handed out
 /// again - was freed once more by `run()`. Masked, the two can never interleave; the mask is a no-op from
-/// the timer, which runs with interrupts off, and the drain is bounded by `PENDING_KSTACK_CAP` and one root.
+/// the timer, which runs with interrupts off, and the drain is bounded by `PENDING_KSTACK_CAP`, one root and one slot.
 fn drain_pending_kstack(cid: usize) {
     let was_enabled = crate::arch::imp::local_irq_save();
     #[cfg(feature = "drain-reentry-test")]
@@ -2851,7 +2852,7 @@ fn drain_pending_kstack(cid: usize) {
         for i in 0..n {
             let kstack = unsafe { (*CORE_PENDING_KSTACK.as_mut_ptr(cid))[i] };
             // SAFETY: RSP is NOT on this kstack (see above).  kstack is the top
-            // of a TASK_KSTACK_MAX-sized block allocated from the kstack pool.
+            // of a `KSTACK_SIZE` stack allocated from the kstack pool.
             if kstack != 0 { super::free_kstack(kstack); }
         }
     }
@@ -2981,7 +2982,7 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
     // Two cores calling kill_task_by_slot(slot) simultaneously would otherwise
     // both pass the !TASK_VALID guard, both reach free_kstack, and double-free
     // the kernel stack.  The slot can also be claimed by reserve_task_slot between
-    // free_kstack (line ~807) and TASK_VALID=false (line ~817), causing the second
+    // free_kstack and TASK_VALID=false, causing the second
     // killer to free a live kernel stack → KERNEL PF.
     //
     // Fix: hold task_slot_lock while checking TASK_VALID and while atomically
@@ -3614,7 +3615,8 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         // the dead task's registers saved over its own context.
         //
         // Context save: the slot stays valid until then, so yield_current saves the
-        // dead task's registers into TASK_CTX[slot], which no one else can hold yet.
+        // dead task's registers into TASK_CTX[slot], which no one else can hold yet,
+        // or into CORE_DEAD_CTX when nothing else is runnable.
         //
         // Cross-kill: this core's RSP is on the supervisor's kstack, not K_a.
         // Free immediately and release the slot now.
@@ -3670,16 +3672,8 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
     }
 }
 
-/// Block the currently-running task and switch to the next ready task.
-///
-/// Returns the wakeup result code (0 = success, negative = IpcError).
-/// Re-enables interrupts before returning.
-///
-/// The caller must have already recorded the blocking reason in the routing
-/// table (under its spinlock) *before* calling this function. The routing
-/// spinlock must be released *before* this call.
 /// Park the current task: block it indefinitely with no waker. Used by idle
-/// trusted-root services (init, supervisor) once their work is done - they must
+/// services once their work is done - they must
 /// not busy-`yield`, which keeps their core off the idle (halt) path and pegs it
 /// at 100%. Parking lets the core reach the scheduler idle loop and halt (cool)
 /// where ARAT/TSC-Deadline allow it. Reuses block_and_reschedule; nothing wakes a
@@ -3688,6 +3682,14 @@ pub fn park_current() -> i64 {
     block_and_reschedule(TaskState::BlockedOnRecv)
 }
 
+/// Block the currently-running task and switch to the next ready task.
+///
+/// Returns the wakeup result code (0 = success, negative = IpcError).
+/// Re-enables interrupts before returning.
+///
+/// The caller must have already recorded the blocking reason in the routing
+/// table (under its spinlock) *before* calling this function. The routing
+/// spinlock must be released *before* this call.
 pub fn block_and_reschedule(state: TaskState) -> i64 {
     // SAFETY: IF=0 (caller ensures this; double-cli is a no-op).
     unsafe {
@@ -3773,7 +3775,7 @@ pub fn block_and_reschedule(state: TaskState) -> i64 {
                     if claim_abort_force(2, next) { abort_to_sched = true; }
                 }
                 if abort_to_sched {
-                    // Kill won the race: release its spin-wait (CORE_CURRENT off `next`), still
+                    // A kill won the race or the claim was given back: release its spin-wait (CORE_CURRENT off `next`), still
                     // claiming `slot`, and switch the now-Blocked `slot` to the scheduler context,
                     // exactly as the None branch does - `slot` resumes here when later woken.
                     core_abort_claim(cid, slot);
@@ -3831,17 +3833,6 @@ pub fn take_recv_message() -> Option<Message> {
 // Private helpers.
 // ---------------------------------------------------------------------------
 
-/// Round-robin scan for the next Ready task pinned to `core_id`.
-///
-/// Uses `CORE_RR_SLOT` as a sticky scan pointer that advances *past* the
-/// selected slot after each pick.  This guarantees every slot in [0, MAX_TASKS)
-/// is visited before the pointer wraps, preventing high-numbered slots from
-/// being permanently starved by a dense band of ready tasks at lower indices
-/// (§9.1 - no service may monopolise a core; §9.3 - yield is advisory).
-///
-/// Before the RR scan, checks `CORE_WAKE_HINT`: if a task was just woken by
-/// `wake_by_slot` it is returned immediately without scanning, so a recently
-/// woken task cannot be starved by the current RR position.
 /// Is the task this core has just claimed pinned to THIS core? `false` - and the claim given back - when it is
 /// not, which is always a bug: a task runs only on the core it was spawned on (9.1), and switching into one
 /// pinned elsewhere would run it on two cores at once (backlog/90 D11, `backlog/fixed/95`).
@@ -3881,6 +3872,17 @@ fn claimed_is_ours(next: usize, cid: usize) -> bool {
     false
 }
 
+/// Round-robin scan for the next Ready task pinned to `core_id`.
+///
+/// Uses `CORE_RR_SLOT` as a sticky scan pointer that advances *past* the
+/// selected slot after each pick.  This guarantees every slot in [0, MAX_TASKS)
+/// is visited before the pointer wraps, preventing high-numbered slots from
+/// being permanently starved by a dense band of ready tasks at lower indices
+/// (§9.1 - no service may monopolise a core; §9.3 - yield is advisory).
+///
+/// Before the RR scan, checks `CORE_WAKE_HINT`: if a task was just woken by
+/// `wake_by_slot` it is returned immediately without scanning, so a recently
+/// woken task cannot be starved by the current RR position.
 fn pick_next(core_id: usize) -> Option<usize> {
     // Fast path: schedule the just-woken task immediately.
     let hint = CORE_WAKE_HINT.get(core_id).load(Ordering::Acquire);

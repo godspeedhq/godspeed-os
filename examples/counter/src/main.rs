@@ -69,7 +69,7 @@ const FS_SECS: i64 = 120;
 /// Send one fs file-API request `[tag, op, path_len, path, data]` and return the reply,
 /// tag stripped.
 ///
-/// Uses `gs::call::request_within`, which embeds a per-request reply cap (a SEND|GRANT
+/// Uses `gs::call::request_within`, which embeds a per-request reply cap (a one-message SEND|GRANT
 /// copy of our reply mailbox, or of our own endpoint if we got none) so `fs` can answer
 /// us, and bounds the wait by
 /// `FS_SECS`. On a send that never left (usually `fs` restarted and our cached cap is
