@@ -1179,6 +1179,11 @@ fn handle_spawn_image(req_ptr: u64, req_len: u64, spawn_cap_slot: u64) -> i64 {
                 Ok(c)  => c,
                 Err(e) => return cap_err_to_i64(e),
             };
+            // An install is a copy, and a copy of a one-shot cap would be a second shot (`handle_derive_cap`).
+            if held.rights.contains(Rights::ONCE) {
+                crate::kprintln!("task: SpawnImage refused - install {} is a one-shot cap", slot);
+                return cap_err_to_i64(CapError::CapInsufficientRights);
+            }
             entry.name     = nm;
             entry.name_len = label_len as u8;
             entry.cap      = held;
