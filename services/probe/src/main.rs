@@ -2332,6 +2332,10 @@ fn mode_adv_a17(ctx: &ServiceContext) -> ! {
         ctx.log("adv: A17 FAIL - a spent resource cap passed by naming ONCE");
         idle(ctx);
     }
+    if !refused(invoke(one, 0), CapError::CapInsufficientRights) {
+        ctx.log("adv: A17 FAIL - a spent resource cap passed by naming no right");
+        idle(ctx);
+    }
     if invoke(file, RIGHT_READ).is_err() {
         ctx.log("adv: A17 FAIL - an ordinary cap to the same resource stopped working");
         idle(ctx);

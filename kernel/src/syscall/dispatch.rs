@@ -1924,8 +1924,9 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let required   = Rights(right_bits);
 
     // `ONCE` is a limit and not a right, and the owner reads this byte as the right the kernel checked. A
-    // spent cap holds `ONCE` alone, so asking for that bit would pass the check below.
-    if required.contains(Rights::ONCE) {
+    // spent cap holds `ONCE` alone, so asking for that bit would pass the check below, and so would asking
+    // for nothing, which any cap passes.
+    if right_bits == 0 || required.contains(Rights::ONCE) {
         return cap_err_to_i64(CapError::CapInsufficientRights);
     }
 
