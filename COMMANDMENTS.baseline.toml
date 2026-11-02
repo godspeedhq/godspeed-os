@@ -931,8 +931,10 @@ SpawnImage               = 52
 # probe-table: `services/probe/src/table.rs`, compiled into the supervisor, gives every test probe its
 # privileges by name - SPAWN and SERVICE_CONTROL (they start and kill victims), ACQUIRE_ANY (all but adv-a13,
 # whose subject is being denied it), INTROSPECT (the prop- and stress- drivers read generations), and the
-# software test interrupt for probe-11a. A probe granted REBOOT would appear here.
-"probe-table" = ["hw:TEST_IRQ", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
+# software test interrupt for probe-11a. A probe granted REBOOT would appear here. RESOURCE_MINT is adv-a17's
+# alone: a holder cannot make a one-shot copy of a resource it was handed, so the probe mints its own to show
+# that an invocation spends one (CLAUDE.md 8.2, backlog/90 D5).
+"probe-table" = ["hw:TEST_IRQ", "priv:ACQUIRE_ANY", "priv:INTROSPECT", "priv:RESOURCE_MINT", "priv:SERVICE_CONTROL", "priv:SPAWN"]
 # kernel-delegatable: SUPERVISOR_DELEGATABLE in kernel/src/task/mod.rs, the ceiling on every row above - the
 # kernel refuses any privilege the supervisor cannot delegate. IMAGE_SPAWN is absent by design (14.1).
 "kernel-delegatable" = ["priv:ACQUIRE_ANY", "priv:CONSOLE_PUSH", "priv:CPU_CLOCK", "priv:FIRE_IRQ", "priv:GPIO", "priv:INTROSPECT", "priv:PCI_CFG", "priv:POWER_OFF", "priv:REBOOT", "priv:RESOURCE_MINT", "priv:SERVICE_CONTROL", "priv:SPAWN"]

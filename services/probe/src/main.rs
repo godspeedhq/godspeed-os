@@ -2291,6 +2291,51 @@ fn mode_adv_a17(ctx: &ServiceContext) -> ! {
         ctx.log("adv: A17 FAIL - an ordinary cap to the same endpoint stopped working");
         idle(ctx);
     }
+    // A one-shot cap to a resource: an invocation is its one message. `ONCE` is not a right to ask for,
+    // on a live cap or on a spent one, which holds that bit and nothing else.
+    const RIGHT_READ: u8 = 1;
+    const RIGHT_GRANT: u8 = 16;
+    const LIMIT_ONCE: u8 = 64;
+    let Ok((_, file)) = gs::resource::mint(ctx, RIGHT_READ | RIGHT_GRANT) else {
+        ctx.log("adv: A17 FAIL - could not mint a resource");
+        idle(ctx);
+    };
+    let Some(one) = ctx.derive_reply_cap(file.handle()) else {
+        ctx.log("adv: A17 FAIL - could not make a one-shot resource cap");
+        idle(ctx);
+    };
+    let invoke = |cap: godspeed_sdk::capability::CapHandle, right: u8| {
+        let Some(reply) = ctx.derive_reply_cap(sg.handle()) else { return Err(IpcError::Unknown(-1)); };
+        let r = ctx.resource_invoke(cap, right, reply, &msg);
+        if r.is_err() { ctx.remove_cap(reply); }
+        r
+    };
+    let refused = |r: Result<(), IpcError>, want: CapError| matches!(r, Err(IpcError::CapError(e)) if e == want);
+    // Not spent, only without SEND, so it says that and not `CapRevoked`.
+    if !refused(gs::ipc::exact::try_send_to(ctx, one.into(), &msg), CapError::CapInsufficientRights) {
+        ctx.log("adv: A17 FAIL - a live one-shot cap with no SEND was reported as spent");
+        idle(ctx);
+    }
+    if !refused(invoke(file.handle(), LIMIT_ONCE), CapError::CapInsufficientRights) {
+        ctx.log("adv: A17 FAIL - an invocation named ONCE as a right");
+        idle(ctx);
+    }
+    if invoke(one, RIGHT_READ).is_err() {
+        ctx.log("adv: A17 FAIL - a one-shot resource cap refused its one invocation");
+        idle(ctx);
+    }
+    if !refused(invoke(one, RIGHT_READ), CapError::CapRevoked) {
+        ctx.log("adv: A17 FAIL - a one-shot resource cap carried a second invocation");
+        idle(ctx);
+    }
+    if !refused(invoke(one, LIMIT_ONCE), CapError::CapInsufficientRights) {
+        ctx.log("adv: A17 FAIL - a spent resource cap passed by naming ONCE");
+        idle(ctx);
+    }
+    if invoke(file.handle(), RIGHT_READ).is_err() {
+        ctx.log("adv: A17 FAIL - an ordinary cap to the same resource stopped working");
+        idle(ctx);
+    }
     ctx.log("adv: A17 pass - a reply cap took one message, refused a second, and could not be copied");
     idle(ctx)
 }

@@ -261,6 +261,8 @@ pub fn privileges_of(name: &str) -> u32 {
     // The property/stress drivers read their victims' generations. adv-a11 must NOT have this - it
     // asserts that a probe WITHOUT INTROSPECT is denied - which is why this cannot be "every probe".
     if name.starts_with("prop-") || name.starts_with("stress-") { p |= privbits::INTROSPECT; }
+    // A17 mints a resource of its own, because no holder can make a one-shot copy of one it was handed.
+    if name == "adv-a17" { p |= privbits::RESOURCE_MINT; }
     p
 }
 

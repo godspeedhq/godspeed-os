@@ -1918,10 +1918,16 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let right_bits = ((packed >> 24) & 0xFF) as u8;
     let required   = Rights(right_bits);
 
+    // `ONCE` is a limit and not a right, and the owner reads this byte as the right the kernel checked. A
+    // spent cap holds `ONCE` alone, so asking for that bit would pass the check below.
+    if required.contains(Rights::ONCE) {
+        return cap_err_to_i64(CapError::CapInsufficientRights);
+    }
+
     // 1. Validate the file cap holds the requested right (generation + rights, global table).
     let file_cap = match scheduler::current_task_lookup_cap(file_slot, required) {
         Ok(c)  => c,
-        Err(e) => return cap_err_to_i64(e),
+        Err(e) => return cap_err_to_i64(send_refusal(file_slot, e)),
     };
     if !delegated::is_delegated(file_cap.resource_id) {
         return cap_err_to_i64(CapError::CapWrongScope); // not a delegated/file cap
@@ -1961,15 +1967,19 @@ fn handle_resource_invoke(packed: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     match crate::ipc::routing::enqueue(owner, msg, owner_gen, Some(my_slot)) {
         Ok(Some(receiver_slot)) => {
             scheduler::current_task_remove_cap(reply_slot);
+            scheduler::current_task_spend_once(file_slot);
             scheduler::wake_by_slot(receiver_slot, 0);
             0
         }
         Ok(None) => {
             scheduler::current_task_remove_cap(reply_slot);
+            scheduler::current_task_spend_once(file_slot);
             0
         }
         Err(IpcError::QueueFull) => {
             scheduler::current_task_remove_cap(reply_slot);
+            // The message is the routing table's now, as in `handle_send`.
+            scheduler::current_task_spend_once(file_slot);
             scheduler::block_and_reschedule(TaskState::BlockedOnSend)
         }
         Err(e) => ipc_err_to_i64(e),
