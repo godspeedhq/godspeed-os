@@ -2244,7 +2244,7 @@ fn mode_adv_a16(ctx: &ServiceContext) -> ! {
     while queued < 64 && gs::ipc::try_send_to(ctx, sg, &fill).is_ok() {
         queued += 1;
     }
-    let reply = match gs::cap::duplicate(ctx, sg) {
+    let reply = match gs::cap::duplicate_once(ctx, sg) {
         Ok(r) => r,
         Err(_) => { ctx.log("adv: A16 FAIL - could not derive a reply cap"); idle(ctx); }
     };
@@ -2270,9 +2270,9 @@ fn mode_adv_a17(ctx: &ServiceContext) -> ! {
         Ok(s) => s,
         Err(_) => { ctx.log("adv: A17 FAIL - no endpoint of its own"); idle(ctx); }
     };
-    let once = match ctx.derive_reply_cap(sg.handle()) {
-        Some(c) => gs::cap::Cap::from(c),
-        None => { ctx.log("adv: A17 FAIL - could not derive a reply cap"); idle(ctx); }
+    let once = match gs::cap::duplicate_once(ctx, sg) {
+        Ok(c) => c,
+        Err(_) => { ctx.log("adv: A17 FAIL - could not derive a reply cap"); idle(ctx); }
     };
     let msg = Message::from_bytes(b"a17");
     if gs::cap::duplicate(ctx, once).is_ok() {
@@ -2300,23 +2300,23 @@ fn mode_adv_a17(ctx: &ServiceContext) -> ! {
         ctx.log("adv: A17 FAIL - could not mint a resource");
         idle(ctx);
     };
-    let Some(one) = ctx.derive_reply_cap(file.handle()) else {
+    let Ok(one) = gs::cap::duplicate_once(ctx, file) else {
         ctx.log("adv: A17 FAIL - could not make a one-shot resource cap");
         idle(ctx);
     };
-    let invoke = |cap: godspeed_sdk::capability::CapHandle, right: u8| {
-        let Some(reply) = ctx.derive_reply_cap(sg.handle()) else { return Err(IpcError::Unknown(-1)); };
-        let r = ctx.resource_invoke(cap, right, reply, &msg);
-        if r.is_err() { ctx.remove_cap(reply); }
+    let invoke = |cap: gs::cap::Cap, right: u8| {
+        let Ok(reply) = gs::cap::duplicate_once(ctx, sg) else { return Err(IpcError::Unknown(-1)); };
+        let r = ctx.resource_invoke(cap.handle(), right, reply.handle(), &msg);
+        if r.is_err() { gs::cap::remove(ctx, reply); }
         r
     };
     let refused = |r: Result<(), IpcError>, want: CapError| matches!(r, Err(IpcError::CapError(e)) if e == want);
     // Not spent, only without SEND, so it says that and not `CapRevoked`.
-    if !refused(gs::ipc::exact::try_send_to(ctx, one.into(), &msg), CapError::CapInsufficientRights) {
+    if !refused(gs::ipc::exact::try_send_to(ctx, one, &msg), CapError::CapInsufficientRights) {
         ctx.log("adv: A17 FAIL - a live one-shot cap with no SEND was reported as spent");
         idle(ctx);
     }
-    if !refused(invoke(file.handle(), LIMIT_ONCE), CapError::CapInsufficientRights) {
+    if !refused(invoke(file, LIMIT_ONCE), CapError::CapInsufficientRights) {
         ctx.log("adv: A17 FAIL - an invocation named ONCE as a right");
         idle(ctx);
     }
@@ -2332,7 +2332,7 @@ fn mode_adv_a17(ctx: &ServiceContext) -> ! {
         ctx.log("adv: A17 FAIL - a spent resource cap passed by naming ONCE");
         idle(ctx);
     }
-    if invoke(file.handle(), RIGHT_READ).is_err() {
+    if invoke(file, RIGHT_READ).is_err() {
         ctx.log("adv: A17 FAIL - an ordinary cap to the same resource stopped working");
         idle(ctx);
     }

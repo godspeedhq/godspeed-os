@@ -60,6 +60,7 @@ REPLACEMENT = {
     "acquire_send_grant_cap": "gs::cap::acquire_grantable",
     "remove_cap": "gs::cap::remove",
     "derive_cap": "gs::cap::duplicate",
+    "derive_reply_cap": "gs::cap::duplicate_once",
     "self_grant_handle": "gs::cap::self_grant",
     "yield_cpu": "gs::task::yield_now",
     "sleep_ms": "gs::task::sleep_ms, or gs::driver::delay for a hardware hold",

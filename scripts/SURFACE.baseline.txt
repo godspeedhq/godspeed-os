@@ -140,6 +140,7 @@ gs cap const WRITE: u8
 gs cap fn acquire(_:&ServiceContext,_:&str)->Result<Cap,Error>
 gs cap fn acquire_grantable(_:&ServiceContext,_:&str)->Result<Cap,Error>
 gs cap fn duplicate(_:&ServiceContext,_:Cap)->Result<Cap,Error>
+gs cap fn duplicate_once(_:&ServiceContext,_:Cap)->Result<Cap,Error>
 gs cap fn reacquire(_:&ServiceContext,_:&str)->bool
 gs cap fn remove(_:&ServiceContext,_:Cap)
 gs cap fn self_grant(_:&ServiceContext)->Result<Cap,Error>

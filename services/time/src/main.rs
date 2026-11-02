@@ -480,7 +480,7 @@ fn send_noblock(ctx: &ServiceContext, peer: &str, req: &[u8]) -> bool {
         }
     };
     let Ok(self_grant) = gs::cap::self_grant(ctx) else { return false };
-    let Ok(reply_cap) = gs::cap::duplicate(ctx, self_grant) else { return false };
+    let Ok(reply_cap) = gs::cap::duplicate_once(ctx, self_grant) else { return false };
     // The reply cap is CONSUMED by `fs` when it answers. If the send itself fails, reclaim it here so a
     // dead `fs` cannot leak one cap-table slot per attempt (§8.5: a transfer that failed leaves the cap
     // with the sender, and it is the sender's job to notice).
@@ -501,7 +501,7 @@ fn send_noblock(ctx: &ServiceContext, peer: &str, req: &[u8]) -> bool {
             return false;
         }
         let Some(target) = gs::ipc::peer(ctx, peer) else { return false };
-        let Ok(reply_cap) = gs::cap::duplicate(ctx, self_grant) else { return false };
+        let Ok(reply_cap) = gs::cap::duplicate_once(ctx, self_grant) else { return false };
         if gs::ipc::send_granting(ctx, target, reply_cap, &Message::from_bytes(req)).is_err() {
             gs::cap::remove(ctx, reply_cap);
             return false;

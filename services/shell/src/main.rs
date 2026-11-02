@@ -17199,9 +17199,9 @@ fn build_deps_table(ctx: &ShellCtx, name: &str) -> Option<Table> {
         // re-delegate it - so the filter also deleted real wiring: `net-stack` showed no `nic-driver`
         // dependency at all, right after a ping that demonstrably used it.
         //
-        // The two are not reliably told apart here: a reply cap the SDK made carries `ONCE` (64), but one
-        // made by `gs::cap::duplicate` has the same right and shape as a peer, and this code does not look
-        // at `ONCE`. Dropping them hides real dependencies; including them silently shows
+        // The two are not reliably told apart here: a reply cap made properly carries `ONCE` (64), but a
+        // package may make one with `gs::cap::duplicate`, the same right and shape as a peer, and this code
+        // does not look at `ONCE`. Dropping them hides real dependencies; including them silently shows
         // return addresses as dependencies. So they are included and MARKED, and the legend says a
         // grantable edge may be either. An honest ambiguity beats a confident wrong answer in either
         // direction (26.7).
@@ -22800,7 +22800,7 @@ fn fc_invoke(ctx: &ShellCtx, file: gs::cap::Cap, right: u8, payload: &[u8]) -> O
     req[1..1 + payload.len()].copy_from_slice(payload);
     let payload = &req[..1 + payload.len()];
     let self_grant = gs::cap::self_grant(ctx).ok()?;
-    let reply = gs::cap::duplicate(ctx, self_grant).ok()?;
+    let reply = gs::cap::duplicate_once(ctx, self_grant).ok()?;
     if ctx.resource_invoke(file.handle(), right, reply.handle(), &Message::from_bytes(payload)).is_err() {
         gs::cap::remove(ctx, reply); // kernel didn't consume it (validation failed) - don't leak the slot
         return None;

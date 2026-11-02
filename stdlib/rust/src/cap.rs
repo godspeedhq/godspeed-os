@@ -159,6 +159,17 @@ pub fn duplicate(ctx: &ServiceContext, cap: Cap) -> Result<Cap, Error> {
     }
 }
 
+/// [`duplicate`] for a reply capability: the copy carries ONE message and cannot be copied (CLAUDE.md
+/// 8.2). Use this for a capability you hand to someone who must answer you; `duplicate` is for one they
+/// keep. Once used it is spent but still holds its slot, so its holder removes it as usual. Fails as
+/// `duplicate` does.
+pub fn duplicate_once(ctx: &ServiceContext, cap: Cap) -> Result<Cap, Error> {
+    match ctx.derive_reply_cap(cap.0) {
+        Some(h) => Ok(Cap(h)),
+        None => Err(Error::PermissionDenied),
+    }
+}
+
 /// Drop a capability from this service's table.
 ///
 /// Authority you no longer need is authority you should not hold. This is also how a table slot is

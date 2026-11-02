@@ -139,12 +139,12 @@ const INVOKE_SECS: i64 = 5;
 /// making it public is an API decision rather than a rename; `gs::file::File` is the wrapped
 /// form for files. This example keeps the long hand so the protocol is visible.
 fn invoke(ctx: &ServiceContext, cap: gs::cap::Cap, right: u8, op: u8) -> Result<Message, IpcError> {
-    // Our endpoint's own SEND|GRANT handle, then a fresh per-invoke copy to embed as the reply cap.
+    // Our endpoint's own SEND|GRANT handle, then a fresh one-message copy to embed as the reply cap.
     let self_grant = match gs::cap::self_grant(ctx) {
         Ok(h)  => h,
         Err(_) => return Err(IpcError::EndpointDead), // no endpoint to reply on (should not happen)
     };
-    let reply = match gs::cap::duplicate(ctx, self_grant) {
+    let reply = match gs::cap::duplicate_once(ctx, self_grant) {
         Ok(r)  => r,
         Err(_) => return Err(IpcError::EndpointDead), // cap table full (should not happen)
     };
