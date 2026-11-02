@@ -1805,6 +1805,8 @@ struct UsbState {
     /// What each host last reported bound (`usbdev::HOST_*`): `present` is worked out from these, so one host
     /// saying it has nothing never marks absent a device the other has.
     by_host: [Option<(u16, u16)>; usbdev::HOSTS],
+    /// Which hosts have reported to this supervisor: until a host has, `by_host` says nothing about it (`gone`).
+    reported: [bool; usbdev::HOSTS],
     /// A host has reported at least once. Until then `present` is only this supervisor's starting value,
     /// and "absent" must not be told to anyone (`tell_radio_of_dongle`).
     heard: bool,
@@ -1815,7 +1817,8 @@ struct UsbState {
 
 impl UsbState {
     const fn new() -> Self {
-        UsbState { present: [false; USB_MATCH_MAX], by_host: [None; usbdev::HOSTS], heard: false, ready: false }
+        UsbState { present: [false; USB_MATCH_MAX], by_host: [None; usbdev::HOSTS], reported: [false; usbdev::HOSTS],
+                   heard: false, ready: false }
     }
 
     /// Each row's device is present when a host its driver is wired to has it bound.
@@ -1831,6 +1834,17 @@ impl UsbState {
         self.by_host.iter().enumerate().find_map(|(h, d)| {
             let name = usbdev::host_name(h as u8)?;
             (*d == Some((m.vid, m.pid)) && m.peers.contains(&name)).then_some(name)
+        })
+    }
+
+    /// Is row `i`'s device known to have gone? Absent from `present`, and every host its driver is wired to has
+    /// reported. A respawned supervisor knows nothing and the hosts answer in no fixed order, so without the second
+    /// half `ehci`'s empty report, arriving before `xhci`'s, stopped a running `wifi-usb` whose dongle had not moved:
+    /// 10 of 63 supervisor respawns on the T630, 2026-11-02.
+    fn gone(&self, i: usize) -> bool {
+        let Some(m) = USB_MATCH.get(i) else { return false };
+        !self.present[i] && self.reported.iter().enumerate().all(|(h, said)| {
+            *said || !usbdev::host_name(h as u8).is_some_and(|name| m.peers.contains(&name))
         })
     }
 
@@ -1900,6 +1914,9 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, ev
     if let Some(slot) = usb.by_host.get_mut(r.host as usize) {
         *slot = r.present.then_some((r.vid, r.pid));
     }
+    if let Some(said) = usb.reported.get_mut(r.host as usize) {
+        *said = true;
+    }
     usb.recompute();
     // An installed driver package of this device comes first: it is started, and no built-in driver is (`holds`).
     if inst.usb_report(ctx, r.host, r.present, r.vid, r.pid) {
@@ -1908,9 +1925,9 @@ fn usb_report(ctx: &ServiceContext, map: &mut NameCapMap, usb: &mut UsbState, ev
         return;
     }
     // A row whose device no host it is wired to has bound any more: its driver stopped. On one host's report only that
-    // host's device can have gone - the other's is still counted in `present`.
+    // host's device can have gone - the other's is still counted in `present`, or not yet heard from (`gone`).
     for (i, m) in USB_MATCH.iter().enumerate() {
-        if !usb.present[i] && name_alive(ctx, m.driver) && !inst.holds(m.driver) {
+        if usb.gone(i) && name_alive(ctx, m.driver) && !inst.holds(m.driver) {
             match ctx.kill(m.driver) {
                 Ok(()) => {
                     events.note(ctx, supcmd::EV_DETACHED, m.driver, m.vid, m.pid);

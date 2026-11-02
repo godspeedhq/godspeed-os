@@ -33,6 +33,9 @@ host, policy in a service).
 4. **The supervisor's own restart reconciles.** A respawned supervisor (CLAUDE.md 6.2) asks each USB
    host what is attached, adopts the drivers already running for those devices, starts the missing
    ones and stops any whose device is gone - the reconcile it already does for every other service.
+   Gone means every host the driver is wired to has answered: the hosts answer in no fixed order, and on
+   the T630 `ehci`'s empty report arriving first stopped a running `wifi-usb` on 10 of 63 respawns
+   (`UsbState::gone`, 2026-11-02).
 
 What stays as it is: the keyboard, mouse and disk paths inside the hosts. This is for devices a host
 does not drive itself.
