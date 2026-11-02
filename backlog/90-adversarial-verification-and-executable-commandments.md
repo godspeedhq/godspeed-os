@@ -468,6 +468,32 @@ reproducible state-machine tests; selected production functions have machine-che
 representative faults make the relevant checks fail; assumptions and uncovered areas are visible; contributors
 reproduce the checks locally; basic assurance needs no manual AI review; and MISCIS is still six responsibilities.
 
+*(Amended 2026-11-02 by the operator: the paragraph above is the aim and has no end, and order step 5 is ongoing by
+design, so it could never close this entry. The list below is the finish line. When every item holds, this entry
+moves to `fixed/`, and backlog/71's soak is what stands between it and v1.)*
+
+**The finish line:**
+
+1. **D5 carded on all five boards.** Done 2026-11-02.
+2. **The defects left in the table are closed:** D14's abandoned kills are retried, the rest of D27 is fixed, and
+   D20's debug-kernel depth is fixed or recorded as a stated limit.
+3. **The enforcement rows are closed:** what E3, E4 and E5 leave open is fixed, or recorded in the row with its
+   reason.
+4. **The registry exists:** `verification/invariants/registry.md`, with the nine starter rows above, each refined
+   against the code and naming the check that holds it.
+5. **Kani covers capabilities and routing**, in a job that runs on every pull request touching `kernel/`. Making it
+   a required check is a repository setting, which is the operator's.
+6. **A container image** lets a contributor run those checks themselves.
+7. **Creusot runs on a few pure functions, or is dropped**, with the decision recorded here.
+
+**Stated limits, not requirements (26.7).** These three stay open after this entry closes, and the registry says so
+where a reader would otherwise rely on the claim: there is no concurrent model of IPC wake and block, weak memory is
+not checked on any port, and the responsibilities other than the ones the suites reach are not exercised at runtime
+under QEMU on arm, aarch64 and riscv64, where the hardware cards are the evidence. v1 ships saying these are not
+verified.
+
+**After it closes.** Order step 5 is how the project works from then on, held by the gates, and not an open item.
+
 ### Not attempted
 
 Reproducing seL4; proving the whole kernel at once; eliminating every vulnerability; verification machinery in the
@@ -499,4 +525,5 @@ either `backlog/49` is fixed before them, or each is A/B-tested over several run
 clock lock (`backlog/49`); with it fixed, each was shown with its own test feature and all four are carded on five boards (2026-11-01).
 
 Still open from the brief: a concurrent model of IPC wake and block, weak memory on every port, and the
-remaining responsibilities at runtime on arm, aarch64 and riscv64.
+remaining responsibilities at runtime on arm, aarch64 and riscv64. Since 2026-11-02 these three are stated limits
+and not part of this entry's finish line (Done when, above).
