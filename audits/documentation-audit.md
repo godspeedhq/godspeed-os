@@ -2289,3 +2289,32 @@ to idle; and `milestones/README.md`'s "A1-A10" names what its linked page covers
 rechecked, as no file there changed.
 
 **Gates:** `build_gates.py` 33/33, with every documentation checker green.
+
+## Audit 29 - documents and code comments, `feat/v1-groundwork` since Audit 28 (2026-11-03)
+
+Scope: everything changed since `b460710b`, up to `9cba7052` (21 commits, 24 files: Audit 28's six D5 gaps closed and
+carded on five boards, `gs::cap::duplicate_once`, the supervisor's USB reconcile race and its T630 card, the
+`driver-packages` harness waits, and backlog/90's finish line), then the documents and comments those changes touch.
+Small enough to read in one pass, by one reader; each finding was checked against the code. The code in the changed
+source files was not altered.
+
+**Result.** 4 files corrected, and 2 code findings recorded.
+
+**In documents:**
+- `utilities/6_caps.md`: the kernel's fixed resources were "ids 1-18", and the page said 19 (`power_off`) is not named
+  and prints as `endpoint#19`. `AUTHORITIES` has named it since `e15d063b` (2026-10-29), which Audit 28 missed.
+- `utilities/46_trace.md`: the same "ids 1-18".
+- `backlog/README.md` row 90: its next step was still "D5's remaining cards", which the finish line marks done; it now
+  names the finish line.
+
+**In code comments:**
+- `services/shell/src/main.rs`: "Ids 1-18" twice, at `cap_resource_name` and `trace endpoint`.
+
+**Code findings, recorded:**
+1. The shell's `trace endpoint` help says "ids 1-18 are log_write, spawn, ...". A user-visible string, so a code change.
+2. Probe A17's pass line says only that a reply cap took one message; since the gap fixes it also covers a one-shot
+   resource cap and the refused right bytes. The harness matches only `adv: A17 pass`. Cosmetic.
+
+**Audit 28's findings:** 1 to 6 are fixed and carded on all five boards (backlog/90 D5). 7, 8 and 9 are open.
+
+**Gates:** below, in the commit that records this.

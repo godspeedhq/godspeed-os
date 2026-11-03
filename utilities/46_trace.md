@@ -267,7 +267,7 @@ endpoint. Three shapes of answer:
 | first line | means |
 |---|---|
 | `owned by task N "name" (state)` | a live service's endpoint |
-| `console_push (id 4) - a kernel resource, not an endpoint: it has no owning task` | ids 1-18 are the kernel's fixed resources (`log_write`, `spawn`, `console_read`, `console_push`, `introspect`, ... - `AUTHORITIES` in the SDK names them all). They have no owning task by design |
+| `console_push (id 4) - a kernel resource, not an endpoint: it has no owning task` | ids 1-19 are the kernel's fixed resources (`log_write`, `spawn`, `console_read`, `console_push`, `introspect`, ... - `AUTHORITIES` in the SDK names them all). They have no owning task by design |
 | `NO LIVE OWNER` | either the owning task died, or it is a REPLY-only endpoint. A task's reply mailbox is not its primary one, and only primaries are named here |
 
 | column | what it holds |

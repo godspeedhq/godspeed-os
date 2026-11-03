@@ -14752,7 +14752,7 @@ fn cap_resource_name(id: u64, buf: &mut [u8]) -> usize {
     // The names match the vocabulary a contract uses (`pci_cfg = true`), so what a service DECLARES
     // and what it is observed to HOLD read the same and can be compared directly.
     //
-    // Ids 1-18 are the kernel's fixed set (`capability::*_RESOURCE`); anything above is a real
+    // Ids 1-19 are the kernel's fixed set (`capability::*_RESOURCE`); anything above is a real
     // endpoint, and only those reach the fallback. Adding a resource without adding it to
     // `AUTHORITIES` puts it straight back into the lie, so keep the two in step.
     // The names are `gs::task::AUTHORITIES`, the one table `ask "who can reboot?"` reads too.
@@ -17647,7 +17647,7 @@ fn trace_endpoint(ctx: &ServiceContext, arg: &str) -> Result<(), ShellError> {
             return Err(ShellError::Unknown);
         }
     };
-    // A STABLE KERNEL RESOURCE IS NOT AN ENDPOINT. Ids 1-18 are the kernel's fixed set (`log_write`,
+    // A STABLE KERNEL RESOURCE IS NOT AN ENDPOINT. Ids 1-19 are the kernel's fixed set (`log_write`,
     // `spawn`, `console_read`, `console_push`, ... - `cap_resource_name` names them all); calling id 4 "an endpoint with no live owner" was true of the
     // lookup and false about the thing - it has no owner because nothing owns it, by design.
     let mut rb = [0u8; 32];
