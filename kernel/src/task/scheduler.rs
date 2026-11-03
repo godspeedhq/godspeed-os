@@ -3250,6 +3250,10 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
             // dead endpoint still fails. Without this the id counter only climbs and a sustained
             // restart storm (`chaos max-carnage`) exhausts the [100, DELEGATED_BASE) band and panics.
             crate::ipc::free_endpoint_id(ep_id);
+            // And the slot stops naming it. The slot stays valid until the reclaim below - for ever, before
+            // an abandoned kill was retried - and `TaskStat` read this as the dead task's endpoint, with the
+            // queue depth of whoever took the id next (backlog/90 D14).
+            TASK_ENDPOINT[slot].store(0, Ordering::Relaxed);
         }
 
         // How many death notifications the supervisor never received. A COUNT, not a resource: it
