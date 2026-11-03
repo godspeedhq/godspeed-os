@@ -57,9 +57,13 @@ BASELINE = os.path.join(ROOT, "scripts", "DOC-SYMBOLS.baseline.txt")
 # worse than no checker, because its silence reads as a pass.
 # `sdk/wifi/src` (2026-10-02): the radios' shared crate. When its modules moved out of `services/`,
 # four names `docs/wifi.md` cites stopped resolving - which is this list doing its job, late.
+# `tests/kani/src` and `tests/host-ipc/tests` hold the harnesses and scenarios the invariant registry cites by
+# name, so they are code a doc may name (backlog/90).
 SRC_DIRS = ["kernel/src", "services", "sdk/rust/src", "sdk/wifi/src", "stdlib/rust/src", "osdev/src",
-            "examples", "scripts"]
-DOC_DIRS = ["docs", "utilities", "backlog"]
+            "examples", "scripts", "tests/kani/src", "tests/host-ipc/tests"]
+# `verification` holds the invariant registry, the authoritative list of what is checked: a name in it that
+# stops resolving is a row that has stopped being true.
+DOC_DIRS = ["docs", "utilities", "backlog", "verification"]
 DOC_FILES = ["CLAUDE.md", "COMMANDMENTS.md", "README.md", "osdev/CLAUDE.md"]
 
 # Anything that looks like a Rust item: snake_case or SCREAMING_CASE, with at least one underscore.
