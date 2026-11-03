@@ -348,6 +348,16 @@ kernel service, never a runtime dependency, nothing added to an image to check i
     `kernel/Cargo.toml`, behind `cfg(creusot)` so the target build never sees them - still a dependency line,
     which is what `I-kernel-deps` (Commandment I) refuses without a recorded reason. The alternative, a copy
     of the function, proves the algorithm and not the implementation, and would be labelled so.
+  - **Kani on the IPC queue, tried 2026-11-03, no result.** Three harnesses over the real `queue.rs` - 20
+    mixed steps; 18 steps of enqueue and dequeue; a matching harness of four messages across the wrap - each
+    ran CBMC past 8 GB, or past 30 minutes, with and without `--arrays-uf-always`, at the real 4 KiB message
+    and with the payload stubbed to 16 bytes under `cfg(kani)`. A queue is 16 messages, and CBMC re-encodes
+    the whole array on every assignment. **Not explained, and recorded rather than dismissed:** the matching
+    harness, stubbed, reported a counterexample on its in-order check, and a native replay of every one of its
+    1,024 inputs on the real `queue.rs`, at the real size, passed; the run that would print the trace timed
+    out. Nothing of it was committed. The queue's guarantees are Creusot's (`enqueue` and `dequeue`, for every
+    input) and the tests' (`queue.rs`'s own, and `tests/host-ipc` over the real `routing.rs`). So Kani covers
+    the capability code and does not cover routing; finish-line item 5 is the operator's to amend or hold.
   - **Creusot proves kernel code, 2026-11-03.** The operator's decision: v1 uses both Kani and Creusot. The
     contracts sit on the production functions as `cfg_attr(creusot, ...)` attributes, and `tests/creusot`
     includes the files by `#[path]` and depends on `creusot-std` itself, so the kernel carries inert

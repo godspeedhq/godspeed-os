@@ -118,7 +118,7 @@ within its bound.
 
 | Check | Result |
 |---|---|
-| A bounded Kani harness over the real `queue.rs` | NOT EXAMINED |
+| Kani over the real `queue.rs` | PROOF GAP: three harnesses ran CBMC past 8 GB or 30 minutes; one, with the payload stubbed, reported a counterexample that a native replay of all its 1,024 inputs refutes, unexplained (`backlog/90`, layer C) |
 | Creusot: the contracts on `MessageQueue::enqueue`, `dequeue`, `is_full` and `is_empty` (head and length stay in range; the length moves by exactly one or the call refuses) | PROVED WITHIN STATED BOUNDS (every input, against the contract; not that the slots hold a message where the length says) |
 | `tests/host-ipc` `t2a` to `t2c`, `t3`, `t4a`, `t4b`, `t5a` to `t5c`, `t9` and the two `t10` cases (D2, D4, D5, D6) | TESTED - NO VIOLATION OBSERVED, each failing before its fix |
 | Adversarial A16 (a deadline bounds the send leg), A17 (a reply cap carries one message) | TESTED - NO VIOLATION OBSERVED |
