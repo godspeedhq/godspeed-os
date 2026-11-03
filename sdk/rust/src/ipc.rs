@@ -290,6 +290,10 @@ pub fn call_deadline_into(
     // the one thing a message path must never do (§26.7).
     if request.len() > MAX_PAYLOAD { return Err(IpcError::MessageTooLarge); }
     if request.len() > buf.len() { return Err(IpcError::MessageTooLarge); }
+    // A buffer under two bytes has no class: class 0 is what an SDK from before the class existed sends,
+    // and the kernel reads it as a full 4 KiB buffer, so a one-byte buffer would let a reply run 4095
+    // bytes past it (backlog/90 D27). Refused, as a reply that cannot fit is.
+    if buf.len() < 2 { return Err(IpcError::MessageTooLarge); }
     let n = request.len();
     buf[..n].copy_from_slice(&request[..n]);
     // TELL THE KERNEL HOW BIG THE REPLY BUFFER IS. It writes the reply back into `buf`, and until
