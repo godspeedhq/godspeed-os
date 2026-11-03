@@ -1083,7 +1083,10 @@ const PENDING_KSTACK_CAP: usize = 8;
 /// kill_task_by_slot through yield_current's switch_context.  After switch_context
 /// RSP is on a different stack; IF=1 is restored in the incoming task.  The timer
 /// ISR can only fire after that point, by which time RSP is not on K_a.
-static CORE_PENDING_KSTACK: PerCoreMut<[u64; PENDING_KSTACK_CAP]> = PerCoreMut::new();
+///
+/// Atomics, read and written by the owning core only, so a drain or a kill reaches an entry with no
+/// raw pointer (and no `unsafe`); the single-owner rule is what keeps the count and the entries in step.
+static CORE_PENDING_KSTACK: PerCore<[AtomicU64; PENDING_KSTACK_CAP]> = PerCore::new();
 static CORE_PENDING_KSTACK_LEN: PerCore<AtomicUsize> = PerCore::new();
 
 /// Per-core PML4 frame (physical address) awaiting deferred free after a self-kill.
@@ -1135,7 +1138,7 @@ static CORE_SCHED_CTX: PerCoreMut<TaskContext> = PerCoreMut::new();
 pub fn init_arenas(n: usize) {
     // Zeroed via the arch primitive so no register name leaks into neutral code (arch/CLAUDE.md).
     const ZERO_CTX: TaskContext = TaskContext::ZERO;
-    CORE_PENDING_KSTACK.init_with(n, |_| [0u64; PENDING_KSTACK_CAP]);
+    CORE_PENDING_KSTACK.init_with(n, |_| core::array::from_fn(|_| AtomicU64::new(0)));
     CORE_DEAD_CTX.init_with(n, |_| ZERO_CTX);
     CORE_SCHED_CTX.init_with(n, |_| ZERO_CTX);
     CORE_CURRENT.init_with(n, |_| AtomicUsize::new(IDLE));
@@ -2850,7 +2853,7 @@ fn drain_pending_kstack(cid: usize) {
         // Clear before processing so a later drain sees an empty queue.
         CORE_PENDING_KSTACK_LEN.get(cid).store(0, Ordering::Relaxed);
         for i in 0..n {
-            let kstack = unsafe { (*CORE_PENDING_KSTACK.as_mut_ptr(cid))[i] };
+            let kstack = CORE_PENDING_KSTACK.get(cid)[i].load(Ordering::Relaxed);
             // SAFETY: RSP is NOT on this kstack (see above).  kstack is the top
             // of a `KSTACK_SIZE` stack allocated from the kstack pool.
             if kstack != 0 { super::free_kstack(kstack); }
@@ -3627,7 +3630,7 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                 if kstack != 0 {
                     let len = CORE_PENDING_KSTACK_LEN.get(my_core).load(Ordering::Relaxed);
                     if len < PENDING_KSTACK_CAP {
-                        (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[len] = kstack;
+                        CORE_PENDING_KSTACK.get(my_core)[len].store(kstack, Ordering::Relaxed);
                         CORE_PENDING_KSTACK_LEN.get(my_core).store(len + 1, Ordering::Relaxed);
                     } else {
                         // Queue full. This freed `kstack` - the stack this core is STANDING ON, since a
@@ -3636,10 +3639,10 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                         // and the core has switched off each of them to reach this one. So those are
                         // freed, and this one queued in their place.
                         for i in 0..len {
-                            let old = (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[i];
+                            let old = CORE_PENDING_KSTACK.get(my_core)[i].load(Ordering::Relaxed);
                             if old != 0 { super::free_kstack(old); }
                         }
-                        (*CORE_PENDING_KSTACK.as_mut_ptr(my_core))[0] = kstack;
+                        CORE_PENDING_KSTACK.get(my_core)[0].store(kstack, Ordering::Relaxed);
                         CORE_PENDING_KSTACK_LEN.get(my_core).store(1, Ordering::Relaxed);
                     }
                 }
