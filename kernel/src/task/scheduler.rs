@@ -1065,6 +1065,14 @@ const WAKE_RESEND_SPINS: u32 = 4096;
 /// `(1 + MAX_WAIT_EXTENSIONS)` windows.
 const MAX_WAIT_EXTENSIONS: u32 = 4;
 
+/// Slots whose kill gave up waiting for another core to let go of them (the ABANDONED path in
+/// `kill_task_by_slot`). Each is Dead with its endpoints, ids, routes and name already gone, and still
+/// holds its frames, page-table root, kernel stack and slot. `retry_abandoned_kills` gives those back once
+/// no core uses it: until 2026-11-03 nothing did, and every abandon was lost until reboot (backlog/90 D14).
+static ABANDONED: [AtomicBool; MAX_TASKS] = [const { AtomicBool::new(false) }; MAX_TASKS];
+/// How many slots `ABANDONED` marks, so the retry costs one load when there are none.
+static ABANDONED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 const PENDING_KSTACK_CAP: usize = 8;
 /// Per-core queue of kernel stack tops awaiting deferred free after a self-kill.
 ///
@@ -1868,6 +1876,8 @@ pub fn run(core_id: u32) -> ! {
         // Free any deferred kstack from a prior self-kill on this core.
         // RSP is on CORE_SCHED_CTX's stack (per-core BSS), not any kstack.
         drain_pending_kstack(cid);
+        // And any kill another core gave up on, once its core has let go (backlog/90 D14).
+        retry_abandoned_kills();
 
         // Path C / Phase 6: respawn the supervisor here if it died - an IF=1 scheduling point, NOT the
         // timer ISR. `spawn_supervisor` is a full ~22 ms service spawn, which when this was written also
@@ -2981,6 +2991,7 @@ fn death_note(name: &str, cause: crate::task::Cause, note: &mut [u8; DEATH_NOTE_
 /// Kill a task by slot: mark Dead, kill its endpoint (if any), notify blocked tasks. `cause` is how it
 /// ended, said in the death notice when the supervisor watches it (`task::death`).
 pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
+    retry_abandoned_kills();
     // Serialize the TASK_VALID check against concurrent kills and spawns.
     // Two cores calling kill_task_by_slot(slot) simultaneously would otherwise
     // both pass the !TASK_VALID guard, both reach free_kstack, and double-free
@@ -3494,18 +3505,20 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                         // kernel may panic the kernel. Reproduced on a Raspberry Pi 4 at chaos round
                         // 943 of 1000 with no host load (backlog/fixed/48).
                         //
-                        // So: abandon the reclaim and leave the slot un-freed. The task is already
+                        // So: put the reclaim off and leave the slot un-freed. The task is already
                         // Dead and its endpoints are already torn down, so it cannot run and cannot be
-                        // messaged; what is given up is only the MEMORY, and only for this one task.
-                        // The slot stays VALID, which is what makes the leak VISIBLE in `status`
-                        // rather than silent (26.7 - degrade and record), and the supervisor is free
-                        // to try again.
+                        // messaged; what waits is only the MEMORY, and only for this one task. The slot
+                        // stays VALID, so it shows in `status` until it is given back, and it is marked
+                        // in `ABANDONED`: the next kill, or the next pass of any core's scheduler loop,
+                        // finishes it once that core has let go (`retry_abandoned_kills`, backlog/90
+                        // D14). A kill of it again could not have: it is Dead, and a kill of a Dead slot
+                        // returns at once.
                         //
                         // The report says which core, which slot, and - the part the old panic could
                         // not say - whether that core was taking interrupts at all, so a reader can
                         // tell a wedged core from a slow one without re-deriving it.
                         crate::kprintln!(
-                            "kill: ABANDONED slot {} - core {} still using it after {} ticks x{} window(s) (CORE_CURRENT={}, CORE_LEAVING={}, its irqs {}->{} last_src={}, output {}->{}). {}. The task is Dead and unreachable; its frames are LEAKED and the slot stays visible in `status`. The machine continues - a kill that cannot finish fails the kill, not the kernel.",
+                            "kill: ABANDONED slot {} - core {} still using it after {} ticks x{} window(s) (CORE_CURRENT={}, CORE_LEAVING={}, its irqs {}->{} last_src={}, output {}->{}). {}. The task is Dead and unreachable; its frames are held and the slot stays visible in `status` until that core lets go, when a later kill or scheduler pass gives them back. The machine continues - a kill that cannot finish fails the kill, not the kernel.",
                             slot, cid, budget, extensions + 1,
                             CORE_CURRENT.get(cid).load(Ordering::SeqCst),
                             CORE_LEAVING.get(cid).0.load(Ordering::SeqCst),
@@ -3516,6 +3529,9 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
                                 "That core is still taking interrupts or writing output, so it is alive but never reached a scheduling point"
                             },
                         );
+                        if !ABANDONED[slot].swap(true, Ordering::AcqRel) {
+                            ABANDONED_COUNT.fetch_add(1, Ordering::AcqRel);
+                        }
                         return;
                     }
                     core::hint::spin_loop();
@@ -3523,6 +3539,18 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
             }
         }
 
+        reclaim_dead_slot(slot, task_name);
+    }
+}
+
+/// The second half of a kill: give back a dead task's frames, page-table root, kernel stack and slot.
+/// `kill_task_by_slot` calls it once no other core is running or leaving the task; `retry_abandoned_kills`
+/// calls it for a kill whose wait gave up, once that core has let go (backlog/90 D14). Either way the
+/// caller owns the slot: it is Dead, its endpoints and ids are gone, and no one else will reclaim it.
+fn reclaim_dead_slot(slot: usize, task_name: &str) {
+    // SAFETY: the slot is Dead and owned by this caller (above), and no other core is running it or
+    // leaving it, so its context, page tables and kernel stack are no one's but this core's to free.
+    unsafe {
         // Detect self-kill before reclaim so we can defer the PML4 frame.
         //
         // Self-kill PML4 race (root cause of 6B/8A KERNEL PF):
@@ -3677,6 +3705,33 @@ pub fn kill_task_by_slot(slot: usize, cause: crate::task::Cause) {
         TASK_VALID[slot].store(false, Ordering::Release);
         task_slot_unlock();
     }
+}
+
+/// Finish each abandoned kill whose core has let go of its slot (`ABANDONED`, backlog/90 D14). Called at
+/// the top of every kill and from every core's scheduler loop, where the kill's own reclaim may run - not
+/// from the tick, which interrupts whatever is running. One load when nothing is abandoned.
+fn retry_abandoned_kills() {
+    if ABANDONED_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let was_enabled = crate::arch::imp::local_irq_save();
+    for slot in 0..MAX_TASKS {
+        if !ABANDONED[slot].load(Ordering::Acquire) {
+            continue;
+        }
+        // Every core, this one too: a Dead slot is never picked again, so once none holds it none will.
+        if (0..num_cores()).any(|cid| core_still_using(cid, slot)) {
+            continue;
+        }
+        if !ABANDONED[slot].swap(false, Ordering::AcqRel) {
+            continue; // another core is finishing it
+        }
+        ABANDONED_COUNT.fetch_sub(1, Ordering::AcqRel);
+        let name = task_name(slot);
+        crate::kprintln!("kill: slot {} '{}' released by its core - finishing its abandoned kill", slot, &*name);
+        reclaim_dead_slot(slot, &name);
+    }
+    crate::arch::imp::local_irq_restore(was_enabled);
 }
 
 /// Park the current task: block it indefinitely with no waker. Used by idle
