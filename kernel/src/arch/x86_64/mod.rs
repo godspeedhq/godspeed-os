@@ -969,8 +969,9 @@ pub static CONSOLE_ECHO_ENABLED: core::sync::atomic::AtomicBool =
 
 /// Set keystroke echo on/off. Called from the `ConsoleEcho` syscall by a service
 /// holding the CONSOLE_READ cap (the shell, or a foreground app).
-pub fn set_console_echo(on: bool) {
+pub fn set_console_echo(on: bool) -> bool {
     CONSOLE_ECHO_ENABLED.store(on, core::sync::atomic::Ordering::Release);
+    true
 }
 
 /// The task slot that currently owns console input (keyboard) **exclusively**, or
@@ -989,17 +990,19 @@ pub static CONSOLE_FOREGROUND: core::sync::atomic::AtomicU32 =
 /// Claim exclusive console input for `task_slot`. After this, only that task's
 /// console reads return bytes; every other task reads empty. Gated upstream by the
 /// CONSOLE_READ cap (the `ConsoleForeground` syscall).
-pub fn claim_console_foreground(task_slot: u32) {
+pub fn claim_console_foreground(task_slot: u32) -> bool {
     CONSOLE_FOREGROUND.store(task_slot, core::sync::atomic::Ordering::Release);
+    true
 }
 
 /// Release exclusive console input back to the unclaimed state (any CONSOLE_READ
 /// holder may read again). Idempotent; the runner calls it on finish or `q`,
 /// after it has ensured a live shell exists to hand control back to. Wakes any task
 /// parked in a muted blocking read so it resumes at once.
-pub fn release_console_foreground() {
+pub fn release_console_foreground() -> bool {
     CONSOLE_FOREGROUND.store(u32::MAX, core::sync::atomic::Ordering::Release);
     wake_console_waiter();
+    true
 }
 
 /// Release the console foreground IF `task_slot` is the current owner. A dying owner must release so a
@@ -1058,10 +1061,11 @@ static BOOT_DISMISSED: core::sync::atomic::AtomicBool = core::sync::atomic::Atom
 /// a `chaos max-carnage` sweep that kills the shell every round - calls this again on startup, but there is
 /// no boot screen to dismiss then, and re-clearing would wipe whatever is on screen (the operator's chaos
 /// panel). So every later call is a no-op: the screen is left exactly as it is.
-pub fn console_boot_complete() {
-    if BOOT_DISMISSED.swap(true, core::sync::atomic::Ordering::AcqRel) { return; }
+pub fn console_boot_complete() -> bool {
+    if BOOT_DISMISSED.swap(true, core::sync::atomic::Ordering::AcqRel) { return true; }
     BOOT_LOG_TO_FB.store(false, core::sync::atomic::Ordering::Release);
     crate::bootcon::clear_and_home();
+    true
 }
 
 /// Set true by the USB keyboard driver (xHCI) once it has finished its setup -

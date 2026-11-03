@@ -2292,7 +2292,9 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
 }
 #[cfg(not(feature = "pi4"))]
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
-pub fn set_console_echo(on: bool) {}
+/// The kernel echoes nothing on this port, so there is nothing to turn on or off; `ConsoleEcho` answers -1
+/// (backlog/90 D27).
+pub fn set_console_echo(on: bool) -> bool { false }
 
 // Console FOREGROUND. `u32::MAX` = unclaimed (anyone may read, everything reaches the display);
 // otherwise the task slot of the full-screen app that owns the console.
@@ -2321,9 +2323,10 @@ static CONSOLE_FG_RENEWED: portable_atomic::AtomicU64 = portable_atomic::AtomicU
 
 /// Claim exclusive console input and output, for a BOUNDED term.
 #[cfg(feature = "pi4")]
-pub fn claim_console_foreground(task_slot: u32) {
+pub fn claim_console_foreground(task_slot: u32) -> bool {
     CONSOLE_FG_RENEWED.store(read_cycle_counter(), Ordering::Relaxed);
     CONSOLE_FOREGROUND.store(task_slot, Ordering::Release);
+    true
 }
 
 /// Has the current claim lapsed? Released and reported once, at the moment it happens (invariant 12).
@@ -2344,9 +2347,10 @@ fn console_fg_lapsed() -> bool {
 }
 
 #[cfg(feature = "pi4")]
-pub fn release_console_foreground() {
+pub fn release_console_foreground() -> bool {
     CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
     wake_console_waiter();
+    true
 }
 
 #[cfg(feature = "pi4")]
@@ -2439,18 +2443,18 @@ fn wake_console_waiter() {
 }
 
 #[cfg(not(feature = "pi4"))]
-pub fn claim_console_foreground(task_slot: u32) {}
+pub fn claim_console_foreground(task_slot: u32) -> bool { false }
 #[cfg(not(feature = "pi4"))]
-pub fn release_console_foreground() {}
+pub fn release_console_foreground() -> bool { false }
 #[cfg(not(feature = "pi4"))]
 pub fn release_console_foreground_if_owner(task_slot: u32) {}
 #[cfg(not(feature = "pi4"))]
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
 /// The shell has the console: dismiss the boot screen and present a clean prompt.
 #[cfg(feature = "pi4")]
-pub fn console_boot_complete() { video::boot_complete(); }
+pub fn console_boot_complete() -> bool { video::boot_complete(); true }
 #[cfg(not(feature = "pi4"))]
-pub fn console_boot_complete() {}
+pub fn console_boot_complete() -> bool { false }
 /// A non-UART producer (a keyboard) delivering one byte to the console input ring.
 #[cfg(feature = "pi4")]
 pub fn console_push_byte(b: u8) { uart_rx::push(b) }
@@ -3109,7 +3113,8 @@ pub mod interrupts {
     #[cfg(not(feature = "pi4"))]
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
-    pub fn fire_test_irq(irq: u8) {}
+    /// No software-injected interrupt here; `FireIrq` answers -1 (backlog/90 D27).
+    pub fn fire_test_irq(irq: u8) -> bool { false }
 }
 
 // ---------------------------------------------------------------------------

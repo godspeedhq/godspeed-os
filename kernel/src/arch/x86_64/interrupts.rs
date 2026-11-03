@@ -519,7 +519,7 @@ pub fn send_eoi() {
 /// service issues for its `FIRE_IRQ` COM2 command (§22 Tests IR1A/IR1B). EOI inside `deliver` is idempotent when no real
 /// hardware interrupt is pending.
 #[inline]
-pub fn fire_test_irq(irq: u8) {
+pub fn fire_test_irq(irq: u8) -> bool {
     // SEC-15: preserve the caller's IF. An unconditional enable_interrupts() here would set IF=1
     // inside any IF=0 caller and open re-entrancy on the ISR stack; local_irq_save/restore keep the
     // caller's state (re-enabling only if they were on), so an idle-loop caller is unaffected and an
@@ -535,5 +535,6 @@ pub fn fire_test_irq(irq: u8) {
     // safe outside a real IRQ - the write is idempotent and the APIC ignores spurious EOIs.
     unsafe { crate::interrupt::route::deliver(irq); }
     local_irq_restore(was);
+    true
 }
 

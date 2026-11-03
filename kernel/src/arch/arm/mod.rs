@@ -1878,7 +1878,9 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     // it is the writer that did the drawing, and the lease is about the writer, not the wire.
     serial_emit(s, to_fb);
 }
-pub fn set_console_echo(on: bool) {}
+/// The kernel echoes nothing on this port, so there is nothing to turn on or off; `ConsoleEcho` answers -1
+/// (backlog/90 D27).
+pub fn set_console_echo(on: bool) -> bool { false }
 
 // Console FOREGROUND. `u32::MAX` = unclaimed (anyone may read, everything reaches the TV); otherwise
 // the task slot of the full-screen app that owns the console. These were empty stubs with
@@ -1914,9 +1916,10 @@ static CONSOLE_FG_RENEWED_US: AtomicU32 = AtomicU32::new(0);
 /// is mechanism; nothing guesses what the operator wants, and there is no chord to discover, document,
 /// or find out does not work on the keyboard in front of you. §26.6 lists bounded authority as a
 /// requirement; a perpetual claim was simply an unbounded one that had not bitten yet.
-pub fn claim_console_foreground(task_slot: u32) {
+pub fn claim_console_foreground(task_slot: u32) -> bool {
     CONSOLE_FG_RENEWED_US.store(timer::systimer_us(), Ordering::Relaxed);
     CONSOLE_FOREGROUND.store(task_slot, Ordering::Release);
+    true
 }
 
 /// Has the current claim lapsed? Released and reported once, at the moment it happens (invariant 12).
@@ -1929,9 +1932,10 @@ fn console_fg_lapsed() -> bool {
     pl011_write_no_fb(b"console: the foreground app stopped drawing - its claim lapsed, console returned\n");
     true
 }
-pub fn release_console_foreground() {
+pub fn release_console_foreground() -> bool {
     CONSOLE_FOREGROUND.store(u32::MAX, Ordering::Release);
     wake_console_waiter();
+    true
 }
 pub fn release_console_foreground_if_owner(task_slot: u32) {
     if CONSOLE_FOREGROUND
@@ -1974,10 +1978,11 @@ static BOOT_DISMISSED: AtomicBool = AtomicBool::new(false);
 /// states the contract it expects: "dismiss the boot screen on the TV (clear + stop mirroring logs to
 /// it) and present a clean prompt. Serial keeps the full stream." ARM simply never implemented its
 /// half. Serial is unchanged - it still receives everything, which is what a captured log needs.
-pub fn console_boot_complete() {
-    if BOOT_DISMISSED.swap(true, Ordering::AcqRel) { return; }
+pub fn console_boot_complete() -> bool {
+    if BOOT_DISMISSED.swap(true, Ordering::AcqRel) { return true; }
     BOOT_LOG_TO_FB.store(false, Ordering::Release);
     bootcon::clear_and_home();
+    true
 }
 
 // PL011 receive FIFO -> a single-producer/single-consumer input ring. The producer is `pl011_rx_drain`
@@ -2733,7 +2738,8 @@ pub mod interrupts {
 
     pub fn idle_can_halt() -> bool { true } // ARM WFI wakes on the generic-timer IRQ; halting is safe
     pub fn send_eoi() {}                    // BCM2836 timer has no separate EOI (TVAL re-arm clears it)
-    pub fn fire_test_irq(_irq: u8) {}
+    /// No software-injected interrupt here; `FireIrq` answers -1 (backlog/90 D27).
+    pub fn fire_test_irq(_irq: u8) -> bool { false }
 }
 
 // ---------------------------------------------------------------------------

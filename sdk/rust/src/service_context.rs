@@ -3797,27 +3797,28 @@ impl ServiceContext {
     /// Enable (`true`) or disable (`false`) console keystroke echo (syscall 25).
     /// A foreground full-screen app disables echo while it owns the screen - so
     /// its raw key polls do not smear its frame - and re-enables it on exit.
-    /// Requires the CONSOLE_READ cap.
-    pub fn console_echo(&self, on: bool) {
+    /// Requires the CONSOLE_READ cap. False where the kernel echoes nothing to switch, or without the cap
+    /// (backlog/90 D27).
+    pub fn console_echo(&self, on: bool) -> bool {
         let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return; }
+        if data.magic != SERVICE_CTX_MAGIC { return false; }
         let slot = data.console_read_slot;
-        if slot == u32::MAX { return; }
+        if slot == u32::MAX { return false; }
         // SAFETY: syscall(25) = ConsoleEcho; slot is kernel-written cap index.
-        let _ = unsafe { raw_syscall(25, slot as u64, on as u64, 0) };
+        unsafe { raw_syscall(25, slot as u64, on as u64, 0) == 0 }
     }
 
     /// End boot-log mirroring to the framebuffer and clear the TV (syscall 26).
     /// The shell calls this once, on the first keystroke, so the user sees the
     /// boot sequence on the display and then gets a clean interactive console.
     /// Requires the CONSOLE_READ cap.
-    pub fn console_boot_complete(&self) {
+    pub fn console_boot_complete(&self) -> bool {
         let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return; }
+        if data.magic != SERVICE_CTX_MAGIC { return false; }
         let slot = data.console_read_slot;
-        if slot == u32::MAX { return; }
+        if slot == u32::MAX { return false; }
         // SAFETY: syscall(26) = ConsoleBootComplete; slot is kernel-written cap index.
-        let _ = unsafe { raw_syscall(26, slot as u64, 0, 0) };
+        unsafe { raw_syscall(26, slot as u64, 0, 0) == 0 }
     }
 
     /// Whether THIS task currently owns (or shares, when unclaimed) console input - i.e. its console
@@ -3834,24 +3835,24 @@ impl ServiceContext {
     /// claims it for the duration of a run so a resurrected shell cannot swallow its
     /// `q`-to-quit. Pair with `release_console_foreground` on exit, after ensuring a live
     /// shell exists to hand the keyboard back to. Requires the CONSOLE_READ cap.
-    pub fn claim_console_foreground(&self) {
+    pub fn claim_console_foreground(&self) -> bool {
         let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return; }
+        if data.magic != SERVICE_CTX_MAGIC { return false; }
         let slot = data.console_read_slot;
-        if slot == u32::MAX { return; }
+        if slot == u32::MAX { return false; }
         // SAFETY: syscall(40) = ConsoleForeground; op 1 = claim; slot is kernel-written cap index.
-        let _ = unsafe { raw_syscall(40, slot as u64, 1, 0) };
+        unsafe { raw_syscall(40, slot as u64, 1, 0) == 0 }
     }
 
     /// Release exclusive console input (syscall 40, op = 0) back to the unclaimed state, so
     /// any CONSOLE_READ holder (the shell) reads normally again. Idempotent.
-    pub fn release_console_foreground(&self) {
+    pub fn release_console_foreground(&self) -> bool {
         let data = Self::ctx();
-        if data.magic != SERVICE_CTX_MAGIC { return; }
+        if data.magic != SERVICE_CTX_MAGIC { return false; }
         let slot = data.console_read_slot;
-        if slot == u32::MAX { return; }
+        if slot == u32::MAX { return false; }
         // SAFETY: syscall(40) = ConsoleForeground; op 0 = release; slot is kernel-written cap index.
-        let _ = unsafe { raw_syscall(40, slot as u64, 0, 0) };
+        unsafe { raw_syscall(40, slot as u64, 0, 0) == 0 }
     }
 
     /// Return the core this service was spawned on.

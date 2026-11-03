@@ -2488,8 +2488,11 @@ fn handle_console_foreground(cap_slot: u64, op: u64) -> i64 {
     if cap.resource_id != CONSOLE_READ_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
+    // A port with no foreground answers -1 rather than 0 for a claim it did not make (backlog/90 D27).
     if op == 0 {
-        crate::arch::imp::release_console_foreground();
+        if !crate::arch::imp::release_console_foreground() {
+            return -1;
+        }
         // WAKE whoever is blocked reading the console, so the prompt comes back on its own.
         //
         // The shell checks the foreground at the TOP of its loop and then BLOCKS in `console_read`. If a
@@ -2504,10 +2507,12 @@ fn handle_console_foreground(cap_slot: u64, op: u64) -> i64 {
         // path uses for the same reason - a working machine that presents as a dead one is what
         // invariant 12 is about, and it is measured in what the OPERATOR can see.
         crate::arch::imp::console_push_byte(b'\n');
+        0
+    } else if crate::arch::imp::claim_console_foreground(scheduler::current_task_slot() as u32) {
+        0
     } else {
-        crate::arch::imp::claim_console_foreground(scheduler::current_task_slot() as u32);
+        -1
     }
-    0
 }
 
 // ---------------------------------------------------------------------------
@@ -2528,8 +2533,8 @@ fn handle_console_echo(cap_slot: u64, on: u64) -> i64 {
     if cap.resource_id != CONSOLE_READ_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
-    crate::arch::imp::set_console_echo(on != 0);
-    0
+    // -1 where the kernel echoes nothing to turn on or off (backlog/90 D27).
+    if crate::arch::imp::set_console_echo(on != 0) { 0 } else { -1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -2550,8 +2555,8 @@ fn handle_console_boot_complete(cap_slot: u64) -> i64 {
     if cap.resource_id != CONSOLE_READ_RESOURCE {
         return cap_err_to_i64(CapError::CapWrongScope);
     }
-    crate::arch::imp::console_boot_complete();
-    0
+    // -1 where there is no boot screen for the kernel to dismiss (backlog/90 D27).
+    if crate::arch::imp::console_boot_complete() { 0 } else { -1 }
 }
 
 // ---------------------------------------------------------------------------
@@ -2661,8 +2666,9 @@ fn handle_fire_irq(irq: u64) -> i64 {
     if irq > u8::MAX as u64 {
         return -1;
     }
-    crate::arch::imp::interrupts::fire_test_irq(irq as u8);
-    0
+    // A port with no software-injected interrupt says so, where it answered 0 having fired nothing
+    // (backlog/90 D27).
+    if crate::arch::imp::interrupts::fire_test_irq(irq as u8) { 0 } else { -1 }
 }
 
 /// No arguments. Does not return (on success).

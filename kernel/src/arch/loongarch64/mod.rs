@@ -167,12 +167,12 @@ pub fn power_off() -> &'static str { "this port has no way to turn the machine o
 pub fn serial_write_byte(b: u8) { unsafe { UART_THR.write_volatile(b); } }
 pub fn serial_write_bytes_lockfree(s: &[u8]) { for &b in s { unsafe { UART_THR.write_volatile(b); } } }
 pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {}
-pub fn set_console_echo(on: bool) {}
-pub fn claim_console_foreground(task_slot: u32) {}
-pub fn release_console_foreground() {}
+pub fn set_console_echo(on: bool) -> bool { false }
+pub fn claim_console_foreground(task_slot: u32) -> bool { false }
+pub fn release_console_foreground() -> bool { false }
 pub fn release_console_foreground_if_owner(task_slot: u32) {}
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
-pub fn console_boot_complete() {}
+pub fn console_boot_complete() -> bool { false }
 pub fn console_push_byte(b: u8) {}
 pub fn set_input_ready() {}
 pub fn input_ready() -> bool { false }
@@ -409,7 +409,7 @@ pub mod interrupts {
 
     pub fn idle_can_halt() -> bool { false }
     pub fn send_eoi() {}                                     // GIC EOIR
-    pub fn fire_test_irq(irq: u8) {}
+    pub fn fire_test_irq(irq: u8) -> bool { false }
 
     /// The pool of MSI vectors the kernel may hand to a driver, as (base, length).
     ///

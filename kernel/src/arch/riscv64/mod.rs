@@ -1819,12 +1819,13 @@ pub fn console_write_bytes_gated(s: &[u8], to_fb: bool) {
     let _ = to_fb;
     serial_write_bytes_lockfree(s);
 }
-pub fn set_console_echo(on: bool) { let _ = on; }
-pub fn claim_console_foreground(task_slot: u32) {}
-pub fn release_console_foreground() {}
+// No console echo and no foreground on this port yet: each says so, and its syscall answers -1 (backlog/90 D27).
+pub fn set_console_echo(on: bool) -> bool { let _ = on; false }
+pub fn claim_console_foreground(task_slot: u32) -> bool { false }
+pub fn release_console_foreground() -> bool { false }
 pub fn release_console_foreground_if_owner(task_slot: u32) {}
 pub fn console_foreground_allows(task_slot: u32) -> bool { true }
-pub fn console_boot_complete() {}
+pub fn console_boot_complete() -> bool { false }
 /// Inject a byte as though it had been typed. The kernel uses this to deliver a newline that
 /// re-prompts a shell, and a keyboard SERVICE would use it to deliver real keys.
 pub fn console_push_byte(b: u8) {
@@ -2740,7 +2741,8 @@ pub mod interrupts {
     /// architecturally a HINT and an implementation may return from it at any time.
     pub fn idle_can_halt() -> bool { true }
     pub fn send_eoi() {}                                     // GIC EOIR
-    pub fn fire_test_irq(irq: u8) {}
+    /// No software-injected interrupt here; `FireIrq` answers -1 (backlog/90 D27).
+    pub fn fire_test_irq(irq: u8) -> bool { false }
 }
 
 // ---------------------------------------------------------------------------
