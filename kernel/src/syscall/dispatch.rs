@@ -483,14 +483,18 @@ fn handle_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
                 // Record the delegated-resource badge (§7.10), if any, for retrieval via
                 // LastRecvBadge. Unbadged messages (every ordinary send) clear it to 0, so a
                 // stale badge from a prior recv can never be read as this message's.
+                // Refused BEFORE anything of it reaches the receiver: a message that does not fit is
+                // dropped whole, its caps with it, as a dying endpoint's queue drops them. Installed
+                // first, as it was, a refused message still left its caps in the receiver's table and
+                // its badge as the last received (backlog/90 D27).
+                let payload  = msg.payload_bytes();
+                if let Some(e) = refuse_oversized("recv", payload.len(), buf_len) { return e; }
                 scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
                 // Install any embedded capabilities into the receiver's cap table
                 // and push their slot indices into the pending-recv-cap buffer so
                 // the receiver can retrieve them via syscall 12 (TakePendingCap).
                 install_received_caps(&msg);
                 // Copy payload to the caller's user-space buffer.
-                let payload  = msg.payload_bytes();
-                if let Some(e) = refuse_oversized("recv", payload.len(), buf_len) { return e; }
                 if !copy_out(out_buf, payload) {
                     return -1;
                 }
@@ -534,10 +538,11 @@ fn handle_try_recv(cap_slot: u64, out_buf: u64, out_len: u64) -> i64 {
             if let Some(slot) = sender_to_wake {
                 scheduler::wake_by_slot(slot, 0);
             }
-            scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
-            install_received_caps(&msg);
+            // Refused before its caps or badge reach the receiver, as in `handle_recv` (backlog/90 D27).
             let payload  = msg.payload_bytes();
             if let Some(e) = refuse_oversized("try_recv", payload.len(), buf_len) { return e; }
+            scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
+            install_received_caps(&msg);
             if !copy_out(out_buf, payload) {
                 return -1;
             }
@@ -586,10 +591,11 @@ fn handle_recv_timeout(packed: u64, out_buf: u64, timeout: u64) -> i64 {
                 if let Some(slot) = sender_to_wake {
                     scheduler::wake_by_slot(slot, 0);
                 }
-                scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
-                install_received_caps(&msg);
+                // Refused before its caps or badge reach the receiver, as in `handle_recv` (backlog/90 D27).
                 let payload  = msg.payload_bytes();
                 if let Some(e) = refuse_oversized("recv_timeout", payload.len(), buf_len) { break e; }
+                scheduler::set_last_recv_badge(msg.badge_id, msg.badge_right);
+                install_received_caps(&msg);
                 if !copy_out(out_buf, payload) { break -1; }
                 break payload.len() as i64;
             }
