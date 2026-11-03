@@ -1,0 +1,23 @@
+# Deductive proofs of the REAL kernel functions with Creusot (backlog/90, layer C).
+#
+# Not a workspace member, and its own workspace root: it is built only by `cargo creusot`, which needs a
+# Linux host (WSL on Windows, or verification/Containerfile). It includes the kernel's own files by
+# `#[path]`, exactly as they are, so a proof is of the code that ships. The contracts are written on the
+# production functions as `cfg_attr(creusot, ...)`: Creusot sets that cfg, the kernel's build does not,
+# so the kernel has no dependency on this crate's.
+[package]
+name = "kernel-creusot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+
+[dependencies]
+creusot-std = "0.15.0-dev"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(creusot)'] }

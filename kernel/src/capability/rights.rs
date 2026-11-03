@@ -8,7 +8,11 @@
 /// at insertion (`CapTable::insert` checks nothing): every transfer path installs a
 /// copy of a cap the sender already holds, or one narrowed by `without`/`narrow`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Rights(pub(crate) u8);
+// Creusot models a derived `PartialEq` through this; the kernel's build never sees it (`tests/creusot`).
+#[cfg_attr(creusot, derive(creusot_std::model::DeepModel))]
+// `pub`, not `pub(crate)`: the kernel is one crate, so the two grant the same access, and Creusot refuses a
+// `pub` constant built from a less visible field.
+pub struct Rights(pub u8);
 
 impl Rights {
     pub const READ:   Rights = Rights(1 << 0);
@@ -25,21 +29,40 @@ impl Rights {
     pub const fn empty() -> Self { Rights(0) }
     pub const fn all()   -> Self { Rights(0b0011_1111) }
 
+    #[cfg_attr(creusot, creusot_std::macros::bitwise_proof)]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result == (other.0 & !self.0 == 0u8)))]
     pub fn contains(self, other: Rights) -> bool {
         (self.0 & other.0) == other.0
     }
 
     /// Narrow `self` to the intersection with `mask`. Never widens, and never drops `ONCE`, which a
     /// mask that did not name it would otherwise turn back into a cap of many uses.
+    ///
+    /// The contract is proved by Creusot over this function as it ships (`tests/creusot`), for every
+    /// rights byte; the kernel's own build never sees the attributes.
+    #[cfg_attr(creusot, creusot_std::macros::bitwise_proof)]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result.0 & !self.0 == 0u8))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result.0 & !(mask.0 | 64u8) == 0u8))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result.0 & 64u8 == self.0 & 64u8))]
     pub fn narrow(self, mask: Rights) -> Rights {
         Rights(self.0 & (mask.0 | Self::ONCE.0))
     }
 
-    /// Remove `mask`'s bits from `self` - only ever clears bits, never widens (SEC-7).
+    /// Remove `mask`'s bits from `self` - only ever clears bits, never widens (SEC-7). Proved by Creusot,
+    /// as `narrow` is.
+    #[cfg_attr(creusot, creusot_std::macros::bitwise_proof)]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result.0 & mask.0 == 0u8))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result.0 & !self.0 == 0u8))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(self.0 & !mask.0 & !result.0 == 0u8))]
     pub fn without(self, mask: Rights) -> Rights {
         Rights(self.0 & !mask.0)
     }
 
+    /// Every right of either, and nothing else. Proved by Creusot, as `narrow` is.
+    #[cfg_attr(creusot, creusot_std::macros::bitwise_proof)]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(self.0 & !result.0 == 0u8))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(other.0 & !result.0 == 0u8))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result.0 & !(self.0 | other.0) == 0u8))]
     pub fn union(self, other: Rights) -> Rights {
         Rights(self.0 | other.0)
     }

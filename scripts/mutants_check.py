@@ -27,7 +27,7 @@ BASELINE = os.path.join(ROOT, "kernel", "mutants-survivors.txt")
 
 
 def key(line):
-    # `kernel/src/ipc/queue.rs:117:9: replace MessageQueue::reset with ()` -> drop the `:117:9`.
+    # `kernel/src/ipc/queue.rs:137:9: replace MessageQueue::reset with ()` -> drop the `:137:9`.
     return re.sub(r"^([^:]+):\d+:\d+:", r"\1:", line.strip())
 
 

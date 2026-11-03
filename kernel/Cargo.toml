@@ -254,3 +254,8 @@ iommu-fault-test = []
 
 [profile.release]
 panic = "abort"
+
+# `cfg(creusot)` is set by Creusot alone (`tests/creusot`), which reads the contracts written beside a few
+# functions as `cfg_attr(creusot, ...)`. Declared so the kernel's own build knows the name and stays quiet.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(creusot)'] }

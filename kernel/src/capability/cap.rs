@@ -7,6 +7,7 @@ use super::rights::Rights;
 /// Unique identifier for a kernel-managed resource
 /// (endpoint, memory region, MMIO range, service handle).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(creusot, derive(creusot_std::model::DeepModel))]
 pub struct ResourceId(pub u64);
 
 /// An unforgeable capability token: `ResourceId + Rights + Generation` (§7.2).
@@ -15,6 +16,7 @@ pub struct ResourceId(pub u64);
 /// User-mode cannot fabricate a `Capability`; it only receives opaque handles
 /// that the kernel resolves against the per-task cap table on each syscall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(creusot, derive(creusot_std::model::DeepModel))]
 pub struct Capability {
     pub resource_id: ResourceId,
     pub rights: Rights,
@@ -187,6 +189,7 @@ mod tests {
 
 /// Errors returned by capability validation (§7.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(creusot, derive(creusot_std::model::DeepModel))]
 pub enum CapError {
     /// Cap not in the calling task's table.
     CapNotHeld,

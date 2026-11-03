@@ -99,6 +99,7 @@ impl Message {
 
 /// Errors returned by IPC syscalls - §8.6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(creusot, derive(creusot_std::model::DeepModel))]
 pub enum IpcError {
     /// The endpoint no longer exists (service died or was restarted).
     EndpointDead,

@@ -33,6 +33,7 @@ impl MessageQueue {
         }
     }
 
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result == (self.len@ == QUEUE_DEPTH@)))]
     pub fn is_full(&self) -> bool {
         self.len == QUEUE_DEPTH
     }
@@ -44,11 +45,20 @@ impl MessageQueue {
         self.len
     }
 
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result == (self.len@ == 0)))]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Enqueue a message. Returns `Err(msg)` if the queue is full.
+    ///
+    /// The bounds and the count are proved by Creusot over this function (`tests/creusot`): from a queue
+    /// whose head and length are in range, they stay in range, the head does not move, and the length
+    /// grows by one or the queue was full and is unchanged.
+    #[cfg_attr(creusot, creusot_std::macros::requires((*self).head@ < QUEUE_DEPTH@ && (*self).len@ <= QUEUE_DEPTH@))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures((^self).head@ < QUEUE_DEPTH@ && (^self).len@ <= QUEUE_DEPTH@))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures((^self).head == (*self).head))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(match result { Ok(_) => (^self).len@ == (*self).len@ + 1, Err(_) => (*self).len@ == QUEUE_DEPTH@ && (^self).len == (*self).len }))]
     pub fn enqueue(&mut self, msg: Message) -> Result<(), Message> {
         if self.is_full() {
             return Err(msg);
@@ -60,6 +70,13 @@ impl MessageQueue {
     }
 
     /// Dequeue the oldest message.
+    ///
+    /// Proved by Creusot as `enqueue` is: an empty queue gives nothing and is unchanged; otherwise the head
+    /// moves on by one, round the ring, and the length falls by one.
+    #[cfg_attr(creusot, creusot_std::macros::requires((*self).head@ < QUEUE_DEPTH@ && (*self).len@ <= QUEUE_DEPTH@))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures((^self).head@ < QUEUE_DEPTH@ && (^self).len@ <= QUEUE_DEPTH@))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures((*self).len@ == 0 ==> result == None && (^self).len == (*self).len && (^self).head == (*self).head))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures((*self).len@ > 0 ==> (^self).len@ == (*self).len@ - 1 && (^self).head@ == ((*self).head@ + 1) % QUEUE_DEPTH@))]
     pub fn dequeue(&mut self) -> Option<Message> {
         if self.is_empty() {
             return None;

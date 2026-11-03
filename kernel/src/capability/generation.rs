@@ -15,6 +15,8 @@
 
 /// Monotonically-increasing generation counter for one resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Creusot models a derived `PartialEq` through this; the kernel's build never sees it (`tests/creusot`).
+#[cfg_attr(creusot, derive(creusot_std::model::DeepModel))]
 pub struct Generation(pub u32);
 
 impl Generation {
@@ -26,7 +28,10 @@ impl Generation {
     /// match a live resource again, defeating revocation (§7.5). A u32 gives ~4
     /// billion restarts of a single resource, unreachable in practice; the panic is
     /// the loud-failure backstop (§3.12; hardening H7). Pinned by
-    /// `bump_at_max_panics_never_wraps`.
+    /// `bump_at_max_panics_never_wraps`. Below the ceiling it is exactly one more, proved by Creusot over
+    /// this function (`tests/creusot`).
+    #[cfg_attr(creusot, creusot_std::macros::requires(self.0@ < u32::MAX@))]
+    #[cfg_attr(creusot, creusot_std::macros::ensures(result.0@ == self.0@ + 1))]
     pub fn bump(self) -> Self {
         Generation(self.0.checked_add(1).expect("generation overflow"))
     }
@@ -36,6 +41,7 @@ impl Generation {
     }
 }
 
+#[cfg(not(creusot))]
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// The single global source for a NEW endpoint's starting generation (§7.5).
@@ -53,8 +59,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// is about the generation a fresh endpoint STARTS at. Starts at 1 (0 = `INITIAL`, reserved for stable kernel resources). Panics on
 /// u32 wrap rather than rolling to 0 (which would alias `INITIAL` and resurrect authority) - ~4.2B
 /// creations per boot, unreachable in practice; loud per H7.
+///
+/// Not seen by Creusot (`tests/creusot`), which cannot translate a `static`: the counter is Kani's and the
+/// unit tests' below.
+#[cfg(not(creusot))]
 static NEXT_GENERATION: AtomicU32 = AtomicU32::new(1);
 
+#[cfg(not(creusot))]
 pub fn next_generation() -> Generation {
     let g = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
     if g == 0 { panic!("generation counter overflow (wrapped to 0)"); }
