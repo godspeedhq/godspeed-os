@@ -16586,7 +16586,7 @@ fn trace_sub_help(ctx: &ServiceContext, view: &str) -> bool {
         ], false),
         "endpoint" => help_block(ctx, "trace endpoint", "who owns an endpoint, and who can reach it", &[
             ("owned by task N", "a live service's endpoint", ""),
-            ("a kernel resource", "ids 1-18 are log_write, spawn, console_read, ...", "trace endpoint 4"),
+            ("a kernel resource", "ids 1-19 are log_write, spawn, console_read, ...", "trace endpoint 4"),
             ("NO LIVE OWNER", "its task died, or it is a reply-only mailbox", ""),
             ("holder / rights", "every live task holding a cap, and its rights", ""),
         ], false),
