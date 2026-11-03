@@ -5,13 +5,13 @@ name: verify
 # attributable to the commit and the checker that produced it, the same argument rust-toolchain.toml
 # makes for the compiler.
 #
-# Runs only where it can say something: on a pull request that touches the files it includes, and by
-# hand. The other test workflows are paused to conserve CI minutes; this one is scoped instead.
+# Runs on every pull request that touches the kernel (backlog/90's finish line: every kernel change, not
+# only the files a harness includes, since a change elsewhere can break an assumption one states), and
+# by hand. The other test workflows are paused to conserve CI minutes; this one is scoped instead.
 on:
   pull_request:
     paths:
-      - 'kernel/src/capability/**'
-      - 'kernel/src/smp/spinlock.rs'
+      - 'kernel/**'
       - 'tests/kani/**'
       - '.github/workflows/verify.yml'
   workflow_dispatch:
