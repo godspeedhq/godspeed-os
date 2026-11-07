@@ -348,6 +348,12 @@ kernel service, never a runtime dependency, nothing added to an image to check i
     `kernel/Cargo.toml`, behind `cfg(creusot)` so the target build never sees them - still a dependency line,
     which is what `I-kernel-deps` (Commandment I) refuses without a recorded reason. The alternative, a copy
     of the function, proves the algorithm and not the implementation, and would be labelled so.
+  - **Three capability harnesses had been failing since D5, found 2026-11-07.** D5 made `Rights::narrow`
+    keep `ONCE`, and `rights_narrow_never_widens`, `rights_without_removes_exactly` and
+    `cap_narrow_for_grant_keeps_identity` still asserted the old rule. The job runs on a pull request and D5
+    went onto this branch without one, so for six days three proofs this entry counted as PROVED were
+    failing. The container's first run found it; each now states the current contract (`4e32813b`), and the
+    lesson is the job's trigger: a branch that never opens a pull request never runs it.
   - **Kani on the IPC queue, tried 2026-11-03, no result.** Three harnesses over the real `queue.rs` - 20
     mixed steps; 18 steps of enqueue and dequeue; a matching harness of four messages across the wrap - each
     ran CBMC past 8 GB, or past 30 minutes, with and without `--arrays-uf-always`, at the real 4 KiB message
@@ -506,7 +512,9 @@ moves to `fixed/`, and backlog/71's soak is what stands between it and v1.)*
    against the code and naming the check that holds it.
 5. **Kani covers capabilities and routing**, in a job that runs on every pull request touching `kernel/`. Making it
    a required check is a repository setting, which is the operator's.
-6. **A container image** lets a contributor run those checks themselves.
+6. **A container image** lets a contributor run those checks themselves. Done 2026-11-07:
+   `verification/Containerfile` (Ubuntu 24.04, the kernel's toolchain, Kani 0.68.0, Creusot at
+   `fe191590`), built with Docker; inside it Kani verifies 15 of 15 and Creusot proves 9 of 9.
 7. **Creusot runs on a few pure functions, or is dropped**, with the decision recorded here. Done 2026-11-03: it
    runs, on nine production functions (layer C, above).
 

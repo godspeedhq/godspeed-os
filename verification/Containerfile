@@ -1,0 +1,50 @@
+# The verification environment as one image (backlog/90, "Where they run"): the Ubuntu, Rust toolchain,
+# Kani and Creusot the proofs were run with, so a contributor reruns a failing proof exactly - on Linux
+# directly, and on macOS or Windows through Docker. Build and run from the repository root:
+#
+#   docker build -t godspeed-verify -f verification/Containerfile .
+#   docker run --rm -v "$PWD:/src" -w /src/tests/kani    godspeed-verify cargo kani
+#   docker run --rm -v "$PWD:/src" -w /src/tests/creusot godspeed-verify ./prove.sh
+#
+# Everything is pinned: the base image's release, the kernel's Rust toolchain (read from rust-toolchain.toml
+# at build time, so the two cannot drift), Kani's version (which must match verify.yml's KANI_VERSION), and
+# Creusot's commit, whose installer pins its own toolchain and every prover's version.
+FROM ubuntu:24.04
+
+ARG KANI_VERSION=0.68.0
+ARG CREUSOT_COMMIT=fe191590ea65beae627979cc2197fe42619548a2
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config python3 git \
+      opam m4 unzip bubblewrap autoconf libgmp-dev zlib1g-dev libssl-dev \
+      libexpat1-dev libcairo2-dev libgtk-3-dev libgtksourceview-3.0-dev rsync \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+
+# The kernel's own pin, so the image's default compiler is the one the kernel builds with.
+COPY rust-toolchain.toml /tmp/rust-toolchain.toml
+RUN channel="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' /tmp/rust-toolchain.toml)" \
+ && test -n "$channel" \
+ && curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "$channel" \
+ && rustc --version
+
+# Kani brings its own toolchain and CBMC; `cargo kani setup` puts them in the image, so a run needs no network.
+RUN cargo install --locked kani-verifier --version "$KANI_VERSION" \
+ && cargo kani setup \
+ && cargo kani --version
+
+# Creusot, from the commit the proofs were made with. Its installer builds Why3 and the provers in an opam
+# switch under ~/.local/share/creusot, which tests/creusot/prove.sh selects.
+# Two jobs, so compiling Why3 and the provers stays within a laptop's Docker memory.
+ENV OPAMJOBS=2
+# The installer asks before pinning Why3 and why3find; a build has no one to answer.
+ENV OPAMYES=1
+RUN opam init -y --bare --disable-sandboxing \
+ && git clone https://github.com/creusot-rs/creusot /opt/creusot \
+ && cd /opt/creusot && git checkout "$CREUSOT_COMMIT" \
+ && ./INSTALL \
+ && cargo creusot --help > /dev/null
+
+# The checked-out tree is mounted at run time; nothing of it is baked in.
+WORKDIR /src
