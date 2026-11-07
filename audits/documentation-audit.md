@@ -2318,3 +2318,67 @@ source files was not altered.
 **Audit 28's findings:** 1 to 6 are fixed and carded on all five boards (backlog/90 D5). 7, 8 and 9 are open.
 
 **Gates:** below, in the commit that records this.
+
+## Audit 30 - documents and code comments, `feat/v1-groundwork` since Audit 29 (2026-11-07)
+
+Scope: everything changed since `a1ef37a7`, up to `40dc7a64` (15 commits, 37 files: D14's abandoned-kill retry, the
+rest of D27, the deferred kernel-stack queue as atomics, Creusot on nine kernel functions, the invariant registry,
+Kani on every kernel pull request, the three stale Kani harnesses, and `verification/Containerfile`), then the
+documents and comments those changes touch. One reader, one pass; each finding was checked against the code. Kani
+(15 of 15) and Creusot (9 of 9) were rerun at `40dc7a64` in WSL first. The code in the changed source files was
+not altered.
+
+**Result.** 9 files corrected (one of them `CLAUDE.md`, in its own commit), and 5 code findings recorded.
+
+**In documents:**
+- `backlog/README.md` row 90: its next step still listed D20, E3-E5, the registry, Kani on pull requests, the
+  container and Creusot, all done. It now names what is left: the D14 and D27 hardware card, and item 5.
+- `backlog/90`, the defects table: **Where** gives the line at the audit's commit, and most have moved (D14's
+  `task/scheduler.rs:2560-2903` is now around 2993-3740). The citations have no `kernel/` prefix, so
+  `line_ref_check` does not see them. A sentence above the table says so, rather than re-pointing 29 rows of
+  evidence.
+- `docs/developer-services-design.md` 13.2 said `ConsoleForeground` gives an app the keyboard. On riscv64 there is
+  no foreground: the claim answers -1 since D27, and the shell keeps reading. Noted, dated.
+- `tests/creusot/README.md`: a run in the container leaves `verif/` and `.why3find/` owned by root, and a later WSL
+  run stops with `Permission denied`. Found by rerunning the proofs for this audit; the README now says what to
+  clear.
+- `CLAUDE.md` 5, the repository map: `tests/` listed only `qemu/`, and `verification/` was missing. It now lists
+  `host-ipc/`, `kani/`, `creusot/` and `verification/`. `tests/conformance` and `tests/hardware` are still not
+  listed; they predate this scope.
+
+**In code comments:**
+- `kernel/src/syscall/dispatch.rs`, `handle_recv`: D27 moved the size check above the badge, and left the badge's
+  comment above the size check's. Each comment now sits on its own line of code.
+- `kernel/src/capability/generation.rs`: said `next_generation`'s counter "is Kani's and the unit tests'". No Kani
+  harness calls it; the two generation harnesses are about `bump`.
+- `kernel/src/capability/cap.rs`, `narrow_for_grant`: did not say the copy keeps `ONCE`.
+- `sdk/rust/src/service_context.rs`: `console_boot_complete`, `claim_console_foreground` and
+  `release_console_foreground` return `bool` since D27 and did not say what `false` means. `console_echo` already did.
+
+**Code findings, recorded:**
+1. **PLAUSIBLE: on riscv64 a released foreground no longer wakes the shell.** `handle_console_foreground` now
+   returns -1 before its newline wake when the port has no foreground (`09dfbb21`). That wake is what brings `gsh>`
+   back after `chaos` or an app ends, if the shell was asleep in `console_read`. riscv64 has no foreground, so the
+   wake is skipped there. A QEMU riscv64 run of `chaos max-carnage all-services 3 yes` printed "chaos: done -
+   foreground returned to the shell" and no prompt after it, but the run was disturbed (finding 5) and the shell
+   had printed `gsh>` just before, so it does not settle it. To settle it: on the VisionFive, run
+   `chaos max-carnage all-services 3` and see whether `gsh>` returns without a key.
+2. Every caller ignores the `bool` D27 added: `gs::app` (`stdlib/rust/src/app.rs`, `open` and `close`), `chaos`,
+   `observe` and the shell. On riscv64 an app goes on as if it held the keyboard while the shell also reads. That
+   was true before D27; the answer now exists and nothing reads it.
+3. `tests/creusot/prove.sh` says "was the function renamed?" whenever a `.coma` file is missing. It is also
+   missing when `verif/` was deleted and Cargo finds the build current, which is how this audit met it.
+4. The container writes its Creusot output into the mounted repository as root. Documented (above); the fix belongs
+   in the Containerfile or `prove.sh`.
+5. Under QEMU riscv64 (`riscv_run.py --release --smp 4`, no disk), `chaos max-carnage all-services 3 yes` printed
+   "chaos: failed to spawn the chaos service", then the supervisor spawned it and it ran 0 rounds. Not
+   investigated.
+
+**Also seen, not changed:** records since 2026-07-09 write `chaos max-carnage 100` as shorthand. That has not been
+a command since `0cb8985b` (it prints the usage); the form is `chaos max-carnage all-services 100`. They are
+records of runs, so they stand; the hardware card this session gave the operator used the shorthand and is
+corrected in conversation.
+
+**Audit 29's findings:** 1 is fixed (`cce07062`); 2 is open. Audit 28's 7, 8 and 9 were not re-examined.
+
+**Gates:** below, in the commit that records this.
