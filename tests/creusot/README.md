@@ -40,5 +40,9 @@ Creusot needs Linux: in WSL (Ubuntu 24.04), or in `verification/Containerfile`.
 ./prove.sh
 ```
 
+A run in the container writes `verif/` and `.why3find/` as root, through the mount. A later run in WSL then
+stops with `Permission denied` on a `proof.json`: remove both folders first (they are generated, and ignored by
+git), and clear the build's target directory too, or Cargo finds the build current and writes no `.coma` files.
+
 `why3find.json` names the provers: Alt-Ergo, CVC5 and CVC4. Z3 is installed with Creusot and runs, but why3find
 cannot calibrate it on the machine these were first proved on, so it is not used; nothing here needs it.

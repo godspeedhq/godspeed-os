@@ -1259,7 +1259,9 @@ service for output, and the right to claim the foreground. Asked at install like
 "it will read the keyboard while it runs". A keyboard is a command channel (6.4, SEC-2), so this is the grant
 that matters, and it is never given silently. *(2026-10-25, as built: there is no contract key. An app is
 asked for `console` at install by its kind (`services/godspeed-pm/src/install.rs`), and the supervisor
-starts it with `SPAWN_FLAG_REQ_CONSOLE` when its grant names it (CLAUDE.md 14.1 amendment).)*
+starts it with `SPAWN_FLAG_REQ_CONSOLE` when its grant names it (CLAUDE.md 14.1 amendment).)* *(2026-11-07:
+the foreground is a port's, and riscv64 has none: there the claim answers -1 (`backlog/90` D27), the shell keeps
+reading while an app runs, and `gs::app` carries on without the keyboard to itself.)*
 
 **Lifecycle.** Started by typing its name, as a utility, and in the foreground until it ends. The shell's
 `[q]` cannot reach a program that owns the keyboard, so the way out is the app's own (its quit key) or from

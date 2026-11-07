@@ -168,6 +168,8 @@ automatic path.
 
 Ids match the audit, section 6, where each has its trace, the minimal correction and the check that would
 catch it. Severity is after the skeptics. KNOWN means already recorded elsewhere, and this pass adds to it.
+**Where** is the line at the audit's commit (`537e6861`); most have moved since, so a name in the row is the
+better guide.
 
 | Id | Sev | Defect | Where |
 |---|---|---|---|
