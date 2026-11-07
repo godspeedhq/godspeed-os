@@ -60,8 +60,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// u32 wrap rather than rolling to 0 (which would alias `INITIAL` and resurrect authority) - ~4.2B
 /// creations per boot, unreachable in practice; loud per H7.
 ///
-/// Not seen by Creusot (`tests/creusot`), which cannot translate a `static`: the counter is Kani's and the
-/// unit tests' below.
+/// Not seen by Creusot (`tests/creusot`), which cannot translate a `static`: the counter is checked by the
+/// unit test below, and by no Kani harness (Kani's two generation harnesses are about `bump`).
 #[cfg(not(creusot))]
 static NEXT_GENERATION: AtomicU32 = AtomicU32::new(1);
 

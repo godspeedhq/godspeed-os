@@ -40,8 +40,8 @@ impl Capability {
         Ok(())
     }
 
-    /// Produce a narrowed copy of this cap for a GRANT transfer (§7.4).
-    /// Panics in debug builds if `mask` would widen rights.
+    /// Produce a narrowed copy of this cap for a GRANT transfer (§7.4): the mask, plus this cap's `ONCE`,
+    /// which `Rights::narrow` keeps (backlog/90 D5). Panics in debug builds if `mask` would widen rights.
     pub fn narrow_for_grant(&self, mask: Rights) -> Self {
         // Every bit in mask must already be in self.rights - no widening.
         debug_assert!(

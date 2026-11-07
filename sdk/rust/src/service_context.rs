@@ -3811,7 +3811,8 @@ impl ServiceContext {
     /// End boot-log mirroring to the framebuffer and clear the TV (syscall 26).
     /// The shell calls this once, on the first keystroke, so the user sees the
     /// boot sequence on the display and then gets a clean interactive console.
-    /// Requires the CONSOLE_READ cap.
+    /// Requires the CONSOLE_READ cap. False where the kernel has no boot screen to dismiss, or without the
+    /// cap (backlog/90 D27).
     pub fn console_boot_complete(&self) -> bool {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return false; }
@@ -3834,7 +3835,9 @@ impl ServiceContext {
     /// `try_console_read` returns bytes; every other task reads empty. The `chaos` service
     /// claims it for the duration of a run so a resurrected shell cannot swallow its
     /// `q`-to-quit. Pair with `release_console_foreground` on exit, after ensuring a live
-    /// shell exists to hand the keyboard back to. Requires the CONSOLE_READ cap.
+    /// shell exists to hand the keyboard back to. Requires the CONSOLE_READ cap. False where the port has
+    /// no foreground to claim (riscv64 has none), or without the cap: the claim did not happen and
+    /// other readers still read (backlog/90 D27).
     pub fn claim_console_foreground(&self) -> bool {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return false; }
@@ -3845,7 +3848,8 @@ impl ServiceContext {
     }
 
     /// Release exclusive console input (syscall 40, op = 0) back to the unclaimed state, so
-    /// any CONSOLE_READ holder (the shell) reads normally again. Idempotent.
+    /// any CONSOLE_READ holder (the shell) reads normally again. Idempotent. False where the port has no
+    /// foreground, or without the cap (backlog/90 D27).
     pub fn release_console_foreground(&self) -> bool {
         let data = Self::ctx();
         if data.magic != SERVICE_CTX_MAGIC { return false; }
