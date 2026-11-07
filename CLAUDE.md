@@ -385,6 +385,12 @@ os/
       identity/            # identity test suite (§22)
       harness/             # shared test infrastructure
       perf/                # performance benchmarks (§22 B1-B10) - 10/10 ✅
+    host-ipc/              # the real `routing.rs`, `queue.rs` and `names.rs` on the host (backlog/90 E4)
+    kani/                  # bounded model checking of the real capability files (backlog/90 layer C)
+    creusot/               # deductive proofs of contracts on nine production kernel functions
+
+  verification/          # how the kernel is checked: the invariant registry, the layers, and the
+                         #   Containerfile a contributor reruns the proofs in (backlog/90)
 
   scripts/               # THE ENFORCEMENT LAYER, and the non-x86 build paths
     commandments.py      #   the Ten Commandments, mechanised where they can be
