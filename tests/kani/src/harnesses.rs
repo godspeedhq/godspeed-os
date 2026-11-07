@@ -30,22 +30,26 @@ fn any_cap() -> Capability {
 
 // ---- rights (7.3: non-escalating) -----------------------------------------------------------------
 
-/// Narrowing can only remove rights: the result is inside both the original and the mask.
+/// Narrowing can only remove rights: the result is inside the original, and inside the mask apart from
+/// `ONCE`, which it keeps exactly as the original had it - a mask that did not name `ONCE` must not turn a
+/// one-shot cap back into one of many uses (CLAUDE.md 8.2, backlog/90 D5).
 #[kani::proof]
 fn rights_narrow_never_widens() {
     let (r, m) = (any_rights(), any_rights());
     let n = r.narrow(m);
     assert!(r.contains(n));
-    assert!(m.contains(n));
+    assert!(m.union(Rights::ONCE).contains(n));
+    assert!(n.contains(Rights::ONCE) == r.contains(Rights::ONCE));
 }
 
-/// `without` removes every right in the mask and adds none.
+/// `without` removes every right in the mask, adds none, and keeps every other bit.
 #[kani::proof]
 fn rights_without_removes_exactly() {
     let (r, m) = (any_rights(), any_rights());
     let w = r.without(m);
     assert!(r.contains(w));
-    assert!(w.narrow(m) == Rights::empty());
+    assert!(w.0 & m.0 == 0);
+    assert!(w.union(m).contains(r));
 }
 
 /// `contains` is a partial order: reflexive, antisymmetric and transitive. Every gate in the kernel is
@@ -102,8 +106,9 @@ fn cap_validate_is_exact() {
     }
 }
 
-/// A grant-narrowed copy names the same resource at the same generation, with exactly the mask -
-/// under the precondition the function asserts in debug builds (the mask is inside what is held).
+/// A grant-narrowed copy names the same resource at the same generation, with exactly the mask plus the
+/// held cap's `ONCE`, which narrowing keeps (backlog/90 D5) - under the precondition the function asserts
+/// in debug builds (the mask is inside what is held).
 #[kani::proof]
 fn cap_narrow_for_grant_keeps_identity() {
     let cap = any_cap();
@@ -111,7 +116,8 @@ fn cap_narrow_for_grant_keeps_identity() {
     kani::assume(cap.rights.contains(mask));
     let n = cap.narrow_for_grant(mask);
     assert!(n.resource_id == cap.resource_id && n.generation.0 == cap.generation.0);
-    assert!(n.rights == mask && cap.rights.contains(n.rights));
+    assert!(n.rights == mask.union(Rights(cap.rights.0 & Rights::ONCE.0)));
+    assert!(cap.rights.contains(n.rights));
 }
 
 /// A cap stripped for re-delegation (SEC-7) can never be passed on again, and keeps everything else.
